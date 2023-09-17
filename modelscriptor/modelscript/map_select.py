@@ -100,7 +100,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     false_offset = torch.tensor(
         ([-big_offset] * len(true_node)) + ([big_offset] * len(true_node))
     )
-    x = Concatenate([true_node, false_node])
+    x: Node = Concatenate([true_node, false_node])
     x = cond_add_vector(cond, x, true_offset, false_offset)
 
     # Splits the input node into two equal-length vectors, apply ReLU to each,
