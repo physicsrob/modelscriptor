@@ -1,4 +1,4 @@
-from modelscriptor.modelscript.input_nodes import create_embedding
+from modelscriptor.modelscript.inout_nodes import create_embedding, create_unembedding
 from modelscriptor.modelscript.map_select import map_to_table
 
 
@@ -15,8 +15,8 @@ def test_embedding():
         default=embedding.get_embedding("default"),
     )
 
-    output = embedding.unembed(
-        lookup,
+    output_node = create_unembedding(lookup, embedding)
+    output = output_node.compute(
         n_pos=6,
         input_values={"embedding_input": ["1", "2", "3", "2", "1", "10"]},
     )

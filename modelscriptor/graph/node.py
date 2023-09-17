@@ -8,7 +8,7 @@ class Node:
         self.d_output = d_output
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def __len__(self):
         return self.d_output

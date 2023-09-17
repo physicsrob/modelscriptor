@@ -41,6 +41,19 @@ def add(inp1: Node, inp2: Node) -> Node:
     return Add(inp1, inp2)
 
 
+def concat(inp_list: List[Node]) -> Node:
+    """
+    Concatenates all the Nodes in inp_list.
+
+    Args:
+        inp_list (List[Node]): List of nodes to concatenate
+
+    Returns:
+        Node: Node resulting from concatenation
+    """
+    return Concatenate(inp_list)
+
+
 def add_scaled_nodes(c1: float, inp1: Node, c2: float, inp2: Node) -> Node:
     """
     Computes the linear combination of two nodes using specified coefficients.
