@@ -25,7 +25,7 @@ class Attn(Node):
         self.d_query_in = query_matrix.shape[0]
         self.d_key_in = key_matrix.shape[0]
         self.d_value_in = value_matrix.shape[0]
-        super().__init__(output_matrix.shape[1])
+        super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
 
         assert query_matrix.shape[1] == self.d_head
         assert key_matrix.shape[1] == self.d_head

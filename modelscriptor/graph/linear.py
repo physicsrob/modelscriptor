@@ -26,13 +26,13 @@ class Linear(Node):
         assert len(input_node) == self.d_input
         self.output_matrix = output_matrix
 
-        if not output_bias:
+        if output_bias is None:
             self.output_bias = torch.zeros(self.d_output)
         else:
             assert len(output_bias) == self.d_output
             self.output_bias = output_bias
 
-        super().__init__(self.d_output)
+        super().__init__(self.d_output, [input_node])
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         value_in = self.input_node.compute(n_pos, input_values)

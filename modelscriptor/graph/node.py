@@ -4,8 +4,9 @@ import torch
 
 
 class Node:
-    def __init__(self, d_output: int):
+    def __init__(self, d_output: int, inputs: List["Node"]):
         self.d_output = d_output
+        self.inputs = inputs
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         raise NotImplementedError()

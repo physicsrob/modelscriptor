@@ -21,7 +21,7 @@ class Embedding(Node):
         self.max_vocab = self.table.shape[0]
         self.vocab = special_tokens + vocab
         assert self.table.shape == (self.max_vocab, d_embed)
-        super().__init__(d_embed)
+        super().__init__(d_embed, [])
 
     def get_token_id(self, text: str) -> int:
         if text in self.vocab:

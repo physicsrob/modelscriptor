@@ -7,7 +7,7 @@ import torch
 class InputNode(Node):
     def __init__(self, name: str, d_output: int):
         self.name = name
-        super().__init__(d_output)
+        super().__init__(d_output, [])
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         if self.name not in input_values:
@@ -27,7 +27,7 @@ class InputNode(Node):
 
 class Concatenate(Node):
     def __init__(self, inputs: List[Node]):
-        super().__init__(sum(len(x) for x in inputs))
+        super().__init__(sum(len(x) for x in inputs), inputs)
         self.inputs = inputs
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
@@ -36,7 +36,7 @@ class Concatenate(Node):
 
 class Add(Node):
     def __init__(self, input1: Node, input2: Node):
-        super().__init__(len(input1))
+        super().__init__(len(input1), [input1, input2])
         self.input1 = input1
         self.input2 = input2
 
@@ -50,7 +50,7 @@ class Constant(Node):
     def __init__(self, value: torch.Tensor):
         assert len(value.shape) == 1
         self.value = value
-        super().__init__(len(value))
+        super().__init__(len(value), [])
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         x = self.value.unsqueeze(0).expand(n_pos, -1)
@@ -62,7 +62,7 @@ class ValueLogger(Node):
     def __init__(self, inp: Node, name: str):
         self.name = name
         self.inp = inp
-        super().__init__(len(inp))
+        super().__init__(len(inp), [inp])
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         x = self.inp.compute(n_pos, input_values)

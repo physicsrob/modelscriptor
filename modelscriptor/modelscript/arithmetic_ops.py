@@ -1,7 +1,10 @@
 from typing import List
 
-from modelscriptor.graph import Node, Add, FFNLayer, Concatenate, Linear
+from modelscriptor.graph import Node, Add, Concatenate, Linear
 import torch
+
+from modelscriptor.graph.relu import ReLU
+from modelscriptor.modelscript.ffn_layer import ffn_layer
 
 
 def add_scalar(inp: Node, scalar: float) -> Node:
@@ -17,7 +20,7 @@ def add_scalar(inp: Node, scalar: float) -> Node:
     """
     return Add(
         inp,
-        FFNLayer(
+        ffn_layer(
             input_node=inp,
             input_proj=torch.tensor([0.0] * len(inp)),
             input_bias=torch.zeros(1),
@@ -110,20 +113,7 @@ def relu(inp: Node) -> Node:
     Returns:
         Node: Node with ReLU applied.
     """
-    # Rectifies val
-    # Equivalent to torch.clamp(val, min=0)
-    input_proj = torch.eye(len(inp))
-    input_bias = torch.zeros(len(inp))
-    output_proj = torch.eye(len(inp))
-    output_bias = torch.zeros(len(inp))
-
-    return FFNLayer(
-        input_node=inp,
-        input_proj=input_proj,
-        input_bias=input_bias,
-        output_proj=output_proj,
-        output_bias=output_bias,
-    )
+    return ReLU(inp)
 
 
 def relu_add(inp1: Node, inp2: Node) -> Node:
@@ -151,7 +141,7 @@ def relu_add(inp1: Node, inp2: Node) -> Node:
         output_proj[i, i] = 1.0
         output_proj[len(inp1) + i, i] = 1.0
 
-    return FFNLayer(
+    return ffn_layer(
         input_node=x,
         input_proj=input_proj,
         input_bias=input_bias,
