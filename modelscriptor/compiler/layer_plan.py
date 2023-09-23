@@ -1,5 +1,5 @@
 from abc import abstractmethod, ABC
-from typing import Set, Optional
+from typing import Set, Optional, Type, List
 
 from modelscriptor.graph import Node, Linear, Add, Attn
 from modelscriptor.graph.relu import ReLU
@@ -23,66 +23,209 @@ class LayerPlan(ABC):
     def get_output_nodes(self) -> Set[Node]:
         ...
 
+    @abstractmethod
+    def can_add_output(self, output_node: Node) -> bool:
+        ...
+
+    @abstractmethod
+    def can_pass_output(self, output_node: Node) -> bool:
+        ...
+
+    @abstractmethod
+    def add_output(self, output_node: Node) -> Set[Node]:
+        ...
+
+
+class SingleLayerPlan(LayerPlan):
+    in_nodes: Set[Node]
+    out_nodes: Set[Node]
+    node_type: Type[Node]
+
+    def __init__(self, node_type: Type[Node]):
+        super().__init__()
+        self.node_type = node_type
+        self.in_nodes = set()
+        self.out_nodes = set()
+
+    def print(self, prefix=""):
+        for node in self.in_nodes:
+            print(f"{prefix}  in:   {repr(node)}")
+        for node in self.out_nodes:
+            print(f"{prefix} out:   {repr(node)}")
+
+    def get_input_nodes(self) -> Set[Node]:
+        return self.in_nodes
+
+    def get_output_nodes(self) -> Set[Node]:
+        return self.out_nodes
+
+    def can_add_output(self, output_node: Node) -> bool:
+        return isinstance(output_node, self.node_type)
+
+    def can_pass_output(self, output_node: Node) -> bool:
+        return self.node_type == Linear
+
+    def add_output(self, output_node: Node) -> Set[Node]:
+        if self.node_type == Linear and not isinstance(output_node, Linear):
+            # We can pass the output node through.
+            self.in_nodes.add(output_node)
+            self.out_nodes.add(output_node)
+            return {output_node}
+        else:
+            assert isinstance(output_node, self.node_type)
+            self.out_nodes.add(output_node)
+            self.in_nodes.update(output_node.inputs)
+            return set(output_node.inputs)
+
+
+class TwoLayerPlan(LayerPlan):
+    node_type1: Type[Node]
+    node_type2: Type[Node]
+    plan1: SingleLayerPlan
+    plan2: SingleLayerPlan
+
+    def __init__(self, node_type1: Type[Node], node_type2: Type[Node]):
+        super().__init__()
+        self.node_type1 = node_type1
+        self.node_type2 = node_type2
+        self.plan1 = SingleLayerPlan(node_type1)
+        self.plan2 = SingleLayerPlan(node_type2)
+
+    def print(self, prefix=""):
+        self.plan1.print(f"{prefix} {self.node_type1}")
+        self.plan2.print(f"{prefix} {self.node_type2}")
+
+    def get_input_nodes(self) -> Set[Node]:
+        return self.plan1.get_input_nodes()
+
+    def get_output_nodes(self) -> Set[Node]:
+        return self.plan2.get_output_nodes()
+
+    def can_add_output(self, output_node: Node) -> bool:
+        for strategy2 in ['pass', 'output']:
+            if strategy2 == 'pass':
+                if not self.plan2.can_pass_output(output_node):
+                    continue
+                plan1_outputs = [output_node]
+            else:
+                if not self.plan2.can_add_output(output_node):
+                    continue
+                plan2_outputs = output_node.inputs
+
+            for strategy1 in ['pass', 'output']:
+                if strategy1 == 'pass':
+                    if not all(self.plan1.can_pass_output(inp)
+        return (self.plan2.can_add_output(output_node) and all(self.plan1.can_add_output(inp) for inp in output_node.inputs)) or
+        (self.plan2.can_pass_output(output_node) and self.plan1.can_add_output(output_node))
+        return isinstance(output_node, self.node_type)
+
+    def can_pass_output(self, output_node: Node) -> bool:
+        return self.node_type == Linear
+
+    def add_output(self, output_node: Node) -> Set[Node]:
+        if self.node_type == Linear and not isinstance(output_node, Linear):
+            # We can pass the output node through.
+            self.in_nodes.add(output_node)
+            self.out_nodes.add(output_node)
+            return {output_node}
+        else:
+            assert isinstance(output_node, self.node_type)
+            self.out_nodes.add(output_node)
+            self.in_nodes.update(output_node.inputs)
+            return set(output_node.inputs)
+
+
+class MultiLayerPlan(LayerPlan):
+    plans: List[SingleLayerPlan]
+
+    def __init__(self, node_types: List[Type[Node]]):
+        super().__init__()
+        self.node_types = node_types
+        self.plans = [SingleLayerPlan(node_type) for node_type in node_types]
+
+    def print(self, prefix=""):
+        for node in self.in_nodes:
+            print(f"{prefix}  in:   {repr(node)}")
+        for node in self.out_nodes:
+            print(f"{prefix} out:   {repr(node)}")
+
+    def get_input_nodes(self) -> Set[Node]:
+        return self.in_nodes
+
+    def get_output_nodes(self) -> Set[Node]:
+        return self.out_nodes
+
+    def can_add_output(self, output_node: Node) -> bool:
+        return isinstance(output_node, self.node_type)
+
+    def can_pass_output(self, output_node: Node) -> bool:
+        return all(plan.can_pass_output(output_node) for plan in self.plans)
+
+    def add_output(self, output_node: Node) -> Set[Node]:
+        if self.node_type == Linear and not isinstance(output_node, Linear):
+            # We can pass the output node through.
+            self.in_nodes.add(output_node)
+            self.out_nodes.add(output_node)
+            return {output_node}
+        else:
+            assert isinstance(output_node, self.node_type)
+            self.out_nodes.add(output_node)
+            self.in_nodes.update(output_node.inputs)
+            return set(output_node.inputs)
+
 
 class FFNPlan(LayerPlan):
     # Plan for FFN, not counting skip.
-    linear1_output_nodes: Set[Node]
-    relu_output_nodes: Set[Node]
-    linear2_output_nodes: Set[Node]
+    linear1_plan: SingleLayerPlan
+    relu_plan: SingleLayerPlan
+    linear2_plan: SingleLayerPlan
 
     def __init__(self):
         super().__init__()
-        self.linear1_output_nodes = set()
-        self.relu_output_nodes = set()
-        self.linear2_output_nodes = set()
+        self.linear1_plan = SingleLayerPlan(Linear)
+        self.relu_plan = SingleLayerPlan(ReLU)
+        self.linear2_plan = SingleLayerPlan(Linear)
 
     def print(self):
         print("FFNPlan:")
-        for node in self.linear1_output_nodes:
-            print(f"linear1:   {repr(node)}")
-        for node in self.relu_output_nodes:
-            print(f"relu   :   {repr(node)}")
-        for node in self.linear2_output_nodes:
-            print(f"linear2:   {repr(node)}")
+        self.linear1_plan.print("linear1")
+        self.relu_plan.print("relu   ")
+        self.linear2_plan.print("linear2")
 
     def get_input_nodes(self) -> Set[Node]:
-        result = set()
-        for relu_inp in self.linear1_output_nodes:
-            if isinstance(relu_inp, Linear):
-                result.update(relu_inp.inputs)
-            else:
-                result.add(relu_inp)
-        return result
+        return self.linear1_plan.get_input_nodes()
 
     def get_output_nodes(self) -> Set[Node]:
-        return self.linear2_output_nodes
+        return self.linear2_plan.get_output_nodes()
 
     def can_add_output(self, output_node: Node) -> bool:
-        # A node can be added to a FFN if it's a linear layer with a relu parent,
-        # or just a relu.
-        if isinstance(output_node, Linear):
-            parent = output_node.inputs[0]
-            return isinstance(parent, ReLU)
-        else:
-            return isinstance(output_node, ReLU)
+        for plan1, plan2, plan3 in [
+            ("pass", "pass", "add"),
+            ("pass", "pass", "pass"),
+            ("pass", "add", "add"),
+            ("pass", "add", "pass"),
+            ("add", "pass", "add"),
+            ("add", "pass", "pass"),
+            ("add", "add", "add"),
+            ("add", "add", "pass"),
+        ]:
+            check1 = self.linear1_plan.can_add_output()
 
     def add_output(self, output_node: Node):
-        current_node = output_node
+        relu_nodes = self.linear2_plan.add_output(output_node)
+        assert all(self.relu_plan.can_add_output(relu_node) for relu_node in relu_nodes)
 
-        # Process linear2 layer
-        self.linear2_output_nodes.add(current_node)
-        if isinstance(current_node, Linear):
-            current_node = current_node.inputs[0]
-        # Otherwise identity matrix will be added, we don't go up the graph.
+        linear1_out_nodes = set()
+        for node in relu_nodes:
+            linear1_out_nodes.update(self.relu_plan.add_output(node))
 
-        # Process relu layer
-        assert isinstance(current_node, ReLU)
+        assert all(
+            self.linear1_plan.can_add_output(n) or self.linear1_plan.can_pass_output(n)
+            for n in linear1_out_nodes
+        )
 
-        self.relu_output_nodes.add(current_node)
-        current_node = current_node.inputs[0]
-
-        # Process relu inputs
-        self.linear1_output_nodes.add(current_node)
+        for node in linear1_out_nodes:
+            self.linear1_plan.add_output(node)
 
 
 class FFNSkipPlan(LayerPlan):
