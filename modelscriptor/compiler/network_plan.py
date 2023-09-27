@@ -1,6 +1,6 @@
 from typing import List, Set
 
-from modelscriptor.compiler.layer_plan import AttnSkipFFNSkipPlan
+from modelscriptor.compiler.plan.layer_plan import AttnSkipFFNSkipPlan
 from modelscriptor.graph import Node
 
 

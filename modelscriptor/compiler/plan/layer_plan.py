@@ -1,123 +1,103 @@
 from abc import abstractmethod, ABC
-from typing import Set, Optional, Type, List
+from typing import Set, List
 
+from modelscriptor.compiler.plan.layer_component import LayerComponent
+from modelscriptor.compiler.plan.placement import (
+    NodePlacementType,
+    CompileStrategy,
+)
 from modelscriptor.graph import Node, Linear, Add, Attn
 from modelscriptor.graph.relu import ReLU
 
 
 class LayerPlan(ABC):
-    def __init__(self):
-        ...
-
-    def is_plan_empty(self) -> bool:
-        # A plan is empty iff all input nodes are output nodes
-        return len(self.get_input_nodes().union(self.get_output_nodes())) == len(
-            self.get_input_nodes()
-        )
-
     @abstractmethod
-    def get_input_nodes(self) -> Set[Node]:
+    def get_strategies(self, output_node: Node) -> List[CompileStrategy]:
         ...
 
     @abstractmethod
-    def get_output_nodes(self) -> Set[Node]:
-        ...
-
-    @abstractmethod
-    def can_add_output(self, output_node: Node) -> bool:
-        ...
-
-    @abstractmethod
-    def can_pass_output(self, output_node: Node) -> bool:
-        ...
-
-    @abstractmethod
-    def add_output(self, output_node: Node) -> Set[Node]:
+    def add_output(self, output_node: Node, strategy: CompileStrategy):
         ...
 
 
 class SingleLayerPlan(LayerPlan):
-    in_nodes: Set[Node]
-    out_nodes: Set[Node]
-    node_type: Type[Node]
+    layer: LayerComponent
 
-    def __init__(self, node_type: Type[Node]):
+    def __init__(self, layer: LayerComponent):
         super().__init__()
-        self.node_type = node_type
-        self.in_nodes = set()
-        self.out_nodes = set()
+        self.layer = layer
 
-    def print(self, prefix=""):
-        for node in self.in_nodes:
-            print(f"{prefix}  in:   {repr(node)}")
-        for node in self.out_nodes:
-            print(f"{prefix} out:   {repr(node)}")
+    def get_strategies(self, output_node: Node) -> List[CompileStrategy]:
+        # For a single layer plan there are only two strategies: pass or compile.
+        result = []
 
-    def get_input_nodes(self) -> Set[Node]:
-        return self.in_nodes
+        if self.layer.can_pass_node(output_node):
+            strategy = CompileStrategy()
+            strategy.place_node(self.layer, output_node, NodePlacementType.pass_through)
+            result.append(strategy)
 
-    def get_output_nodes(self) -> Set[Node]:
-        return self.out_nodes
+        if self.layer.can_compile_node(output_node):
+            strategy = CompileStrategy()
+            strategy.place_node(self.layer, output_node, NodePlacementType.compile)
+            result.append(strategy)
 
-    def can_add_output(self, output_node: Node) -> bool:
-        return isinstance(output_node, self.node_type)
+        return result
 
-    def can_pass_output(self, output_node: Node) -> bool:
-        return self.node_type == Linear
+    def add_output(self, output_node: Node, strategy: CompileStrategy):
+        self.out_nodes.add(output_node)
 
-    def add_output(self, output_node: Node) -> Set[Node]:
-        if self.node_type == Linear and not isinstance(output_node, Linear):
-            # We can pass the output node through.
+        if (
+            strategy.get_layer_node_strategy(self.layer, output_node)
+            == NodePlacementType.pass_through
+        ):
             self.in_nodes.add(output_node)
-            self.out_nodes.add(output_node)
-            return {output_node}
-        else:
-            assert isinstance(output_node, self.node_type)
-            self.out_nodes.add(output_node)
+        elif (
+            strategy.get_layer_node_strategy(self.layer, output_node)
+            == NodePlacementType.compile
+        ):
             self.in_nodes.update(output_node.inputs)
-            return set(output_node.inputs)
+        else:
+            assert False
 
 
 class TwoLayerPlan(LayerPlan):
-    node_type1: Type[Node]
-    node_type2: Type[Node]
     plan1: SingleLayerPlan
     plan2: SingleLayerPlan
 
-    def __init__(self, node_type1: Type[Node], node_type2: Type[Node]):
+    def __init__(self, layer1: LayerComponent, layer2: LayerComponent):
         super().__init__()
-        self.node_type1 = node_type1
-        self.node_type2 = node_type2
-        self.plan1 = SingleLayerPlan(node_type1)
-        self.plan2 = SingleLayerPlan(node_type2)
+        self.plan1 = SingleLayerPlan(layer1)
+        self.plan2 = SingleLayerPlan(layer2)
 
     def print(self, prefix=""):
-        self.plan1.print(f"{prefix} {self.node_type1}")
-        self.plan2.print(f"{prefix} {self.node_type2}")
+        self.plan1.print(prefix)
+        self.plan2.print(prefix)
 
-    def get_input_nodes(self) -> Set[Node]:
-        return self.plan1.get_input_nodes()
+    def get_strategies(self, output_node: Node) -> List[CompileStrategy]:
+        # For a single layer plan there are only two strategies: pass or compile.
+        result = []
 
-    def get_output_nodes(self) -> Set[Node]:
-        return self.plan2.get_output_nodes()
+        if self.layer.can_pass_node(output_node):
+            strategy = CompileStrategy()
+            strategy.place_node(self.layer, output_node, NodePlacementType.pass_through)
+            result.append(strategy)
 
-    def can_add_output(self, output_node: Node) -> bool:
-        for strategy2 in ['pass', 'output']:
-            if strategy2 == 'pass':
-                if not self.plan2.can_pass_output(output_node):
-                    continue
-                plan1_outputs = [output_node]
-            else:
-                if not self.plan2.can_add_output(output_node):
-                    continue
-                plan2_outputs = output_node.inputs
+        if self.layer.can_compile_node(output_node):
+            strategy = CompileStrategy()
+            strategy.place_node(self.layer, output_node, NodePlacementType.compile)
+            result.append(strategy)
 
-            for strategy1 in ['pass', 'output']:
-                if strategy1 == 'pass':
-                    if not all(self.plan1.can_pass_output(inp)
-        return (self.plan2.can_add_output(output_node) and all(self.plan1.can_add_output(inp) for inp in output_node.inputs)) or
-        (self.plan2.can_pass_output(output_node) and self.plan1.can_add_output(output_node))
-        return isinstance(output_node, self.node_type)
+        return result
+
+    def get_strategies(self, output_node: Node):
+        # For a single layer plan there are only two strategies: pass or compile.
+        result = []
+        if self.layer.can_pass_node(output_node):
+            result.add("pass")
+
+        if self.layer.can_compile_node(output_node):
+            result.add("compile")
+        return result
 
     def can_pass_output(self, output_node: Node) -> bool:
         return self.node_type == Linear
@@ -136,12 +116,11 @@ class TwoLayerPlan(LayerPlan):
 
 
 class MultiLayerPlan(LayerPlan):
-    plans: List[SingleLayerPlan]
+    layers: List[LayerComponent]
 
-    def __init__(self, node_types: List[Type[Node]]):
+    def __init__(self, layers: List[LayerComponent]):
         super().__init__()
-        self.node_types = node_types
-        self.plans = [SingleLayerPlan(node_type) for node_type in node_types]
+        self.layers = layers
 
     def print(self, prefix=""):
         for node in self.in_nodes:
@@ -149,29 +128,21 @@ class MultiLayerPlan(LayerPlan):
         for node in self.out_nodes:
             print(f"{prefix} out:   {repr(node)}")
 
-    def get_input_nodes(self) -> Set[Node]:
-        return self.in_nodes
+    def get_strategies(self, output_node: Node) -> List[CompileStrategy]:
+        # For a single layer plan there are only two strategies: pass or compile.
+        result = []
 
-    def get_output_nodes(self) -> Set[Node]:
-        return self.out_nodes
+        if self.layer.can_pass_node(output_node):
+            strategy = CompileStrategy()
+            strategy.place_node(self.layer, output_node, NodePlacementType.pass_through)
+            result.append(strategy)
 
-    def can_add_output(self, output_node: Node) -> bool:
-        return isinstance(output_node, self.node_type)
+        if self.layer.can_compile_node(output_node):
+            strategy = CompileStrategy()
+            strategy.place_node(self.layer, output_node, NodePlacementType.compile)
+            result.append(strategy)
 
-    def can_pass_output(self, output_node: Node) -> bool:
-        return all(plan.can_pass_output(output_node) for plan in self.plans)
-
-    def add_output(self, output_node: Node) -> Set[Node]:
-        if self.node_type == Linear and not isinstance(output_node, Linear):
-            # We can pass the output node through.
-            self.in_nodes.add(output_node)
-            self.out_nodes.add(output_node)
-            return {output_node}
-        else:
-            assert isinstance(output_node, self.node_type)
-            self.out_nodes.add(output_node)
-            self.in_nodes.update(output_node.inputs)
-            return set(output_node.inputs)
+        return result
 
 
 class FFNPlan(LayerPlan):
@@ -191,25 +162,6 @@ class FFNPlan(LayerPlan):
         self.linear1_plan.print("linear1")
         self.relu_plan.print("relu   ")
         self.linear2_plan.print("linear2")
-
-    def get_input_nodes(self) -> Set[Node]:
-        return self.linear1_plan.get_input_nodes()
-
-    def get_output_nodes(self) -> Set[Node]:
-        return self.linear2_plan.get_output_nodes()
-
-    def can_add_output(self, output_node: Node) -> bool:
-        for plan1, plan2, plan3 in [
-            ("pass", "pass", "add"),
-            ("pass", "pass", "pass"),
-            ("pass", "add", "add"),
-            ("pass", "add", "pass"),
-            ("add", "pass", "add"),
-            ("add", "pass", "pass"),
-            ("add", "add", "add"),
-            ("add", "add", "pass"),
-        ]:
-            check1 = self.linear1_plan.can_add_output()
 
     def add_output(self, output_node: Node):
         relu_nodes = self.linear2_plan.add_output(output_node)
@@ -238,12 +190,6 @@ class FFNSkipPlan(LayerPlan):
         self.ffn_plan = FFNPlan()
         self.out_nodes = set()
         self.res_input_nodes = set()
-
-    def get_input_nodes(self) -> Set[Node]:
-        return self.ffn_plan.get_input_nodes().union(self.res_input_nodes)
-
-    def get_output_nodes(self) -> Set[Node]:
-        return self.res_output_nodes
 
     def add_output(self, output_node: Node):
         if isinstance(output_node, Add):
@@ -283,14 +229,6 @@ class AttnSkipPlan(LayerPlan):
         self.res_input_nodes = set()
         self.res_output_nodes = set()
 
-    def get_input_nodes(self) -> Set[Node]:
-        return self.res_input_nodes.union(
-            {inp for attn in self.attn_nodes for inp in attn.inputs}
-        )
-
-    def get_output_nodes(self) -> Set[Node]:
-        return self.res_output_nodes
-
     def add_output(self, output_node: Node):
         if isinstance(output_node, Add):
             if isinstance(output_node.inputs[0], Attn):
@@ -322,12 +260,6 @@ class AttnSkipFFNSkipPlan(LayerPlan):
         super().__init__()
         self.attn_plan = AttnSkipPlan()
         self.ffn_plan = FFNSkipPlan()
-
-    def get_input_nodes(self) -> Set[Node]:
-        return self.attn_plan.get_input_nodes()
-
-    def get_output_nodes(self) -> Set[Node]:
-        return self.ffn_plan.get_output_nodes()
 
     def add_output(self, output_node: Node):
         self.ffn_plan.add_output(output_node)
