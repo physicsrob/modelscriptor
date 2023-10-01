@@ -51,12 +51,12 @@ class SkipLayerComponent(Component):
             zero = create_constant(torch.zeros(len(node)))
             strategies.append(
                 SkipNodeComponentStrategy(
-                    skip_node=zero, in_node=node, out_node=node, points=1
+                    skip_node=zero, in_node=node, out_node=node, points=0
                 )
             )
             strategies.append(
                 SkipNodeComponentStrategy(
-                    skip_node=node, in_node=zero, out_node=node, points=1
+                    skip_node=node, in_node=zero, out_node=node, points=0
                 )
             )
         return strategies
