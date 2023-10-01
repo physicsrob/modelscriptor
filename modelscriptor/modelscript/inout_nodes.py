@@ -3,6 +3,8 @@ from typing import List
 from modelscriptor.graph import Node, InputNode, Constant, Embedding, PosEncoding
 import torch
 
+from modelscriptor.graph.embedding import Unembedding
+
 
 def create_input(name: str, d: int) -> Node:
     """
@@ -42,6 +44,20 @@ def create_embedding(vocab: List[str]) -> Embedding:
     - Node: Embedding node.
     """
     return Embedding(vocab)
+
+
+def create_unembedding(inp: Node, embedding: Embedding) -> Unembedding:
+    """
+    Create an unembedding output.
+
+    Args:
+    - inp (Node): Node with embedding vector to unembed
+    - embedding (Embedding): Embedding instance to use for unembedding.
+
+    Returns:
+    - Unembedding
+    """
+    return Unembedding(inp, embedding)
 
 
 def create_pos_encoding() -> PosEncoding:

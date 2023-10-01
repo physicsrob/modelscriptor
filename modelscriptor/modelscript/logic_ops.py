@@ -1,6 +1,7 @@
 from typing import List
 
-from modelscriptor.graph import Node, FFNLayer, Add
+from modelscriptor.graph import Node, Add
+from modelscriptor.modelscript.ffn_layer import ffn_layer
 
 import torch
 
@@ -54,7 +55,7 @@ def compare_to_vector(inp: Node, vector: torch.Tensor) -> Node:
     input_bias = 1.0 / turn_on_speed - vector @ vector
     output_proj = torch.tensor([[2.0 * turn_on_speed]])
     output_bias = torch.tensor([-1.0])
-    return FFNLayer(
+    return ffn_layer(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,
@@ -101,7 +102,7 @@ def cond_add_vector(
 
     return Add(
         inp,
-        FFNLayer(
+        ffn_layer(
             input_node=cond,
             input_proj=input_proj,
             input_bias=input_bias,
