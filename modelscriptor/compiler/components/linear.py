@@ -18,11 +18,9 @@ class LinearNodeComponentStrategy(NodeComponentStrategy):
         output_bias: torch.Tensor,
         points: int,
     ):
-        self.in_nodes = {in_node}
-        self.out_node = out_node
+        super().__init__(in_nodes={in_node}, out_node=out_node, points=points)
         self.output_matrix = output_matrix
         self.output_bias = output_bias
-        self.points = points
 
 
 class LinearLayerComponent(Component):
@@ -81,3 +79,8 @@ class LinearLayerComponent(Component):
 
         for j, out_idx in enumerate(out_indices):
             self.output_bias[out_idx] = strategy.output_bias[j]
+
+    def forward(self, inp: torch.Tensor):
+        # inp shape (n_pos, d)
+        x = inp @ self.output_matrix
+        return x + self.output_bias

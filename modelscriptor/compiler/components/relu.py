@@ -44,3 +44,6 @@ class ReLULayerComponent(Component):
         ), "Strategy applied before output allocated"
         in_node = next(iter(strategy.in_nodes))
         self.in_state.connect_allocation(self.out_state, strategy.out_node, in_node)
+
+    def forward(self, inp: torch.Tensor):
+        return torch.clamp(inp, min=0)

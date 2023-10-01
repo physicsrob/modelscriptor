@@ -14,7 +14,7 @@ class ResState(ABC):
     # Represents the state of the residual stream at one point in time.
     d: int
     nodes: Set[Node]
-    node_to_indices: Dict[Node, Set[int]]
+    node_to_indices: Dict[Node, List[int]]
 
     def __init__(self, d):
         self.d = d
@@ -41,14 +41,14 @@ class ResState(ABC):
 
         used_indices = set()
         for indices in self.node_to_indices.values():
-            used_indices |= indices
+            used_indices |= set(indices)
         available_indices = {idx for idx in range(self.d) if idx not in used_indices}
         if len(node) > len(available_indices):
             raise AllocationError(
                 "Insufficient space in residual stream for allocation"
             )
         indices = sorted(available_indices)[0 : len(node)]
-        self.node_to_indices[node] = set(indices)
+        self.node_to_indices[node] = indices
         self.nodes.add(node)
 
     def connect_allocation(
@@ -59,14 +59,14 @@ class ResState(ABC):
             idx for indices in self.node_to_indices.values() for idx in indices
         }
 
-        node_indices = other_state.node_to_indices[other_node].copy()
+        node_indices = set(other_state.node_to_indices[other_node])
         assert not bool(node_indices & existing_in_node_indices)
 
         self.nodes.add(this_node)
         self.node_to_indices[this_node] = other_state.node_to_indices[other_node]
 
-    def connect(self, other: "ResState"):
+    def update_from(self, other: "ResState"):
         # other represents the same state as this residual state, and it has already been
         # allocated.
-        self.nodes = other.nodes.copy()
-        self.node_to_indices = other.node_to_indices.copy()
+        self.nodes.update(other.nodes)
+        self.node_to_indices.update(other.node_to_indices)
