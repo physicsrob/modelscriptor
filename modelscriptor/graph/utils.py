@@ -1,5 +1,4 @@
 import torch
-import math
 
 
 def load_spherical_codes(filename):

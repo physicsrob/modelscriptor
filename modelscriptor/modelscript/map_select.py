@@ -1,9 +1,10 @@
-from modelscriptor.graph import Node, Concatenate, FFNLayer, ValueLogger
+from modelscriptor.graph import Node, Concatenate
 from typing import List, Tuple, Dict
 import torch
 
 from modelscriptor.modelscript.const import big_offset, turn_on_speed
 from modelscriptor.modelscript.logic_ops import cond_add_vector
+from modelscriptor.modelscript.ffn_layer import ffn_layer
 
 
 def map_to_table(
@@ -46,7 +47,7 @@ def map_to_table(
         input_bias[i] = 1.0 / turn_on_speed - (key @ key)
         output_proj[i, :] = turn_on_speed * (value - default)
 
-    return FFNLayer(
+    return ffn_layer(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,
@@ -114,7 +115,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
         output_proj[i, i] = 1.0
         output_proj[len(true_node) + i, i] = 1.0
 
-    return FFNLayer(
+    return ffn_layer(
         input_node=x,
         input_proj=input_proj,
         input_bias=input_bias,

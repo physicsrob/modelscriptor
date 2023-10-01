@@ -1,5 +1,5 @@
 from modelscriptor.modelscript.arithmetic_ops import add_scalar
-from modelscriptor.modelscript.input_nodes import (
+from modelscriptor.modelscript.inout_nodes import (
     create_input,
     create_constant,
     create_embedding,

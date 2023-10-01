@@ -2,13 +2,13 @@ from modelscriptor.graph import Node, Concatenate, Attn
 import torch
 import math
 
-attention_hardness = 100.0  # Scales attention to be 1.0 and 0.0 everywhere elee
+attention_hardness = 100.0  # Scales attention to be 1.0 and 0.0 everywhere else
 
 
 class PosEncoding(Node):
     def __init__(self, d_pos: int):
         self.d_pos = d_pos
-        super().__init__(d_pos)
+        super().__init__(d_pos, [])
 
     def compute(self, n_pos: int, input_values: dict):
         result = torch.zeros((n_pos, self.d_pos))

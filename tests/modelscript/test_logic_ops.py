@@ -1,5 +1,5 @@
 from modelscriptor.graph.utils import index_to_vector
-from modelscriptor.modelscript.input_nodes import create_constant, create_input
+from modelscriptor.modelscript.inout_nodes import create_constant, create_input
 from modelscriptor.modelscript.logic_ops import compare_to_vector, cond_add_vector
 
 import torch

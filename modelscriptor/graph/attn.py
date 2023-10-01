@@ -13,10 +13,6 @@ class Attn(Node):
         value_matrix: torch.Tensor,
         output_matrix: torch.Tensor,
     ):
-        self.query_in = query_in
-        self.key_in = key_in
-        self.value_in = value_in
-
         # query_matrix shape (d_query_in, d_head)
         # key_matrix shape (d_key_in, d_head)
         # value_matrix shape (d_value_in, d_head)
@@ -25,7 +21,7 @@ class Attn(Node):
         self.d_query_in = query_matrix.shape[0]
         self.d_key_in = key_matrix.shape[0]
         self.d_value_in = value_matrix.shape[0]
-        super().__init__(output_matrix.shape[1])
+        super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
 
         assert query_matrix.shape[1] == self.d_head
         assert key_matrix.shape[1] == self.d_head
@@ -37,9 +33,10 @@ class Attn(Node):
         self.output_matrix = output_matrix
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
-        query_in = self.query_in.compute(n_pos, input_values)
-        key_in = self.key_in.compute(n_pos, input_values)
-        value_in = self.value_in.compute(n_pos, input_values)
+        query_in_node, key_in_node, value_in_node = self.inputs
+        query_in = query_in_node.compute(n_pos, input_values)
+        key_in = key_in_node.compute(n_pos, input_values)
+        value_in = value_in_node.compute(n_pos, input_values)
 
         assert query_in.shape == (n_pos, self.d_query_in)
         assert key_in.shape == (n_pos, self.d_key_in)

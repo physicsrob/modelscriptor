@@ -1,5 +1,5 @@
 from modelscriptor.modelscript.arithmetic_ops import add_scalar, relu_add
-from modelscriptor.modelscript.input_nodes import create_input
+from modelscriptor.modelscript.inout_nodes import create_input
 import torch
 
 

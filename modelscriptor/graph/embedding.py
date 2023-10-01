@@ -21,7 +21,7 @@ class Embedding(Node):
         self.max_vocab = self.table.shape[0]
         self.vocab = special_tokens + vocab
         assert self.table.shape == (self.max_vocab, d_embed)
-        super().__init__(d_embed)
+        super().__init__(d_embed, [])
 
     def get_token_id(self, text: str) -> int:
         if text in self.vocab:
@@ -43,13 +43,19 @@ class Embedding(Node):
         assert result.shape == (len(embedding_input), self.d_embed)
         return result
 
-    def unembed(self, input_node: Node, n_pos: int, input_values: dict) -> List[str]:
-        assert len(input_node) == self.d_embed
-        input_value = input_node.compute(n_pos, input_values)
+
+class Unembedding:
+    def __init__(self, inp: Node, embedding: Embedding):
+        self.embedding = embedding
+        self.inp = inp
+        assert len(self.inp) == self.embedding.d_embed
+
+    def compute(self, n_pos: int, input_values: dict) -> List[str]:
+        input_value = self.inp.compute(n_pos, input_values)
         result = []
         for pos in range(n_pos):
-            probs = self.table @ input_value[pos]
+            probs = self.embedding.table @ input_value[pos]
             token_id = probs.argmax().item()
             assert isinstance(token_id, int)
-            result.append(self.vocab[token_id])
+            result.append(self.embedding.vocab[token_id])
         return result
