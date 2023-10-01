@@ -2,7 +2,7 @@ from itertools import product
 from typing import Set, List, Tuple
 
 from modelscriptor.compiler.components.component import Component, NodeComponentStrategy
-from modelscriptor.graph import Node
+from modelscriptor.graph import Node, Add
 
 
 class GroupStrategy:
@@ -94,14 +94,38 @@ def get_sequential_placement_strategies(
     return result_strategies
 
 
-def get_res_sequential_placement_strategies(
-    output_nodes: Set[Node],
-    layer_components: List[Component],
-    strategy_count: int = 3,
-) -> List[GroupStrategy]:
-    # Assumes a network substructure which is:
-    # [Input] -> [LayerComponent 1] -> ... -> [LayerComponent N] -> [Add LayerComponent N w/ Input]
-    # This could be the attention sub-layer of a transformer (with one layer_component, the
-    # attention head), or a ffn sub-layer of a transformer (with layer_components being Linear ->
-    # ReLU -> Linear)
-    ...
+# def get_res_sequential_placement_strategies(
+#     output_nodes: Set[Node],
+#     layer_components: List[Component],
+#     strategy_count: int = 3,
+# ) -> List[GroupStrategy]:
+#     # Assumes a network substructure which is:
+#     # [Input] -> [LayerComponent 1] -> ... -> [LayerComponent N] -> [Add LayerComponent N w/ Input]
+#     # This could be the attention sub-layer of a transformer (with one layer_component, the
+#     # attention head), or a ffn sub-layer of a transformer (with layer_components being Linear ->
+#     # ReLU -> Linear)
+#     if len(output_nodes) > 1:
+#         assert False  # NEED TO IMPLEMENT
+#
+#     output_node = next(iter(output_nodes))
+#
+#     # If output_node is add (with inputs addend1, addend2):
+#     if isinstance(output_node, Add):
+#         # Options:
+#         #   Add(addend1 on input, addend2 on linear2)
+#         #   Add(addend2 on input, addend1 on linear2)
+#         strategy1 = GroupStrategy()
+#         strategy1.place_node()
+#     else:
+#         # Options:
+#         #   Add(Constant(0) on input, output_node on linear2)
+#         #   Add(Constant(0) on linear2, output_node on input)
+#         zeros = create_constant(torch.zeros(len(output_node)))
+#         add_node = Add(zeros, output_node)
+#         strategy1 = get_sequential_placement_strategies(
+#             {output_node}, [self.linear1, self.relu, self.linear2]
+#         )
+#
+#     return get_sequential_placement_strategies(
+#         {output_node}, [self.linear1, self.relu, self.linear2]
+#     )

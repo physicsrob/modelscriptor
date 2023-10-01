@@ -34,6 +34,11 @@ class ResState(ABC):
         print()
 
     def allocate_node(self, node: Node):
+        # If the node is already allocated, this is a no-op.
+        # This can happen due to skip connections
+        if node in self.nodes:
+            return
+
         used_indices = set()
         for indices in self.node_to_indices.values():
             used_indices |= indices

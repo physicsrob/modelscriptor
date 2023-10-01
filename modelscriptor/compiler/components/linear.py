@@ -3,7 +3,7 @@ from typing import Set, Dict, List, NamedTuple
 import torch
 
 from modelscriptor.compiler.components.component import NodeComponentStrategy, Component
-from modelscriptor.graph import Node, Concatenate, Linear
+from modelscriptor.graph import Node, Concatenate, Linear, Constant
 
 
 class LinearNodeComponentStrategy(NodeComponentStrategy):
@@ -63,6 +63,8 @@ class LinearLayerComponent(Component):
 
     def apply_strategy(self, strategy: NodeComponentStrategy):
         assert isinstance(strategy, LinearNodeComponentStrategy)
+        self.out_state.print("pre alloc")
+        print("strategy out", strategy.out_node)
         assert (
             strategy.out_node in self.out_state.nodes
         ), "Strategy applied before output allocated"
