@@ -14,7 +14,7 @@ from modelscriptor.modelscript.map_select import select
 
 
 def compiler_test(
-    output_node: Node, n_pos: int, input_values: Dict[str, torch.tensor], d: int = 20
+    output_node: Node, n_pos: int, input_values: Dict[str, torch.Tensor], d: int = 20
 ):
     net = compile_ffn_network(d, output_node)
     all_pass = True
@@ -31,9 +31,9 @@ def compiler_test(
                 )
     assert all_pass
 
-    result = net.compute(n_pos, input_values)[output_node]
+    final_result = net.compute(n_pos, input_values)[output_node]
     expected_output = output_node.compute(n_pos, input_values)
-    assert torch.allclose(result, expected_output), "Final output"
+    assert torch.allclose(final_result, expected_output), "Final output"
 
 
 def test_compile_1layer():

@@ -70,7 +70,7 @@ class FFNNetwork:
         for layer in self.layers[: layer_n + 1]:
             res, states = layer.forward(res, return_states=True)
 
-        result = {}
+        result: Dict[Node, torch.Tensor] = {}
         for state_name, (res_state, x) in states.items():
             for node in res_state.get_distinct_nodes():
                 indices = res_state.get_node_indices(node)

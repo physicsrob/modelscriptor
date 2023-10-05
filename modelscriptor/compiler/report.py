@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+from typing import List, Optional, Tuple
 
 from modelscriptor.compiler.components.component import Component
 from modelscriptor.compiler.components.skip import SkipLayerComponent
@@ -30,16 +31,14 @@ def render_res_state(residual_state: ResState, name: str):
     sorted_node_spans.sort(key=lambda span: span[1])
 
     # Initialize the list that will hold both node and empty spans
-    complete_spans = []
+    complete_spans: List[Tuple[Optional[str], Optional[int], int]] = []
     last_span_end = -1  # Last ending index of the previous span
 
     # Fill in node and empty spans
     for node, start_idx, end_idx in sorted_node_spans:
         if start_idx - last_span_end > 1:
             complete_spans.append((None, None, start_idx - last_span_end - 1))
-        complete_spans.append(
-            (repr(node) + f"{start_idx}-{end_idx}", id(node), end_idx - start_idx + 1)
-        )
+        complete_spans.append((repr(node), id(node), end_idx - start_idx + 1))
         last_span_end = end_idx
 
     # Add a final empty span if needed
