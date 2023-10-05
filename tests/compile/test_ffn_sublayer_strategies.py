@@ -1,6 +1,5 @@
 import torch
 
-from modelscriptor.compiler.compile import compile_ffn_network
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 
 from modelscriptor.graph import Linear, ReLU
@@ -20,7 +19,7 @@ def test_net1():
     print(strategies)
     ffn_sublayer.apply_strategy(strategies[0])
     ffn_sublayer.print()
-    assert input_node in ffn_sublayer.in_state.nodes
+    assert ffn_sublayer.in_state.has_node(input_node)
 
 
 def test_net2():
@@ -37,5 +36,16 @@ def test_net2():
     print(strategies)
     ffn_sublayer.apply_strategy(strategies[0])
     ffn_sublayer.print()
-    assert input_node in ffn_sublayer.in_state.nodes
-    assert constant in ffn_sublayer.in_state.nodes
+    assert ffn_sublayer.in_state.has_node(input_node)
+    assert ffn_sublayer.in_state.has_node(constant)
+
+
+def test_net3():
+    input_node = create_input("test", 1)
+    ffn_sublayer = FFNSubLayer(d=10)
+    ffn_sublayer.out_state.allocate_node(input_node)
+    strategies = ffn_sublayer.get_strategies(input_node)
+    print(strategies)
+    ffn_sublayer.apply_strategy(strategies[0])
+    ffn_sublayer.print()
+    assert ffn_sublayer.in_state.has_node(input_node)

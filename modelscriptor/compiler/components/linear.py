@@ -4,6 +4,7 @@ import torch
 
 from modelscriptor.compiler.components.component import NodeComponentStrategy, Component
 from modelscriptor.graph import Node, Concatenate, Linear, Constant
+from modelscriptor.graph.misc import Placeholder
 
 
 class LinearNodeComponentStrategy(NodeComponentStrategy):
@@ -32,6 +33,9 @@ class LinearLayerComponent(Component):
         self.output_matrix = torch.zeros(d, d)
         self.output_bias = torch.zeros(d)
 
+    def __repr__(self):
+        return f"LinearLayerComponent()"
+
     def get_strategies(self, node: Node) -> List[LinearNodeComponentStrategy]:
         strategies = []
 
@@ -57,21 +61,32 @@ class LinearLayerComponent(Component):
                     points=1,
                 )
             )
+
+        # If the node is constant, we can compile it
+        if isinstance(node, Constant):
+            strategies.append(
+                LinearNodeComponentStrategy(
+                    in_node=Placeholder(),
+                    out_node=node,
+                    output_matrix=torch.zeros(0, 0),
+                    output_bias=node.value,
+                    points=1,
+                )
+            )
+
         return strategies
 
     def apply_strategy(self, strategy: NodeComponentStrategy):
         assert isinstance(strategy, LinearNodeComponentStrategy)
-        self.out_state.print("pre alloc")
-        print("strategy out", strategy.out_node)
-        assert (
-            strategy.out_node in self.out_state.nodes
+        assert self.out_state.has_node(
+            strategy.out_node
         ), "Strategy applied before output allocated"
         in_node = next(iter(strategy.in_nodes))
         self.in_state.allocate_node(in_node)
 
         # Copy the matrix
-        in_indices = self.in_state.node_to_indices[in_node]
-        out_indices = self.out_state.node_to_indices[strategy.out_node]
+        in_indices = self.in_state.get_node_indices(in_node)
+        out_indices = self.out_state.get_node_indices(strategy.out_node)
 
         for i, in_idx in enumerate(in_indices):
             for j, out_idx in enumerate(out_indices):

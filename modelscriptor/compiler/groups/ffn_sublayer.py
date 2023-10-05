@@ -40,10 +40,24 @@ class FFNSubLayer(Group):
         self.skip.skip_state.print("skip skip_in")
         self.skip.out_state.print("skip out")
 
+    def print_strategy(self, strategy: GroupStrategy):
+        strategy.print(
+            layer_components=[self.skip, self.linear2, self.relu, self.linear1],
+            layer_names=["skip", "linear2", "relu", "linear1"],
+        )
+
     def get_strategies(self, output_node: Node) -> List[GroupStrategy]:
-        return get_sequential_placement_strategies(
+        strategies = get_sequential_placement_strategies(
             {output_node}, [self.linear1, self.relu, self.linear2, self.skip]
         )
+        print(f"Strategies for {output_node}: {strategies}")
+        return strategies
+
+    def apply_skip_allocation(self, strategy: GroupStrategy):
+        self.skip.out_state.update_from(self.out_state)
+        for s in strategy.get_component_strategies(self.skip):
+            self.skip.apply_strategy(s)
+        self.linear1.in_state.update_from(self.skip.skip_state)
 
     def apply_strategy(self, strategy: GroupStrategy):
         # Connect skip out to group output
@@ -80,8 +94,18 @@ class FFNSubLayer(Group):
         # Connect group input to linear1 input
         self.in_state.update_from(self.linear1.in_state)
 
-    def forward(self, inp: torch.Tensor):
+    def forward(self, inp: torch.Tensor, return_states=False):
+        states = {}
+
         x = self.linear1.forward(inp)
+        states["linear1_out"] = (self.linear1.out_state, x)
         x = self.relu.forward(x)
+        states["relu_out"] = (self.relu.out_state, x)
         x = self.linear2.forward(x)
-        return x + inp
+        states["linear2_out"] = (self.linear2.out_state, x)
+        x = x + inp
+        states["skip"] = (self.skip.out_state, x)
+        if return_states:
+            return x, states
+        else:
+            return x

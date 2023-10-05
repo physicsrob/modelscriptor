@@ -2,11 +2,7 @@ from typing import List, Set, Dict
 
 import torch
 
-from modelscriptor.compiler.components.component import Component
-from modelscriptor.compiler.components.linear import LinearLayerComponent
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
-from modelscriptor.compiler.groups.group import Group
-from modelscriptor.compiler.res_state import ResState
 from modelscriptor.graph import Node, Constant, InputNode
 
 
@@ -30,17 +26,12 @@ class FFNNetwork:
             layer.print()
         print()
 
-    def get_input_nodes(self) -> Set[Node]:
-        return self.layers[0].in_state.nodes
-
-    def get_output_nodes(self) -> Set[Node]:
-        return self.layers[-1].out_state.nodes
-
     def get_input_res_stream(self, n_pos: int, input_values: Dict[str, torch.Tensor]):
         in_state = self.layers[0].in_state
         res_stream = torch.zeros((n_pos, self.d))
 
-        for node, indices in in_state.node_to_indices.items():
+        for node in in_state.get_distinct_nodes():
+            indices = in_state.get_node_indices(node)
             if isinstance(node, Constant):
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = node.value[i]
@@ -66,6 +57,30 @@ class FFNNetwork:
         result = {}
         out_state = self.layers[-1].out_state
 
-        for out_node, out_indices in out_state.node_to_indices.items():
-            result[out_node] = res[:, out_indices]
+        for node in out_state.get_distinct_nodes():
+            indices = out_state.get_node_indices(node)
+            result[node] = res[:, indices]
+        return result
+
+    def compute_layer_output(
+        self, n_pos: int, input_values: Dict[str, torch.Tensor], layer_n: int
+    ) -> Dict[Node, torch.Tensor]:
+        res = self.get_input_res_stream(n_pos, input_values)
+
+        for layer in self.layers[: layer_n + 1]:
+            res, states = layer.forward(res, return_states=True)
+
+        result = {}
+        for state_name, (res_state, x) in states.items():
+            for node in res_state.get_distinct_nodes():
+                indices = res_state.get_node_indices(node)
+                if node in result:
+                    if not torch.allclose(result[node], x[:, indices]):
+                        print(
+                            f"Node {node} changed value from {result[node]} to {x[:, indices]}"
+                        )
+                        print(f"indices: {indices}")
+                        assert False
+                else:
+                    result[node] = x[:, indices]
         return result
