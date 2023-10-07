@@ -50,7 +50,6 @@ class FFNSubLayer(Group):
         strategies = get_sequential_placement_strategies(
             {output_node}, [self.linear1, self.relu, self.linear2, self.skip]
         )
-        print(f"Strategies for {output_node}: {strategies}")
         return strategies
 
     def apply_skip_allocation(self, strategy: GroupStrategy):
@@ -95,14 +94,35 @@ class FFNSubLayer(Group):
         self.in_state.update_from(self.linear1.in_state)
 
     def forward(self, inp: torch.Tensor, return_states=False):
+        """
+        Forward pass through the FFNSublayer.
+
+        Parameters
+        ----------
+        inp : torch.Tensor
+            Input tensor for the forward pass.
+
+        return_states : bool, optional (default=False)
+            If True, return the internal states of each layer alongside the output.
+
+        Returns
+        -------
+        torch.Tensor or tuple of torch.Tensor and dict
+            The output tensor if `return_states=False`.
+            A tuple of the output tensor and a dictionary containing intermediate states
+            if `return_states=True`. The dictionary keys are the names of the layers or
+            operations, and the values are tuples containing the state object and the
+            output tensor of that layer.
+
+        """
         states = {}
 
         x = self.linear1.forward(inp)
-        states["linear1_out"] = (self.linear1.out_state, x)
+        states["linear1"] = (self.linear1.out_state, x)
         x = self.relu.forward(x)
-        states["relu_out"] = (self.relu.out_state, x)
+        states["relu"] = (self.relu.out_state, x)
         x = self.linear2.forward(x)
-        states["linear2_out"] = (self.linear2.out_state, x)
+        states["linear2"] = (self.linear2.out_state, x)
         x = x + inp
         states["skip"] = (self.skip.out_state, x)
         if return_states:

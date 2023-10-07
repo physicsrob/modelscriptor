@@ -22,7 +22,7 @@ class CompilationError(Exception):
     pass
 
 
-def compile_ffn_network(d: int, output_node: Node) -> FFNNetwork:
+def compile_ffn_network(d: int, output_node: Node, verbose: bool = False) -> FFNNetwork:
     # Start with the first layer and try to compile as much as possible.
 
     net = FFNNetwork(d)
@@ -32,10 +32,11 @@ def compile_ffn_network(d: int, output_node: Node) -> FFNNetwork:
     layer.out_state.allocate_node(output_node)
 
     for layer_cnt in range(MAX_LAYERS):
-        print(f"\n\nCompiling layer {layer_cnt}")
-        print(f"Nodes to be compiled: {to_compile_nodes}")
-        layer.out_state.print("Layer Output")
-        print("\n\n")
+        if verbose:
+            print(f"\n\nCompiling layer {layer_cnt}")
+            print(f"Nodes to be compiled: {to_compile_nodes}")
+            layer.out_state.print("Layer Output")
+            print("\n\n")
 
         applied_strategy_cnt = 0
         chosen_strategies = []
@@ -45,18 +46,20 @@ def compile_ffn_network(d: int, output_node: Node) -> FFNNetwork:
             )
             if len(strategies):
                 chosen_strategies.append(strategies[0])
-                print("\n\nBest strategy: ")
-                layer.print_strategy(strategies[0])
-                print("\n\n")
+                if verbose:
+                    print("\n\nBest strategy: ")
+                    layer.print_strategy(strategies[0])
+                    print("\n\n")
                 layer.apply_skip_allocation(strategies[0])
-            else:
+            elif verbose:
                 print("No strategy for: ", node)
 
         for chosen_strategy in chosen_strategies:
             layer.apply_strategy(chosen_strategy)
             applied_strategy_cnt += 1
 
-        print(f"Applied {applied_strategy_cnt} strategies.")
+        if verbose:
+            print(f"Applied {applied_strategy_cnt} strategies.")
         to_compile_nodes = layer.in_state.get_compilable_nodes()
         if not len(to_compile_nodes) and not applied_strategy_cnt:
             raise CompilationError("Could not compile network.")
@@ -65,18 +68,20 @@ def compile_ffn_network(d: int, output_node: Node) -> FFNNetwork:
             isinstance(node, InputNode) or isinstance(node, Constant)
             for node in to_compile_nodes
         ):
-            print("Compilation complete")
-            layer.out_state.print("Final Layer Output")
-            layer.in_state.print("Final Layer Input")
+            if verbose:
+                print("Compilation complete")
+                layer.out_state.print("Final Layer Output")
+                layer.in_state.print("Final Layer Input")
             break
         else:
             new_layer = net.add_layer()
             new_layer.out_state.update_from(layer.in_state)
-            print("\n\nCreating new layer:")
-            # layer.out_state.print("Old Layer Output")
-            # layer.in_state.print("Old Layer Input")
-            # new_layer.out_state.print("New Layer Output")
-            # new_layer.in_state.print("New Layer Input")
+            if verbose:
+                print("\n\nCreating new layer:")
+                layer.out_state.print("Old Layer Output")
+                layer.in_state.print("Old Layer Input")
+                new_layer.out_state.print("New Layer Output")
+                new_layer.in_state.print("New Layer Input")
             layer = new_layer
 
     make_report(net)

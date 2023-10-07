@@ -79,12 +79,6 @@ class SkipLayerComponent(Component):
         self.in_state.connect_allocation(
             self.out_state, strategy.out_node, strategy.in_node
         )
-        print("After applying skip strategy indices:")
-        print(f"{self.in_state.get_node_indices(strategy.in_node)=}")
-        print(f"{self.skip_state.get_node_indices(strategy.skip_node)=}")
-        print(f"{self.skip_state._node_to_indices.get(strategy.skip_node)=}")
-        print(f"{self.out_state.get_node_indices(strategy.out_node)=}")
-        print()
         assert self.in_state.get_node_indices(
             strategy.in_node
         ) == self.skip_state.get_node_indices(strategy.skip_node)

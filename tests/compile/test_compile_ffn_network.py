@@ -19,15 +19,19 @@ def compiler_test(
     net = compile_ffn_network(d, output_node)
     all_pass = True
 
-    for layer_n, layer in list(enumerate(net.layers)):
-        result = net.compute_layer_output(n_pos, input_values, layer_n)
-        for intermediate_node, intermediate_value in result.items():
-            expected_output = intermediate_node.compute(n_pos, input_values)
-            print(f"Testing layer {layer_n} node {intermediate_node}")
-            if not torch.allclose(expected_output, intermediate_value):
+    # Run a forward pass preserving all intermediate states
+    inp = net.get_input_res_stream(n_pos, input_values)
+    res, states = net.forward(inp, return_states=True)
+
+    for state_name, (res_state, x) in states.items():
+        for node in res_state.get_distinct_nodes():
+            indices = res_state.get_node_indices(node)
+            expected_output = node.compute(n_pos, input_values)
+            result = x[:, indices]
+            if not torch.allclose(expected_output, result):
                 all_pass = False
                 print(
-                    f"   Failed. Expected {expected_output}, got {intermediate_value}"
+                    f"   Failed. Expected {expected_output}, got {result}, at {state_name}"
                 )
     assert all_pass
 
