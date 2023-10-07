@@ -132,7 +132,7 @@ def cond_gate(cond: Node, inp: Node) -> Node:
         cond=cond,
         inp=inp,
         true_vector=torch.tensor([big_offset] * len(inp)),
-        false_vector=torch.tensor([big_offset] * len(inp)),
+        false_vector=torch.tensor([-big_offset] * len(inp)),
     )
     x = relu(x)
     x = cond_add_vector(

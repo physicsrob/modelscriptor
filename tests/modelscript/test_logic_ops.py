@@ -1,6 +1,10 @@
 from modelscriptor.graph.utils import index_to_vector
 from modelscriptor.modelscript.inout_nodes import create_constant, create_input
-from modelscriptor.modelscript.logic_ops import compare_to_vector, cond_add_vector
+from modelscriptor.modelscript.logic_ops import (
+    compare_to_vector,
+    cond_add_vector,
+    cond_gate,
+)
 
 import torch
 
@@ -31,3 +35,23 @@ def test_cond_add_vector():
         else:
             expected_value = base_value + false_offset
         assert (output == expected_value.unsqueeze(0)).all()
+
+
+def test_cond_gate():
+    x = create_input("x", 1)
+    cond_input = create_input("cond", 1)
+    out = cond_gate(cond_input, x)
+    for cond_value in [-1.0, 1.0]:
+        for x_value in [-2.0, -1.0, 0.0, 1.0, 2.0]:
+            output = out.compute(
+                n_pos=1,
+                input_values={
+                    "cond": torch.tensor([[cond_value]]),
+                    "x": torch.tensor([[x_value]]),
+                },
+            )
+            if cond_value > 0.0:
+                expected_value = x_value
+            else:
+                expected_value = 0.0
+            assert output.item() == expected_value
