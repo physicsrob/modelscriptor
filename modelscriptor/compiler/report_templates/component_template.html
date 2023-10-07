@@ -1,0 +1,15 @@
+        <details class="component">
+            <summary>{{ component_name }} </summary>
+            {{ in_state }}
+            {% if skip_state %}
+                {{ skip_state }}
+            {% endif %}
+            <nodes>
+                {% for node in nodes %}
+                    {{ node }}
+                {% endfor %}
+            </nodes>
+            
+            {{ out_state }}
+        </details>
+

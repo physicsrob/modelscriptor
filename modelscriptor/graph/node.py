@@ -19,19 +19,21 @@ class Node:
             if self.inputs[i] == old_input:
                 self.inputs[i] = new_input
 
+    def node_type(self):
+        return type(self).__name__
+
     def __repr__(self):
-        type_name = type(self).__name__
+        type_name = self.node_type()
         if len(self.inputs) == 0:
             return f"{type_name}(d={len(self)})"
         elif len(self.inputs) == 1:
             inp = self.inputs[0]
-            inp_type_name = type(inp).__name__
+            inp_type_name = inp.node_type()
             return f"{type_name}(inp={inp_type_name}(d={len(inp)}), d={len(self)})"
         else:
             inp_strings = []
             for i, inp in enumerate(self.inputs):
-                inp = self.inputs[0]
-                inp_type_name = type(inp).__name__
+                inp_type_name = inp.node_type()
                 inp_strings.append(f"inp{i}={inp_type_name}(d={len(inp)})")
             inp_str = ", ".join(inp_strings)
             return f"{type_name}({inp_str}, d={len(self)})"

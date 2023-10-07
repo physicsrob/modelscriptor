@@ -1,0 +1,15 @@
+<node data-node-id="{{ node_id }}">
+    <div class="node-name">
+        {{ node_name }}
+    </div>
+    {% if input_nodes %}
+    <div class="node-children">
+        <p>Inputs:</p>
+        <ul class="child-nodes">
+            {% for input_node_id, input_node_name in input_nodes %}
+            <li data-node-id="{{ input_node_id }}" class="">{{ input_node_name }}</li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+</node>

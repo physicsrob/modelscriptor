@@ -21,10 +21,18 @@ class ReLUNodeComponentStrategy(NodeComponentStrategy):
         self.output_bias = output_bias
         self.points = points
 
+    def __repr__(self):
+        return (
+            f"ReLUComponentStrategy(in_nodes={self.in_nodes}, out_node={self.out_node})"
+        )
+
 
 class ReLULayerComponent(Component):
     def __init__(self, d: int):
         super().__init__(d)
+
+    def __repr__(self):
+        return f"ReLULayerComponent()"
 
     def get_strategies(self, node: Node) -> List[NodeComponentStrategy]:
         if isinstance(node, ReLU):
@@ -39,8 +47,8 @@ class ReLULayerComponent(Component):
             return []
 
     def apply_strategy(self, strategy: NodeComponentStrategy):
-        assert (
-            strategy.out_node in self.out_state.nodes
+        assert self.out_state.has_node(
+            strategy.out_node
         ), "Strategy applied before output allocated"
         in_node = next(iter(strategy.in_nodes))
         self.in_state.connect_allocation(self.out_state, strategy.out_node, in_node)

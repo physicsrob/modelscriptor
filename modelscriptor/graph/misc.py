@@ -32,6 +32,16 @@ class Concatenate(Node):
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         return torch.cat([x.compute(n_pos, input_values) for x in self.inputs], dim=-1)
 
+    def simplify_inputs(self: Node) -> List[Node]:
+        # Flatten concatenation and return the list of nodes
+        inputs = []
+        for n in self.inputs:
+            if isinstance(n, Concatenate):
+                inputs += n.simplify_inputs()
+            else:
+                inputs.append(n)
+        return inputs
+
 
 class Add(Node):
     def __init__(self, input1: Node, input2: Node):
@@ -60,6 +70,21 @@ class Constant(Node):
         x = self.value.unsqueeze(0).expand(n_pos, -1)
         assert x.shape == (n_pos, len(self))
         return x
+
+    def node_type(self):
+        if self.value.eq(0).all():
+            return "Zero"
+        else:
+            return "Constant"
+
+
+class Placeholder(Node):
+    # This node-type is length 0 placeholder
+    def __init__(self):
+        super().__init__(0, [])
+
+    def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
+        return torch.zeros(0)
 
 
 class ValueLogger(Node):

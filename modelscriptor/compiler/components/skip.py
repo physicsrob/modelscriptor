@@ -17,6 +17,9 @@ class SkipNodeComponentStrategy(NodeComponentStrategy):
         self.skip_node = skip_node
         self.in_node = in_node
 
+    def __repr__(self):
+        return f"SkipNodeComponentStrategy(in_node={self.in_node}, skip_node={self.skip_node}, out_node={self.out_node})"
+
 
 class SkipLayerComponent(Component):
     d: int
@@ -28,6 +31,9 @@ class SkipLayerComponent(Component):
         super().__init__(d)
         self.skip_state = ResState(d)
         self.in_state = ResState(d)
+
+    def __repr__(self):
+        return f"SkipLayerComponent()"
 
     def get_strategies(self, node: Node) -> List[SkipNodeComponentStrategy]:
         strategies = []
@@ -63,11 +69,19 @@ class SkipLayerComponent(Component):
 
     def apply_strategy(self, strategy: NodeComponentStrategy):
         assert isinstance(strategy, SkipNodeComponentStrategy)
-        assert (
-            strategy.out_node in self.out_state.nodes
+        assert self.out_state.has_node(
+            strategy.out_node
         ), "Strategy applied before output allocated"
 
-        self.in_state.allocate_node(strategy.in_node)
         self.skip_state.connect_allocation(
-            self.in_state, strategy.in_node, strategy.skip_node
+            self.out_state, strategy.out_node, strategy.skip_node
         )
+        self.in_state.connect_allocation(
+            self.out_state, strategy.out_node, strategy.in_node
+        )
+        assert self.in_state.get_node_indices(
+            strategy.in_node
+        ) == self.skip_state.get_node_indices(strategy.skip_node)
+        assert self.in_state.get_node_indices(
+            strategy.in_node
+        ) == self.out_state.get_node_indices(strategy.out_node)
