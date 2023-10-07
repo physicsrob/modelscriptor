@@ -18,6 +18,11 @@ class NodeComponentStrategy:
         self.out_node = out_node
         self.points = points
 
+    def __repr__(self):
+        return (
+            f"NodeComponentStrategy(in_nodes={self.in_nodes}, out_node={self.out_node})"
+        )
+
 
 T = TypeVar("T", bound=NodeComponentStrategy)
 

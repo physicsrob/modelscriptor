@@ -1,0 +1,23 @@
+    <residual-stream>
+        <h3>{{ name }} Residual Stream</h3>
+        <table>
+            <tr>
+                <td>Indices:</td>
+                <!-- Indices from 0-20 -->
+                {% for idx in indices %}
+                    <td>{{ idx }}</td>
+                {% endfor %}
+            </tr>
+            <tr>
+                <td>Nodes:</td>
+                {% for name, node_id, span in node_spans %}
+                    {% if name %}
+                    <td class="node-cell" data-node-id="{{ node_id }}" colspan="{{ span }}">{{ name }}</td>
+                    {% else %}
+                    <td colspan="{{ span }}"></td>
+                    {% endif %}
+                {% endfor %}
+            </tr>
+        </table>
+    </residual-stream>
+

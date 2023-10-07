@@ -2,11 +2,7 @@ from typing import List, Set, Dict
 
 import torch
 
-from modelscriptor.compiler.components.component import Component
-from modelscriptor.compiler.components.linear import LinearLayerComponent
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
-from modelscriptor.compiler.groups.group import Group
-from modelscriptor.compiler.res_state import ResState
 from modelscriptor.graph import Node, Constant, InputNode
 
 
@@ -30,17 +26,12 @@ class FFNNetwork:
             layer.print()
         print()
 
-    def get_input_nodes(self) -> Set[Node]:
-        return self.layers[0].in_state.nodes
-
-    def get_output_nodes(self) -> Set[Node]:
-        return self.layers[-1].out_state.nodes
-
     def get_input_res_stream(self, n_pos: int, input_values: Dict[str, torch.Tensor]):
         in_state = self.layers[0].in_state
         res_stream = torch.zeros((n_pos, self.d))
 
-        for node, indices in in_state.node_to_indices.items():
+        for node in in_state.get_distinct_nodes():
+            indices = in_state.get_node_indices(node)
             if isinstance(node, Constant):
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = node.value[i]
@@ -53,11 +44,43 @@ class FFNNetwork:
                 assert False, "Unsupported node type"
         return res_stream
 
-    def forward(self, inp: torch.Tensor):
+    def forward(self, inp: torch.Tensor, return_states=False):
+        """
+        Forward pass through the model.
+
+        Parameters
+        ----------
+        inp : torch.Tensor
+            The input tensor.
+        return_states : bool, optional
+            If True, returns the intermediate states from each layer.
+            Default is False.
+
+        Returns
+        -------
+        torch.Tensor or tuple of torch.Tensor and dict
+            The output tensor if `return_states=False`.
+            A tuple of the output tensor and a dictionary containing intermediate states
+            if `return_states=True`. The dictionary keys are the names of the layers or
+            operations, and the values are tuples containing the state object and the
+            output tensor of that layer.
+        """
         res = inp
-        for layer in self.layers:
-            res = layer.forward(res)
-        return res
+        all_states = {}  # Dictionary to collect all states
+        for i, layer in enumerate(self.layers):
+            if return_states:
+                res, states = layer.forward(res, return_states=True)
+                # Prefix the keys in the states dict and update all_states
+                prefixed_states = {
+                    f"layer_{i}_{key}": value for key, value in states.items()
+                }
+                all_states.update(prefixed_states)
+            else:
+                res = layer.forward(res)
+        if return_states:
+            return res, all_states
+        else:
+            return res
 
     def compute(
         self, n_pos: int, input_values: Dict[str, torch.Tensor]
@@ -66,6 +89,7 @@ class FFNNetwork:
         result = {}
         out_state = self.layers[-1].out_state
 
-        for out_node, out_indices in out_state.node_to_indices.items():
-            result[out_node] = res[:, out_indices]
+        for node in out_state.get_distinct_nodes():
+            indices = out_state.get_node_indices(node)
+            result[node] = res[:, indices]
         return result

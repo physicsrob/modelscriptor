@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ModelScript Compiler Visualization</title>
+    <style>
+        details.layer, details.component, components, node, nodes, residual-stream {
+            display: block;
+            margin: 10px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        
+        details.component {
+            border-color: #666;
+        }
+        
+        node {
+            border-color: #999;
+        }
+        
+        summary {
+            cursor: pointer;
+        }
+
+        components::before {
+            content: "Components";
+            display: block;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        nodes::before {
+            content: "Nodes";
+            display: block;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            border: 1px solid black;
+            text-align: center;
+            padding: 5px;
+        }
+
+        .node-cell {
+            background-color: #ddd;
+        }
+
+        .highlight {
+          background-color: yellow;
+        }
+    </style>
+</head>
+<body>
+
+<h1>ModelScript Compiler Visualization</h1>
+
+    {% for layer in layers %}
+        {{ layer }}
+    {% endfor %}
+
+<script>
+    document.addEventListener('mouseover', function (e) {
+  // Search up the DOM tree for a parent element with a data-node-id attribute
+  let elem = e.target;
+  while (elem && !elem.hasAttribute('data-node-id')) {
+    elem = elem.parentElement;
+  }
+
+  // If we found such an element, proceed to highlight all similar nodes
+  if (elem) {
+    const nodeID = elem.getAttribute('data-node-id');
+    const nodes = document.querySelectorAll(`[data-node-id="${nodeID}"]`);
+    nodes.forEach(node => {
+      node.classList.add('highlight');
+    });
+  }
+});
+
+document.addEventListener('mouseout', function (e) {
+  // Same logic for finding the parent with the data-node-id
+  let elem = e.target;
+  while (elem && !elem.hasAttribute('data-node-id')) {
+    elem = elem.parentElement;
+  }
+
+  // Remove highlighting
+  if (elem) {
+    const nodeID = elem.getAttribute('data-node-id');
+    const nodes = document.querySelectorAll(`[data-node-id="${nodeID}"]`);
+    nodes.forEach(node => {
+      node.classList.remove('highlight');
+    });
+  }
+});
+</script>
+</body>
+</html>
+
+

@@ -1,4 +1,6 @@
 # Must do:
+1. Linear can implement constant
+1. Better scoring
 1. Add should be implemented by linear layers, currently only implemented in skip connections.
 1. Implement compilation of concat layers
 1. Implement Attention compilation

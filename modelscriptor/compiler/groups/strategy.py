@@ -2,7 +2,8 @@ from itertools import product
 from typing import Set, List, Tuple
 
 from modelscriptor.compiler.components.component import Component, NodeComponentStrategy
-from modelscriptor.graph import Node, Add
+from modelscriptor.graph import Node, Add, Concatenate
+from modelscriptor.graph.misc import Placeholder
 
 
 class GroupStrategy:
@@ -24,12 +25,25 @@ class GroupStrategy:
     ) -> List[NodeComponentStrategy]:
         return [s for c, n, s in self.sub_strategies if c == component]
 
-    def get_component_inputs(self, component: Component) -> Set[Node]:
+    def get_compilable_input_nodes(self, component: Component) -> Set[Node]:
         strategies = self.get_component_strategies(component)
         input_nodes = set()
         for s in strategies:
-            input_nodes |= s.in_nodes
+            for n in s.in_nodes:
+                if isinstance(n, Concatenate):
+                    inputs = n.simplify_inputs()
+                    input_nodes.update(set(inputs))
+                elif isinstance(n, Placeholder):
+                    pass
+                else:
+                    input_nodes.add(n)
         return input_nodes
+
+    def print(self, layer_components: List[Component], layer_names: List[str]):
+        print("Group Strategy")
+        for layer, name in zip(layer_components, layer_names):
+            for s in self.get_component_strategies(layer):
+                print(f"- {name}: {repr(layer)} {repr(s)}")
 
     @classmethod
     def from_node_strategies(
@@ -59,16 +73,22 @@ def get_sequential_placement_strategies(
     # Get all strategies for output_node on layers[-1]
     # (Remember we always work from the output towards the input)
     current_component = layer_components[-1]
+    # print(
+    #     "get_sequential_placement_strategies called for: ",
+    #     output_nodes,
+    #     "top layer:",
+    #     current_component,
+    # )
 
     # Each entry in node_strategies is a list of strategies for the corresponding node.
     nodes_strategies: List[List[NodeComponentStrategy]] = [
         current_component.get_strategies(node) for node in output_nodes
     ]
-
+    print(f"{nodes_strategies=} {len(output_nodes)=} {output_nodes=}")
     # Combined strategy is the outer product of the strategies for each current output node
     # in the current layer.
     group_strategies = [
-        GroupStrategy.from_node_strategies(current_component, strategy_list)
+        GroupStrategy.from_node_strategies(current_component, list(strategy_list))
         for strategy_list in product(*nodes_strategies)
     ]
 
@@ -82,7 +102,7 @@ def get_sequential_placement_strategies(
     result_strategies = []
     for s in group_strategies:
         # Now let's process all strategies that start with s
-        out_nodes = s.get_component_inputs(current_component)
+        out_nodes = s.get_compilable_input_nodes(current_component)
         s_strategies = get_sequential_placement_strategies(
             out_nodes, layer_components[:-1]
         )
