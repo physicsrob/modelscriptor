@@ -1,4 +1,4 @@
-from modelscriptor.modelscript.arithmetic_ops import add_scalar, relu_add
+from modelscriptor.modelscript.arithmetic_ops import add_scalar, relu_add, compare
 from modelscriptor.modelscript.inout_nodes import create_input
 import torch
 
@@ -23,3 +23,17 @@ def test_relu_add():
         )
         expected_value = torch.clamp(val1, min=0) + torch.clamp(val2, min=0)
         assert (output == expected_value).all()
+
+
+def test_compare():
+    thresh = 100.0
+    for delta in [-10.0, -5.0, 5.0, 10.0]:
+        for true_level in [-10.0, 0.0, 1.0, 10.0]:
+            for false_level in [-5.0, -1.0]:
+                value_input = create_input("value", 1)
+                n = compare(value_input, thresh, true_level, false_level)
+                test_val = thresh + delta
+                output = n.compute(
+                    n_pos=1, input_values={"value": torch.tensor([[test_val]])}
+                )
+                assert output.item() == true_level if delta > 0 else false_level

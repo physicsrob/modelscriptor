@@ -6,6 +6,8 @@ import torch
 from modelscriptor.graph.relu import ReLU
 from modelscriptor.modelscript.ffn_layer import ffn_layer
 
+from modelscriptor.modelscript.const import turn_on_speed, big_offset
+
 
 def add_scalar(inp: Node, scalar: float) -> Node:
     """
@@ -42,6 +44,44 @@ def add(inp1: Node, inp2: Node) -> Node:
         Node: Node resulting from element-wise addition.
     """
     return Add(inp1, inp2)
+
+
+def compare(
+    inp: Node, thresh: float, true_level: float = 1.0, false_level: float = -1.0
+) -> Node:
+    """
+    Compare input with threshold and return boolean valued node (1.0 for true, -1.0 for false)
+
+    Args:
+        inp: Node to compare. Must be length 1.
+        thresh: Threshold to use.
+        true_level: Value to return if inp is greater than thresh.
+        false_level: Value to return if inp is less than thresh.
+
+
+    Returns:
+        Node: Node with a value of true_level if inp is greater than thresh, false_level otherwise.
+    """
+
+    # We need 2 FFN entries, we'll use the equation:
+    # y= (true_level-false_level) * [
+    #   max(turn_on_speed*x - turn_on_speed*thresh, 0) - max(turn_on_speed*x - turn_on_speed*thresh - 1, 0)
+    # ] + false_level
+
+    d_input = len(inp)
+
+    input_proj = torch.tensor([[turn_on_speed], [turn_on_speed]])
+    input_bias = torch.tensor([-turn_on_speed * thresh, -turn_on_speed * thresh - 1.0])
+    output_proj = torch.tensor([[true_level - false_level], [false_level - true_level]])
+    output_bias = false_level * torch.ones(1)
+
+    return ffn_layer(
+        input_node=inp,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=output_bias,
+    )
 
 
 def concat(inp_list: List[Node]) -> Node:

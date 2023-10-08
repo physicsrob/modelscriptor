@@ -57,5 +57,8 @@ class Unembedding:
             probs = self.embedding.table @ input_value[pos]
             token_id = probs.argmax().item()
             assert isinstance(token_id, int)
-            result.append(self.embedding.vocab[token_id])
+            if token_id < len(self.embedding.vocab):
+                result.append(self.embedding.vocab[token_id])
+            else:
+                result.append(unk_token)
         return result
