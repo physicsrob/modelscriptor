@@ -17,6 +17,10 @@ class PosEncoding(Node):
         return result
 
     def get_last_value(self, value: Node, delta_pos=-1) -> Node:
+        if delta_pos == 0:
+            # NOOP -- supporting this simplifies some use cases.
+            return value
+
         # We're applying the query/key to the position
         d_head = 64
         assert self.d_pos < d_head

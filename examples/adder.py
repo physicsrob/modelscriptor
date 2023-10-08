@@ -1,4 +1,4 @@
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import torch
 
@@ -20,9 +20,12 @@ from modelscriptor.modelscript.logic_ops import (
 from modelscriptor.modelscript.map_select import map_to_table, select
 
 
-def check_is_num(embedding_value: Node, embedding: Embedding) -> Node:
+def check_is_digit(embedding: Embedding) -> Node:
+    """
+    Check if the current embedding value is a digits.
+    """
     return map_to_table(
-        inp=embedding_value,
+        inp=embedding,
         key_to_value={
             embedding.get_embedding(str(i)): torch.tensor([1.0]) for i in range(10)
         },
@@ -30,8 +33,8 @@ def check_is_num(embedding_value: Node, embedding: Embedding) -> Node:
     )
 
 
-def sum_numbers(
-    embedding: Embedding, num1: Node, num2: Node, carry_in: Optional[Node] = None
+def sum_digits(
+    embedding: Embedding, num1: Node, num2: Node, carry_in: Node
 ) -> Tuple[Node, Node]:
     """
     Adds num1 + num2 + carry_in.
@@ -43,38 +46,24 @@ def sum_numbers(
     sum_out_table = {}
     carry_out_table = {}
 
-    # If carry_in is specified, we use concat([num1, num2, carry_in]) as the key.
-    # If carry_in is not specified, we use concat([num1, num2]) as the key.
-    if carry_in:
-        key = concat([num1, num2, carry_in])
-    else:
-        key = concat([num1, num2])
-
     for A in range(10):
         for B in range(10):
-            for C in [0, 1] if carry_in else [0]:
-                if carry_in:
-                    carry_tensor = torch.tensor([1.0 if C else -1.0])
-                    entry_key = torch.cat(
-                        [
-                            embedding.get_embedding(str(A)),
-                            embedding.get_embedding(str(B)),
-                            carry_tensor,
-                        ]
-                    )
-                else:
-                    entry_key = torch.cat(
-                        [
-                            embedding.get_embedding(str(A)),
-                            embedding.get_embedding(str(B)),
-                        ]
-                    )
+            for C in [0, 1]:
+                entry_key = torch.cat(
+                    [
+                        embedding.get_embedding(str(A)),
+                        embedding.get_embedding(str(B)),
+                        torch.tensor([1.0 if C else -1.0]),
+                    ]
+                )
                 sum_out_table[entry_key] = embedding.get_embedding(
                     str((A + B + C) % 10)
                 )
                 carry_out_table[entry_key] = torch.tensor(
                     [1.0 if (A + B + C) >= 10 else -1.0]
                 )
+
+    key = concat([num1, num2, carry_in])
 
     return (
         map_to_table(
@@ -86,34 +75,102 @@ def sum_numbers(
     )
 
 
+def sum_digit_seqs(
+    embedding: Embedding, seq1: List[Node], seq2: List[Node]
+) -> List[Node]:
+    """
+    Sums a sequence of digits. The order of the sequence is greatest to least significance,
+    so the first element is the 100s digit, the second element is the 10s digit, and the third
+    element is the 1s digit.
+    """
+
+    carry = create_constant(torch.tensor([-1.0]))
+    out = []
+    # We add from right to left.
+    for digit1, digit2 in reversed(list(zip(seq1, seq2))):
+        sum, carry = sum_digits(embedding, digit1, digit2, carry)
+        out.append(sum)
+
+    return list(reversed(out))
+
+
+def remove_leading_0s(
+    embedding: Embedding, seq: List[Node], max_removals: int
+) -> List[Node]:
+    """
+    Removes leading 0s from a sequence of digits.
+    """
+    if max_removals == 0:
+        return seq
+
+    is_leading_zero = compare_to_vector(inp=seq[0], vector=embedding.get_embedding("0"))
+
+    out = []
+    seq = seq + [seq[-1]]
+    for i, _ in enumerate(seq[:-1]):
+        out.append(
+            select(cond=is_leading_zero, true_node=seq[i + 1], false_node=seq[i])
+        )
+    return remove_leading_0s(embedding, out, max_removals - 1)
+
+
 def output_sequence(
     pos_encoding: PosEncoding,
     trigger_condition: Node,
-    value1: Node,
-    value2: Node,
-    value3: Node,
+    seq: List[Node],
     default_output: torch.Tensor,
-    eos_output: torch.Tensor,
 ):
+    # Add <eos> token ot seq.
+    seq = seq
+
     # has_triggered will be true for all positions starting when trigger_condition is true.
     has_triggered = pos_encoding.get_prev_value(trigger_condition, trigger_condition)
 
-    # If trigger_condition is true, output value1.
-    # Next, output value 2.
-    trigger_condition2 = pos_encoding.get_last_value(trigger_condition, delta_pos=-1)
-    trigger_condition3 = pos_encoding.get_last_value(trigger_condition, delta_pos=-2)
-    trigger_condition4 = pos_encoding.get_last_value(trigger_condition, delta_pos=-3)
-
-    out_value1 = cond_gate(trigger_condition, value1)
-    out_value2 = cond_gate(trigger_condition2, value2)
-    out_value3 = cond_gate(trigger_condition3, value3)
-    out_value4 = cond_gate(trigger_condition4, create_constant(eos_output))
+    out_values = []
+    for i, value in enumerate(seq):
+        delta = -i
+        trigger = pos_encoding.get_last_value(trigger_condition, delta_pos=delta)
+        out_values.append(cond_gate(trigger, value))
 
     return select(
         cond=has_triggered,
-        true_node=sum_nodes([out_value1, out_value2, out_value3, out_value4]),
+        true_node=sum_nodes(out_values),
         false_node=create_constant(default_output),
     )
+
+
+class NumericSequence:
+    def __init__(self, pos_encoding: PosEncoding, embedding: Embedding, digits: int):
+        self.pos_encoding = pos_encoding
+        zero_constant = create_constant(embedding.get_embedding("0"))
+        is_digit = check_is_digit(embedding)
+        is_num_start = bool_all_true(
+            [is_digit, bool_not(pos_encoding.get_last_value(is_digit))]
+        )
+
+        current_digits = [embedding]
+        for i in range(digits - 1):
+            current_digits.append(
+                select(
+                    cond=is_num_start,
+                    true_node=zero_constant,
+                    false_node=pos_encoding.get_last_value(current_digits[-1]),
+                )
+            )
+
+        # We always reference digit values one sequence position after.
+        self.digit_values = [
+            pos_encoding.get_last_value(digit) for digit in current_digits
+        ]
+
+    def get_digits_at_event(self, termination_event: Node) -> List[Node]:
+        # Get the number that was just completed when termination_event is true.
+        digits = [
+            self.pos_encoding.get_prev_value(digit, termination_event)
+            for digit in self.digit_values
+        ]
+        # We reverse the list of digits so that they go in the greatest to least significance order.
+        return list(reversed(digits))
 
 
 def create_network() -> Unembedding:
@@ -124,23 +181,8 @@ def create_network() -> Unembedding:
     embedding = create_embedding(vocab=vocab)
     pos_encoding = create_pos_encoding()
 
-    #
-    # Make network that adds 2 digit numbers
-    #
+    num_seq = NumericSequence(pos_encoding, embedding, 3)
 
-    # Define current number.
-    zero_constant = create_constant(embedding.get_embedding("0"))
-    is_num = check_is_num(embedding_value=embedding, embedding=embedding)
-
-    is_num_start = bool_all_true(
-        [is_num, bool_not(pos_encoding.get_last_value(is_num, delta_pos=-1))]
-    )
-
-    # current_num is the embedding of the current character if it is a number,
-    # otherwise it is the embedding of 0.
-    current_num = select(cond=is_num, true_node=embedding, false_node=zero_constant)
-
-    # Define a flag for the end of the first number (when we hit the + symbol).
     is_end_of_first_num = compare_to_vector(
         inp=embedding, vector=embedding.get_embedding("+")
     )
@@ -150,59 +192,20 @@ def create_network() -> Unembedding:
         inp=embedding, vector=embedding.get_embedding("=")
     )
 
-    current_num_1s = current_num
-    current_num_10s = select(
-        cond=is_num_start,
-        true_node=zero_constant,
-        false_node=pos_encoding.get_last_value(current_num_1s, delta_pos=-1),
-    )
-    current_num_100s = select(
-        cond=is_num_start,
-        true_node=zero_constant,
-        false_node=pos_encoding.get_last_value(current_num_10s, delta_pos=-1),
-    )
+    first_num_digits = num_seq.get_digits_at_event(is_end_of_first_num)
+    second_num_digits = num_seq.get_digits_at_event(is_end_of_second_num)
+    sum_digits = sum_digit_seqs(embedding, first_num_digits, second_num_digits) + [
+        create_constant(embedding.get_embedding("<eos>"))
+    ]
+    sum_digits = remove_leading_0s(embedding, sum_digits, max_removals=2)
 
-    just_completed_num_1s = pos_encoding.get_last_value(current_num, delta_pos=-1)
-    just_completed_num_10s = pos_encoding.get_last_value(current_num_10s, delta_pos=-1)
-    just_completed_num_100s = pos_encoding.get_last_value(
-        current_num_100s, delta_pos=-1
-    )
-
-    first_num_1s = pos_encoding.get_prev_value(
-        just_completed_num_1s, is_end_of_first_num
-    )
-    first_num_10s = pos_encoding.get_prev_value(
-        just_completed_num_10s, is_end_of_first_num
-    )
-    first_num_100s = pos_encoding.get_prev_value(
-        just_completed_num_100s, is_end_of_first_num
-    )
-    second_num_1s = pos_encoding.get_prev_value(
-        just_completed_num_1s, is_end_of_second_num
-    )
-    second_num_10s = pos_encoding.get_prev_value(
-        just_completed_num_10s, is_end_of_second_num
-    )
-    second_num_100s = pos_encoding.get_prev_value(
-        just_completed_num_100s, is_end_of_second_num
-    )
-
-    # Figure out how to calculate output index.
-    sum_1s, carry_1s = sum_numbers(embedding, first_num_1s, second_num_1s)
-    sum_10s, carry_10s = sum_numbers(embedding, first_num_10s, second_num_10s, carry_1s)
-    sum_100s, carry_100s = sum_numbers(
-        embedding, first_num_100s, second_num_100s, carry_10s
-    )
     # return create_unembedding(sum_100s, embedding)
     return create_unembedding(
         output_sequence(
             pos_encoding,
             is_end_of_second_num,
-            sum_100s,
-            sum_10s,
-            sum_1s,
+            sum_digits,
             embedding.get_embedding(" "),
-            embedding.get_embedding("<eos>"),
         ),
         embedding,
     )
