@@ -6,6 +6,7 @@ from modelscriptor.modelscript.logic_ops import (
     cond_gate,
     bool_any_true,
     bool_all_true,
+    bool_not,
 )
 
 import torch
@@ -101,3 +102,17 @@ def test_bool_all_true():
                     1.0 if (x_value > 0.0 and y_value > 0.0 and z_value > 0.0) else -1.0
                 )
                 assert output.item() == expected_value
+
+
+def test_bool_not():
+    x = create_input("x", 1)
+    out = bool_not(x)
+    for x_value in [-1.0, 1.0]:
+        output = out.compute(
+            n_pos=1,
+            input_values={
+                "x": torch.tensor([[x_value]]),
+            },
+        )
+        expected_value = 1.0 if x_value < 0.0 else -1.0
+        assert output.item() == expected_value

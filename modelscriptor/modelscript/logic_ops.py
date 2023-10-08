@@ -49,6 +49,19 @@ def bool_all_true(inp_list: List[Node]) -> Node:
     )
 
 
+def bool_not(inp: Node) -> Node:
+    """
+    Returns a node that evaluates to 1.0 if the input node is false, and -1.0 if the input node is true.
+
+    Args:
+        inp: Input node to be evaluated
+
+    Returns:
+        Node: Output node that is 1.0 if the input node is false, and -1.0 if the input node is true.
+    """
+    return compare(inp, thresh=0.0, true_level=-1.0, false_level=1.0)
+
+
 def compare_to_vector(inp: Node, vector: torch.Tensor) -> Node:
     """
     Compares a node's value to a vector tensor.
