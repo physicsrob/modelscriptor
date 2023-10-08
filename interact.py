@@ -1,15 +1,23 @@
 from examples.adder import create_network
 from modelscriptor.graph.embedding import Unembedding
 
+max_chars = 10
+
 
 def eval_network(output_node: Unembedding, input_text: str):
-    in_tokens = list(input_text)
-    n_pos = len(in_tokens)
-    output = output_node.compute(
-        n_pos=n_pos,
-        input_values={"embedding_input": in_tokens},
-    )
-    return "".join(output)
+    in_tokens = ["<bos>"] + list(input_text)
+    for i in range(max_chars):
+        n_pos = len(in_tokens)
+        out_tokens = output_node.compute(
+            n_pos=n_pos,
+            input_values={"embedding_input": in_tokens},
+        )
+        if out_tokens[-1] == "<eos>":
+            break
+        else:
+            in_tokens.append(out_tokens[-1])
+
+    return "".join(out_tokens)
 
 
 output = create_network()
