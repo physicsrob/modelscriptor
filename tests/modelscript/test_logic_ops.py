@@ -4,6 +4,8 @@ from modelscriptor.modelscript.logic_ops import (
     compare_to_vector,
     cond_add_vector,
     cond_gate,
+    bool_any_true,
+    bool_all_true,
 )
 
 import torch
@@ -55,3 +57,47 @@ def test_cond_gate():
             else:
                 expected_value = 0.0
             assert output.item() == expected_value
+
+
+def test_bool_any_true():
+    x = create_input("x", 1)
+    y = create_input("y", 1)
+    z = create_input("z", 1)
+    out = bool_any_true([x, y, z])
+    for x_value in [-1.0, 1.0]:
+        for y_value in [-1.0, 1.0]:
+            for z_value in [-1.0, 1.0]:
+                output = out.compute(
+                    n_pos=1,
+                    input_values={
+                        "x": torch.tensor([[x_value]]),
+                        "y": torch.tensor([[y_value]]),
+                        "z": torch.tensor([[z_value]]),
+                    },
+                )
+                expected_value = (
+                    1.0 if (x_value > 0.0 or y_value > 0.0 or z_value > 0.0) else -1.0
+                )
+                assert output.item() == expected_value
+
+
+def test_bool_all_true():
+    x = create_input("x", 1)
+    y = create_input("y", 1)
+    z = create_input("z", 1)
+    out = bool_all_true([x, y, z])
+    for x_value in [-1.0, 1.0]:
+        for y_value in [-1.0, 1.0]:
+            for z_value in [-1.0, 1.0]:
+                output = out.compute(
+                    n_pos=1,
+                    input_values={
+                        "x": torch.tensor([[x_value]]),
+                        "y": torch.tensor([[y_value]]),
+                        "z": torch.tensor([[z_value]]),
+                    },
+                )
+                expected_value = (
+                    1.0 if (x_value > 0.0 and y_value > 0.0 and z_value > 0.0) else -1.0
+                )
+                assert output.item() == expected_value
