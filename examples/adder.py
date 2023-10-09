@@ -150,7 +150,7 @@ class NumericSequence:
             [is_digit, bool_not(pos_encoding.get_last_value(is_digit))]
         )
 
-        current_digits = [embedding]
+        current_digits: List[Node] = [embedding]
         for i in range(digits - 1):
             current_digits.append(
                 select(
