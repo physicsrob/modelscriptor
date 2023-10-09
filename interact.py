@@ -17,7 +17,7 @@ def eval_network(output_node: Unembedding, input_text: str):
         else:
             in_tokens.append(out_tokens[-1])
 
-    return "".join(out_tokens)
+    return "".join(t for t in out_tokens if t != "<bos>" and t != "<eos>")
 
 
 output = create_network()

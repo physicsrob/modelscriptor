@@ -19,6 +19,8 @@ from modelscriptor.modelscript.logic_ops import (
 )
 from modelscriptor.modelscript.map_select import map_to_table, select
 
+max_digits = 3
+
 
 def check_is_digit(embedding: Embedding) -> Node:
     """
@@ -165,12 +167,10 @@ class NumericSequence:
 
     def get_digits_at_event(self, termination_event: Node) -> List[Node]:
         # Get the number that was just completed when termination_event is true.
-        digits = [
+        return [
             self.pos_encoding.get_prev_value(digit, termination_event)
-            for digit in self.digit_values
+            for digit in reversed(self.digit_values)
         ]
-        # We reverse the list of digits so that they go in the greatest to least significance order.
-        return list(reversed(digits))
 
 
 def create_network() -> Unembedding:
@@ -181,7 +181,7 @@ def create_network() -> Unembedding:
     embedding = create_embedding(vocab=vocab)
     pos_encoding = create_pos_encoding()
 
-    num_seq = NumericSequence(pos_encoding, embedding, 3)
+    num_seq = NumericSequence(pos_encoding, embedding, max_digits)
 
     is_end_of_first_num = compare_to_vector(
         inp=embedding, vector=embedding.get_embedding("+")
@@ -197,9 +197,8 @@ def create_network() -> Unembedding:
     sum_digits = sum_digit_seqs(embedding, first_num_digits, second_num_digits) + [
         create_constant(embedding.get_embedding("<eos>"))
     ]
-    sum_digits = remove_leading_0s(embedding, sum_digits, max_removals=2)
+    sum_digits = remove_leading_0s(embedding, sum_digits, max_removals=max_digits - 1)
 
-    # return create_unembedding(sum_100s, embedding)
     return create_unembedding(
         output_sequence(
             pos_encoding,
