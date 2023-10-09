@@ -11,6 +11,8 @@ class Linear(Node):
     # e.g. add ReLU layer
     # FFN = LinearBLock(ReLU(LinearBlock(input_node, ...), ...)
     # AttnHead = Attn(LinearBlock(query_in, ...), LinearBlock(key_in, ...), LinearBlock(value_in, ...)
+    output_matrix: torch.Tensor  # d_input x d_output
+    output_bias: torch.Tensor  # d_output
 
     def __init__(
         self,

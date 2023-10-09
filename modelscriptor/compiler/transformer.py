@@ -19,13 +19,6 @@ class FFNNetwork:
         self.layers = [layer] + self.layers
         return layer
 
-    def print(self):
-        print("FFNNetwork")
-        print(f"{len(self.layers)} layers.")
-        for layer in self.layers:
-            layer.print()
-        print()
-
     def get_input_res_stream(self, n_pos: int, input_values: Dict[str, torch.Tensor]):
         in_state = self.layers[0].in_state
         res_stream = torch.zeros((n_pos, self.d))

@@ -3,6 +3,18 @@ from modelscriptor.graph import Node
 
 
 class Attn(Node):
+    # query_matrix shape (d_query_in, d_head)
+    query_matrix: torch.Tensor
+
+    # key_matrix shape (d_key_in, d_head)
+    key_matrix: torch.Tensor
+
+    # value_matrix shape (d_value_in, d_head)
+    value_matrix: torch.Tensor
+
+    # output_matrix shape (d_head, d_output)
+    output_matrix: torch.Tensor
+
     def __init__(
         self,
         query_in: Node,
@@ -13,10 +25,6 @@ class Attn(Node):
         value_matrix: torch.Tensor,
         output_matrix: torch.Tensor,
     ):
-        # query_matrix shape (d_query_in, d_head)
-        # key_matrix shape (d_key_in, d_head)
-        # value_matrix shape (d_value_in, d_head)
-        # output_matrix shape (d_head, d_output)
         self.d_head = query_matrix.shape[1]
         self.d_query_in = query_matrix.shape[0]
         self.d_key_in = key_matrix.shape[0]

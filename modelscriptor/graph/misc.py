@@ -71,8 +71,11 @@ class Constant(Node):
         assert x.shape == (n_pos, len(self))
         return x
 
+    def is_zero(self):
+        return self.value.eq(0).all()
+
     def node_type(self):
-        if self.value.eq(0).all():
+        if self.is_zero():
             return "Zero"
         else:
             return "Constant"

@@ -60,8 +60,13 @@ def compile_ffn_network(d: int, output_node: Node, verbose: bool = False) -> FFN
 
         if verbose:
             print(f"Applied {applied_strategy_cnt} strategies.")
+
         to_compile_nodes = layer.in_state.get_compilable_nodes()
-        if not len(to_compile_nodes) and not applied_strategy_cnt:
+
+        if (
+            layer.out_state.get_compilable_nodes()
+            == layer.in_state.get_compilable_nodes()
+        ):
             raise CompilationError("Could not compile network.")
 
         if all(

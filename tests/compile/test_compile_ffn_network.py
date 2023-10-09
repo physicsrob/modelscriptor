@@ -8,7 +8,11 @@ from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 # from modelscriptor.compiler.plan.layer_plan import FFNPlan
 from modelscriptor.graph import Linear, ReLU, Node
 from modelscriptor.modelscript.arithmetic_ops import add, add_scalar, relu_add
-from modelscriptor.modelscript.inout_nodes import create_input, create_constant
+from modelscriptor.modelscript.inout_nodes import (
+    create_input,
+    create_constant,
+    create_pos_encoding,
+)
 from modelscriptor.modelscript.logic_ops import cond_add_vector
 from modelscriptor.modelscript.map_select import select
 
@@ -94,3 +98,24 @@ def test_compile_relu_add():
             n_pos=1,
             input_values={"val1": val1.unsqueeze(0), "val2": val2.unsqueeze(0)},
         )
+
+
+# def test_compile_get_prev_value():
+#     input_values = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
+#     cond_values = torch.tensor([[1.0], [0.0], [0.0], [1.0], [0.0]])
+#
+#     value_input = create_input("value", 1)
+#     cond_input = create_input("cond", 1)
+#     pos_encoding = create_pos_encoding()
+#     last_input = pos_encoding.get_prev_value(value_input, cond_input)
+#     compiler_test(
+#         last_input, n_pos=5, input_values={"value": input_values, "cond": cond_values}
+#     )
+#
+#
+# def test_compile_get_last_value():
+#     input_values = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
+#     value_input = create_input("value", 1)
+#     pos_encoding = create_pos_encoding()
+#     last_input = pos_encoding.get_last_value(value_input, delta_pos=-1)
+#     compiler_test(last_input, n_pos=5, input_values={"value": input_values})
