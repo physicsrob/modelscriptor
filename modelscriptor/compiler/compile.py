@@ -1,8 +1,10 @@
 from typing import Set
 
+from modelscriptor.compiler.groups.strategy import _get_ancestor_nodes
+from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
 from modelscriptor.compiler.report import make_report
-from modelscriptor.compiler.transformer import FFNNetwork
-from modelscriptor.graph import Node, InputNode, Constant
+from modelscriptor.compiler.transformer import Transformer
+from modelscriptor.graph import Node, InputNode, Constant, PosEncoding
 
 MAX_LAYERS = 100
 
@@ -22,67 +24,99 @@ class CompilationError(Exception):
     pass
 
 
-def compile_ffn_network(d: int, output_node: Node, verbose: bool = False) -> FFNNetwork:
+def is_compilation_complete(layer: TransformerLayer) -> bool:
+    return all(
+        isinstance(node, InputNode)
+        or isinstance(node, Constant)
+        or isinstance(node, PosEncoding)
+        for node in layer.attn.in_state.get_compilable_nodes()
+    )
+
+
+def compile_network(
+    d: int, d_head: int, output_node: Node, verbose: bool = True
+) -> Transformer:
     # Start with the first layer and try to compile as much as possible.
 
-    net = FFNNetwork(d)
+    net = Transformer(d, d_head)
 
-    to_compile_nodes = {output_node}
     layer = net.add_layer()
-    layer.out_state.allocate_node(output_node)
+    layer.ffn.out_state.allocate_node(output_node)
+    needed_nodes = _get_ancestor_nodes({output_node})
 
     for layer_cnt in range(MAX_LAYERS):
         if verbose:
             print(f"\n\nCompiling layer {layer_cnt}")
-            print(f"Nodes to be compiled: {to_compile_nodes}")
-            layer.out_state.print("Layer Output")
+            layer.ffn.out_state.print("Layer FFN Output")
             print("\n\n")
 
-        applied_strategy_cnt = 0
-        chosen_strategies = []
-        for node in to_compile_nodes:
-            strategies = sorted(
-                layer.get_strategies(node), key=lambda s: -s.get_score()
-            )
-            if len(strategies):
-                chosen_strategies.append(strategies[0])
-                if verbose:
-                    print("\n\nBest strategy: ")
-                    layer.print_strategy(strategies[0])
-                    print("\n\n")
-                layer.apply_skip_allocation(strategies[0])
-            elif verbose:
-                print("No strategy for: ", node)
+        for sublayer in [layer.ffn, layer.attn]:
+            to_compile_nodes = sublayer.out_state.get_compilable_nodes()
 
-        for chosen_strategy in chosen_strategies:
-            layer.apply_strategy(chosen_strategy)
-            applied_strategy_cnt += 1
+            chosen_strategies = []
+            for node in to_compile_nodes:
+                strategies = sorted(
+                    sublayer.get_strategies(node),
+                    key=lambda s: -len(s.get_represented_nodes() & needed_nodes),
+                )
+                if len(strategies):
+                    chosen_strategies.append(strategies[0])
+                    if verbose:
+                        print("\n\nStrategies considered: ")
+                        for s in strategies:
+                            sublayer.print_strategy(s)
+                            print(f"Represented Nodes: {s.get_represented_nodes()}\n")
+                            print(f"Score: {s.get_score()}\n")
+                        print("\n\n")
+                    sublayer.apply_skip_allocation(strategies[0])
+                else:
+                    raise CompilationError(f"No strategy for {node}")
 
-        if verbose:
-            print(f"Applied {applied_strategy_cnt} strategies.")
-        to_compile_nodes = layer.in_state.get_compilable_nodes()
-        if not len(to_compile_nodes) and not applied_strategy_cnt:
-            raise CompilationError("Could not compile network.")
+            for chosen_strategy in chosen_strategies:
+                sublayer.apply_strategy(chosen_strategy)
 
-        if all(
-            isinstance(node, InputNode) or isinstance(node, Constant)
-            for node in to_compile_nodes
+            if sublayer == layer.ffn:
+                layer.attn.out_state.update_from(layer.ffn.in_state)
+
+        if (
+            layer.ffn.out_state.get_compilable_nodes()
+            == layer.attn.in_state.get_compilable_nodes()
         ):
+            import pdb
+
+            pdb.set_trace()
+            raise CompilationError("Could not compile network.")
+        else:
+            print(
+                f"Nodes changed from {layer.ffn.out_state.get_compilable_nodes()} to {layer.attn.in_state.get_compilable_nodes()}"
+            )
+
+        if str(layer.ffn.out_state.get_compilable_nodes()) == str(
+            layer.attn.in_state.get_compilable_nodes()
+        ):
+            import pdb
+
+            pdb.set_trace()
+
+        if is_compilation_complete(layer):
             if verbose:
                 print("Compilation complete")
-                layer.out_state.print("Final Layer Output")
-                layer.in_state.print("Final Layer Input")
+                layer.ffn.out_state.print("Final Layer Output")
+                layer.attn.in_state.print("Final Layer Input")
             break
         else:
             new_layer = net.add_layer()
-            new_layer.out_state.update_from(layer.in_state)
+            new_layer.ffn.out_state.update_from(layer.attn.in_state)
             if verbose:
                 print("\n\nCreating new layer:")
-                layer.out_state.print("Old Layer Output")
-                layer.in_state.print("Old Layer Input")
-                new_layer.out_state.print("New Layer Output")
-                new_layer.in_state.print("New Layer Input")
+                layer.ffn.out_state.print("Old Layer Output")
+                layer.attn.in_state.print("Old Layer Input")
+                new_layer.ffn.out_state.print("New Layer Output")
+                new_layer.attn.in_state.print("New Layer Input")
             layer = new_layer
+
+    if not is_compilation_complete(layer):
+        raise CompilationError(f"Exceeded maximum number of layers {MAX_LAYERS}.")
 
     make_report(net)
 

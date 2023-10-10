@@ -118,7 +118,6 @@ class ResState:
         # This forces the allocation for this_nodes to be the same as the allocation for other_nodes
         # in other_state.
 
-        print(f"Connecting {this_nodes} to {other_nodes}")
         # Simplify all concatenations
         simplified_other_nodes = []
         for n in other_nodes:
@@ -138,8 +137,6 @@ class ResState:
             else:
                 simplified_this_nodes.append(n)
 
-        print("Simplified this nodes: ", simplified_this_nodes)
-        print("Simplified other nodes: ", simplified_other_nodes)
         # Assert that the allocation is the same length
         assert (
             sum(len(n) for n in simplified_this_nodes)

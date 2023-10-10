@@ -1,15 +1,17 @@
 import os
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 from modelscriptor.compiler.components.component import Component
 from modelscriptor.compiler.components.skip import SkipLayerComponent
+from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
+from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
 from modelscriptor.compiler.res_state import ResState
 from jinja2 import Environment, FileSystemLoader
 from jinja2 import Environment, FileSystemLoader
 
-from modelscriptor.compiler.transformer import FFNNetwork
+from modelscriptor.compiler.transformer import Transformer
 from modelscriptor.graph import Node
 
 current_module_directory = os.path.dirname(os.path.abspath(__file__))
@@ -80,13 +82,15 @@ def render_component(component: Component):
     )
 
 
-def render_layer(layer: FFNSubLayer, layer_idx: int):
+def render_ffn_layer(layer: FFNSubLayer, layer_idx: int):
     env = Environment(loader=FileSystemLoader(template_directory))
+
     template = env.get_template("layer_template.html")
 
     # Populate and render the template
     return template.render(
         layer_index=layer_idx,
+        layer_type="FFN",
         components=[
             render_component(c)
             for c in [layer.linear1, layer.relu, layer.linear2, layer.skip]
@@ -96,17 +100,34 @@ def render_layer(layer: FFNSubLayer, layer_idx: int):
     )
 
 
-def render_network(network: FFNNetwork):
+def render_attn_layer(layer: AttnSubLayer, layer_idx: int):
     env = Environment(loader=FileSystemLoader(template_directory))
-    template = env.get_template("report_template.html")
+
+    template = env.get_template("layer_template.html")
 
     # Populate and render the template
     return template.render(
-        layers=[render_layer(l, i) for i, l in enumerate(network.layers)]
+        layer_index=layer_idx,
+        layer_type="Attention",
+        components=[render_component(c) for c in [layer.attn, layer.skip]],
+        in_state=render_res_state(layer.in_state, "Layer Input"),
+        out_state=render_res_state(layer.out_state, "Layer Output"),
     )
 
 
-def make_report(network: FFNNetwork):
+def render_network(network: Transformer):
+    env = Environment(loader=FileSystemLoader(template_directory))
+    template = env.get_template("report_template.html")
+
+    layers = []
+    for i, l in enumerate(network.layers):
+        layers.append(render_attn_layer(l.attn, i))
+        layers.append(render_ffn_layer(l.ffn, i))
+    # Populate and render the template
+    return template.render(layers=layers)
+
+
+def make_report(network: Transformer):
     # Generate the current timestamp with microseconds for higher granularity
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 

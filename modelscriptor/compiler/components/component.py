@@ -9,14 +9,12 @@ from modelscriptor.graph import Node, Concatenate, Linear
 
 class NodeComponentStrategy:
     # Represents the way a node passes through and is transformed by one component
-    in_nodes: Set[Node]  # Input nodes used for this computation
+    in_nodes: List[Node]  # Input nodes used for this computation
     out_node: Node  # Output node fhor this computation
-    points: int
 
-    def __init__(self, in_nodes: Set[Node], out_node: Node, points: int):
+    def __init__(self, in_nodes: List[Node], out_node: Node):
         self.in_nodes = in_nodes
         self.out_node = out_node
-        self.points = points
 
     def __repr__(self):
         return (

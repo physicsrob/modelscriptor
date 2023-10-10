@@ -4,6 +4,9 @@ import torch
 
 
 class Node:
+    inputs: List["Node"]
+    d_output: int
+
     def __init__(self, d_output: int, inputs: List["Node"]):
         self.d_output = d_output
         self.inputs = inputs
