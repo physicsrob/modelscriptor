@@ -1,4 +1,4 @@
-# Operaiton Naming Convention
+# Operation Naming Convention
 
 Operation Naming Convention:
 - Operation names start with a verb where possible. Most operations are performing actions on nodes, and verbs make it easier to interpret what the operation will do.

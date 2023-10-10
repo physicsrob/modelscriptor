@@ -17,11 +17,16 @@ class LinearNodeComponentStrategy(NodeComponentStrategy):
         out_node: Node,
         output_matrix: torch.Tensor,
         output_bias: torch.Tensor,
-        points: int,
     ):
-        super().__init__(in_nodes={in_node}, out_node=out_node, points=points)
+        super().__init__(in_nodes=[in_node], out_node=out_node)
         self.output_matrix = output_matrix
         self.output_bias = output_bias
+
+    def __repr__(self):
+        if self.in_nodes == [self.out_node]:
+            return f"LinearNodeComponentStrategy(passthrough=True, node={self.in_nodes[0]})"
+        else:
+            return f"LinearNodeComponentStrategy(in_node={self.in_nodes[0]}, out_node={self.out_node})"
 
 
 class LinearLayerComponent(Component):
@@ -46,7 +51,6 @@ class LinearLayerComponent(Component):
                 out_node=node,
                 output_matrix=torch.eye(len(node)),
                 output_bias=torch.zeros(len(node)),
-                points=0,
             )
         )
 
@@ -58,7 +62,6 @@ class LinearLayerComponent(Component):
                     out_node=node,
                     output_matrix=node.output_matrix,
                     output_bias=node.output_bias,
-                    points=1,
                 )
             )
 
@@ -70,7 +73,6 @@ class LinearLayerComponent(Component):
                     out_node=node,
                     output_matrix=torch.zeros(0, 0),
                     output_bias=node.value,
-                    points=1,
                 )
             )
 
@@ -81,7 +83,7 @@ class LinearLayerComponent(Component):
         assert self.out_state.has_node(
             strategy.out_node
         ), "Strategy applied before output allocated"
-        in_node = next(iter(strategy.in_nodes))
+        in_node = strategy.in_nodes[0]
         self.in_state.allocate_node(in_node)
 
         # Copy the matrix

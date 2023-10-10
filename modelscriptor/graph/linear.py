@@ -11,6 +11,8 @@ class Linear(Node):
     # e.g. add ReLU layer
     # FFN = LinearBLock(ReLU(LinearBlock(input_node, ...), ...)
     # AttnHead = Attn(LinearBlock(query_in, ...), LinearBlock(key_in, ...), LinearBlock(value_in, ...)
+    output_matrix: torch.Tensor  # d_input x d_output
+    output_bias: torch.Tensor  # d_output
 
     def __init__(
         self,
@@ -37,3 +39,25 @@ class Linear(Node):
 
         assert value_in.shape == (n_pos, self.d_input)
         return torch.matmul(value_in, self.output_matrix) + self.output_bias
+
+    def __eq__(self, other):
+        if not isinstance(other, Linear):
+            return False
+        if not self.inputs == other.inputs:
+            return False
+        if not torch.equal(self.output_matrix, other.output_matrix):
+            return False
+        if not torch.equal(self.output_bias, other.output_bias):
+            return False
+        return True
+
+    def __hash__(self):
+        if not all(self.output_matrix.shape):
+            return 0
+
+        native_floats = [
+            float(x)
+            for x in self.output_matrix.reshape(-1).tolist()
+            + self.output_bias.reshape(-1).tolist()
+        ]
+        return hash(tuple(native_floats + self.inputs))

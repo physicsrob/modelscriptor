@@ -4,19 +4,22 @@ from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 
 from modelscriptor.graph import Linear, ReLU
 from modelscriptor.modelscript.arithmetic_ops import add
-from modelscriptor.modelscript.inout_nodes import create_input, create_constant
+from modelscriptor.modelscript.inout_nodes import (
+    create_input,
+    create_constant,
+    create_pos_encoding,
+)
 
 
 def test_net1():
     input_node = create_input("test", 10)
-    linear1 = Linear(input_node, torch.zeros(10, 10), torch.zeros(10))
+    linear1 = Linear(input_node, torch.rand(10, 10), torch.zeros(10))
     relu_out = ReLU(linear1)
-    linear2 = Linear(relu_out, torch.zeros(10, 10), torch.zeros(10))
+    linear2 = Linear(relu_out, torch.rand(10, 10), torch.zeros(10))
 
     ffn_sublayer = FFNSubLayer(d=20)
     ffn_sublayer.out_state.allocate_node(linear2)
     strategies = ffn_sublayer.get_strategies(linear2)
-    print(strategies)
     ffn_sublayer.apply_strategy(strategies[0])
     ffn_sublayer.print()
     assert ffn_sublayer.in_state.has_node(input_node)
@@ -40,7 +43,8 @@ def test_net2():
     assert ffn_sublayer.in_state.has_node(constant)
 
 
-def test_net3():
+def test_input_pass_through():
+    # Test that input node is passed through FFN layer
     input_node = create_input("test", 1)
     ffn_sublayer = FFNSubLayer(d=10)
     ffn_sublayer.out_state.allocate_node(input_node)
@@ -49,3 +53,15 @@ def test_net3():
     ffn_sublayer.apply_strategy(strategies[0])
     ffn_sublayer.print()
     assert ffn_sublayer.in_state.has_node(input_node)
+
+
+def test_posencoding_pass_through():
+    # Test that pos encoding is passed through FFN layer
+    pos_encoding = create_pos_encoding()
+    ffn_sublayer = FFNSubLayer(d=30)
+    ffn_sublayer.out_state.allocate_node(pos_encoding)
+    strategies = ffn_sublayer.get_strategies(pos_encoding)
+    print(strategies)
+    ffn_sublayer.apply_strategy(strategies[0])
+    ffn_sublayer.print()
+    assert ffn_sublayer.in_state.has_node(pos_encoding)

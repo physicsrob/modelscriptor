@@ -10,11 +10,19 @@ class PosEncoding(Node):
         self.d_pos = d_pos
         super().__init__(d_pos, [])
 
-    def compute(self, n_pos: int, input_values: dict):
-        result = torch.zeros((n_pos, self.d_pos))
+    def get_pos_encoding(self, n_pos: int):
+        # Compute the positional encodings once in log space.
+        pe = torch.zeros((n_pos, self.d_pos))
+        div_term = torch.exp(
+            torch.arange(0, self.d_pos, 2) * -(math.log(10000.0) / self.d_pos)
+        )
         for pos in range(n_pos):
-            result[pos] = get_pos_encoding(pos, self.d_pos)
-        return result
+            pe[pos, 0::2] = torch.sin(pos * div_term)
+            pe[pos, 1::2] = torch.cos(pos * div_term)
+        return pe
+
+    def compute(self, n_pos: int, input_values: dict):
+        return self.get_pos_encoding(n_pos)
 
     def get_last_value(self, value: Node, delta_pos=-1) -> Node:
         if delta_pos == 0:
@@ -22,9 +30,9 @@ class PosEncoding(Node):
             return value
 
         # We're applying the query/key to the position
-        d_head = 64
-        assert self.d_pos < d_head
-        assert len(value) < d_head
+        d_head = self.d_pos
+        assert self.d_pos <= d_head
+        assert len(value) <= d_head
 
         # key_matrix shape (d_key_in, d_head)
         key_matrix = torch.zeros((len(self), d_head))
@@ -58,10 +66,10 @@ class PosEncoding(Node):
         # sin(pos / 10000.0), which for our purposes is monotonically increasing.
 
         key_in = Concatenate([self, cond])
-        d_head = 64
+        d_head = self.d_pos
 
-        assert self.d_pos < d_head
-        assert len(value) < d_head
+        assert self.d_pos <= d_head
+        assert len(value) <= d_head
         assert len(cond) == 1
 
         # We'll setup the key matrix such that query * pos_encoding = [(cond + pos[-2]) 0 ... 0]
@@ -89,15 +97,6 @@ class PosEncoding(Node):
             value_matrix=value_matrix,
             output_matrix=output_matrix,
         )
-
-
-def get_pos_encoding(pos: int, d: int):
-    # Compute the positional encodings once in log space.
-    pe = torch.zeros(d)
-    div_term = torch.exp(torch.arange(0, d, 2) * -(math.log(10000.0) / d))
-    pe[0::2] = torch.sin(pos * div_term)
-    pe[1::2] = torch.cos(pos * div_term)
-    return pe
 
 
 def get_pos_delta_matrix(delta_pos: int, d: int):

@@ -20,7 +20,19 @@ class Group:
         self.out_state = ResState(d)
 
     @abstractmethod
+    def forward(self, inp: torch.Tensor, return_states=False):
+        ...
+
+    @abstractmethod
+    def print_strategy(self, strategy: GroupStrategy):
+        ...
+
+    @abstractmethod
     def get_strategies(self, node: Node) -> List[GroupStrategy]:
+        ...
+
+    @abstractmethod
+    def apply_skip_allocation(self, strategy: GroupStrategy):
         ...
 
     @abstractmethod

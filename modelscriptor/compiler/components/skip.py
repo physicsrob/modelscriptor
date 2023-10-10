@@ -12,8 +12,8 @@ class SkipNodeComponentStrategy(NodeComponentStrategy):
     skip_node: Node
     in_node: Node  # The non-skip node
 
-    def __init__(self, skip_node: Node, in_node: Node, out_node: Node, points: int):
-        super().__init__({in_node}, out_node, points)
+    def __init__(self, skip_node: Node, in_node: Node, out_node: Node):
+        super().__init__([in_node], out_node)
         self.skip_node = skip_node
         self.in_node = in_node
 
@@ -37,32 +37,30 @@ class SkipLayerComponent(Component):
 
     def get_strategies(self, node: Node) -> List[SkipNodeComponentStrategy]:
         strategies = []
+        zero = create_constant(torch.zeros(len(node)))
 
-        # If node is add, we have two strategies
+        # We always have two skip strategies where we don't compile anything.
+        strategies.append(
+            SkipNodeComponentStrategy(skip_node=zero, in_node=node, out_node=node)
+        )
+        strategies.append(
+            SkipNodeComponentStrategy(skip_node=node, in_node=zero, out_node=node)
+        )
+
         if isinstance(node, Add):
+            # If node is Add, we have two additional strategies:
+            # - add(input0, input1)
+            # - add(input1, input0)
             addend0 = node.inputs[0]
             addend1 = node.inputs[1]
             strategies.append(
                 SkipNodeComponentStrategy(
-                    skip_node=addend0, in_node=addend1, out_node=node, points=1
+                    skip_node=addend0, in_node=addend1, out_node=node
                 )
             )
             strategies.append(
                 SkipNodeComponentStrategy(
-                    skip_node=addend1, in_node=addend0, out_node=node, points=1
-                )
-            )
-        else:
-            # If node is not add
-            zero = create_constant(torch.zeros(len(node)))
-            strategies.append(
-                SkipNodeComponentStrategy(
-                    skip_node=zero, in_node=node, out_node=node, points=0
-                )
-            )
-            strategies.append(
-                SkipNodeComponentStrategy(
-                    skip_node=node, in_node=zero, out_node=node, points=0
+                    skip_node=addend1, in_node=addend0, out_node=node
                 )
             )
         return strategies

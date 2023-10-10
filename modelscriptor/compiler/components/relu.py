@@ -13,13 +13,10 @@ class ReLUNodeComponentStrategy(NodeComponentStrategy):
         out_node: Node,
         output_matrix: torch.Tensor,
         output_bias: torch.Tensor,
-        points: int,
     ):
-        self.in_nodes = {in_node}
-        self.out_node = out_node
+        super().__init__(in_nodes=[in_node], out_node=out_node)
         self.output_matrix = output_matrix
         self.output_bias = output_bias
-        self.points = points
 
     def __repr__(self):
         return (
@@ -37,11 +34,7 @@ class ReLULayerComponent(Component):
     def get_strategies(self, node: Node) -> List[NodeComponentStrategy]:
         if isinstance(node, ReLU):
             # Only one strategy for relus.
-            return [
-                NodeComponentStrategy(
-                    in_nodes={node.inputs[0]}, out_node=node, points=1
-                )
-            ]
+            return [NodeComponentStrategy(in_nodes=node.inputs, out_node=node)]
         else:
             # No strategy for non-relu
             return []
@@ -50,7 +43,7 @@ class ReLULayerComponent(Component):
         assert self.out_state.has_node(
             strategy.out_node
         ), "Strategy applied before output allocated"
-        in_node = next(iter(strategy.in_nodes))
+        in_node = strategy.in_nodes[0]
         self.in_state.connect_allocation(self.out_state, strategy.out_node, in_node)
 
     def forward(self, inp: torch.Tensor):
