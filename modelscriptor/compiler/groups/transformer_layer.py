@@ -6,6 +6,6 @@ class TransformerLayer:
     attn: AttnSubLayer
     ffn: FFNSubLayer
 
-    def __init__(self, d: int):
-        self.attn = AttnSubLayer(d)
+    def __init__(self, d: int, d_head: int):
+        self.attn = AttnSubLayer(d, d_head)
         self.ffn = FFNSubLayer(d)

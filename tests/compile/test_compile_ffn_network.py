@@ -2,7 +2,7 @@ from typing import Dict
 
 import torch
 
-from modelscriptor.compiler.compile import compile_ffn_network
+from modelscriptor.compiler.compile import compile_network
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 
 # from modelscriptor.compiler.plan.layer_plan import FFNPlan
@@ -18,9 +18,9 @@ from modelscriptor.modelscript.map_select import select
 
 
 def compiler_test(
-    output_node: Node, n_pos: int, input_values: Dict[str, torch.Tensor], d: int = 20
+    output_node: Node, n_pos: int, input_values: Dict[str, torch.Tensor], d: int = 128
 ):
-    net = compile_ffn_network(d, output_node)
+    net = compile_network(d, 16, output_node)
     all_pass = True
 
     # Run a forward pass preserving all intermediate states
@@ -100,22 +100,22 @@ def test_compile_relu_add():
         )
 
 
-# def test_compile_get_prev_value():
-#     input_values = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
-#     cond_values = torch.tensor([[1.0], [0.0], [0.0], [1.0], [0.0]])
-#
-#     value_input = create_input("value", 1)
-#     cond_input = create_input("cond", 1)
-#     pos_encoding = create_pos_encoding()
-#     last_input = pos_encoding.get_prev_value(value_input, cond_input)
-#     compiler_test(
-#         last_input, n_pos=5, input_values={"value": input_values, "cond": cond_values}
-#     )
-#
-#
-# def test_compile_get_last_value():
-#     input_values = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
-#     value_input = create_input("value", 1)
-#     pos_encoding = create_pos_encoding()
-#     last_input = pos_encoding.get_last_value(value_input, delta_pos=-1)
-#     compiler_test(last_input, n_pos=5, input_values={"value": input_values})
+def test_compile_get_prev_value():
+    input_values = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
+    cond_values = torch.tensor([[1.0], [0.0], [0.0], [1.0], [0.0]])
+
+    value_input = create_input("value", 1)
+    cond_input = create_input("cond", 1)
+    pos_encoding = create_pos_encoding()
+    last_input = pos_encoding.get_prev_value(value_input, cond_input)
+    compiler_test(
+        last_input, n_pos=5, input_values={"value": input_values, "cond": cond_values}
+    )
+
+
+def test_compile_get_last_value():
+    input_values = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
+    value_input = create_input("value", 1)
+    pos_encoding = create_pos_encoding()
+    last_input = pos_encoding.get_last_value(value_input, delta_pos=-1)
+    compiler_test(last_input, n_pos=5, input_values={"value": input_values})

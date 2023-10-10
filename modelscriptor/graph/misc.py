@@ -74,6 +74,15 @@ class Constant(Node):
     def is_zero(self):
         return self.value.eq(0).all()
 
+    def __eq__(self, other):
+        if not isinstance(other, Constant):
+            return False
+        return torch.equal(self.value, other.value)
+
+    def __hash__(self):
+        native_floats = map(float, self.value.view(-1).tolist())
+        return hash(tuple(native_floats))
+
     def node_type(self):
         if self.is_zero():
             return "Zero"

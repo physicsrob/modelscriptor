@@ -1,26 +1,30 @@
-from typing import List, Set, Dict
+from typing import List, Set, Dict, Union
 
 import torch
 
+from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
-from modelscriptor.graph import Node, Constant, InputNode
+from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
+from modelscriptor.graph import Node, Constant, InputNode, PosEncoding
 
 
-class FFNNetwork:
-    layers: List[FFNSubLayer]
+class Transformer:
+    layers: List[TransformerLayer]
     d: int
+    d_head: int
 
-    def __init__(self, d: int):
+    def __init__(self, d: int, d_head: int):
         self.d = d
+        self.d_head = d_head
         self.layers = []
 
-    def add_layer(self) -> FFNSubLayer:
-        layer = FFNSubLayer(self.d)
+    def add_layer(self) -> TransformerLayer:
+        layer = TransformerLayer(self.d, self.d_head)
         self.layers = [layer] + self.layers
         return layer
 
     def get_input_res_stream(self, n_pos: int, input_values: Dict[str, torch.Tensor]):
-        in_state = self.layers[0].in_state
+        in_state = self.layers[0].attn.in_state
         res_stream = torch.zeros((n_pos, self.d))
 
         for node in in_state.get_distinct_nodes():
@@ -33,6 +37,10 @@ class FFNNetwork:
                 value = input_values[node.name]
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = value[:, i]
+            elif isinstance(node, PosEncoding):
+                encoding = node.get_pos_encoding(n_pos)
+                for i, idx in enumerate(indices):
+                    res_stream[:, idx] = encoding[:, i]
             else:
                 assert False, "Unsupported node type"
         return res_stream
@@ -61,15 +69,17 @@ class FFNNetwork:
         res = inp
         all_states = {}  # Dictionary to collect all states
         for i, layer in enumerate(self.layers):
-            if return_states:
-                res, states = layer.forward(res, return_states=True)
-                # Prefix the keys in the states dict and update all_states
-                prefixed_states = {
-                    f"layer_{i}_{key}": value for key, value in states.items()
-                }
-                all_states.update(prefixed_states)
-            else:
-                res = layer.forward(res)
+            for sublayer, sublayer_name in [(layer.attn, "attn"), (layer.ffn, "ffn")]:
+                if return_states:
+                    res, states = sublayer.forward(res, return_states=True)
+                    # Prefix the keys in the states dict and update all_states
+                    prefixed_states = {
+                        f"layer_{i}_{sublayer_name}_{key}": value
+                        for key, value in states.items()
+                    }
+                    all_states.update(prefixed_states)
+                else:
+                    res = sublayer.forward(res)
         if return_states:
             return res, all_states
         else:
@@ -80,7 +90,7 @@ class FFNNetwork:
     ) -> Dict[Node, torch.Tensor]:
         res = self.forward(self.get_input_res_stream(n_pos, input_values))
         result = {}
-        out_state = self.layers[-1].out_state
+        out_state = self.layers[-1].ffn.out_state
 
         for node in out_state.get_distinct_nodes():
             indices = out_state.get_node_indices(node)

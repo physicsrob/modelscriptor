@@ -34,12 +34,9 @@ class AttnNodeComponentStrategy(NodeComponentStrategy):
         key_matrix: torch.Tensor,
         value_matrix: torch.Tensor,
         output_matrix: torch.Tensor,
-        points: int,
         d_head: int,
     ):
-        super().__init__(
-            in_nodes={query_in, key_in, value_in}, out_node=out_node, points=points
-        )
+        super().__init__(in_nodes=[query_in, key_in, value_in], out_node=out_node)
         self.query_in = query_in
         self.key_in = key_in
         self.value_in = value_in
@@ -105,13 +102,12 @@ class AttnLayerComponent(Component):
                     key_matrix=node.key_matrix,
                     value_matrix=node.value_matrix,
                     output_matrix=node.output_matrix,
-                    points=1,
                     d_head=node_d_head,
                 )
             )
 
         # We can compile a zero constant.
-        if isinstance(node, Constant) and node.is_zero() and len(node) < self.d_head:
+        if isinstance(node, Constant) and node.is_zero() and len(node) <= self.d_head:
             strategies.append(
                 AttnNodeComponentStrategy(
                     query_in=Placeholder(),
@@ -122,7 +118,6 @@ class AttnLayerComponent(Component):
                     key_matrix=torch.zeros(0, self.d_head),
                     value_matrix=torch.zeros(0, self.d_head),
                     output_matrix=torch.zeros(self.d_head, len(node)),
-                    points=1,
                     d_head=self.d_head,
                 )
             )
