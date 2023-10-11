@@ -177,3 +177,15 @@ class ResState:
         self._nodes.update(other._nodes)
         self._node_to_indices.update(other._node_to_indices)
         self._sanity_check()
+
+    def get_min_width(self):
+        if not len(self._node_to_indices):
+            return 0
+
+        return (
+            max(idx for indices in self._node_to_indices.values() for idx in indices)
+            + 1
+        )
+
+    def resize(self, new_d):
+        self.d = new_d

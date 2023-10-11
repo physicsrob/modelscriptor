@@ -52,6 +52,14 @@ class AttnNodeComponentStrategy(NodeComponentStrategy):
         assert self.output_matrix.shape == (d_head, len(out_node))
 
 
+class AttnNodeComponentZeroStrategy(NodeComponentStrategy):
+    def __init__(
+        self,
+        out_node: Node,
+    ):
+        super().__init__(in_nodes=[], out_node=out_node)
+
+
 class AttnLayerComponent(Component):
     # query_matrix shape (n_head, d, d_head)
     query_matrix: torch.Tensor
@@ -83,8 +91,8 @@ class AttnLayerComponent(Component):
     def __repr__(self):
         return f"AttnLayerComponent()"
 
-    def get_strategies(self, node: Node) -> List[AttnNodeComponentStrategy]:
-        strategies = []
+    def get_strategies(self, node: Node) -> List[NodeComponentStrategy]:
+        strategies: List[NodeComponentStrategy] = []
 
         # We can compile attention components.
         if isinstance(node, Attn):
@@ -109,22 +117,20 @@ class AttnLayerComponent(Component):
         # We can compile a zero constant.
         if isinstance(node, Constant) and node.is_zero() and len(node) <= self.d_head:
             strategies.append(
-                AttnNodeComponentStrategy(
-                    query_in=Placeholder(),
-                    key_in=Placeholder(),
-                    value_in=Placeholder(),
+                AttnNodeComponentZeroStrategy(
                     out_node=node,
-                    query_matrix=torch.zeros(0, self.d_head),
-                    key_matrix=torch.zeros(0, self.d_head),
-                    value_matrix=torch.zeros(0, self.d_head),
-                    output_matrix=torch.zeros(self.d_head, len(node)),
-                    d_head=self.d_head,
                 )
             )
 
         return strategies
 
     def apply_strategy(self, strategy: NodeComponentStrategy):
+        if isinstance(strategy, AttnNodeComponentZeroStrategy):
+            # Apply zero strategy.
+            # This is a noop because the output matrices are already initialized to zero.
+            # Any node in the output stream will be zero by default.
+            return
+
         assert isinstance(strategy, AttnNodeComponentStrategy)
         assert self.out_state.has_node(
             strategy.out_node
@@ -198,3 +204,22 @@ class AttnLayerComponent(Component):
             output += values @ self.output_matrix[n_head]
 
         return output
+
+    def num_params(self) -> int:
+        return (
+            self.query_matrix.numel()
+            + self.key_matrix.numel()
+            + self.value_matrix.numel()
+            + self.output_matrix.numel()
+        )
+
+    def resize(self, new_d):
+        self.n_heads = new_d // self.d_head
+        self.query_matrix = self.query_matrix[: self.n_heads, :new_d, :]
+        self.key_matrix = self.key_matrix[: self.n_heads, :new_d, :]
+        self.value_matrix = self.value_matrix[: self.n_heads, :new_d, :]
+        self.output_matrix = self.output_matrix[: self.n_heads, :, :new_d]
+        super().resize(new_d)
+
+    def get_min_width(self):
+        return max(self.d_head * self.used_heads, super().get_min_width())

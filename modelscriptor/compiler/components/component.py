@@ -47,3 +47,15 @@ class Component(Generic[T], ABC):
     @abstractmethod
     def apply_strategy(self, strategy: T):
         ...
+
+    @abstractmethod
+    def num_params(self) -> int:
+        ...
+
+    def resize(self, new_d):
+        self.d = new_d
+        self.in_state.resize(new_d)
+        self.out_state.resize(new_d)
+
+    def get_min_width(self):
+        return max(self.in_state.get_min_width(), self.out_state.get_min_width())
