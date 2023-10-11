@@ -13,6 +13,7 @@ class Embedding(Node):
     vocab: List[str]
     table: torch.Tensor
     max_vocab: int
+    d_embed: int
 
     def __init__(self, vocab: List[str], d_embed: int = 8):
         assert d_embed == 8, "Only support length-8 embeddings at the moment"
@@ -42,6 +43,9 @@ class Embedding(Node):
         result = self.table[token_ids]
         assert result.shape == (len(embedding_input), self.d_embed)
         return result
+
+    def num_params(self):
+        return self.d_embed * self.max_vocab
 
 
 class Unembedding:

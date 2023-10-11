@@ -40,3 +40,6 @@ class Node:
                 inp_strings.append(f"inp{i}={inp_type_name}(d={len(inp)})")
             inp_str = ", ".join(inp_strings)
             return f"{type_name}({inp_str}, d={len(self)})"
+
+    def num_params(self):
+        return 0

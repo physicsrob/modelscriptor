@@ -72,3 +72,11 @@ class Attn(Node):
         values_output = values.matmul(self.output_matrix)
         # values shape is now (query pos, d_output)
         return values_output
+
+    def num_params(self):
+        return (
+            self.query_matrix.numel()
+            + self.key_matrix.numel()
+            + self.value_matrix.numel()
+            + self.output_matrix.numel()
+        )

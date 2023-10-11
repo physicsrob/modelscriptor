@@ -1,3 +1,4 @@
+import inspect
 from typing import Dict
 
 import torch
@@ -17,10 +18,18 @@ from modelscriptor.modelscript.logic_ops import cond_add_vector
 from modelscriptor.modelscript.map_select import select
 
 
+def current_test_name():
+    stack = inspect.stack()
+    for frame in stack:
+        if frame.function.startswith("test_"):
+            return frame.function
+    return "unknown"
+
+
 def compiler_test(
     output_node: Node, n_pos: int, input_values: Dict[str, torch.Tensor], d: int = 128
 ):
-    net = compile_network(d, 16, output_node)
+    net = compile_network(d, 16, output_node, report_name=current_test_name())
     all_pass = True
 
     # Run a forward pass preserving all intermediate states

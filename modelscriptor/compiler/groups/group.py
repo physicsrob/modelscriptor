@@ -38,3 +38,11 @@ class Group:
     @abstractmethod
     def apply_strategy(self, strategy: GroupStrategy):
         ...
+
+    @abstractmethod
+    def resize(self, new_d):
+        ...
+
+    @abstractmethod
+    def get_min_width(self):
+        ...

@@ -115,7 +115,38 @@ def render_attn_layer(layer: AttnSubLayer, layer_idx: int):
     )
 
 
-def render_network(network: Transformer):
+def graph_stats(nodes: List[Node]) -> Tuple[int, int]:
+    param_cnt = 0
+    node_cnt = 0
+
+    for node in nodes:
+        param_cnt += node.num_params()
+        node_cnt += 1
+        input_param_cnt, input_node_cnt = graph_stats(node.inputs)
+        param_cnt += input_param_cnt
+        node_cnt += input_node_cnt
+    return param_cnt, node_cnt
+
+
+def render_summary(network: Transformer, output_node: Node):
+    env = Environment(loader=FileSystemLoader(template_directory))
+    template = env.get_template("summary_template.html")
+
+    graph_params, graph_nodes = graph_stats([output_node])
+    net_params = sum(layer.num_params() for layer in network.layers)
+
+    # Populate and render the template
+    return template.render(
+        n_layers=len(network.layers),
+        net_params=net_params,
+        d_model=network.d,
+        d_head=network.d_head,
+        graph_nodes=graph_nodes,
+        graph_params=graph_params,
+    )
+
+
+def render_network(network: Transformer, output_node: Node):
     env = Environment(loader=FileSystemLoader(template_directory))
     template = env.get_template("report_template.html")
 
@@ -123,22 +154,25 @@ def render_network(network: Transformer):
     for i, l in enumerate(network.layers):
         layers.append(render_attn_layer(l.attn, i))
         layers.append(render_ffn_layer(l.ffn, i))
+
+    summary = render_summary(network, output_node)
+
     # Populate and render the template
-    return template.render(layers=layers)
+    return template.render(layers=layers, summary=summary)
 
 
-def make_report(network: Transformer):
+def make_report(network: Transformer, output_node: Node, report_name: str):
     # Generate the current timestamp with microseconds for higher granularity
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
     # Create a unique filename using the high-granularity timestamp
-    file_name = f"/tmp/modelscript_compile_{current_time}.html"
+    file_name = f"/tmp/modelscript_compile_{report_name}_{current_time}.html"
 
     # Log the action
     print(f"Generating report and saving to {file_name}")
 
     # Render the network to HTML
-    rendered_html = render_network(network)
+    rendered_html = render_network(network, output_node)
 
     # Save the rendered HTML to the file
     try:
