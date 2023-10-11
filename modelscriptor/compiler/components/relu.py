@@ -48,3 +48,6 @@ class ReLULayerComponent(Component):
 
     def forward(self, inp: torch.Tensor):
         return torch.clamp(inp, min=0)
+
+    def num_params(self) -> int:
+        return 0

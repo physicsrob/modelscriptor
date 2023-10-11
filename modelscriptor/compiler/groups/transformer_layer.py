@@ -9,3 +9,6 @@ class TransformerLayer:
     def __init__(self, d: int, d_head: int):
         self.attn = AttnSubLayer(d, d_head)
         self.ffn = FFNSubLayer(d)
+
+    def num_params(self):
+        return self.attn.num_params() + self.ffn.num_params()

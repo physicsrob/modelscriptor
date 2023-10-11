@@ -34,7 +34,12 @@ def is_compilation_complete(layer: TransformerLayer) -> bool:
 
 
 def compile_network(
-    d: int, d_head: int, output_node: Node, verbose: bool = True
+    d: int,
+    d_head: int,
+    output_node: Node,
+    report_name: str = "",
+    verbose: bool = True,
+    optimize: bool = True,
 ) -> Transformer:
     # Start with the first layer and try to compile as much as possible.
 
@@ -118,6 +123,22 @@ def compile_network(
     if not is_compilation_complete(layer):
         raise CompilationError(f"Exceeded maximum number of layers {MAX_LAYERS}.")
 
-    make_report(net)
+    if optimize:
+        # Find the minimum width (d) for the network
+        min_d = 0
+        for layer in net.layers:
+            for sublayer in [layer.ffn, layer.attn]:
+                min_d = max(sublayer.get_min_width(), min_d)
+
+        if verbose:
+            print("Optimizing network from a width of {d} to {min_d}.")
+
+        for layer in net.layers:
+            for sublayer in [layer.ffn, layer.attn]:
+                sublayer.resize(min_d)
+
+        net.d = min_d
+
+    make_report(net, output_node, report_name)
 
     return net

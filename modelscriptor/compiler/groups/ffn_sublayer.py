@@ -129,3 +129,25 @@ class FFNSubLayer(Group):
             return x, states
         else:
             return x
+
+    def num_params(self):
+        return self.linear1.num_params() + self.linear2.num_params()
+
+    def resize(self, new_d):
+        self.d = new_d
+        self.linear1.resize(new_d)
+        self.linear2.resize(new_d)
+        self.relu.resize(new_d)
+        self.skip.resize(new_d)
+        self.in_state.resize(new_d)
+        self.out_state.resize(new_d)
+
+    def get_min_width(self):
+        return max(
+            self.linear1.get_min_width(),
+            self.linear2.get_min_width(),
+            self.relu.get_min_width(),
+            self.skip.get_min_width(),
+            self.in_state.get_min_width(),
+            self.out_state.get_min_width(),
+        )

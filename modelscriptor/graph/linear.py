@@ -61,3 +61,6 @@ class Linear(Node):
             + self.output_bias.reshape(-1).tolist()
         ]
         return hash(tuple(native_floats + self.inputs))
+
+    def num_params(self):
+        return self.d_input * self.d_output + self.d_output
