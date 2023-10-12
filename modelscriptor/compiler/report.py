@@ -11,7 +11,7 @@ from modelscriptor.compiler.res_state import ResState
 from jinja2 import Environment, FileSystemLoader
 from jinja2 import Environment, FileSystemLoader
 
-from modelscriptor.compiler.transformer import Transformer
+from modelscriptor.compiler.transformer import HeadlessTransformer
 from modelscriptor.graph import Node
 
 current_module_directory = os.path.dirname(os.path.abspath(__file__))
@@ -128,7 +128,7 @@ def graph_stats(nodes: List[Node]) -> Tuple[int, int]:
     return param_cnt, node_cnt
 
 
-def render_summary(network: Transformer, output_node: Node):
+def render_summary(network: HeadlessTransformer, output_node: Node):
     env = Environment(loader=FileSystemLoader(template_directory))
     template = env.get_template("summary_template.html")
 
@@ -146,7 +146,7 @@ def render_summary(network: Transformer, output_node: Node):
     )
 
 
-def render_network(network: Transformer, output_node: Node):
+def render_network(network: HeadlessTransformer, output_node: Node):
     env = Environment(loader=FileSystemLoader(template_directory))
     template = env.get_template("report_template.html")
 
@@ -161,7 +161,7 @@ def render_network(network: Transformer, output_node: Node):
     return template.render(layers=layers, summary=summary)
 
 
-def make_report(network: Transformer, output_node: Node, report_name: str):
+def make_report(network: HeadlessTransformer, output_node: Node, report_name: str):
     # Generate the current timestamp with microseconds for higher granularity
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 

@@ -25,6 +25,10 @@ class ResState:
         for node, indices in self._node_to_indices.items():
             for idx in indices:
                 idx_to_nodes[idx].append(node)
+        if any(len(nodes) > 1 for nodes in idx_to_nodes.values()):
+            print(self._node_to_indices)
+            print(idx_to_nodes)
+            breakpoint()
         assert all(len(nodes) <= 1 for nodes in idx_to_nodes.values())
 
     def has_node(self, node: Node):
@@ -78,10 +82,12 @@ class ResState:
         if len(prefix) and not prefix.endswith(" "):
             prefix = prefix + " "
         print(f"{prefix}Residual Stream:", end="")
-        sorted_nodes = sorted(self._nodes, key=lambda n: min(self._node_to_indices[n]))
+        sorted_nodes = sorted(
+            self._nodes, key=lambda n: min(self._node_to_indices.get(n, [0]))
+        )
         for node in sorted_nodes:
             print(
-                f" {node} [{' '.join(str(idx) for idx in sorted(self._node_to_indices[node]))}]",
+                f" {node} [{' '.join(str(idx) for idx in sorted(self._node_to_indices.get(node)))}]",
                 end="",
             )
         print()
@@ -174,6 +180,38 @@ class ResState:
         self._sanity_check()
         # other represents the same state as this residual state, and it has already been
         # allocated.
+
+        idx_to_nodes = defaultdict(set)
+        for node, indices in self._node_to_indices.items():
+            for idx in indices:
+                idx_to_nodes[idx].add(node)
+        for node, indices in other._node_to_indices.items():
+            for idx in indices:
+                idx_to_nodes[idx].add(node)
+
+        if any(len(nodes) > 1 for nodes in idx_to_nodes.values()):
+            print("State conflict in update_from.")
+            # Rewrite the above as a set comprehension
+            conflicting_nodes = {
+                node
+                for nodes in idx_to_nodes.values()
+                if len(nodes) > 1
+                for node in nodes
+            }
+            print(f"Conflicting nodes: {conflicting_nodes}")
+            for node in conflicting_nodes:
+                if self.has_node(node):
+                    print(
+                        f"Node {node} has indices (self) {self.get_node_indices(node)}"
+                    )
+                if other.has_node(node):
+                    print(
+                        f"Node {node} has indices (other) {other.get_node_indices(node)}"
+                    )
+
+            breakpoint()
+        assert all(len(nodes) <= 1 for nodes in idx_to_nodes.values())
+
         self._nodes.update(other._nodes)
         self._node_to_indices.update(other._node_to_indices)
         self._sanity_check()

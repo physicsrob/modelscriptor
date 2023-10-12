@@ -1,10 +1,14 @@
 from typing import Set
 
-from modelscriptor.compiler.groups.strategy import _get_ancestor_nodes
+from modelscriptor.compiler.groups.strategy import (
+    _get_ancestor_nodes,
+    get_strategies_for_component,
+    get_combined_strategies,
+)
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
 from modelscriptor.compiler.report import make_report
-from modelscriptor.compiler.transformer import Transformer
-from modelscriptor.graph import Node, InputNode, Constant, PosEncoding
+from modelscriptor.compiler.transformer import HeadlessTransformer, Transformer
+from modelscriptor.graph import Node, InputNode, Constant, PosEncoding, Embedding
 
 MAX_LAYERS = 100
 
@@ -29,6 +33,7 @@ def is_compilation_complete(layer: TransformerLayer) -> bool:
         isinstance(node, InputNode)
         or isinstance(node, Constant)
         or isinstance(node, PosEncoding)
+        or isinstance(node, Embedding)
         for node in layer.attn.in_state.get_compilable_nodes()
     )
 
@@ -40,48 +45,60 @@ def compile_network(
     report_name: str = "",
     verbose: bool = True,
     optimize: bool = True,
-) -> Transformer:
+) -> HeadlessTransformer:
     # Start with the first layer and try to compile as much as possible.
 
-    net = Transformer(d, d_head)
+    net = HeadlessTransformer(d, d_head)
 
     layer = net.add_layer()
     layer.ffn.out_state.allocate_node(output_node)
     needed_nodes = _get_ancestor_nodes({output_node})
 
     for layer_cnt in range(MAX_LAYERS):
-        if verbose:
-            print(f"\n\nCompiling layer {layer_cnt}")
-            layer.ffn.out_state.print("Layer FFN Output")
-            print("\n\n")
+        for sublayer_type in ["ffn", "attn"]:
+            if sublayer_type == "ffn":
+                sublayer = layer.ffn
+            elif sublayer_type == "attn":
+                sublayer = layer.attn
+            else:
+                assert False
 
-        for sublayer in [layer.ffn, layer.attn]:
+            if verbose:
+                print(f"\n\nCompiling layer {layer_cnt} {sublayer_type}")
+                sublayer.out_state.print(f"Sublayer {sublayer_type} Output")
+                sublayer.in_state.print(f"Sublayer {sublayer_type} Starting Input")
+                print("\n\n")
+
             to_compile_nodes = sublayer.out_state.get_compilable_nodes()
 
-            chosen_strategies = []
-            for node in to_compile_nodes:
-                strategies = sorted(
-                    sublayer.get_strategies(node),
-                    key=lambda s: -len(s.get_represented_nodes() & needed_nodes),
-                )
-                if len(strategies):
-                    chosen_strategies.append(strategies[0])
-                    if verbose:
-                        print("\n\nStrategies considered: ")
-                        for s in strategies:
-                            sublayer.print_strategy(s)
-                            print(f"Represented Nodes: {s.get_represented_nodes()}\n")
-                            print(f"Score: {s.get_score()}\n")
-                        print("\n\n")
-                    sublayer.apply_skip_allocation(strategies[0])
-                else:
-                    raise CompilationError(f"No strategy for {node}")
+            group_strategies = get_combined_strategies(
+                {node: sublayer.get_strategies(node) for node in to_compile_nodes}
+            )
 
-            for chosen_strategy in chosen_strategies:
-                sublayer.apply_strategy(chosen_strategy)
+            print("Combined Strategies considered:")
+            for s in group_strategies:
+                print(s.sub_strategies)
+                sublayer.print_strategy(s)
+                print("Score: ", s.get_score())
+                # s.print([sublayer], [sublayer_type])
+
+            strategy = group_strategies[0]
+
+            sublayer.in_state._sanity_check()
+            sublayer.out_state._sanity_check()
+            sublayer.apply_skip_allocation(strategy)
+            sublayer.in_state._sanity_check()
+            sublayer.out_state._sanity_check()
+
+            sublayer.apply_strategy(strategy)
+            sublayer.in_state._sanity_check()
+            sublayer.out_state._sanity_check()
 
             if sublayer == layer.ffn:
+                print("Connecting attn.out_state from layer.ffn.in_state")
                 layer.attn.out_state.update_from(layer.ffn.in_state)
+            sublayer.in_state.print("Sublayer Input")
+            sublayer.out_state.print("Sublayer Output")
 
         if (
             layer.ffn.out_state.get_compilable_nodes()
@@ -142,3 +159,30 @@ def compile_network(
     make_report(net, output_node, report_name)
 
     return net
+
+
+def compile_transformer(
+    d: int,
+    d_head: int,
+    output_node: Node,
+    report_name: str = "",
+    verbose: bool = True,
+    optimize: bool = True,
+):
+    # Compile everything but the embedding layer
+    headless_net = compile_network(
+        d, d_head, output_node, report_name, verbose, optimize
+    )
+    net = Transformer(headless_net.d, d_head)
+    net.layers = headless_net.layers
+
+    in_nodes = net.layers[0].attn.in_state.get_distinct_nodes()
+    strategies = []
+    for node in in_nodes:
+        node_strategies = net.embed.get_strategies(node)
+        if len(node_strategies) != 1:
+            raise CompilationError(f"Expected 1 strategy for {node}")
+        strategies.append(node_strategies[0])
+
+    for stratey in strategies:
+        net.embed.apply_strategy(stratey)

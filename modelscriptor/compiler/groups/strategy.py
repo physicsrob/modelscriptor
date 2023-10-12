@@ -1,5 +1,6 @@
+from collections import defaultdict
 from itertools import product
-from typing import Set, List, Tuple
+from typing import Set, List, Tuple, Dict
 
 from modelscriptor.compiler.components.component import Component, NodeComponentStrategy
 from modelscriptor.compiler.components.skip import SkipNodeComponentStrategy
@@ -30,6 +31,9 @@ class GroupStrategy:
         self, layer_component: Component, node: Node, strategy: NodeComponentStrategy
     ):
         self.sub_strategies.append((layer_component, node, strategy))
+        self.dependent_nodes |= set(strategy.in_nodes)
+        if isinstance(strategy, SkipNodeComponentStrategy):
+            self.dependent_nodes.add(strategy.skip_node)
 
     def get_component_strategies(
         self, component: Component
@@ -59,15 +63,6 @@ class GroupStrategy:
         return input_nodes
 
     def get_score(self):
-        represented_nodes = self.get_represented_nodes()
-        needed_nodes = _get_ancestor_nodes(self.get_represented_nodes())
-        input_nodes = {n for n in needed_nodes if not len(n.inputs)}
-        print(f"{represented_nodes=}")
-        print(f"{needed_nodes=}")
-        print(f"{input_nodes=}")
-        print(f"{self.dependent_nodes=}")
-        print(f"missing nodes: {needed_nodes.difference(represented_nodes)}")
-
         dependenct_ancestors = _get_ancestor_nodes(self.dependent_nodes)
         return len(dependenct_ancestors)
 
@@ -84,26 +79,70 @@ class GroupStrategy:
         ret = cls()
         for s in strategies:
             ret.place_node(component, s.out_node, s)
-            ret.dependent_nodes |= set(s.in_nodes)
-            if isinstance(s, SkipNodeComponentStrategy):
-                ret.dependent_nodes.add(s.skip_node)
         return ret
 
     @classmethod
-    def merge(cls, strategy1: "GroupStrategy", strategy2: "GroupStrategy"):
-        # strategy1 is for the component towards the output.
-        # We assume that the dependencies of strategy1 are satisfied by strategy2.
+    def merge_layer_strategies(
+        cls, layer1_strategy: "GroupStrategy", layer2_strategy: "GroupStrategy"
+    ):
+        # We assume that the dependencies of layer1_strategy are satisfied by layer2_strategy,
+        # except for any skip nodes which will still have the skip dependencies.
 
         result = cls()
-        result.sub_strategies = strategy1.sub_strategies + strategy2.sub_strategies
-        result.dependent_nodes = strategy2.dependent_nodes
-        # If any of the strategies in strategy1 are skip strategies, we need to add the skip node
+        result.sub_strategies = (
+            layer1_strategy.sub_strategies + layer2_strategy.sub_strategies
+        )
+        result.dependent_nodes = layer2_strategy.dependent_nodes
+        # If any of the strategies in layer1_strategy are skip strategies, we need to add the skip node
         # to the dependent nodes.
-        for c, n, s in strategy1.sub_strategies:
+        for c, n, s in layer1_strategy.sub_strategies:
             if isinstance(s, SkipNodeComponentStrategy):
                 result.dependent_nodes.add(s.skip_node)
 
         return result
+
+    @classmethod
+    def merge_parallel_strategies(cls, strategies: List["GroupStrategy"]):
+        # We assume that all strategies are for the same layer.
+        result = cls()
+        for strategy in strategies:
+            result.sub_strategies += strategy.sub_strategies
+            result.dependent_nodes |= strategy.dependent_nodes
+        return result
+
+
+def get_strategies_for_component(
+    output_nodes: Set[Node], layer_component: Component, strategy_count: int = 10
+):
+    nodes_strategies: List[List[NodeComponentStrategy]] = [
+        layer_component.get_strategies(node) for node in output_nodes
+    ]
+
+    # take the outer product of the strategies for each current output nodde
+    group_strategies = [
+        GroupStrategy.from_node_strategies(layer_component, list(strategy_list))
+        for strategy_list in product(*nodes_strategies)
+    ]
+
+    # Sort the strategies and only keep the top-k
+    group_strategies.sort(key=lambda s: s.get_score())
+    return group_strategies[:strategy_count]
+
+
+def get_combined_strategies(node_to_strategies: Dict[Node, List[GroupStrategy]]):
+    # Given a dictionary of node -> strategies, this function returns a list of strategies
+    # which are the combination of all strategies for each node.
+    # For example, if node1 has strategies [s1, s2] and node2 has strategies [s3, s4], this
+    # function will return [s1 + s3, s1 + s4, s2 + s3, s2 + s4]
+    # for k, v in node_to_strategies:
+    #     print(k, v)
+
+    combined_strategies = [
+        GroupStrategy.merge_parallel_strategies(strategies)
+        for strategies in product(*node_to_strategies.values())
+    ]
+    combined_strategies.sort(key=lambda s: s.get_score())
+    return combined_strategies
 
 
 def get_sequential_placement_strategies(
@@ -111,44 +150,19 @@ def get_sequential_placement_strategies(
     layer_components: List[Component],
     strategy_count: int = 10,
 ) -> List[GroupStrategy]:
+    # print(f"{output_nodes=}")
+    # print(f"{layer_components=}")
+    # breakpoint()
+
     # Given a sequence of components, each one connected to the next, this function searches
     # for placement strategies which result in output_nodes being accessible on the last layer.
 
     # Get all strategies for output_node on layers[-1]
     # (Remember we always work from the output towards the input)
     current_component = layer_components[-1]
-    # print(
-    #     "get_sequential_placement_strategies called for: ",
-    #     output_nodes,
-    #     "top layer:",
-    #     current_component,
-    # )
-
-    # Each entry in node_strategies is a list of strategies for the corresponding node.
-    nodes_strategies: List[List[NodeComponentStrategy]] = [
-        current_component.get_strategies(node) for node in output_nodes
-    ]
-    if len(output_nodes) == 1:
-        node = next(iter(output_nodes))
-        print(f"{node=} {current_component=} {nodes_strategies=}")
-    else:
-        print(f"{output_nodes=} {current_component=} {nodes_strategies=}")
-
-    # if "PosEnc" in str(output_nodes):
-    #     import pdb
-    #
-    #     pdb.set_trace()
-
-    # Combined strategy is the outer product of the strategies for each current output node
-    # in the current layer.
-    group_strategies = [
-        GroupStrategy.from_node_strategies(current_component, list(strategy_list))
-        for strategy_list in product(*nodes_strategies)
-    ]
-
-    # Sort the strategies and only keep the top-k
-    group_strategies.sort(key=lambda s: s.get_score())
-    group_strategies = group_strategies[:strategy_count]
+    group_strategies = get_strategies_for_component(
+        output_nodes, current_component, strategy_count
+    )
 
     if len(layer_components) == 1:
         return group_strategies
@@ -161,7 +175,7 @@ def get_sequential_placement_strategies(
             out_nodes, layer_components[:-1]
         )
         for s2 in s_strategies:
-            result_strategies.append(GroupStrategy.merge(s, s2))
+            result_strategies.append(GroupStrategy.merge_layer_strategies(s, s2))
 
     result_strategies.sort(key=lambda s: s.get_score())
     result_strategies = result_strategies[:strategy_count]

@@ -2,13 +2,14 @@ from typing import List, Set, Dict, Union
 
 import torch
 
+from modelscriptor.compiler.components.embedding import EmbeddingLayerComponent
 from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
 from modelscriptor.graph import Node, Constant, InputNode, PosEncoding
 
 
-class Transformer:
+class HeadlessTransformer:
     layers: List[TransformerLayer]
     d: int
     d_head: int
@@ -96,3 +97,34 @@ class Transformer:
             indices = out_state.get_node_indices(node)
             result[node] = res[:, indices]
         return result
+
+
+class Transformer(HeadlessTransformer):
+    embed: EmbeddingLayerComponent
+
+    def __init__(self, d: int, d_head: int, max_vocab: int = 1000):
+        self.embed = EmbeddingLayerComponent(d, max_vocab)
+        super().__init__(d, d_head)
+
+    def forward(self, inp: torch.Tensor, return_states=False):
+        """
+        Forward pass through the model.
+
+        Parameters
+        ----------
+        inp : torch.Tensor
+            The input tensor.
+        return_states : bool, optional
+            If True, returns the intermediate states from each layer.
+            Default is False.
+
+        Returns
+        -------
+        List[str]
+        """
+        x = self.embed.forward(inp)
+        x = super().forward(x, return_states)
+        return self.embed.deembed_forward(x)
+
+    def compute(self, n_pos: int, inp: List[str]) -> List[str]:
+        raise NotImplementedError("TODO")
