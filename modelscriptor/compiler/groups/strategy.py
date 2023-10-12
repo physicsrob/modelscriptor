@@ -1,22 +1,11 @@
-from collections import defaultdict
 from itertools import product
 from typing import Set, List, Tuple, Dict
 
 from modelscriptor.compiler.components.component import Component, NodeComponentStrategy
 from modelscriptor.compiler.components.skip import SkipNodeComponentStrategy
-from modelscriptor.graph import Node, Add, Concatenate
+from modelscriptor.compiler.utils import get_ancestor_nodes
+from modelscriptor.graph import Node, Concatenate
 from modelscriptor.graph.misc import Placeholder
-
-
-def _get_ancestor_nodes(start_nodes: Set[Node]) -> Set[Node]:
-    # Find all ancestors
-    result = set()
-
-    for node in start_nodes:
-        result.add(node)
-        if node.inputs:
-            result |= _get_ancestor_nodes(set(node.inputs))
-    return result
 
 
 class GroupStrategy:
@@ -63,7 +52,7 @@ class GroupStrategy:
         return input_nodes
 
     def get_score(self):
-        dependenct_ancestors = _get_ancestor_nodes(self.dependent_nodes)
+        dependenct_ancestors = get_ancestor_nodes(self.dependent_nodes)
         return len(dependenct_ancestors)
 
     def print(self, layer_components: List[Component], layer_names: List[str]):

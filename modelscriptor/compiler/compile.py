@@ -1,27 +1,17 @@
-from typing import Set
+from typing import Union
 
+from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
+from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 from modelscriptor.compiler.groups.strategy import (
-    _get_ancestor_nodes,
-    get_strategies_for_component,
     get_combined_strategies,
 )
+from modelscriptor.compiler.utils import get_ancestor_nodes
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
 from modelscriptor.compiler.report import make_report
 from modelscriptor.compiler.transformer import HeadlessTransformer, Transformer
 from modelscriptor.graph import Node, InputNode, Constant, PosEncoding, Embedding
 
 MAX_LAYERS = 100
-
-
-def _get_input_nodes(output_node: Node) -> Set[Node]:
-    # Find all ancestors to node.
-    if not output_node.inputs:
-        return {output_node}
-    else:
-        result = set()
-        for n in output_node.inputs:
-            result |= _get_input_nodes(n)
-        return result
 
 
 class CompilationError(Exception):
@@ -52,10 +42,11 @@ def compile_network(
 
     layer = net.add_layer()
     layer.ffn.out_state.allocate_node(output_node)
-    needed_nodes = _get_ancestor_nodes({output_node})
+    needed_nodes = get_ancestor_nodes({output_node})
 
     for layer_cnt in range(MAX_LAYERS):
         for sublayer_type in ["ffn", "attn"]:
+            sublayer: Union[FFNSubLayer, AttnSubLayer]
             if sublayer_type == "ffn":
                 sublayer = layer.ffn
             elif sublayer_type == "attn":
@@ -139,15 +130,14 @@ def compile_network(
         # Find the minimum width (d) for the network
         min_d = 0
         for layer in net.layers:
-            for sublayer in [layer.ffn, layer.attn]:
-                min_d = max(sublayer.get_min_width(), min_d)
+            min_d = max(layer.ffn.get_min_width(), layer.attn.get_min_width(), min_d)
 
         if verbose:
             print("Optimizing network from a width of {d} to {min_d}.")
 
         for layer in net.layers:
-            for sublayer in [layer.ffn, layer.attn]:
-                sublayer.resize(min_d)
+            layer.ffn.resize(min_d)
+            layer.attn.resize(min_d)
 
         net.d = min_d
 
@@ -168,10 +158,9 @@ def compile_transformer(
     headless_net = compile_network(
         d, d_head, output_node, report_name, verbose, optimize
     )
-    net = Transformer(headless_net.d, d_head)
-    net.layers = headless_net.layers
+    net = Transformer(headless_net)
 
-    in_nodes = net.layers[0].attn.in_state.get_nodes()
+    in_nodes = net.headless_net.layers[0].attn.in_state.get_nodes()
     strategies = []
     for node in in_nodes:
         node_strategies = net.embed.get_strategies(node)

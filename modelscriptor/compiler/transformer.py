@@ -99,12 +99,13 @@ class HeadlessTransformer:
         return result
 
 
-class Transformer(HeadlessTransformer):
+class Transformer:
     embed: EmbeddingLayerComponent
+    headless_net: HeadlessTransformer
 
-    def __init__(self, d: int, d_head: int, max_vocab: int = 1000):
-        self.embed = EmbeddingLayerComponent(d, max_vocab)
-        super().__init__(d, d_head)
+    def __init__(self, headless_net: HeadlessTransformer, max_vocab: int = 1000):
+        self.headless_net = headless_net
+        self.embed = EmbeddingLayerComponent(headless_net.d, max_vocab)
 
     def forward(self, inp: torch.Tensor, return_states=False):
         """
@@ -123,7 +124,7 @@ class Transformer(HeadlessTransformer):
         List[str]
         """
         x = self.embed.forward(inp)
-        x = super().forward(x, return_states)
+        x = self.headless_net.forward(x, return_states)
         return self.embed.deembed_forward(x)
 
     def compute(self, n_pos: int, inp: List[str]) -> List[str]:
