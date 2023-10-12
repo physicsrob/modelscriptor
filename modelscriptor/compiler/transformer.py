@@ -28,7 +28,7 @@ class HeadlessTransformer:
         in_state = self.layers[0].attn.in_state
         res_stream = torch.zeros((n_pos, self.d))
 
-        for node in in_state.get_distinct_nodes():
+        for node in in_state.get_nodes():
             indices = in_state.get_node_indices(node)
             if isinstance(node, Constant):
                 for i, idx in enumerate(indices):
@@ -93,7 +93,7 @@ class HeadlessTransformer:
         result = {}
         out_state = self.layers[-1].ffn.out_state
 
-        for node in out_state.get_distinct_nodes():
+        for node in out_state.get_nodes():
             indices = out_state.get_node_indices(node)
             result[node] = res[:, indices]
         return result

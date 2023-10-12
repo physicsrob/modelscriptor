@@ -34,7 +34,7 @@ def is_compilation_complete(layer: TransformerLayer) -> bool:
         or isinstance(node, Constant)
         or isinstance(node, PosEncoding)
         or isinstance(node, Embedding)
-        for node in layer.attn.in_state.get_compilable_nodes()
+        for node in layer.attn.in_state.get_nodes()
     )
 
 
@@ -69,7 +69,7 @@ def compile_network(
                 sublayer.in_state.print(f"Sublayer {sublayer_type} Starting Input")
                 print("\n\n")
 
-            to_compile_nodes = sublayer.out_state.get_compilable_nodes()
+            to_compile_nodes = sublayer.out_state.get_nodes()
 
             group_strategies = get_combined_strategies(
                 {node: sublayer.get_strategies(node) for node in to_compile_nodes}
@@ -84,15 +84,15 @@ def compile_network(
 
             strategy = group_strategies[0]
 
-            sublayer.in_state._sanity_check()
-            sublayer.out_state._sanity_check()
+            sublayer.in_state._consistency_check()
+            sublayer.out_state._consistency_check()
             sublayer.apply_skip_allocation(strategy)
-            sublayer.in_state._sanity_check()
-            sublayer.out_state._sanity_check()
+            sublayer.in_state._consistency_check()
+            sublayer.out_state._consistency_check()
 
             sublayer.apply_strategy(strategy)
-            sublayer.in_state._sanity_check()
-            sublayer.out_state._sanity_check()
+            sublayer.in_state._consistency_check()
+            sublayer.out_state._consistency_check()
 
             if sublayer == layer.ffn:
                 print("Connecting attn.out_state from layer.ffn.in_state")
@@ -100,22 +100,17 @@ def compile_network(
             sublayer.in_state.print("Sublayer Input")
             sublayer.out_state.print("Sublayer Output")
 
-        if (
-            layer.ffn.out_state.get_compilable_nodes()
-            == layer.attn.in_state.get_compilable_nodes()
-        ):
+        if layer.ffn.out_state.get_nodes() == layer.attn.in_state.get_nodes():
             import pdb
 
             pdb.set_trace()
             raise CompilationError("Could not compile network.")
         else:
             print(
-                f"Nodes changed from {layer.ffn.out_state.get_compilable_nodes()} to {layer.attn.in_state.get_compilable_nodes()}"
+                f"Nodes changed from {layer.ffn.out_state.get_nodes()} to {layer.attn.in_state.get_nodes()}"
             )
 
-        if str(layer.ffn.out_state.get_compilable_nodes()) == str(
-            layer.attn.in_state.get_compilable_nodes()
-        ):
+        if str(layer.ffn.out_state.get_nodes()) == str(layer.attn.in_state.get_nodes()):
             import pdb
 
             pdb.set_trace()
@@ -176,7 +171,7 @@ def compile_transformer(
     net = Transformer(headless_net.d, d_head)
     net.layers = headless_net.layers
 
-    in_nodes = net.layers[0].attn.in_state.get_distinct_nodes()
+    in_nodes = net.layers[0].attn.in_state.get_nodes()
     strategies = []
     for node in in_nodes:
         node_strategies = net.embed.get_strategies(node)

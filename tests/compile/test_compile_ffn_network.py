@@ -37,7 +37,7 @@ def compiler_test(
     res, states = net.forward(inp, return_states=True)
 
     for state_name, (res_state, x) in states.items():
-        for node in res_state.get_distinct_nodes():
+        for node in res_state.get_nodes():
             indices = res_state.get_node_indices(node)
             expected_output = node.compute(n_pos, input_values)
             result = x[:, indices]
