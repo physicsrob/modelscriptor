@@ -4,8 +4,17 @@ from typing import Set, List, Tuple, Dict
 from modelscriptor.compiler.components.component import Component, NodeComponentStrategy
 from modelscriptor.compiler.components.skip import SkipNodeComponentStrategy
 from modelscriptor.compiler.utils import get_ancestor_nodes
-from modelscriptor.graph import Node, Concatenate
-from modelscriptor.graph.misc import Placeholder
+from modelscriptor.graph import Node, Concatenate, PosEncoding, Embedding
+from modelscriptor.graph.misc import Placeholder, InputNode, Constant
+
+
+def is_input_type(node: Node):
+    return (
+        isinstance(node, InputNode)
+        or isinstance(node, Constant)
+        or isinstance(node, PosEncoding)
+        or isinstance(node, Embedding)
+    )
 
 
 class GroupStrategy:
@@ -53,7 +62,7 @@ class GroupStrategy:
 
     def get_score(self):
         dependenct_ancestors = get_ancestor_nodes(self.dependent_nodes)
-        return len(dependenct_ancestors)
+        return len([node for node in dependenct_ancestors if not is_input_type(node)])
 
     def print(self, layer_components: List[Component], layer_names: List[str]):
         print("Group Strategy")

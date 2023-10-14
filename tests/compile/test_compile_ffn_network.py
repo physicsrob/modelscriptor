@@ -1,5 +1,5 @@
 import inspect
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -7,8 +7,8 @@ from modelscriptor.compiler.compile import compile_network
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 
 # from modelscriptor.compiler.plan.layer_plan import FFNPlan
-from modelscriptor.graph import Linear, ReLU, Node
-from modelscriptor.modelscript.arithmetic_ops import add, add_scalar, relu_add
+from modelscriptor.graph import Linear, ReLU, Node, PosEncoding
+from modelscriptor.modelscript.arithmetic_ops import add, add_scalar, relu_add, relu
 from modelscriptor.modelscript.inout_nodes import (
     create_input,
     create_constant,
@@ -27,9 +27,15 @@ def current_test_name():
 
 
 def compiler_test(
-    output_node: Node, n_pos: int, input_values: Dict[str, torch.Tensor], d: int = 128
+    output_node: Node,
+    n_pos: int,
+    input_values: Dict[str, torch.Tensor],
+    d: int = 256,
+    pos_encoding: Optional[PosEncoding] = None,
 ):
-    net = compile_network(d, 16, output_node, report_name=current_test_name())
+    net = compile_network(
+        d, 64, output_node, report_name=current_test_name(), pos_encoding=pos_encoding
+    )
     all_pass = True
 
     # Run a forward pass preserving all intermediate states
@@ -46,6 +52,8 @@ def compiler_test(
                 print(
                     f"   Failed. Expected {expected_output}, got {result}, at {state_name}"
                 )
+                breakpoint()
+                print("Here")
     assert all_pass
 
     final_result = net.compute(n_pos, input_values)[output_node]
@@ -61,6 +69,43 @@ def test_compile_1layer():
     # Now try using compiler
     n_pos = 2
     compiler_test(linear2, n_pos=n_pos, input_values={"test": torch.rand(n_pos, 10)})
+
+
+def test_compile_repeated_adds():
+    c1 = create_constant(torch.tensor([1.0]))
+    c2 = create_constant(torch.tensor([1.0]))
+    c3 = create_constant(torch.tensor([1.0]))
+    c4 = create_constant(torch.tensor([1.0]))
+    pos = create_pos_encoding()
+    a1 = add(c1, c2)
+    a2 = add(c3, c4)
+    a3 = add(a1, a2)
+    # Not compilable because Add(Add, Add) requires one of the Adds to be compiled by the Linear->Relu->Linear,
+    # which can't happen.
+    # This necessitates the creation of other Add strategies (e.g. in Attention with a simple linear addition)
+    # But that requires a position encoding to be accessible by the attention layer
+    compiler_test(a3, n_pos=2, input_values={}, pos_encoding=pos)
+
+
+def test_compile_add_relu():
+    value_input1 = create_input("value1", 4)
+    value_input2 = create_input("value2", 4)
+    inp1 = torch.rand(2, 4) - 0.5
+    inp2 = torch.rand(2, 4) - 0.5
+    pos = create_pos_encoding()
+    a1 = add(value_input1, value_input2)
+    x = relu(a1)
+    x2 = relu(x)
+    # Not compilable because Add(Add, Add) requires one of the Adds to be compiled by the Linear->Relu->Linear,
+    # which can't happen.
+    # This necessitates the creation of other Add strategies (e.g. in Attention with a simple linear addition)
+    # But that requires a position encoding to be accessible by the attention layer
+    compiler_test(
+        x2,
+        n_pos=2,
+        input_values={"value1": inp1, "value2": inp2},
+        pos_encoding=pos,
+    )
 
 
 def test_compile_add_scalar():

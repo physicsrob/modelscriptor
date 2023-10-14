@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Optional
 
 from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
@@ -35,10 +35,11 @@ def compile_network(
     report_name: str = "",
     verbose: bool = True,
     optimize: bool = True,
+    pos_encoding: Optional[PosEncoding] = None,
 ) -> HeadlessTransformer:
     # Start with the first layer and try to compile as much as possible.
 
-    net = HeadlessTransformer(d, d_head)
+    net = HeadlessTransformer(d, d_head, pos_encoding)
 
     layer = net.add_layer()
     layer.ffn.out_state.allocate_node(output_node)
@@ -66,14 +67,11 @@ def compile_network(
                 {node: sublayer.get_strategies(node) for node in to_compile_nodes}
             )
 
-            print("Combined Strategies considered:")
-            for s in group_strategies:
-                print(s.sub_strategies)
-                sublayer.print_strategy(s)
-                print("Score: ", s.get_score())
-                # s.print([sublayer], [sublayer_type])
-
             strategy = group_strategies[0]
+            print("Combined Strategy:")
+            print(strategy.sub_strategies)
+            sublayer.print_strategy(strategy)
+            print("Score: ", strategy.get_score())
 
             sublayer.in_state._consistency_check()
             sublayer.out_state._consistency_check()
@@ -153,10 +151,16 @@ def compile_transformer(
     report_name: str = "",
     verbose: bool = True,
     optimize: bool = True,
+    pos_encoding: Optional[PosEncoding] = None,
 ):
-    # Compile everything but the embedding layer
     headless_net = compile_network(
-        d, d_head, output_node, report_name, verbose, optimize
+        d=d,
+        d_head=d_head,
+        output_node=output_node,
+        report_name=report_name,
+        verbose=verbose,
+        optimize=optimize,
+        pos_encoding=pos_encoding,
     )
     net = Transformer(headless_net)
 

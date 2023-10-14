@@ -1,4 +1,4 @@
-from typing import List, Set, Dict, Union
+from typing import List, Set, Dict, Union, Optional
 
 import torch
 
@@ -13,14 +13,16 @@ class HeadlessTransformer:
     layers: List[TransformerLayer]
     d: int
     d_head: int
+    pos_encoding: Optional[PosEncoding]
 
-    def __init__(self, d: int, d_head: int):
+    def __init__(self, d: int, d_head: int, pos_encoding: Optional[PosEncoding] = None):
         self.d = d
         self.d_head = d_head
+        self.pos_encoding = pos_encoding
         self.layers = []
 
     def add_layer(self) -> TransformerLayer:
-        layer = TransformerLayer(self.d, self.d_head)
+        layer = TransformerLayer(self.d, self.d_head, self.pos_encoding)
         self.layers = [layer] + self.layers
         return layer
 
