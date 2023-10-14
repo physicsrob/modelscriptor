@@ -1,25 +1,28 @@
-from typing import List, Set, Dict, Union
+from typing import List, Set, Dict, Union, Optional
 
 import torch
 
+from modelscriptor.compiler.components.embedding import EmbeddingLayerComponent
 from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
 from modelscriptor.graph import Node, Constant, InputNode, PosEncoding
 
 
-class Transformer:
+class HeadlessTransformer:
     layers: List[TransformerLayer]
     d: int
     d_head: int
+    pos_encoding: Optional[PosEncoding]
 
-    def __init__(self, d: int, d_head: int):
+    def __init__(self, d: int, d_head: int, pos_encoding: Optional[PosEncoding] = None):
         self.d = d
         self.d_head = d_head
+        self.pos_encoding = pos_encoding
         self.layers = []
 
     def add_layer(self) -> TransformerLayer:
-        layer = TransformerLayer(self.d, self.d_head)
+        layer = TransformerLayer(self.d, self.d_head, self.pos_encoding)
         self.layers = [layer] + self.layers
         return layer
 
@@ -27,7 +30,7 @@ class Transformer:
         in_state = self.layers[0].attn.in_state
         res_stream = torch.zeros((n_pos, self.d))
 
-        for node in in_state.get_distinct_nodes():
+        for node in in_state.get_nodes():
             indices = in_state.get_node_indices(node)
             if isinstance(node, Constant):
                 for i, idx in enumerate(indices):
@@ -92,7 +95,39 @@ class Transformer:
         result = {}
         out_state = self.layers[-1].ffn.out_state
 
-        for node in out_state.get_distinct_nodes():
+        for node in out_state.get_nodes():
             indices = out_state.get_node_indices(node)
             result[node] = res[:, indices]
         return result
+
+
+class Transformer:
+    embed: EmbeddingLayerComponent
+    headless_net: HeadlessTransformer
+
+    def __init__(self, headless_net: HeadlessTransformer, max_vocab: int = 1000):
+        self.headless_net = headless_net
+        self.embed = EmbeddingLayerComponent(headless_net.d, max_vocab)
+
+    def forward(self, inp: torch.Tensor, return_states=False):
+        """
+        Forward pass through the model.
+
+        Parameters
+        ----------
+        inp : torch.Tensor
+            The input tensor.
+        return_states : bool, optional
+            If True, returns the intermediate states from each layer.
+            Default is False.
+
+        Returns
+        -------
+        List[str]
+        """
+        x = self.embed.forward(inp)
+        x = self.headless_net.forward(x, return_states)
+        return self.embed.deembed_forward(x)
+
+    def compute(self, n_pos: int, inp: List[str]) -> List[str]:
+        raise NotImplementedError("TODO")

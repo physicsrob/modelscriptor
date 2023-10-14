@@ -1,10 +1,12 @@
-from typing import Set, Dict, List, NamedTuple
+from typing import Set, Dict, List, NamedTuple, Optional
 
 import torch
+from torch.nn import functional as F
 
-from modelscriptor.graph import Node, Concatenate, Linear, Constant, Attn
+from modelscriptor.graph import Node, Concatenate, Linear, Constant, Attn, PosEncoding
 from modelscriptor.compiler.components.component import NodeComponentStrategy, Component
 from modelscriptor.graph.misc import Placeholder
+from modelscriptor.graph.pos_encoding import attention_hardness
 
 
 class AttnNodeComponentStrategy(NodeComponentStrategy):
@@ -75,13 +77,15 @@ class AttnLayerComponent(Component):
     d_head: int
     n_heads: int
     used_heads: int
+    pos_encoding: Optional[PosEncoding]
 
-    def __init__(self, d: int, d_head: int):
+    def __init__(self, d: int, d_head: int, pos_encoding: Optional[PosEncoding]):
         super().__init__(d)
         assert (d % d_head) == 0, "Invalid combination of d and d_head"
         self.d_head = d_head
         self.n_heads = d // d_head
         self.used_heads = 0
+        self.pos_encoding = pos_encoding
 
         self.query_matrix = torch.zeros(self.n_heads, d, d_head)
         self.key_matrix = torch.zeros(self.n_heads, d, d_head)
@@ -122,6 +126,47 @@ class AttnLayerComponent(Component):
                 )
             )
 
+        # We can compile linear, if we have a pos_encoding, and if the bias is zero.
+        if (
+            isinstance(node, Linear)
+            and self.pos_encoding is not None
+            and torch.allclose(node.output_bias, torch.zeros_like(node.output_bias))
+            and len(node) <= self.d_head
+        ):
+            strategies.append(
+                AttnNodeComponentStrategy(
+                    query_in=self.pos_encoding,
+                    key_in=self.pos_encoding,
+                    value_in=node.inputs[0],
+                    out_node=node,
+                    query_matrix=attention_hardness
+                    * torch.eye(len(self.pos_encoding), self.d_head),
+                    key_matrix=torch.eye(len(self.pos_encoding), self.d_head),
+                    value_matrix=torch.eye(len(node.inputs[0]), self.d_head),
+                    output_matrix=F.pad(
+                        node.output_matrix, (0, 0, 0, self.d_head - len(node.inputs[0]))
+                    ),
+                    d_head=self.d_head,
+                )
+            )
+
+        if self.pos_encoding is not None:
+            # Pass through is always an option by implementing an identity operation
+            # while attending to the current position.
+            strategies.append(
+                AttnNodeComponentStrategy(
+                    query_in=self.pos_encoding,
+                    key_in=self.pos_encoding,
+                    value_in=node,
+                    out_node=node,
+                    query_matrix=attention_hardness
+                    * torch.eye(len(self.pos_encoding), self.d_head),
+                    key_matrix=torch.eye(len(self.pos_encoding), self.d_head),
+                    value_matrix=torch.eye(len(node), self.d_head),
+                    output_matrix=torch.eye(self.d_head, len(node)),
+                    d_head=self.d_head,
+                )
+            )
         return strategies
 
     def apply_strategy(self, strategy: NodeComponentStrategy):

@@ -61,6 +61,7 @@ class FFNSubLayer(Group):
     def apply_strategy(self, strategy: GroupStrategy):
         # Connect skip out to group output
         self.skip.out_state.update_from(self.out_state)
+        # self.skip.skip_state.update_from(self.in_state)
 
         # Apply all skip strategies
         for s in strategy.get_component_strategies(self.skip):
