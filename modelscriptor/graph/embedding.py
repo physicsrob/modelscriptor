@@ -3,7 +3,7 @@ from typing import List
 from modelscriptor.graph import Node
 import torch
 
-from modelscriptor.graph.utils import get_spherical_codes
+from modelscriptor.graph.spherical_codes import get_spherical_codes
 
 unk_token = "<unk>"
 special_tokens = [unk_token]

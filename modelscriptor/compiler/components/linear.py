@@ -106,9 +106,6 @@ class LinearLayerComponent(Component):
         return self.output_matrix.numel() + self.output_bias.numel()
 
     def resize(self, new_d):
-        self.d = new_d
+        super().resize(new_d)
         self.output_matrix = self.output_matrix[:new_d, :new_d]
         self.output_bias = self.output_bias[:new_d]
-
-    def get_min_width(self):
-        return max(self.in_state.get_min_width(), self.out_state.get_min_width())

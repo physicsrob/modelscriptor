@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -10,7 +10,7 @@ from modelscriptor.compiler.groups.strategy import (
     get_sequential_placement_strategies,
 )
 from modelscriptor.compiler.res_state import ResState
-from modelscriptor.graph import Node
+from modelscriptor.graph import Node, PosEncoding
 
 
 class AttnSubLayer(Group):
@@ -19,9 +19,11 @@ class AttnSubLayer(Group):
     in_state: ResState
     out_state: ResState
 
-    def __init__(self, d: int, d_head: int = 64):
+    def __init__(
+        self, d: int, d_head: int = 64, pos_encoding: Optional[PosEncoding] = None
+    ):
         super().__init__(d)
-        self.attn = AttnLayerComponent(d, d_head)
+        self.attn = AttnLayerComponent(d, d_head, pos_encoding)
         self.skip = SkipLayerComponent(d)
         self.out_state = ResState(d)
         self.in_state = ResState(d)

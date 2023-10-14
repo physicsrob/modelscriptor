@@ -1,4 +1,4 @@
-from modelscriptor.graph.utils import index_to_vector
+from modelscriptor.graph.spherical_codes import index_to_vector
 from modelscriptor.modelscript.inout_nodes import create_constant, create_input
 from modelscriptor.modelscript.logic_ops import (
     compare_to_vector,
