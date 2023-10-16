@@ -22,7 +22,7 @@ def test_net1():
     strategies = ffn_sublayer.get_strategies(linear2)
     ffn_sublayer.apply_strategy(strategies[0])
     ffn_sublayer.print()
-    assert ffn_sublayer.in_state.has_node(input_node)
+    assert ffn_sublayer.in_state.has_node_indices(input_node)
 
 
 def test_net2():
@@ -39,8 +39,8 @@ def test_net2():
     print(strategies)
     ffn_sublayer.apply_strategy(strategies[0])
     ffn_sublayer.print()
-    assert ffn_sublayer.in_state.has_node(input_node)
-    assert ffn_sublayer.in_state.has_node(constant)
+    assert ffn_sublayer.in_state.has_node_indices(input_node)
+    assert ffn_sublayer.in_state.has_node_indices(constant)
 
 
 def test_input_pass_through():
@@ -52,7 +52,7 @@ def test_input_pass_through():
     print(strategies)
     ffn_sublayer.apply_strategy(strategies[0])
     ffn_sublayer.print()
-    assert ffn_sublayer.in_state.has_node(input_node)
+    assert ffn_sublayer.in_state.has_node_indices(input_node)
 
 
 def test_posencoding_pass_through():
@@ -64,4 +64,4 @@ def test_posencoding_pass_through():
     print(strategies)
     ffn_sublayer.apply_strategy(strategies[0])
     ffn_sublayer.print()
-    assert ffn_sublayer.in_state.has_node(pos_encoding)
+    assert ffn_sublayer.in_state.has_node_indices(pos_encoding)

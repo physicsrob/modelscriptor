@@ -25,8 +25,10 @@ class AttnSubLayer(Group):
         super().__init__(d)
         self.attn = AttnLayerComponent(d, d_head, pos_encoding)
         self.skip = SkipLayerComponent(d)
-        self.out_state = ResState(d)
-        self.in_state = ResState(d)
+        self.out_state = self.skip.out_state
+        self.in_state = self.skip.skip_state
+        self.attn.in_state.link(self.in_state)
+        self.attn.out_state.link(self.skip.in_state)
 
     def print_strategy(self, strategy: GroupStrategy):
         strategy.print(
@@ -40,29 +42,18 @@ class AttnSubLayer(Group):
         )
         return strategies
 
-    def apply_skip_allocation(self, strategy: GroupStrategy):
-        self.skip.out_state.update_from(self.out_state)
+    def apply_pre_allocation(self, strategy: GroupStrategy):
         for s in strategy.get_component_strategies(self.skip):
             self.skip.apply_strategy(s)
-        self.attn.in_state.update_from(self.skip.skip_state)
 
     def apply_strategy(self, strategy: GroupStrategy):
-        # Connect skip out to group output
-        self.skip.out_state.update_from(self.out_state)
-
         # Apply all skip strategies
         for s in strategy.get_component_strategies(self.skip):
             self.skip.apply_strategy(s)
 
-        self.attn.out_state.update_from(self.skip.in_state)
-        self.attn.in_state.update_from(self.skip.skip_state)
-
         # Apply all attention strategies
         for s in strategy.get_component_strategies(self.attn):
             self.attn.apply_strategy(s)
-
-        # Connect group input to attention input
-        self.in_state.update_from(self.attn.in_state)
 
     def forward(self, inp: torch.Tensor, return_states=False):
         """

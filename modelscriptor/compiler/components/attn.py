@@ -177,7 +177,7 @@ class AttnLayerComponent(Component):
             return
 
         assert isinstance(strategy, AttnNodeComponentStrategy)
-        assert self.out_state.has_node(
+        assert self.out_state.has_node_indices(
             strategy.out_node
         ), "Strategy applied before output allocated"
         if self.used_heads >= self.n_heads:

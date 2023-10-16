@@ -31,7 +31,7 @@ class Group:
         ...
 
     @abstractmethod
-    def apply_skip_allocation(self, strategy: GroupStrategy):
+    def apply_pre_allocation(self, strategy: GroupStrategy):
         ...
 
     @abstractmethod

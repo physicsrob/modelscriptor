@@ -57,7 +57,7 @@ class EmbeddingLayerComponent(Component):
             return []
 
     def apply_strategy(self, strategy: NodeComponentStrategy):
-        assert self.out_state.has_node(
+        assert self.out_state.has_node_indices(
             strategy.out_node
         ), "Strategy applied before output allocated"
         out_indices = self.out_state.get_node_indices(strategy.out_node)

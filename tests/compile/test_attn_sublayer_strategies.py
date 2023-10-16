@@ -18,7 +18,7 @@ def test_pass_through():
     strategies = attn_sublayer.get_strategies(input_node)
     print(strategies)
     attn_sublayer.apply_strategy(strategies[0])
-    assert attn_sublayer.in_state.has_node(input_node)
+    assert attn_sublayer.in_state.has_node_indices(input_node)
 
 
 def test_add_pass_through():
@@ -33,7 +33,7 @@ def test_add_pass_through():
     strategies = attn_sublayer.get_strategies(added)
     print(strategies)
     attn_sublayer.apply_strategy(strategies[0])
-    assert attn_sublayer.in_state.has_node(added)
+    assert attn_sublayer.in_state.has_node_indices(added)
 
 
 def test_posencoding_pass_through():
@@ -44,7 +44,7 @@ def test_posencoding_pass_through():
     strategies = attn_sublayer.get_strategies(pos_encoding)
     print(strategies)
     attn_sublayer.apply_strategy(strategies[0])
-    assert attn_sublayer.in_state.has_node(pos_encoding)
+    assert attn_sublayer.in_state.has_node_indices(pos_encoding)
 
 
 def test_attn():
@@ -56,8 +56,8 @@ def test_attn():
     attn_sublayer.out_state.allocate_node(last_input)
     strategies = attn_sublayer.get_strategies(last_input)
     attn_sublayer.apply_strategy(strategies[0])
-    assert not attn_sublayer.in_state.has_node(last_input)
-    assert attn_sublayer.in_state.has_node(value_input)
+    assert not attn_sublayer.in_state.has_node_indices(last_input)
+    assert attn_sublayer.in_state.has_node_indices(value_input)
 
 
 def test_linear_on_attn():
@@ -83,8 +83,8 @@ def test_linear_on_attn():
         print("Score: ", s.get_score())
         # s.print([sublayer], [sublayer_type])
     attn_sublayer.apply_strategy(strategies[0])
-    assert attn_sublayer.in_state.has_node(value_input)
-    assert not attn_sublayer.in_state.has_node(transformed)
+    assert attn_sublayer.in_state.has_node_indices(value_input)
+    assert not attn_sublayer.in_state.has_node_indices(transformed)
 
     out_indices = attn_sublayer.out_state.get_node_indices(transformed)
     in_indices = attn_sublayer.in_state.get_node_indices(value_input)
@@ -120,10 +120,10 @@ def test_add_on_attn():
         print("Score: ", s.get_score())
         # s.print([sublayer], [sublayer_type])
     attn_sublayer.apply_strategy(strategies[0])
-    assert attn_sublayer.in_state.has_node(
+    assert attn_sublayer.in_state.has_node_indices(
         value_input1
-    ) and attn_sublayer.in_state.has_node(value_input2)
-    assert not attn_sublayer.in_state.has_node(added)
+    ) and attn_sublayer.in_state.has_node_indices(value_input2)
+    assert not attn_sublayer.in_state.has_node_indices(added)
 
     out_indices = attn_sublayer.out_state.get_node_indices(added)
     in_indices1 = attn_sublayer.in_state.get_node_indices(value_input1)

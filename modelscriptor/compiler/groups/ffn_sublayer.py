@@ -25,8 +25,12 @@ class FFNSubLayer(Group):
         self.relu = ReLULayerComponent(d)
         self.linear2 = LinearLayerComponent(d)
         self.skip = SkipLayerComponent(d)
-        self.out_state = ResState(d)
-        self.in_state = ResState(d)
+        self.out_state = self.skip.out_state
+        self.in_state = self.linear1.in_state
+        self.relu.in_state.link(self.linear1.out_state)
+        self.linear2.in_state.link(self.relu.out_state)
+        self.skip.skip_state.link(self.in_state)
+        self.skip.in_state.link(self.linear2.out_state)
 
     def print(self):
         print("FFNSubLayer")
@@ -52,47 +56,26 @@ class FFNSubLayer(Group):
         )
         return strategies
 
-    def apply_skip_allocation(self, strategy: GroupStrategy):
-        self.skip.out_state.update_from(self.out_state)
+    def apply_pre_allocation(self, strategy: GroupStrategy):
         for s in strategy.get_component_strategies(self.skip):
             self.skip.apply_strategy(s)
-        self.linear1.in_state.update_from(self.skip.skip_state)
 
     def apply_strategy(self, strategy: GroupStrategy):
-        # Connect skip out to group output
-        self.skip.out_state.update_from(self.out_state)
-        # self.skip.skip_state.update_from(self.in_state)
-
         # Apply all skip strategies
         for s in strategy.get_component_strategies(self.skip):
             self.skip.apply_strategy(s)
-
-        # Connect linear2 output to group output
-        self.linear2.out_state.update_from(self.skip.in_state)
 
         # Apply all linear2 strategies
         for s in strategy.get_component_strategies(self.linear2):
             self.linear2.apply_strategy(s)
 
-        # Connect relu out to linear2 in
-        self.relu.out_state.update_from(self.linear2.in_state)
-
         # Apply relu strategies
         for s in strategy.get_component_strategies(self.relu):
             self.relu.apply_strategy(s)
 
-        # Connect linear1 out to relu in
-        self.linear1.out_state.update_from(self.relu.in_state)
-
-        # Copy skip connection to linear1 in state
-        self.linear1.in_state.update_from(self.skip.skip_state)
-
         # Apply linear1 strategies
         for s in strategy.get_component_strategies(self.linear1):
             self.linear1.apply_strategy(s)
-
-        # Connect group input to linear1 input
-        self.in_state.update_from(self.linear1.in_state)
 
     def forward(self, inp: torch.Tensor, return_states=False):
         """
