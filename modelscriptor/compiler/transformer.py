@@ -27,15 +27,19 @@ class HeadlessTransformer:
         layer = TransformerLayer(self.d, self.d_head, self.pos_encoding)
         if not end:
             self.layers = [layer] + self.layers
+            if len(self.layers) > 1:
+                self.layers[0].ffn.out_state.link(self.layers[1].attn.in_state)
         else:
             self.layers.append(layer)
+            if len(self.layers) > 1:
+                self.layers[-2].ffn.out_state.link(self.layers[-1].attn.in_state)
         return layer
 
     def get_input_res_stream(self, n_pos: int, input_values: Dict[str, torch.Tensor]):
         in_state = self.layers[0].attn.in_state
         res_stream = torch.zeros((n_pos, self.d))
 
-        for node in in_state.get_nodes():
+        for node in in_state.get_nodes_with_indices():
             indices = in_state.get_node_indices(node)
             if isinstance(node, Constant):
                 for i, idx in enumerate(indices):
@@ -100,7 +104,7 @@ class HeadlessTransformer:
         result = {}
         out_state = self.layers[-1].ffn.out_state
 
-        for node in out_state.get_nodes():
+        for node in out_state.get_nodes_with_indices():
             indices = out_state.get_node_indices(node)
             result[node] = res[:, indices]
         return result
@@ -121,6 +125,8 @@ class Transformer:
         self.embed = EmbeddingLayerComponent(headless_net.d, len(tokenizer))
         self.pos_encoding = PosEncodingLayerComponent(headless_net.d)
         self.tokenizer = tokenizer
+        self.embed.out_state.link(self.headless_net.layers[0].attn.in_state)
+        self.pos_encoding.out_state.link(self.headless_net.layers[0].attn.in_state)
 
     def forward(self, inp: torch.Tensor, return_states=False):
         """

@@ -40,7 +40,7 @@ class ReLULayerComponent(Component):
             return []
 
     def apply_strategy(self, strategy: NodeComponentStrategy):
-        assert self.out_state.has_node(
+        assert self.out_state.has_node_indices(
             strategy.out_node
         ), "Strategy applied before output allocated"
         in_node = strategy.in_nodes[0]

@@ -67,7 +67,7 @@ class SkipLayerComponent(Component):
 
     def apply_strategy(self, strategy: NodeComponentStrategy):
         assert isinstance(strategy, SkipNodeComponentStrategy)
-        assert self.out_state.has_node(
+        assert self.out_state.has_node_indices(
             strategy.out_node
         ), "Strategy applied before output allocated"
 
@@ -77,9 +77,6 @@ class SkipLayerComponent(Component):
         self.in_state.connect_allocation(
             self.out_state, strategy.out_node, strategy.in_node
         )
-        self.skip_state.print("Skip State After")
-        self.in_state.print("In State After")
-        self.out_state.print("Out State After")
         assert self.in_state.get_node_indices(
             strategy.in_node
         ) == self.skip_state.get_node_indices(strategy.skip_node)

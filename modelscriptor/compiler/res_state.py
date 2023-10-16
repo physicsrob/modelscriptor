@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Set, Dict, List, Iterable
+from typing import Set, Dict, List, Iterable, Optional
 
 from modelscriptor.graph import Node, Concatenate
 from modelscriptor.graph.misc import Placeholder
@@ -13,10 +13,12 @@ class ResState:
     # Represents the state of the residual stream at one point in time.
     d: int
     _node_to_indices: Dict[Node, List[int]]
+    _linked_from: Optional["ResState"]
 
     def __init__(self, d):
         self.d = d
         self._node_to_indices = {}
+        self._linked_from = None
 
     def _consistency_check(self):
         # This function checks that the state is consistent.
@@ -26,7 +28,7 @@ class ResState:
                 idx_to_nodes[idx].append(node)
         assert all(len(nodes) <= 1 for nodes in idx_to_nodes.values())
 
-    def has_node(self, node: Node):
+    def has_node_indices(self, node: Node):
         self._consistency_check()
         if node in self._node_to_indices:
             return True
@@ -35,7 +37,7 @@ class ResState:
         if isinstance(node, Concatenate):
             inputs = node.simplify_inputs()
             # If node is a concatenation, we have the node if we have all the inputs
-            return all(self.has_node(inp) for inp in inputs)
+            return all(self.has_node_indices(inp) for inp in inputs)
         return False
 
     def get_node_indices(self, node: Node) -> List[int]:
@@ -64,7 +66,7 @@ class ResState:
             used_indices |= set(indices)
         return {idx for idx in range(self.d) if idx not in used_indices}
 
-    def get_nodes(self) -> Set[Node]:
+    def get_nodes_with_indices(self) -> Set[Node]:
         self._consistency_check()
         return set(self._node_to_indices.keys())
 
@@ -72,7 +74,11 @@ class ResState:
         self._consistency_check()
         if len(prefix) and not prefix.endswith(" "):
             prefix = prefix + " "
-        print(f"{prefix}Residual Stream:", end="")
+        print(f"{prefix}Residual Stream {id(self)=}:", end="")
+        if self._linked_from:
+            print(f" linked from {id(self._linked_from)}")
+            return
+
         sorted_nodes = sorted(
             self._node_to_indices.keys(),
             key=lambda n: min(self._node_to_indices[n]),
@@ -88,7 +94,7 @@ class ResState:
         self._consistency_check()
         # If the node is already allocated, this is a no-op.
         # This can happen due to skip connections
-        if self.has_node(node):
+        if self.has_node_indices(node):
             return
 
         if isinstance(node, Concatenate):
@@ -107,6 +113,12 @@ class ResState:
             )
         indices = sorted(available_indices)[0 : len(node)]
         self._node_to_indices[node] = indices
+
+    # def pre_allocate_node(self, node: Node):
+    #     self._pre_allocated_nodes.add(node)
+    #
+    # def get_pre_allocated_nodes(self) -> Set[Node]:
+    #     return self._pre_allocated_nodes
 
     def _connect_allocations(
         self, other_state: "ResState", other_nodes: List[Node], this_nodes: List[Node]
@@ -166,44 +178,16 @@ class ResState:
 
         self._connect_allocations(other_state, [other_node], [this_node])
 
-    def update_from(self, other: "ResState"):
-        self._consistency_check()
-        # other represents the same state as this residual state, and it has already been
-        # allocated.
-
-        idx_to_nodes = defaultdict(set)
-        for node, indices in self._node_to_indices.items():
-            for idx in indices:
-                idx_to_nodes[idx].add(node)
-        for node, indices in other._node_to_indices.items():
-            for idx in indices:
-                idx_to_nodes[idx].add(node)
-
-        if any(len(nodes) > 1 for nodes in idx_to_nodes.values()):
-            print("State conflict in update_from.")
-            # Rewrite the above as a set comprehension
-            conflicting_nodes = {
-                node
-                for nodes in idx_to_nodes.values()
-                if len(nodes) > 1
-                for node in nodes
-            }
-            print(f"Conflicting nodes: {conflicting_nodes}")
-            for node in conflicting_nodes:
-                if self.has_node(node):
-                    print(
-                        f"Node {node} has indices (self) {self.get_node_indices(node)}"
-                    )
-                if other.has_node(node):
-                    print(
-                        f"Node {node} has indices (other) {other.get_node_indices(node)}"
-                    )
-
-            breakpoint()
-        assert all(len(nodes) <= 1 for nodes in idx_to_nodes.values())
-
-        self._node_to_indices.update(other._node_to_indices)
-        self._consistency_check()
+    def link(self, other: "ResState"):
+        if id(other._node_to_indices) == id(self._node_to_indices):
+            return  # Already linked
+        elif self._linked_from is not None:
+            self._linked_from.link(other)
+        elif other._linked_from is not None:
+            other._linked_from.link(self)
+        else:
+            other._node_to_indices = self._node_to_indices
+            other._linked_from = self
 
     def get_min_width(self):
         if not len(self._node_to_indices):

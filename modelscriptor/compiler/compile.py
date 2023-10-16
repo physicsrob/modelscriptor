@@ -1,9 +1,10 @@
-from typing import Union, Optional
+from typing import Union, Optional, Dict
 
 from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 from modelscriptor.compiler.groups.strategy import (
     get_combined_strategies,
+    GroupStrategy,
 )
 from modelscriptor.compiler.utils import get_ancestor_nodes
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
@@ -25,8 +26,12 @@ def is_compilation_complete(layer: TransformerLayer) -> bool:
         or isinstance(node, Constant)
         or isinstance(node, PosEncoding)
         or isinstance(node, Embedding)
-        for node in layer.attn.in_state.get_nodes()
+        for node in layer.attn.in_state.get_nodes_with_indices()
     )
+
+
+class OverallStrategy:
+    layer_to_strategy: Dict[TransformerLayer, GroupStrategy]
 
 
 def compile_layer(layer: TransformerLayer, verbose: bool = False):
@@ -43,7 +48,7 @@ def compile_layer(layer: TransformerLayer, verbose: bool = False):
             sublayer.out_state.print(f"Sublayer {sublayer_type} Output")
             sublayer.in_state.print(f"Sublayer {sublayer_type} Starting Input")
 
-        to_compile_nodes = sublayer.out_state.get_nodes()
+        to_compile_nodes = sublayer.out_state.get_nodes_with_indices()
 
         node_to_strategies = {
             node: sublayer.get_strategies(node) for node in to_compile_nodes
@@ -52,7 +57,7 @@ def compile_layer(layer: TransformerLayer, verbose: bool = False):
             if len(strategies) > 1 and strategies[0].get_score() == 0:
                 node_to_strategies[node] = [strategies[0]]
 
-        group_strategies = get_combined_strategies(sublayer, node_to_strategies)
+        group_strategies = get_combined_strategies(node_to_strategies)
 
         strategy = group_strategies[0]
         if verbose:
@@ -63,18 +68,13 @@ def compile_layer(layer: TransformerLayer, verbose: bool = False):
 
         sublayer.in_state._consistency_check()
         sublayer.out_state._consistency_check()
-        sublayer.apply_skip_allocation(strategy)
+        sublayer.apply_pre_allocation(strategy)
         sublayer.in_state._consistency_check()
         sublayer.out_state._consistency_check()
 
         sublayer.apply_strategy(strategy)
         sublayer.in_state._consistency_check()
         sublayer.out_state._consistency_check()
-
-        if sublayer == layer.ffn:
-            layer.attn.out_state.update_from(layer.ffn.in_state)
-        if verbose:
-            sublayer.in_state.print("Sublayer Final Input")
 
 
 def compile_network(
@@ -92,11 +92,13 @@ def compile_network(
 
     layer = net.add_layer()
     layer.ffn.out_state.allocate_node(output_node)
-    needed_nodes = get_ancestor_nodes({output_node})
 
     for layer_cnt in range(MAX_LAYERS):
         compile_layer(layer, verbose)
-        if layer.ffn.out_state.get_nodes() == layer.attn.in_state.get_nodes():
+        if (
+            layer.ffn.out_state.get_nodes_with_indices()
+            == layer.attn.in_state.get_nodes_with_indices()
+        ):
             raise CompilationError("Could not compile network.")
 
         if is_compilation_complete(layer):
@@ -107,7 +109,6 @@ def compile_network(
             break
         else:
             new_layer = net.add_layer()
-            new_layer.ffn.out_state.update_from(layer.attn.in_state)
             if verbose:
                 print("\n\nCreating new layer:")
                 layer.ffn.out_state.print("Old Layer Output")
@@ -164,11 +165,9 @@ def compile_transformer(
     # Get the nodes at the input to the transformer layer stack
     in_state = net.headless_net.layers[0].attn.in_state
     out_state = net.headless_net.layers[-1].ffn.out_state
-    net.pos_encoding.out_state.update_from(in_state)
-    net.embed.out_state.update_from(in_state)
 
     # Compile the position encoding nodes
-    for node in in_state.get_nodes():
+    for node in in_state.get_nodes_with_indices():
         pos_encoding_strategies = net.pos_encoding.get_strategies(node)
         embed_node_strategies = net.embed.get_strategies(node)
         if len(pos_encoding_strategies):
@@ -182,7 +181,9 @@ def compile_transformer(
 
     # Check to see if input and output have the same allocation, as they must.
     embed_node = next(
-        node for node in in_state.get_nodes() if isinstance(node, Embedding)
+        node
+        for node in in_state.get_nodes_with_indices()
+        if isinstance(node, Embedding)
     )
     out_node = unembedding.inp
     if in_state.get_node_indices(embed_node) != out_state.get_node_indices(out_node):

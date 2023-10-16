@@ -26,7 +26,7 @@ def render_res_state(residual_state: ResState, name: str):
             min(residual_state.get_node_indices(node)),
             max(residual_state.get_node_indices(node)),
         )
-        for node in residual_state.get_nodes()
+        for node in residual_state.get_nodes_with_indices()
     ]
 
     # Sort spans by their starting index
@@ -78,7 +78,7 @@ def render_component(component: Component):
         if isinstance(component, SkipLayerComponent)
         else None,
         out_state=render_res_state(component.out_state, name="Output"),
-        nodes=[render_node(n) for n in component.out_state.get_nodes()],
+        nodes=[render_node(n) for n in component.out_state.get_nodes_with_indices()],
     )
 
 
