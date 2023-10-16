@@ -1,5 +1,5 @@
 from itertools import product
-from typing import Set, List, Tuple, Dict
+from typing import Set, List, Tuple, Dict, Any
 
 from modelscriptor.compiler.components.component import Component, NodeComponentStrategy
 from modelscriptor.compiler.components.skip import SkipNodeComponentStrategy
@@ -92,7 +92,9 @@ def get_strategies_for_component(
     return group_strategies[:strategy_count]
 
 
-def get_combined_strategies(node_to_strategies: Dict[Node, List[GroupStrategy]]):
+def get_combined_strategies(
+    sublayer: Any, node_to_strategies: Dict[Node, List[GroupStrategy]]
+):
     # Given a dictionary of node -> strategies, this function returns a list of strategies
     # which are the combination of all strategies for each node.
     # For example, if node1 has strategies [s1, s2] and node2 has strategies [s3, s4], this
@@ -102,13 +104,20 @@ def get_combined_strategies(node_to_strategies: Dict[Node, List[GroupStrategy]])
 
     combined_strategies = []
 
+    print("Get_combined_strategies")
+    count = len([x for x in product(*node_to_strategies.values())])
+    if count > 10000:
+        breakpoint()
     for strategies in product(*node_to_strategies.values()):
+        print(f"strategy {count}")
         combined = GroupStrategy()
         for strategy in strategies:
             combined.sub_strategies += strategy.sub_strategies
             combined.dependent_nodes |= strategy.dependent_nodes
         combined_strategies.append(combined)
     combined_strategies.sort(key=lambda s: s.get_score())
+    if count > 10000:
+        breakpoint()
     return combined_strategies
 
 

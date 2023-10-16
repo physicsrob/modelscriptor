@@ -3,10 +3,12 @@ from typing import List, Set, Dict, Union, Optional
 import torch
 
 from modelscriptor.compiler.components.embedding import EmbeddingLayerComponent
+from modelscriptor.compiler.components.pos_encoding import PosEncodingLayerComponent
 from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
 from modelscriptor.graph import Node, Constant, InputNode, PosEncoding
+from modelscriptor.graph.embedding import Tokenizer
 
 
 class HeadlessTransformer:
@@ -21,9 +23,12 @@ class HeadlessTransformer:
         self.pos_encoding = pos_encoding
         self.layers = []
 
-    def add_layer(self) -> TransformerLayer:
+    def add_layer(self, end: bool = False) -> TransformerLayer:
         layer = TransformerLayer(self.d, self.d_head, self.pos_encoding)
-        self.layers = [layer] + self.layers
+        if not end:
+            self.layers = [layer] + self.layers
+        else:
+            self.layers.append(layer)
         return layer
 
     def get_input_res_stream(self, n_pos: int, input_values: Dict[str, torch.Tensor]):
@@ -104,10 +109,18 @@ class HeadlessTransformer:
 class Transformer:
     embed: EmbeddingLayerComponent
     headless_net: HeadlessTransformer
+    tokenizer: Tokenizer
+    pos_encoding: PosEncodingLayerComponent
 
-    def __init__(self, headless_net: HeadlessTransformer, max_vocab: int = 1000):
+    def __init__(
+        self,
+        headless_net: HeadlessTransformer,
+        tokenizer: Tokenizer,
+    ):
         self.headless_net = headless_net
-        self.embed = EmbeddingLayerComponent(headless_net.d, max_vocab)
+        self.embed = EmbeddingLayerComponent(headless_net.d, len(tokenizer))
+        self.pos_encoding = PosEncodingLayerComponent(headless_net.d)
+        self.tokenizer = tokenizer
 
     def forward(self, inp: torch.Tensor, return_states=False):
         """
@@ -116,7 +129,7 @@ class Transformer:
         Parameters
         ----------
         inp : torch.Tensor
-            The input tensor.
+            The input tensor, shape n_pos, values are longs.
         return_states : bool, optional
             If True, returns the intermediate states from each layer.
             Default is False.
@@ -125,9 +138,22 @@ class Transformer:
         -------
         List[str]
         """
-        x = self.embed.forward(inp)
-        x = self.headless_net.forward(x, return_states)
-        return self.embed.deembed_forward(x)
+        x = self.embed.forward(inp) + self.pos_encoding.forward(inp)
+        if return_states:
+            x, states = self.headless_net.forward(x, return_states)
+            return self.embed.deembed_forward(x), states
+        else:
+            x = self.headless_net.forward(x, return_states)
+            return self.embed.deembed_forward(x)
 
-    def compute(self, n_pos: int, inp: List[str]) -> List[str]:
-        raise NotImplementedError("TODO")
+    def compute(self, inp: List[str], return_states: bool = False):
+        tokenized = [self.tokenizer.get_token_id(txt) for txt in inp]
+        in_x = torch.tensor(tokenized, dtype=torch.long)
+        if return_states:
+            x, states = self.forward(in_x, True)
+            res = [self.tokenizer.decode_id(x_i) for x_i in x]
+            return res, states
+        else:
+            x = self.forward(in_x, False)
+            res = [self.tokenizer.decode_id(x_i) for x_i in x]
+            return res

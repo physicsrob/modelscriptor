@@ -3,7 +3,6 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from modelscriptor.compiler.components.component import Component, NodeComponentStrategy
 from modelscriptor.compiler.groups.strategy import GroupStrategy
 from modelscriptor.compiler.res_state import ResState
 from modelscriptor.graph import Node, Concatenate, Linear

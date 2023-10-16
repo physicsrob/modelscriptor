@@ -8,6 +8,12 @@ This project is a work in progress.
 ## TODO List
 This list is a non-exhaustive list of all the things that needs to be done before this project is relatively feature complete.
 
+Immediately:
+- Remove group strategy optimization -- it's only necessary because we aren't compiling zero nodes.
+- Compile zero nodes to free up space -- can get away with just doing it in the attention layers
+- Copy the output to the input in the last attention layer
+
+
 - [ ] Implement embedding / deembedding compilation
 - [ ] Separate tokenizer from embedding
 - [ ] Export to ONNX

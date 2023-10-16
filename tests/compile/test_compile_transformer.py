@@ -2,7 +2,7 @@ from typing import Tuple
 
 import torch
 
-from modelscriptor.compiler.compile import compile_network
+from modelscriptor.compiler.compile import compile_network, compile_transformer
 from modelscriptor.graph import Node, Embedding
 from modelscriptor.modelscript.arithmetic_ops import concat
 
@@ -10,6 +10,7 @@ from modelscriptor.modelscript.inout_nodes import (
     create_embedding,
     create_pos_encoding,
     create_constant,
+    create_unembedding,
 )
 from modelscriptor.modelscript.logic_ops import compare_to_vector
 from modelscriptor.modelscript.map_select import select, map_to_table
@@ -91,18 +92,25 @@ def test_adder_1digit():
     # Define a flag for the end of the first number (when we hit the + symbol).
     is_first_num = compare_to_vector(inp=embedding, vector=embedding.get_embedding("+"))
 
-    # net = compile_network(256, 16, is_first_num, report_name="is_first_num")
-
     # # Define a flag for the end of the second number (when we hit the = symbol).
     is_second_num = compare_to_vector(
         inp=embedding, vector=embedding.get_embedding("=")
     )
     #
     just_completed_num = pos_encoding.get_last_value(current_num, delta_pos=-1)
-    net = compile_network(256, 16, just_completed_num, report_name="just_completed_num")
     first_num = pos_encoding.get_prev_value(just_completed_num, is_first_num)
     second_num = pos_encoding.get_prev_value(just_completed_num, is_second_num)
     #
     # # Figure out how to calculate output index.
     summed, carry = sum_numbers(embedding, first_num, second_num)
-    net = compile_network(256, 16, just_completed_num, report_name="summed")
+    out = create_unembedding(summed, embedding)
+    net = compile_transformer(
+        256, 16, out, pos_encoding, report_name="summed", optimize=False, verbose=False
+    )
+    net.compute(["1", "+", "1", "="])
+
+    breakpoint()
+
+    # net = compile_network(
+    #     256, 16, first_num, report_name="summed", pos_encoding=pos_encoding
+    # )
