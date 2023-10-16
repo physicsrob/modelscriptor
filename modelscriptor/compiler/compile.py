@@ -10,6 +10,7 @@ from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
 from modelscriptor.compiler.report import make_report
 from modelscriptor.compiler.transformer import HeadlessTransformer, Transformer
 from modelscriptor.graph import Node, InputNode, Constant, PosEncoding, Embedding
+from modelscriptor.graph.embedding import Unembedding
 
 MAX_LAYERS = 100
 
@@ -26,6 +27,54 @@ def is_compilation_complete(layer: TransformerLayer) -> bool:
         or isinstance(node, Embedding)
         for node in layer.attn.in_state.get_nodes()
     )
+
+
+def compile_layer(layer: TransformerLayer, verbose: bool = False):
+    for sublayer_type in ["ffn", "attn"]:
+        sublayer: Union[FFNSubLayer, AttnSubLayer]
+        if sublayer_type == "ffn":
+            sublayer = layer.ffn
+        elif sublayer_type == "attn":
+            sublayer = layer.attn
+        else:
+            assert False
+
+        if verbose:
+            sublayer.out_state.print(f"Sublayer {sublayer_type} Output")
+            sublayer.in_state.print(f"Sublayer {sublayer_type} Starting Input")
+
+        to_compile_nodes = sublayer.out_state.get_nodes()
+
+        node_to_strategies = {
+            node: sublayer.get_strategies(node) for node in to_compile_nodes
+        }
+        for node, strategies in node_to_strategies.items():
+            if len(strategies) > 1 and strategies[0].get_score() == 0:
+                node_to_strategies[node] = [strategies[0]]
+
+        group_strategies = get_combined_strategies(sublayer, node_to_strategies)
+
+        strategy = group_strategies[0]
+        if verbose:
+            print("Combined Strategy:")
+            print(strategy.sub_strategies)
+            sublayer.print_strategy(strategy)
+            print("Score: ", strategy.get_score())
+
+        sublayer.in_state._consistency_check()
+        sublayer.out_state._consistency_check()
+        sublayer.apply_skip_allocation(strategy)
+        sublayer.in_state._consistency_check()
+        sublayer.out_state._consistency_check()
+
+        sublayer.apply_strategy(strategy)
+        sublayer.in_state._consistency_check()
+        sublayer.out_state._consistency_check()
+
+        if sublayer == layer.ffn:
+            layer.attn.out_state.update_from(layer.ffn.in_state)
+        if verbose:
+            sublayer.in_state.print("Sublayer Final Input")
 
 
 def compile_network(
@@ -46,63 +95,9 @@ def compile_network(
     needed_nodes = get_ancestor_nodes({output_node})
 
     for layer_cnt in range(MAX_LAYERS):
-        for sublayer_type in ["ffn", "attn"]:
-            sublayer: Union[FFNSubLayer, AttnSubLayer]
-            if sublayer_type == "ffn":
-                sublayer = layer.ffn
-            elif sublayer_type == "attn":
-                sublayer = layer.attn
-            else:
-                assert False
-
-            if verbose:
-                print(f"\n\nCompiling layer {layer_cnt} {sublayer_type}")
-                sublayer.out_state.print(f"Sublayer {sublayer_type} Output")
-                sublayer.in_state.print(f"Sublayer {sublayer_type} Starting Input")
-                print("\n\n")
-
-            to_compile_nodes = sublayer.out_state.get_nodes()
-
-            group_strategies = get_combined_strategies(
-                {node: sublayer.get_strategies(node) for node in to_compile_nodes}
-            )
-
-            strategy = group_strategies[0]
-            print("Combined Strategy:")
-            print(strategy.sub_strategies)
-            sublayer.print_strategy(strategy)
-            print("Score: ", strategy.get_score())
-
-            sublayer.in_state._consistency_check()
-            sublayer.out_state._consistency_check()
-            sublayer.apply_skip_allocation(strategy)
-            sublayer.in_state._consistency_check()
-            sublayer.out_state._consistency_check()
-
-            sublayer.apply_strategy(strategy)
-            sublayer.in_state._consistency_check()
-            sublayer.out_state._consistency_check()
-
-            if sublayer == layer.ffn:
-                print("Connecting attn.out_state from layer.ffn.in_state")
-                layer.attn.out_state.update_from(layer.ffn.in_state)
-            sublayer.in_state.print("Sublayer Input")
-            sublayer.out_state.print("Sublayer Output")
-
+        compile_layer(layer, verbose)
         if layer.ffn.out_state.get_nodes() == layer.attn.in_state.get_nodes():
-            import pdb
-
-            pdb.set_trace()
             raise CompilationError("Could not compile network.")
-        else:
-            print(
-                f"Nodes changed from {layer.ffn.out_state.get_nodes()} to {layer.attn.in_state.get_nodes()}"
-            )
-
-        if str(layer.ffn.out_state.get_nodes()) == str(layer.attn.in_state.get_nodes()):
-            import pdb
-
-            pdb.set_trace()
 
         if is_compilation_complete(layer):
             if verbose:
@@ -147,30 +142,61 @@ def compile_network(
 def compile_transformer(
     d: int,
     d_head: int,
-    output_node: Node,
+    unembedding: Unembedding,
+    pos_encoding: PosEncoding,
     report_name: str = "",
     verbose: bool = True,
     optimize: bool = True,
-    pos_encoding: Optional[PosEncoding] = None,
-):
+) -> Transformer:
     headless_net = compile_network(
         d=d,
         d_head=d_head,
-        output_node=output_node,
+        output_node=unembedding.inp,
         report_name=report_name,
         verbose=verbose,
         optimize=optimize,
         pos_encoding=pos_encoding,
     )
-    net = Transformer(headless_net)
+    net = Transformer(headless_net, unembedding.embedding.tokenizer)
 
-    in_nodes = net.headless_net.layers[0].attn.in_state.get_nodes()
-    strategies = []
-    for node in in_nodes:
-        node_strategies = net.embed.get_strategies(node)
-        if len(node_strategies) != 1:
-            raise CompilationError(f"Expected 1 strategy for {node}")
-        strategies.append(node_strategies[0])
+    # We need to update the input to have the same position as the output.
 
-    for stratey in strategies:
-        net.embed.apply_strategy(stratey)
+    # Get the nodes at the input to the transformer layer stack
+    in_state = net.headless_net.layers[0].attn.in_state
+    out_state = net.headless_net.layers[-1].ffn.out_state
+    net.pos_encoding.out_state.update_from(in_state)
+    net.embed.out_state.update_from(in_state)
+
+    # Compile the position encoding nodes
+    for node in in_state.get_nodes():
+        pos_encoding_strategies = net.pos_encoding.get_strategies(node)
+        embed_node_strategies = net.embed.get_strategies(node)
+        if len(pos_encoding_strategies):
+            net.pos_encoding.apply_strategy(pos_encoding_strategies[0])
+        elif len(embed_node_strategies):
+            net.embed.apply_strategy(embed_node_strategies[0])
+        else:
+            raise CompilationError(
+                "Unsupport node type at input to transformer layer stack."
+            )
+
+    # Check to see if input and output have the same allocation, as they must.
+    embed_node = next(
+        node for node in in_state.get_nodes() if isinstance(node, Embedding)
+    )
+    out_node = unembedding.inp
+    if in_state.get_node_indices(embed_node) != out_state.get_node_indices(out_node):
+        raise CompilationError("Input and output node must have the same allocation.")
+        # # Rewire
+        # layer = net.headless_net.add_layer(end=True)
+        # layer.attn.in_state.copy_from(out_state)
+        # # FIXME FIXME FIXME -- implement the rewrite here?
+        # from_indices = out_state.get_node_indices(out_node)
+        # to_indices = in_state.get_node_indices(embed_node)
+        # for from_idx, to_idx in zip(from_indices, to_indices):
+        #
+        #
+        # layer.ffn.in_state.copy_from(layer.attn.out_state)
+        # layer.ffn.out_state.copy_from(layer.attn.out_state)
+
+    return net

@@ -40,25 +40,21 @@ class EmbeddingLayerComponent(Component):
         return f"EmbeddingLayerComponent()"
 
     def get_strategies(self, node: Node) -> List[NodeComponentStrategy]:
-        strategies: List[NodeComponentStrategy] = []
-
         # If the node is embedding, we can compile it!
         if isinstance(node, Embedding):
-            strategies.append(
+            return [
                 EmbeddingNodeComponentStrategy(
                     out_node=node,
                 )
-            )
+            ]
         elif isinstance(node, Constant):
-            strategies.append(
+            return [
                 EmbeddingConstantNodeComponentStrategy(
                     out_node=node,
                 )
-            )
+            ]
         else:
-            raise Exception(f"Unsupport node type for embedding layer: {type(node)}")
-
-        return strategies
+            return []
 
     def apply_strategy(self, strategy: NodeComponentStrategy):
         assert self.out_state.has_node(
@@ -67,8 +63,9 @@ class EmbeddingLayerComponent(Component):
         out_indices = self.out_state.get_node_indices(strategy.out_node)
 
         if isinstance(strategy, EmbeddingNodeComponentStrategy):
+            vocab_len = self.output_matrix.shape[0]
             for j, out_idx in enumerate(out_indices):
-                self.output_matrix[out_idx] = strategy.output_matrix[j]
+                self.output_matrix[:, out_idx] = strategy.output_matrix[:vocab_len, j]
         elif isinstance(strategy, EmbeddingConstantNodeComponentStrategy):
             for j, out_idx in enumerate(out_indices):
                 self.output_matrix[:, out_idx] = strategy.value[j]
