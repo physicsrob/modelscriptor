@@ -4,31 +4,31 @@ import torch
 
 from modelscriptor.compiler.components.attn import AttnLayerComponent
 from modelscriptor.compiler.components.skip import SkipLayerComponent
+from modelscriptor.compiler.feature_assignment import (
+    FeatureAssignmentConstraints,
+    FeatureAssignment,
+)
 from modelscriptor.compiler.groups.group import Group
 from modelscriptor.compiler.groups.strategy import (
     GroupStrategy,
     get_sequential_placement_strategies,
 )
-from modelscriptor.compiler.res_state import ResState
 from modelscriptor.graph import Node, PosEncoding
 
 
 class AttnSubLayer(Group):
     attn: AttnLayerComponent
     skip: SkipLayerComponent
-    in_state: ResState
-    out_state: ResState
 
     def __init__(
-        self, d: int, d_head: int = 64, pos_encoding: Optional[PosEncoding] = None
+        self,
+        d: int,
+        d_head: int,
+        pos_encoding: Optional[PosEncoding] = None,
     ):
         super().__init__(d)
         self.attn = AttnLayerComponent(d, d_head, pos_encoding)
         self.skip = SkipLayerComponent(d)
-        self.out_state = self.skip.out_state
-        self.in_state = self.skip.skip_state
-        self.attn.in_state.link(self.in_state)
-        self.attn.out_state.link(self.skip.in_state)
 
     def print_strategy(self, strategy: GroupStrategy):
         strategy.print(
@@ -42,18 +42,24 @@ class AttnSubLayer(Group):
         )
         return strategies
 
-    def apply_pre_allocation(self, strategy: GroupStrategy):
-        for s in strategy.get_component_strategies(self.skip):
-            self.skip.apply_strategy(s)
+    def get_constraints(self, strategy: GroupStrategy) -> FeatureAssignmentConstraints:
+        constraints = strategy.get_constraints_for_strategy()
+        constraints.add_equivalency(self.in_state, self.attn.in_state)
+        constraints.add_equivalency(self.in_state, self.skip.skip_state)
+        constraints.add_equivalency(self.out_state, self.skip.out_state)
+        constraints.add_equivalency(self.attn.out_state, self.skip.in_state)
+        return constraints
 
-    def apply_strategy(self, strategy: GroupStrategy):
+    def apply_strategy(
+        self, feature_assignment: FeatureAssignment, strategy: GroupStrategy
+    ):
         # Apply all skip strategies
         for s in strategy.get_component_strategies(self.skip):
-            self.skip.apply_strategy(s)
+            self.skip.apply_strategy(feature_assignment, s)
 
         # Apply all attention strategies
         for s in strategy.get_component_strategies(self.attn):
-            self.attn.apply_strategy(s)
+            self.attn.apply_strategy(feature_assignment, s)
 
     def forward(self, inp: torch.Tensor, return_states=False):
         """
@@ -96,11 +102,3 @@ class AttnSubLayer(Group):
         self.attn.resize(new_d)
         self.in_state.resize(new_d)
         self.out_state.resize(new_d)
-
-    def get_min_width(self):
-        return max(
-            self.attn.get_min_width(),
-            self.skip.get_min_width(),
-            self.in_state.get_min_width(),
-            self.out_state.get_min_width(),
-        )

@@ -3,6 +3,10 @@ from typing import Set, Dict, List, NamedTuple
 import torch
 
 from modelscriptor.compiler.components.component import NodeComponentStrategy, Component
+from modelscriptor.compiler.feature_assignment import (
+    FeatureAssignmentConstraints,
+    FeatureAssignment,
+)
 from modelscriptor.graph import Node, Concatenate, Linear, Constant
 from modelscriptor.graph.misc import Placeholder
 
@@ -78,17 +82,17 @@ class LinearLayerComponent(Component):
 
         return strategies
 
-    def apply_strategy(self, strategy: NodeComponentStrategy):
+    def apply_strategy(
+        self, feature_assignment: FeatureAssignment, strategy: NodeComponentStrategy
+    ):
         assert isinstance(strategy, LinearNodeComponentStrategy)
-        assert self.out_state.has_node_indices(
-            strategy.out_node
-        ), "Strategy applied before output allocated"
         in_node = strategy.in_nodes[0]
-        self.in_state.allocate_node(in_node)
 
         # Copy the matrix
-        in_indices = self.in_state.get_node_indices(in_node)
-        out_indices = self.out_state.get_node_indices(strategy.out_node)
+        in_indices = feature_assignment.get_node_indices(self.in_state, in_node)
+        out_indices = feature_assignment.get_node_indices(
+            self.out_state, strategy.out_node
+        )
 
         for i, in_idx in enumerate(in_indices):
             for j, out_idx in enumerate(out_indices):

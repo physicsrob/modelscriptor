@@ -3,6 +3,10 @@ from typing import Set, Dict, List, NamedTuple
 import torch
 
 from modelscriptor.compiler.components.component import NodeComponentStrategy, Component
+from modelscriptor.compiler.feature_assignment import (
+    FeatureAssignmentConstraints,
+    FeatureAssignment,
+)
 from modelscriptor.graph import Node, Concatenate, Linear, Constant, Embedding
 from modelscriptor.graph.misc import Placeholder
 
@@ -56,11 +60,12 @@ class EmbeddingLayerComponent(Component):
         else:
             return []
 
-    def apply_strategy(self, strategy: NodeComponentStrategy):
-        assert self.out_state.has_node_indices(
-            strategy.out_node
-        ), "Strategy applied before output allocated"
-        out_indices = self.out_state.get_node_indices(strategy.out_node)
+    def apply_strategy(
+        self, feature_assignment: FeatureAssignment, strategy: NodeComponentStrategy
+    ):
+        out_indices = feature_assignment.get_node_indices(
+            self.out_state, strategy.out_node
+        )
 
         if isinstance(strategy, EmbeddingNodeComponentStrategy):
             vocab_len = self.output_matrix.shape[0]
@@ -94,6 +99,3 @@ class EmbeddingLayerComponent(Component):
     def resize(self, new_d):
         self.d = new_d
         self.output_matrix = self.output_matrix[:, :new_d]
-
-    def get_min_width(self):
-        return self.out_state.get_min_width()

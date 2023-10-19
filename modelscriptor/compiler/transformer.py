@@ -7,6 +7,7 @@ from modelscriptor.compiler.components.pos_encoding import PosEncodingLayerCompo
 from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
+from modelscriptor.compiler.res_state import NetworkResidualState
 from modelscriptor.graph import Node, Constant, InputNode, PosEncoding
 from modelscriptor.graph.embedding import Tokenizer
 
@@ -16,23 +17,37 @@ class HeadlessTransformer:
     d: int
     d_head: int
     pos_encoding: Optional[PosEncoding]
+    network_res_state: NetworkResidualState
 
-    def __init__(self, d: int, d_head: int, pos_encoding: Optional[PosEncoding] = None):
+    def __init__(
+        self,
+        d: int,
+        d_head: int,
+        network_res_state: NetworkResidualState,
+        pos_encoding: Optional[PosEncoding] = None,
+    ):
         self.d = d
         self.d_head = d_head
+        self.network_res_state = network_res_state
         self.pos_encoding = pos_encoding
         self.layers = []
 
     def add_layer(self, end: bool = False) -> TransformerLayer:
-        layer = TransformerLayer(self.d, self.d_head, self.pos_encoding)
+        layer = TransformerLayer(
+            self.d, self.d_head, self.network_res_state, self.pos_encoding
+        )
         if not end:
             self.layers = [layer] + self.layers
             if len(self.layers) > 1:
-                self.layers[0].ffn.out_state.link(self.layers[1].attn.in_state)
+                self.network_res_state.link_refs(
+                    self.layers[0].ffn.out_state, self.layers[1].attn.in_state
+                )
         else:
             self.layers.append(layer)
             if len(self.layers) > 1:
-                self.layers[-2].ffn.out_state.link(self.layers[-1].attn.in_state)
+                self.network_res_state.link_refs(
+                    self.layers[-2].ffn.out_state, self.layers[-1].attn.in_state
+                )
         return layer
 
     def get_input_res_stream(self, n_pos: int, input_values: Dict[str, torch.Tensor]):

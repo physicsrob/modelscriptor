@@ -3,9 +3,11 @@ from typing import Set, Dict, List, NamedTuple, Optional
 import torch
 from torch.nn import functional as F
 
-from modelscriptor.graph import Node, Concatenate, Linear, Constant, Attn, PosEncoding
+from modelscriptor.compiler.feature_assignment import (
+    FeatureAssignment,
+)
+from modelscriptor.graph import Node, Linear, Constant, Attn, PosEncoding
 from modelscriptor.compiler.components.component import NodeComponentStrategy, Component
-from modelscriptor.graph.misc import Placeholder
 from modelscriptor.graph.pos_encoding import attention_hardness
 
 
@@ -79,7 +81,12 @@ class AttnLayerComponent(Component):
     used_heads: int
     pos_encoding: Optional[PosEncoding]
 
-    def __init__(self, d: int, d_head: int, pos_encoding: Optional[PosEncoding]):
+    def __init__(
+        self,
+        d: int,
+        d_head: int,
+        pos_encoding: Optional[PosEncoding],
+    ):
         super().__init__(d)
         assert (d % d_head) == 0, "Invalid combination of d and d_head"
         self.d_head = d_head
@@ -169,7 +176,9 @@ class AttnLayerComponent(Component):
             )
         return strategies
 
-    def apply_strategy(self, strategy: NodeComponentStrategy):
+    def apply_strategy(
+        self, feature_assignment: FeatureAssignment, strategy: NodeComponentStrategy
+    ):
         if isinstance(strategy, AttnNodeComponentZeroStrategy):
             # Apply zero strategy.
             # This is a noop because the output matrices are already initialized to zero.
@@ -177,23 +186,24 @@ class AttnLayerComponent(Component):
             return
 
         assert isinstance(strategy, AttnNodeComponentStrategy)
-        assert self.out_state.has_node_indices(
-            strategy.out_node
-        ), "Strategy applied before output allocated"
         if self.used_heads >= self.n_heads:
             assert False, "Ran out of heads to apply strategy"
         n_head = self.used_heads
         self.used_heads += 1
 
-        # Allocate the input nodes
-        for node in strategy.in_nodes:
-            self.in_state.allocate_node(node)
-
         # Copy the matrices
-        query_in_indices = self.in_state.get_node_indices(strategy.query_in)
-        key_in_indices = self.in_state.get_node_indices(strategy.key_in)
-        value_in_indices = self.in_state.get_node_indices(strategy.value_in)
-        out_indices = self.out_state.get_node_indices(strategy.out_node)
+        query_in_indices = feature_assignment.get_node_indices(
+            self.in_state, strategy.query_in
+        )
+        key_in_indices = feature_assignment.get_node_indices(
+            self.in_state, strategy.key_in
+        )
+        value_in_indices = feature_assignment.get_node_indices(
+            self.in_state, strategy.value_in
+        )
+        out_indices = feature_assignment.get_node_indices(
+            self.out_state, strategy.out_node
+        )
 
         # Copy the query matrix from the strategy (d_query_in, d_head) to self.query_matrix (n_head, d_query_in, d_head)
         for i, in_idx in enumerate(query_in_indices):
@@ -257,14 +267,3 @@ class AttnLayerComponent(Component):
             + self.value_matrix.numel()
             + self.output_matrix.numel()
         )
-
-    def resize(self, new_d):
-        self.n_heads = new_d // self.d_head
-        self.query_matrix = self.query_matrix[: self.n_heads, :new_d, :]
-        self.key_matrix = self.key_matrix[: self.n_heads, :new_d, :]
-        self.value_matrix = self.value_matrix[: self.n_heads, :new_d, :]
-        self.output_matrix = self.output_matrix[: self.n_heads, :, :new_d]
-        super().resize(new_d)
-
-    def get_min_width(self):
-        return max(self.d_head * self.used_heads, super().get_min_width())

@@ -5,9 +5,12 @@ import torch
 from modelscriptor.compiler.components.linear import LinearLayerComponent
 from modelscriptor.compiler.components.relu import ReLULayerComponent
 from modelscriptor.compiler.components.skip import SkipLayerComponent
+from modelscriptor.compiler.feature_assignment import (
+    FeatureAssignmentConstraints,
+    FeatureAssignment,
+)
 from modelscriptor.compiler.groups.group import Group, GroupStrategy
 from modelscriptor.compiler.groups.strategy import get_sequential_placement_strategies
-from modelscriptor.compiler.res_state import ResState
 from modelscriptor.graph import Node, Add
 
 
@@ -16,33 +19,16 @@ class FFNSubLayer(Group):
     relu: ReLULayerComponent
     linear2: LinearLayerComponent
     skip: SkipLayerComponent
-    in_state: ResState
-    out_state: ResState
 
-    def __init__(self, d: int):
+    def __init__(
+        self,
+        d: int,
+    ):
         super().__init__(d)
         self.linear1 = LinearLayerComponent(d)
         self.relu = ReLULayerComponent(d)
         self.linear2 = LinearLayerComponent(d)
         self.skip = SkipLayerComponent(d)
-        self.out_state = self.skip.out_state
-        self.in_state = self.linear1.in_state
-        self.relu.in_state.link(self.linear1.out_state)
-        self.linear2.in_state.link(self.relu.out_state)
-        self.skip.skip_state.link(self.in_state)
-        self.skip.in_state.link(self.linear2.out_state)
-
-    def print(self):
-        print("FFNSubLayer")
-        self.linear2.out_state.print("linear2 out")
-        self.linear2.in_state.print("linear2 in")
-        self.relu.out_state.print("relu out")
-        self.relu.in_state.print("relu in")
-        self.linear1.out_state.print("linear1 out")
-        self.linear1.in_state.print("linear1 in")
-        self.skip.in_state.print("skip in")
-        self.skip.skip_state.print("skip skip_in")
-        self.skip.out_state.print("skip out")
 
     def print_strategy(self, strategy: GroupStrategy):
         strategy.print(
@@ -56,26 +42,34 @@ class FFNSubLayer(Group):
         )
         return strategies
 
-    def apply_pre_allocation(self, strategy: GroupStrategy):
-        for s in strategy.get_component_strategies(self.skip):
-            self.skip.apply_strategy(s)
+    def get_constraints(self, strategy: GroupStrategy) -> FeatureAssignmentConstraints:
+        constraints = strategy.get_constraints_for_strategy()
+        constraints.add_equivalency(self.in_state, self.linear1.in_state)
+        constraints.add_equivalency(self.linear1.out_state, self.relu.in_state)
+        constraints.add_equivalency(self.relu.out_state, self.linear2.in_state)
+        constraints.add_equivalency(self.linear2.out_state, self.skip.in_state)
+        constraints.add_equivalency(self.skip.skip_state, self.in_state)
+        constraints.add_equivalency(self.skip.out_state, self.out_state)
+        return constraints
 
-    def apply_strategy(self, strategy: GroupStrategy):
+    def apply_strategy(
+        self, feature_assignment: FeatureAssignment, strategy: GroupStrategy
+    ):
         # Apply all skip strategies
         for s in strategy.get_component_strategies(self.skip):
-            self.skip.apply_strategy(s)
+            self.skip.apply_strategy(feature_assignment, s)
 
         # Apply all linear2 strategies
         for s in strategy.get_component_strategies(self.linear2):
-            self.linear2.apply_strategy(s)
+            self.linear2.apply_strategy(feature_assignment, s)
 
         # Apply relu strategies
         for s in strategy.get_component_strategies(self.relu):
-            self.relu.apply_strategy(s)
+            self.relu.apply_strategy(feature_assignment, s)
 
         # Apply linear1 strategies
         for s in strategy.get_component_strategies(self.linear1):
-            self.linear1.apply_strategy(s)
+            self.linear1.apply_strategy(feature_assignment, s)
 
     def forward(self, inp: torch.Tensor, return_states=False):
         """
@@ -125,13 +119,3 @@ class FFNSubLayer(Group):
         self.skip.resize(new_d)
         self.in_state.resize(new_d)
         self.out_state.resize(new_d)
-
-    def get_min_width(self):
-        return max(
-            self.linear1.get_min_width(),
-            self.linear2.get_min_width(),
-            self.relu.get_min_width(),
-            self.skip.get_min_width(),
-            self.in_state.get_min_width(),
-            self.out_state.get_min_width(),
-        )

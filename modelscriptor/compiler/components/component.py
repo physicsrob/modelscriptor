@@ -3,7 +3,11 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from modelscriptor.compiler.res_state import ResState
+from modelscriptor.compiler.feature_assignment import (
+    ResidualStreamState,
+    FeatureAssignmentConstraints,
+    FeatureAssignment,
+)
 from modelscriptor.graph import Node, Concatenate, Linear
 
 
@@ -27,25 +31,29 @@ T = TypeVar("T", bound=NodeComponentStrategy)
 
 class Component(Generic[T], ABC):
     d: int
-    in_state: ResState
-    out_state: ResState
+    in_state: ResidualStreamState
+    out_state: ResidualStreamState
 
-    def __init__(self, d):
+    def __init__(self, d: int):
         self.d = d
-        self.in_state = ResState(d)
-        self.out_state = ResState(d)
-
-    def print(self):
-        print(f"{repr(self)}")
-        self.in_state.print("in ")
-        self.out_state.print("in ")
+        self.in_state = ResidualStreamState()
+        self.out_state = ResidualStreamState()
 
     @abstractmethod
     def get_strategies(self, node: Node) -> List[T]:
         ...
 
+    def get_constraints_for_strategy(
+        self, strategy: NodeComponentStrategy
+    ) -> FeatureAssignmentConstraints:
+        constraints = FeatureAssignmentConstraints()
+        constraints.add_node_to_state(strategy.out_node, self.out_state)
+        for node in strategy.in_nodes:
+            constraints.add_node_to_state(node, self.in_state)
+        return constraints
+
     @abstractmethod
-    def apply_strategy(self, strategy: T):
+    def apply_strategy(self, feature_assignment: FeatureAssignment, strategy: T):
         ...
 
     @abstractmethod
@@ -54,8 +62,3 @@ class Component(Generic[T], ABC):
 
     def resize(self, new_d):
         self.d = new_d
-        self.in_state.resize(new_d)
-        self.out_state.resize(new_d)
-
-    def get_min_width(self):
-        return max(self.in_state.get_min_width(), self.out_state.get_min_width())

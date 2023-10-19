@@ -2,6 +2,10 @@ from typing import Set, Dict, List, NamedTuple
 
 import torch
 
+from modelscriptor.compiler.feature_assignment import (
+    FeatureAssignmentConstraints,
+    FeatureAssignment,
+)
 from modelscriptor.graph import Node, Concatenate, Linear, ReLU
 from modelscriptor.compiler.components.component import NodeComponentStrategy, Component
 
@@ -39,12 +43,23 @@ class ReLULayerComponent(Component):
             # No strategy for non-relu
             return []
 
-    def apply_strategy(self, strategy: NodeComponentStrategy):
-        assert self.out_state.has_node_indices(
-            strategy.out_node
-        ), "Strategy applied before output allocated"
+    def get_constraints_for_strategy(self, strategy: NodeComponentStrategy):
         in_node = strategy.in_nodes[0]
-        self.in_state.connect_allocation(self.out_state, strategy.out_node, in_node)
+        out_node = strategy.out_node
+
+        constraints = FeatureAssignmentConstraints()
+        constraints.add_node_to_state(out_node, self.out_state)
+        constraints.add_node_to_state(in_node, self.in_state)
+
+        constraints.add_shared_features_constraint(
+            self.in_state, in_node, self.out_state, strategy.out_node
+        )
+        return constraints
+
+    def apply_strategy(
+        self, feature_assignment: FeatureAssignment, strategy: NodeComponentStrategy
+    ):
+        pass
 
     def forward(self, inp: torch.Tensor):
         return torch.clamp(inp, min=0)
