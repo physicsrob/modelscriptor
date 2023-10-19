@@ -3,6 +3,7 @@ from typing import Set, List, Tuple, Dict, Any
 
 from modelscriptor.compiler.components.component import Component, NodeComponentStrategy
 from modelscriptor.compiler.components.skip import SkipNodeComponentStrategy
+from modelscriptor.compiler.feature_assignment import FeatureAssignmentConstraints
 from modelscriptor.compiler.utils import get_ancestor_nodes
 from modelscriptor.graph import Node, Concatenate, PosEncoding, Embedding
 from modelscriptor.graph.misc import Placeholder, InputNode, Constant
@@ -28,6 +29,7 @@ class GroupStrategy:
     def place_node(
         self, layer_component: Component, node: Node, strategy: NodeComponentStrategy
     ):
+        # Only called for single layer groupstrategies
         self.sub_strategies.append((layer_component, node, strategy))
         self.dependent_nodes |= set(strategy.in_nodes)
         if isinstance(strategy, SkipNodeComponentStrategy):
@@ -37,6 +39,12 @@ class GroupStrategy:
         self, component: Component
     ) -> List[NodeComponentStrategy]:
         return [s for c, n, s in self.sub_strategies if c == component]
+
+    def get_constraints_for_strategy(self):
+        constraints = []
+        for c, n, s in self.sub_strategies:
+            constraints.append(c.get_constraints_for_strategy(s))
+        return FeatureAssignmentConstraints.merge(constraints)
 
     def get_represented_nodes(self) -> Set[Node]:
         result = set()
@@ -97,8 +105,6 @@ def get_combined_strategies(node_to_strategies: Dict[Node, List[GroupStrategy]])
     # which are the combination of all strategies for each node.
     # For example, if node1 has strategies [s1, s2] and node2 has strategies [s3, s4], this
     # function will return [s1 + s3, s1 + s4, s2 + s3, s2 + s4]
-    # for k, v in node_to_strategies:
-    #     print(k, v)
 
     combined_strategies = []
 

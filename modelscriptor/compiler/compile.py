@@ -6,6 +6,7 @@ from modelscriptor.compiler.groups.strategy import (
     get_combined_strategies,
     GroupStrategy,
 )
+from modelscriptor.compiler.res_state import NetworkResidualState
 from modelscriptor.compiler.utils import get_ancestor_nodes
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
 from modelscriptor.compiler.report import make_report
@@ -43,10 +44,6 @@ def compile_layer(layer: TransformerLayer, verbose: bool = False):
             sublayer = layer.attn
         else:
             assert False
-
-        if verbose:
-            sublayer.out_state.print(f"Sublayer {sublayer_type} Output")
-            sublayer.in_state.print(f"Sublayer {sublayer_type} Starting Input")
 
         to_compile_nodes = sublayer.out_state.get_nodes_with_indices()
 
@@ -87,6 +84,8 @@ def compile_network(
     pos_encoding: Optional[PosEncoding] = None,
 ) -> HeadlessTransformer:
     # Start with the first layer and try to compile as much as possible.
+
+    network_res_state = NetworkResidualState(d)
 
     net = HeadlessTransformer(d, d_head, pos_encoding)
 

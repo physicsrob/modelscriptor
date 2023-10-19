@@ -3,6 +3,7 @@ from typing import List, Optional
 import torch
 
 from modelscriptor.compiler.components.component import NodeComponentStrategy, Component
+from modelscriptor.compiler.feature_assignment import FeatureAssignment
 from modelscriptor.graph import Node, PosEncoding
 
 
@@ -41,11 +42,12 @@ class PosEncodingLayerComponent(Component):
 
         return strategies
 
-    def apply_strategy(self, strategy: NodeComponentStrategy):
-        assert self.out_state.has_node_indices(
-            strategy.out_node
-        ), "Strategy applied before output allocated"
-        out_indices = self.out_state.get_node_indices(strategy.out_node)
+    def apply_strategy(
+        self, feature_assignment: FeatureAssignment, strategy: NodeComponentStrategy
+    ):
+        out_indices = feature_assignment.get_node_indices(
+            self.out_state, strategy.out_node
+        )
 
         if isinstance(strategy, PosEncodingNodeComponentStrategy):
             self.pos_encoding = strategy.out_node
@@ -68,6 +70,3 @@ class PosEncodingLayerComponent(Component):
 
     def resize(self, new_d):
         self.d = new_d
-
-    def get_min_width(self):
-        return max(self.out_indices) + 1
