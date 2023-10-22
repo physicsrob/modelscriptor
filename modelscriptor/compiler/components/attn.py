@@ -82,12 +82,9 @@ class AttnLayerComponent(Component):
     pos_encoding: Optional[PosEncoding]
 
     def __init__(
-        self,
-        d: int,
-        d_head: int,
-        pos_encoding: Optional[PosEncoding],
+        self, d: int, d_head: int, pos_encoding: Optional[PosEncoding], name: str = ""
     ):
-        super().__init__(d)
+        super().__init__(d, name)
         assert (d % d_head) == 0, "Invalid combination of d and d_head"
         self.d_head = d_head
         self.n_heads = d // d_head
@@ -100,7 +97,7 @@ class AttnLayerComponent(Component):
         self.output_matrix = torch.zeros(self.n_heads, d_head, d)
 
     def __repr__(self):
-        return f"AttnLayerComponent()"
+        return f"AttnLayerComponent(name='{self.name}')"
 
     def get_strategies(self, node: Node) -> List[NodeComponentStrategy]:
         strategies: List[NodeComponentStrategy] = []

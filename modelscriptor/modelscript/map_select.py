@@ -121,4 +121,5 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
         input_bias=input_bias,
         output_proj=output_proj,
         output_bias=output_bias,
+        name="select",
     )

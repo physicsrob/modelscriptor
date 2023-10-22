@@ -4,11 +4,11 @@ import torch
 
 from modelscriptor.compiler.components.embedding import EmbeddingLayerComponent
 from modelscriptor.compiler.components.pos_encoding import PosEncodingLayerComponent
+from modelscriptor.compiler.feature_assignment import FeatureAssignment
 from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
-from modelscriptor.compiler.res_state import NetworkResidualState
-from modelscriptor.graph import Node, Constant, InputNode, PosEncoding
+from modelscriptor.graph import Node, Constant, InputNode, PosEncoding, Concatenate
 from modelscriptor.graph.embedding import Tokenizer
 
 
@@ -17,45 +17,39 @@ class HeadlessTransformer:
     d: int
     d_head: int
     pos_encoding: Optional[PosEncoding]
-    network_res_state: NetworkResidualState
+    feature_assignment: Optional[FeatureAssignment]
 
     def __init__(
         self,
         d: int,
         d_head: int,
-        network_res_state: NetworkResidualState,
         pos_encoding: Optional[PosEncoding] = None,
     ):
         self.d = d
         self.d_head = d_head
-        self.network_res_state = network_res_state
         self.pos_encoding = pos_encoding
         self.layers = []
+        self.feature_assignment = None
 
     def add_layer(self, end: bool = False) -> TransformerLayer:
-        layer = TransformerLayer(
-            self.d, self.d_head, self.network_res_state, self.pos_encoding
-        )
+        layer = TransformerLayer(self.d, self.d_head, self.pos_encoding)
         if not end:
             self.layers = [layer] + self.layers
-            if len(self.layers) > 1:
-                self.network_res_state.link_refs(
-                    self.layers[0].ffn.out_state, self.layers[1].attn.in_state
-                )
         else:
             self.layers.append(layer)
-            if len(self.layers) > 1:
-                self.network_res_state.link_refs(
-                    self.layers[-2].ffn.out_state, self.layers[-1].attn.in_state
-                )
         return layer
 
-    def get_input_res_stream(self, n_pos: int, input_values: Dict[str, torch.Tensor]):
+    def get_input_res_stream(
+        self,
+        n_pos: int,
+        input_values: Dict[str, torch.Tensor],
+    ):
+        assert self.feature_assignment
         in_state = self.layers[0].attn.in_state
         res_stream = torch.zeros((n_pos, self.d))
 
-        for node in in_state.get_nodes_with_indices():
-            indices = in_state.get_node_indices(node)
+        for node in self.feature_assignment.get_nodes(in_state):
+            indices = self.feature_assignment.get_node_indices(in_state, node)
             if isinstance(node, Constant):
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = node.value[i]
@@ -68,6 +62,9 @@ class HeadlessTransformer:
                 encoding = node.get_pos_encoding(n_pos)
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = encoding[:, i]
+            elif isinstance(node, Concatenate):
+                # This is a noop since the input node are guaranteed to be here too.
+                pass
             else:
                 assert False, "Unsupported node type"
         return res_stream
@@ -115,12 +112,14 @@ class HeadlessTransformer:
     def compute(
         self, n_pos: int, input_values: Dict[str, torch.Tensor]
     ) -> Dict[Node, torch.Tensor]:
+        assert self.feature_assignment
+
         res = self.forward(self.get_input_res_stream(n_pos, input_values))
         result = {}
         out_state = self.layers[-1].ffn.out_state
 
-        for node in out_state.get_nodes_with_indices():
-            indices = out_state.get_node_indices(node)
+        for node in self.feature_assignment.get_nodes(out_state):
+            indices = self.feature_assignment.get_node_indices(out_state, node)
             result[node] = res[:, indices]
         return result
 
@@ -140,8 +139,8 @@ class Transformer:
         self.embed = EmbeddingLayerComponent(headless_net.d, len(tokenizer))
         self.pos_encoding = PosEncodingLayerComponent(headless_net.d)
         self.tokenizer = tokenizer
-        self.embed.out_state.link(self.headless_net.layers[0].attn.in_state)
-        self.pos_encoding.out_state.link(self.headless_net.layers[0].attn.in_state)
+        # self.embed.out_state.link(self.headless_net.layers[0].attn.in_state)
+        # self.pos_encoding.out_state.link(self.headless_net.layers[0].attn.in_state)
 
     def forward(self, inp: torch.Tensor, return_states=False):
         """

@@ -1,32 +1,38 @@
 import os
 from datetime import datetime
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 from modelscriptor.compiler.components.component import Component
 from modelscriptor.compiler.components.skip import SkipLayerComponent
+from modelscriptor.compiler.feature_assignment import (
+    ResidualStreamState,
+    FeatureAssignment,
+)
 from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
-from modelscriptor.compiler.res_state import ResState
 from jinja2 import Environment, FileSystemLoader
 from jinja2 import Environment, FileSystemLoader
 
 from modelscriptor.compiler.transformer import HeadlessTransformer
-from modelscriptor.graph import Node
+from modelscriptor.graph import Node, Concatenate
 
 current_module_directory = os.path.dirname(os.path.abspath(__file__))
 template_directory = os.path.join(current_module_directory, "report_templates")
 
 
-def render_res_state(residual_state: ResState, name: str):
+def render_res_state(
+    feature_assignment: FeatureAssignment, state: ResidualStreamState, name: str, d: int
+):
     # Prepare node span data. Span is defined as (node, min_index, max_index).
     sorted_node_spans = [
         (
             node,
-            min(residual_state.get_node_indices(node)),
-            max(residual_state.get_node_indices(node)),
+            min(feature_assignment.get_node_indices(state, node)),
+            max(feature_assignment.get_node_indices(state, node)),
         )
-        for node in residual_state.get_nodes_with_indices()
+        for node in feature_assignment.get_nodes(state)
+        if not isinstance(node, Concatenate)
     ]
 
     # Sort spans by their starting index
@@ -44,16 +50,14 @@ def render_res_state(residual_state: ResState, name: str):
         last_span_end = end_idx
 
     # Add a final empty span if needed
-    if last_span_end < residual_state.d:
-        complete_spans.append((None, None, residual_state.d - last_span_end))
+    if last_span_end < d:
+        complete_spans.append((None, None, d - last_span_end))
 
     env = Environment(loader=FileSystemLoader(template_directory))
     template = env.get_template("res_state_template.html")
 
     # Populate and render the template
-    return template.render(
-        indices=list(range(residual_state.d)), node_spans=complete_spans, name=name
-    )
+    return template.render(indices=list(range(d)), node_spans=complete_spans, name=name)
 
 
 def render_node(node: Node):
@@ -66,23 +70,33 @@ def render_node(node: Node):
     )
 
 
-def render_component(component: Component):
+def render_component(feature_assignment: FeatureAssignment, component: Component):
     env = Environment(loader=FileSystemLoader(template_directory))
     template = env.get_template("component_template.html")
 
     # Populate and render the template
     return template.render(
         component_name=repr(component),
-        in_state=render_res_state(component.in_state, name="Input"),
-        skip_state=render_res_state(component.skip_state, name="Skip")
+        in_state=render_res_state(
+            feature_assignment, component.in_state, name="Input", d=component.d
+        ),
+        skip_state=render_res_state(
+            feature_assignment, component.skip_state, name="Skip", d=component.d
+        )
         if isinstance(component, SkipLayerComponent)
         else None,
-        out_state=render_res_state(component.out_state, name="Output"),
-        nodes=[render_node(n) for n in component.out_state.get_nodes_with_indices()],
+        out_state=render_res_state(
+            feature_assignment, component.out_state, name="Output", d=component.d
+        ),
+        nodes=[
+            render_node(n) for n in feature_assignment.get_nodes(component.out_state)
+        ],
     )
 
 
-def render_ffn_layer(layer: FFNSubLayer, layer_idx: int):
+def render_ffn_layer(
+    feature_assignment: FeatureAssignment, layer: FFNSubLayer, layer_idx: int
+):
     env = Environment(loader=FileSystemLoader(template_directory))
 
     template = env.get_template("layer_template.html")
@@ -92,15 +106,21 @@ def render_ffn_layer(layer: FFNSubLayer, layer_idx: int):
         layer_index=layer_idx,
         layer_type="FFN",
         components=[
-            render_component(c)
+            render_component(feature_assignment, c)
             for c in [layer.linear1, layer.relu, layer.linear2, layer.skip]
         ],
-        in_state=render_res_state(layer.in_state, "Layer Input"),
-        out_state=render_res_state(layer.out_state, "Layer Output"),
+        in_state=render_res_state(
+            feature_assignment, layer.in_state, "Layer Input", d=layer.d
+        ),
+        out_state=render_res_state(
+            feature_assignment, layer.out_state, "Layer Output", d=layer.d
+        ),
     )
 
 
-def render_attn_layer(layer: AttnSubLayer, layer_idx: int):
+def render_attn_layer(
+    feature_assignment: FeatureAssignment, layer: AttnSubLayer, layer_idx: int
+):
     env = Environment(loader=FileSystemLoader(template_directory))
 
     template = env.get_template("layer_template.html")
@@ -109,9 +129,15 @@ def render_attn_layer(layer: AttnSubLayer, layer_idx: int):
     return template.render(
         layer_index=layer_idx,
         layer_type="Attention",
-        components=[render_component(c) for c in [layer.attn, layer.skip]],
-        in_state=render_res_state(layer.in_state, "Layer Input"),
-        out_state=render_res_state(layer.out_state, "Layer Output"),
+        components=[
+            render_component(feature_assignment, c) for c in [layer.attn, layer.skip]
+        ],
+        in_state=render_res_state(
+            feature_assignment, layer.in_state, "Layer Input", d=layer.d
+        ),
+        out_state=render_res_state(
+            feature_assignment, layer.out_state, "Layer Output", d=layer.d
+        ),
     )
 
 
@@ -147,13 +173,14 @@ def render_summary(network: HeadlessTransformer, output_node: Node):
 
 
 def render_network(network: HeadlessTransformer, output_node: Node):
+    assert network.feature_assignment
     env = Environment(loader=FileSystemLoader(template_directory))
     template = env.get_template("report_template.html")
 
     layers = []
     for i, l in enumerate(network.layers):
-        layers.append(render_attn_layer(l.attn, i))
-        layers.append(render_ffn_layer(l.ffn, i))
+        layers.append(render_attn_layer(network.feature_assignment, l.attn, i))
+        layers.append(render_ffn_layer(network.feature_assignment, l.ffn, i))
 
     summary = render_summary(network, output_node)
 

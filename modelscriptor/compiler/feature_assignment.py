@@ -4,27 +4,32 @@ from ortools.sat.python import cp_model  # type: ignore
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple, Union, Optional
 
+from modelscriptor.graph.misc import Placeholder
+
 global_state_id = 0
 
 
 class ResidualStreamState:
     state_id: int
+    name: str  # For debugging
 
-    def __init__(self):
+    def __init__(self, name: str = ""):
         global global_state_id
         self.state_id = global_state_id
+        self.name = name
         global_state_id += 1
+
+    def __repr__(self):
+        return f"ResidualStreamState({self.state_id}, name='{self.name}')"
 
 
 class FeatureAssignment:
     mapping: Dict[ResidualStreamState, Dict[Node, List[int]]]
 
-    def __init__(self):
-        self.mapping = {}
+    def __init__(self, states: Set[ResidualStreamState]):
+        self.mapping = {state: {} for state in states}
 
     def assign(self, state: ResidualStreamState, node: Node, indices: List[int]):
-        if state not in self.mapping:
-            self.mapping[state] = {}
         self.mapping[state][node] = indices
 
     def duplicate_state(self, src: ResidualStreamState, dst: ResidualStreamState):
@@ -33,8 +38,22 @@ class FeatureAssignment:
     def has_node(self, state: ResidualStreamState, node: Node) -> bool:
         return node in self.mapping[state]
 
+    def get_nodes(self, state: ResidualStreamState) -> Set[Node]:
+        return set(self.mapping.get(state, {}).keys())
+
     def get_node_indices(self, state: ResidualStreamState, node: Node) -> List[int]:
+        if isinstance(node, Placeholder):
+            return []
         return self.mapping[state][node]
+
+    def print(self, states: Optional[List[ResidualStreamState]] = None):
+        if not states:
+            states = sorted(self.mapping.keys(), key=lambda s: s.state_id)
+        print("Feature Assignment: ")
+        for state in states:
+            print(f" {state}")
+            for node in self.mapping[state]:
+                print(f" - {node} {self.mapping[state][node]}")
 
 
 def simplify_nodes(nodes: List[Node]) -> List[Node]:
@@ -43,6 +62,8 @@ def simplify_nodes(nodes: List[Node]) -> List[Node]:
     for n in nodes:
         if isinstance(n, Concatenate):
             simplified_other_nodes += simplify_nodes(n.inputs)
+        elif isinstance(n, Placeholder):
+            pass
         else:
             simplified_other_nodes.append(n)
     return simplified_other_nodes
@@ -61,11 +82,38 @@ class FeatureAssignmentConstraints:
         self._shared_feature_constraints = []
         self._equivalent = []
 
+    def print(self, states: Optional[List[ResidualStreamState]] = None):
+        consolidated = self.get_consolidated_constraints()
+        simplified = self.get_simplified_state_mapping()
+        state_to_nodes = consolidated["state_to_nodes"]
+        if not states:
+            states = sorted(state_to_nodes.keys(), key=lambda s: s.state_id)
+
+        print("Feature Assignment Constraints: ")
+        for state in states:
+            print(f" {state} Nodes:")
+            for node in state_to_nodes[simplified[state]]:
+                print(f"   - {node}")
+
+        groups = defaultdict(list)
+        for x1, x2 in simplified.items():
+            groups[x2].append(x1)
+
+        print("Equivalent States:")
+        for states in groups.values():
+            print("Group: ")
+            for s in states:
+                print(f"  - {s}")
+            print()
+
     def add_node_to_state(self, node: Node, state: ResidualStreamState):
+        if isinstance(node, Placeholder):
+            return
         self._state_to_nodes[state].add(node)
         if isinstance(node, Concatenate):
             simplified = simplify_nodes([node])
             self._state_to_nodes[state] |= set(simplified)
+            self.add_shared_features_constraint(state, node, state, simplified)
             self._shared_feature_constraints.append((state, [node], state, simplified))
 
     def add_shared_features_constraint(
@@ -79,13 +127,18 @@ class FeatureAssignmentConstraints:
             nodes1 = [nodes1]
         if not isinstance(nodes2, list):
             nodes2 = [nodes2]
+        for node in nodes1:
+            assert node in self._state_to_nodes[state1]
+        for node in nodes2:
+            assert node in self._state_to_nodes[state2]
 
         nodes1 = simplify_nodes(nodes1)
         nodes2 = simplify_nodes(nodes2)
         len1 = sum(len(n) for n in nodes1)
         len2 = sum(len(n) for n in nodes2)
         assert len1 == len2, f"Shared constraint of unequal lengths {len1} and {len2}"
-
+        assert all(n in self._state_to_nodes[state1] for n in nodes1)
+        assert all(n in self._state_to_nodes[state2] for n in nodes2)
         # Adds a constraint that when you concatenate the features from nodes1 in state1 together you will get the same features
         # as when you concatenate the features from nodes2 in state2.
         self._shared_feature_constraints.append((state1, nodes1, state2, nodes2))
@@ -95,14 +148,16 @@ class FeatureAssignmentConstraints:
         # In other words, they share the same nodes, and all nodes have the same indices.
         self._equivalent.append((state1, state2))
 
+    def get_all_states(self) -> Set[ResidualStreamState]:
+        states = {k for k in self._state_to_nodes.keys()}
+        states |= {s for s1, s2 in self._equivalent for s in (s1, s2)}
+        return states
+
     def get_simplified_state_mapping(
         self,
     ) -> Dict[ResidualStreamState, ResidualStreamState]:
-        states = {k for k in self._state_to_nodes.keys()}
-        states |= {s for s1, s2 in self._equivalent for s in (s1, s2)}
-
         # Build simplification of equivalents
-        simplification = {state: state for state in states}
+        simplification = {state: state for state in self.get_all_states()}
 
         for state1, state2 in self._equivalent:
             root_state1 = simplification[state1]
@@ -114,25 +169,29 @@ class FeatureAssignmentConstraints:
                         simplification[state] = root_state1
         return simplification
 
+    def is_equivalent(self, state1: ResidualStreamState, state2: ResidualStreamState):
+        simplification = self.get_simplified_state_mapping()
+        return simplification[state1] == simplification[state2]
+
     def get_consolidated_constraints(self):
         simplification = self.get_simplified_state_mapping()
 
-        for state1, state2 in self._equivalent:
-            root_state1 = simplification[state1]
-            root_state2 = simplification[state2]
+        state_to_nodes = defaultdict(set)
+        for state, nodes in self._state_to_nodes.items():
+            state_to_nodes[simplification[state]].update(nodes)
 
-            if root_state1 != root_state2:
-                for state, root_state in simplification.items():
-                    if root_state == root_state2:
-                        simplification[state] = root_state1
-
-        state_to_nodes = {
-            simplification[state]: node for state, node in self._state_to_nodes.items()
-        }
         shared_feature_constraints = [
             (simplification[state1], nodes1, simplification[state2], nodes2)
             for state1, nodes1, state2, nodes2 in self._shared_feature_constraints
         ]
+        for state1, nodes1, state2, nodes2 in shared_feature_constraints:
+            for node in nodes1:
+                if node not in state_to_nodes[state1]:
+                    breakpoint()
+                assert node in state_to_nodes[state1]
+            for node in nodes2:
+                assert node in state_to_nodes[state2]
+
         return {
             "state_to_nodes": state_to_nodes,
             "shared_feature_constraints": shared_feature_constraints,
@@ -179,14 +238,11 @@ class FeatureAssignmentConstraints:
 
         return True
 
-    @classmethod
-    def merge(cls, constraints: List["FeatureAssignmentConstraints"]):
-        result = cls()
-        for c in constraints:
-            result._state_to_nodes.update(c._state_to_nodes)
-            result._shared_feature_constraints.extend(c._shared_feature_constraints)
-            result._equivalent.extend(c._equivalent)
-        return result
+    def update(self, other: "FeatureAssignmentConstraints"):
+        for state, nodes in other._state_to_nodes.items():
+            self._state_to_nodes[state].update(nodes)
+        self._shared_feature_constraints.extend(other._shared_feature_constraints)
+        self._equivalent.extend(other._equivalent)
 
 
 def solve(
@@ -195,9 +251,9 @@ def solve(
     model = cp_model.CpModel()
     node_to_interval_var = {}
     end_feature_indices = []
-    consolidated_constriants = constraints.get_consolidated_constraints()
-    state_to_nodes = consolidated_constriants["state_to_nodes"]
-    shared_feature_constraints = consolidated_constriants["shared_feature_constraints"]
+    consolidated_constraints = constraints.get_consolidated_constraints()
+    state_to_nodes = consolidated_constraints["state_to_nodes"]
+    shared_feature_constraints = consolidated_constraints["shared_feature_constraints"]
 
     # Step 1: Define Interval Variables
     for state, nodes in state_to_nodes.items():
@@ -254,8 +310,11 @@ def solve(
 
     # Step 5: Define Objective
     max_end_var = model.NewIntVar(0, 1000, "")  # Adjust the upper limit as needed
-    for state, nodes in constraints._state_to_nodes.items():
+    for state, nodes in state_to_nodes.items():
         for node in nodes:
+            if (state, node) not in node_to_interval_var:
+                print(f"{(state,node)=} missing from node_to_interval_val")
+                breakpoint()
             model.Add(max_end_var >= node_to_interval_var[(state, node)].EndExpr())
     model.Minimize(max_end_var)
 
@@ -265,7 +324,7 @@ def solve(
 
     # Step 7: Populate Results
     if status == cp_model.FEASIBLE or status == cp_model.OPTIMAL:
-        result = FeatureAssignment()
+        result = FeatureAssignment(constraints.get_all_states())
         for state, nodes in state_to_nodes.items():
             for node in nodes:
                 interval_var = node_to_interval_var[(state, node)]

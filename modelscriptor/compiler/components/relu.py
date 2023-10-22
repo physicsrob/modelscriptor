@@ -29,11 +29,11 @@ class ReLUNodeComponentStrategy(NodeComponentStrategy):
 
 
 class ReLULayerComponent(Component):
-    def __init__(self, d: int):
-        super().__init__(d)
+    def __init__(self, d: int, name: str = ""):
+        super().__init__(d, name)
 
     def __repr__(self):
-        return f"ReLULayerComponent()"
+        return f"ReLULayerComponent(name='{self.name}')"
 
     def get_strategies(self, node: Node) -> List[NodeComponentStrategy]:
         if isinstance(node, ReLU):

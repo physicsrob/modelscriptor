@@ -33,11 +33,13 @@ class Component(Generic[T], ABC):
     d: int
     in_state: ResidualStreamState
     out_state: ResidualStreamState
+    name: str
 
-    def __init__(self, d: int):
+    def __init__(self, d: int, name: str = ""):
         self.d = d
-        self.in_state = ResidualStreamState()
-        self.out_state = ResidualStreamState()
+        self.name = name
+        self.in_state = ResidualStreamState(name=f"{self} in_state")
+        self.out_state = ResidualStreamState(name=f"{self} out_state")
 
     @abstractmethod
     def get_strategies(self, node: Node) -> List[T]:
@@ -50,6 +52,7 @@ class Component(Generic[T], ABC):
         constraints.add_node_to_state(strategy.out_node, self.out_state)
         for node in strategy.in_nodes:
             constraints.add_node_to_state(node, self.in_state)
+
         return constraints
 
     @abstractmethod

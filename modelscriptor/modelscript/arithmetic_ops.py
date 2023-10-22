@@ -28,7 +28,9 @@ def add_scalar(inp: Node, scalar: float) -> Node:
             input_bias=torch.zeros(1),
             output_proj=torch.tensor([0.0] * len(inp)),
             output_bias=torch.tensor([scalar] * len(inp)),
+            name="add_scalar_ffn",
         ),
+        name="add_scalar_add",
     )
 
 
