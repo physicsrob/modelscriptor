@@ -37,13 +37,13 @@ class LinearLayerComponent(Component):
     output_matrix: torch.Tensor  # d_input x d_output
     output_bias: torch.Tensor  # d_output
 
-    def __init__(self, d: int):
-        super().__init__(d)
+    def __init__(self, d: int, name: str = ""):
+        super().__init__(d, name)
         self.output_matrix = torch.zeros(d, d)
         self.output_bias = torch.zeros(d)
 
     def __repr__(self):
-        return f"LinearLayerComponent()"
+        return f"LinearLayerComponent(name='{self.name}')"
 
     def get_strategies(self, node: Node) -> List[LinearNodeComponentStrategy]:
         strategies = []

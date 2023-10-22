@@ -6,8 +6,7 @@ import torch
 
 class InputNode(Node):
     def __init__(self, name: str, d_output: int):
-        self.name = name
-        super().__init__(d_output, [])
+        super().__init__(d_output, [], name=name)
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         if self.name not in input_values:
@@ -44,8 +43,8 @@ class Concatenate(Node):
 
 
 class Add(Node):
-    def __init__(self, input1: Node, input2: Node):
-        super().__init__(len(input1), [input1, input2])
+    def __init__(self, input1: Node, input2: Node, name: str = ""):
+        super().__init__(len(input1), [input1, input2], name)
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         input1, input2 = self.inputs
@@ -61,10 +60,10 @@ class Add(Node):
 
 
 class Constant(Node):
-    def __init__(self, value: torch.Tensor):
+    def __init__(self, value: torch.Tensor, name: str = ""):
         assert len(value.shape) == 1
         self.value = value
-        super().__init__(len(value), [])
+        super().__init__(len(value), [], name)
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         x = self.value.unsqueeze(0).expand(n_pos, -1)

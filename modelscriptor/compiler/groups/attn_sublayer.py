@@ -26,19 +26,13 @@ class AttnSubLayer(Group):
         d_head: int,
         pos_encoding: Optional[PosEncoding] = None,
     ):
-        super().__init__(d)
-        self.attn = AttnLayerComponent(d, d_head, pos_encoding)
-        self.skip = SkipLayerComponent(d)
+        super().__init__(d, name="AttnSubLayer")
+        self.attn = AttnLayerComponent(d, d_head, pos_encoding, name="attn")
+        self.skip = SkipLayerComponent(d, name="attn_skip")
 
-    def print_strategy(self, strategy: GroupStrategy):
-        strategy.print(
-            layer_components=[self.skip, self.attn],
-            layer_names=["skip", "attn"],
-        )
-
-    def get_strategies(self, output_node: Node) -> List[GroupStrategy]:
+    def get_strategies_for_node(self, output_node: Node) -> List[GroupStrategy]:
         strategies = get_sequential_placement_strategies(
-            {output_node}, [self.attn, self.skip]
+            {output_node}, [self.attn, self.skip], ["attn", "skip"]
         )
         return strategies
 
@@ -86,9 +80,9 @@ class AttnSubLayer(Group):
         states = {}
 
         x = self.attn.forward(inp)
-        states["attn"] = (self.attn.out_state, x)
+        states["attn_out_state"] = (self.attn.out_state, x)
         x = x + inp
-        states["skip"] = (self.skip.out_state, x)
+        states["skip_out_state"] = (self.skip.out_state, x)
         if return_states:
             return x, states
         else:

@@ -24,21 +24,17 @@ class FFNSubLayer(Group):
         self,
         d: int,
     ):
-        super().__init__(d)
-        self.linear1 = LinearLayerComponent(d)
-        self.relu = ReLULayerComponent(d)
-        self.linear2 = LinearLayerComponent(d)
-        self.skip = SkipLayerComponent(d)
+        super().__init__(d, name="FFNSubLayer")
+        self.linear1 = LinearLayerComponent(d, name="linear1")
+        self.relu = ReLULayerComponent(d, name="relu")
+        self.linear2 = LinearLayerComponent(d, name="linear2")
+        self.skip = SkipLayerComponent(d, name="linear_skip")
 
-    def print_strategy(self, strategy: GroupStrategy):
-        strategy.print(
-            layer_components=[self.skip, self.linear2, self.relu, self.linear1],
-            layer_names=["skip", "linear2", "relu", "linear1"],
-        )
-
-    def get_strategies(self, output_node: Node) -> List[GroupStrategy]:
+    def get_strategies_for_node(self, output_node: Node) -> List[GroupStrategy]:
         strategies = get_sequential_placement_strategies(
-            {output_node}, [self.linear1, self.relu, self.linear2, self.skip]
+            {output_node},
+            [self.linear1, self.relu, self.linear2, self.skip],
+            component_names=["linear1", "relu", "linear2", "skip"],
         )
         return strategies
 
@@ -96,11 +92,11 @@ class FFNSubLayer(Group):
         states = {}
 
         x = self.linear1.forward(inp)
-        states["linear1"] = (self.linear1.out_state, x)
+        states["linear1_out_state"] = (self.linear1.out_state, x)
         x = self.relu.forward(x)
-        states["relu"] = (self.relu.out_state, x)
+        states["relu_out_state"] = (self.relu.out_state, x)
         x = self.linear2.forward(x)
-        states["linear2"] = (self.linear2.out_state, x)
+        states["linear2_out_state"] = (self.linear2.out_state, x)
         x = x + inp
         states["skip"] = (self.skip.out_state, x)
         if return_states:

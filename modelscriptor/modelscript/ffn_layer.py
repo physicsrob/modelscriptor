@@ -11,6 +11,7 @@ def ffn_layer(
     input_bias: torch.Tensor,
     output_proj: torch.Tensor,
     output_bias: torch.Tensor,
+    name: str = "",
 ) -> Node:
     if len(input_proj.shape) == 1:
         input_proj = input_proj.unsqueeze(0)
@@ -29,7 +30,7 @@ def ffn_layer(
     assert output_proj.shape == (d_int, d_output)
     assert output_bias.shape == (d_output,)
 
-    linear1 = Linear(input_node, input_proj.t(), input_bias)
-    relu_out = ReLU(linear1)
-    linear2 = Linear(relu_out, output_proj, output_bias)
+    linear1 = Linear(input_node, input_proj.t(), input_bias, name=f"{name}_linear1")
+    relu_out = ReLU(linear1, name=f"{name}_relu")
+    linear2 = Linear(relu_out, output_proj, output_bias, name=f"{name}_linear2")
     return linear2

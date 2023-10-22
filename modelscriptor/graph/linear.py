@@ -19,6 +19,7 @@ class Linear(Node):
         input_node: Node,
         output_matrix: torch.Tensor,
         output_bias: Optional[torch.Tensor] = None,
+        name: str = "",
     ):
         # output_matrix shape (d_input, d_output)
         self.d_input = output_matrix.shape[0]
@@ -32,7 +33,7 @@ class Linear(Node):
             assert len(output_bias) == self.d_output
             self.output_bias = output_bias
 
-        super().__init__(self.d_output, [input_node])
+        super().__init__(self.d_output, [input_node], name=name)
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         value_in = self.inputs[0].compute(n_pos, input_values)

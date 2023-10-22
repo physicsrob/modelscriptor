@@ -29,12 +29,12 @@ class SkipLayerComponent(Component):
     d: int
     skip_state: ResidualStreamState
 
-    def __init__(self, d):
-        super().__init__(d)
+    def __init__(self, d, name: str = ""):
+        super().__init__(d, name)
         self.skip_state = ResidualStreamState()
 
     def __repr__(self):
-        return f"SkipLayerComponent()"
+        return f"SkipLayerComponent(name='{self.name}')"
 
     def get_strategies(self, node: Node) -> List[SkipNodeComponentStrategy]:
         strategies = []

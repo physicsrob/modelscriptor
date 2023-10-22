@@ -10,12 +10,14 @@ class Node:
     inputs: List["Node"]
     d_output: int
     node_id: int
+    name: str
 
-    def __init__(self, d_output: int, inputs: List["Node"]):
+    def __init__(self, d_output: int, inputs: List["Node"], name: str = ""):
         global global_node_id
         self.d_output = d_output
         self.inputs = inputs
         self.node_id = global_node_id
+        self.name = name
         global_node_id += 1
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
@@ -35,20 +37,20 @@ class Node:
     def __repr__(self):
         type_name = self.node_type()
         if len(self.inputs) == 0:
-            return f"{type_name}(id={self.node_id}, d={len(self)})"
+            return f"{type_name}(id={self.node_id}, name='{self.name}', d={len(self)})"
         elif len(self.inputs) == 1:
             inp = self.inputs[0]
             inp_type_name = inp.node_type()
-            return f"{type_name}(id={self.node_id}, inp={inp_type_name}(id={inp.node_id}, d={len(inp)}), d={len(self)})"
+            return f"{type_name}(id={self.node_id}, name='{self.name}', inp={inp_type_name}(id={inp.node_id}, name='{inp.name}', d={len(inp)}), d={len(self)})"
         else:
             inp_strings = []
             for i, inp in enumerate(self.inputs):
                 inp_type_name = inp.node_type()
                 inp_strings.append(
-                    f"inp{i}={inp_type_name}(id={inp.node_id}, d={len(inp)})"
+                    f"inp{i}={inp_type_name}(id={inp.node_id}, name='{inp.name}', d={len(inp)})"
                 )
             inp_str = ", ".join(inp_strings)
-            return f"{type_name}(id={self.node_id}, {inp_str}, d={len(self)})"
+            return f"{type_name}(id={self.node_id}, name='{self.name}', {inp_str}, d={len(self)})"
 
     def num_params(self):
         return 0

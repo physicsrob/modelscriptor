@@ -8,7 +8,14 @@ from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 
 # from modelscriptor.compiler.plan.layer_plan import FFNPlan
 from modelscriptor.graph import Linear, ReLU, Node, PosEncoding
-from modelscriptor.modelscript.arithmetic_ops import add, add_scalar, relu_add, relu
+from modelscriptor.modelscript.arithmetic_ops import (
+    add,
+    add_scalar,
+    relu_add,
+    relu,
+    concat,
+    sum_nodes,
+)
 from modelscriptor.modelscript.inout_nodes import (
     create_input,
     create_constant,
@@ -36,6 +43,7 @@ def compiler_test(
     net = compile_network(
         d, 64, output_node, report_name=current_test_name(), pos_encoding=pos_encoding
     )
+    assert net.feature_assignment
     all_pass = True
 
     # Run a forward pass preserving all intermediate states
@@ -43,17 +51,16 @@ def compiler_test(
     res, states = net.forward(inp, return_states=True)
 
     for state_name, (res_state, x) in states.items():
-        for node in res_state.get_nodes_with_indices():
-            indices = res_state.get_node_indices(node)
+        print(f"Checking {state_name}")
+        for node in net.feature_assignment.get_nodes(res_state):
+            indices = net.feature_assignment.get_node_indices(res_state, node)
             expected_output = node.compute(n_pos, input_values)
             result = x[:, indices]
             if not torch.allclose(expected_output, result):
                 all_pass = False
                 print(
-                    f"   Failed. Expected {expected_output}, got {result}, at {state_name}"
+                    f"   Failed. Expected {expected_output}, got {result} for {node} at {state_name}"
                 )
-                breakpoint()
-                print("Here")
     assert all_pass
 
     final_result = net.compute(n_pos, input_values)[output_node]
@@ -80,10 +87,6 @@ def test_compile_repeated_adds():
     a1 = add(c1, c2)
     a2 = add(c3, c4)
     a3 = add(a1, a2)
-    # Not compilable because Add(Add, Add) requires one of the Adds to be compiled by the Linear->Relu->Linear,
-    # which can't happen.
-    # This necessitates the creation of other Add strategies (e.g. in Attention with a simple linear addition)
-    # But that requires a position encoding to be accessible by the attention layer
     compiler_test(a3, n_pos=2, input_values={}, pos_encoding=pos)
 
 
@@ -96,10 +99,6 @@ def test_compile_add_relu():
     a1 = add(value_input1, value_input2)
     x = relu(a1)
     x2 = relu(x)
-    # Not compilable because Add(Add, Add) requires one of the Adds to be compiled by the Linear->Relu->Linear,
-    # which can't happen.
-    # This necessitates the creation of other Add strategies (e.g. in Attention with a simple linear addition)
-    # But that requires a position encoding to be accessible by the attention layer
     compiler_test(
         x2,
         n_pos=2,
@@ -130,14 +129,34 @@ def test_compile_cond_add_vector():
         compiler_test(x, n_pos=1, input_values={"cond": torch.tensor([[cond_value]])})
 
 
+def test_compile_concatenate():
+    inp1 = create_input("inp1", 1)
+    inp2 = create_input("inp2", 1)
+    x = sum_nodes([inp1, inp2])
+    compiler_test(
+        x,
+        n_pos=1,
+        input_values={
+            "inp1": torch.tensor([[10.0]]),
+            "inp2": torch.tensor([[-10.0]]),
+        },
+        pos_encoding=create_pos_encoding(),
+    )
+
+
 def test_compile_select():
     start = 100.0
     offset = 123.0
     cond_input = create_input("cond", 1)
-    x = create_constant(torch.tensor([start]))
+    pos = create_pos_encoding()
+    x = create_constant(torch.tensor([start]), name="start_constant")
     x = select(cond=cond_input, true_node=add_scalar(x, offset), false_node=x)
     for cond in [1.0, -1.0]:
-        compiler_test(x, n_pos=1, input_values={"cond": torch.tensor([[cond]])})
+        compiler_test(
+            x,
+            n_pos=1,
+            input_values={"cond": torch.tensor([[cond]])},  # pos_encoding=pos
+        )
 
 
 def test_compile_relu_add():
