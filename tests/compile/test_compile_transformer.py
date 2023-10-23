@@ -106,8 +106,8 @@ def test_adder_1digit():
     out = create_unembedding(summed, embedding)
     net = compile_network(
         1024,
-        16,
-        first_num,
+        64,
+        summed,
         pos_encoding=pos_encoding,
         report_name="summed",
         verbose=True,

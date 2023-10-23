@@ -16,10 +16,11 @@ from modelscriptor.graph import Node, Concatenate, PosEncoding, Embedding
 from modelscriptor.graph.misc import Placeholder, InputNode, Constant
 
 
-def is_input_type(node: Node):
+def _is_input_type(node: Node):
+    # Although a Constant is compilable, we don't consider it as such for calculating the score
+    # of a strategy.  This encourages the constants to be compiled away.
     return (
         isinstance(node, InputNode)
-        or isinstance(node, Constant)
         or isinstance(node, PosEncoding)
         or isinstance(node, Embedding)
     )
@@ -73,7 +74,7 @@ class GroupStrategy:
 
     def get_score(self):
         dependenct_ancestors = get_ancestor_nodes(self.dependent_nodes)
-        return len([node for node in dependenct_ancestors if not is_input_type(node)])
+        return len([node for node in dependenct_ancestors if not _is_input_type(node)])
 
     def print(self, prefix: str = ""):
         print(f"{prefix}Group Strategy")
@@ -108,17 +109,32 @@ def get_strategies_for_component(
 
 
 def get_combined_strategies(
-    node_to_strategies: Dict[Node, List[GroupStrategy]], max_strategies: int = 2
+    node_to_strategies: Dict[Node, List[GroupStrategy]],
+    existing_constraints: FeatureAssignmentConstraints,
+    max_strategies: int = 2,
 ) -> List[GroupStrategy]:
     # Given a dictionary of node -> strategies, this function returns a list of strategies
     # which are the combination of all strategies for each node.
     # For example, if node1 has strategies [s1, s2] and node2 has strategies [s3, s4], this
     # function will return [s1 + s3, s1 + s4, s2 + s3, s2 + s4]
+    node = next(iter(node_to_strategies.keys()))
+    if not solve(existing_constraints):
+        print("Could not solve")
+        breakpoint()
+        print()
 
     if len(node_to_strategies) == 1:
-        return next(iter(node_to_strategies.values()))
+        strategies = []
+        for s in node_to_strategies[node]:
+            constraint = s.get_constraints_for_strategy()
+            constraint.update(existing_constraints)
+            if solve(constraint):
+                strategies.append(s)
+        if not len(strategies):
+            print("Filtered out all strategies due to existing constraint")
+            breakpoint()
+        return strategies
     else:
-        node = next(iter(node_to_strategies.keys()))
         strategies = node_to_strategies[node]
         strategies.sort(key=lambda s: s.get_score())
         strategies = strategies[:max_strategies]
@@ -127,7 +143,7 @@ def get_combined_strategies(
             n: s for n, s in node_to_strategies.items() if n != node
         }
         other_strategies = get_combined_strategies(
-            other_node_to_strategies, max_strategies
+            other_node_to_strategies, existing_constraints, max_strategies
         )
 
         # Calculate product
@@ -138,9 +154,14 @@ def get_combined_strategies(
                 combined.sub_strategies = s1.sub_strategies + s2.sub_strategies
                 combined.dependent_nodes = s1.dependent_nodes | s2.dependent_nodes
                 constraint = combined.get_constraints_for_strategy()
+                constraint.update(existing_constraints)
                 solvable = solve(constraint)
                 if solvable:
                     combined_strategies.append(combined)
+        if not len(combined_strategies):
+            breakpoint()
+            print()
+
         combined_strategies.sort(key=lambda s: s.get_score())
         return combined_strategies[:max_strategies]
 

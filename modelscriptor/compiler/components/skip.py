@@ -9,7 +9,16 @@ from modelscriptor.compiler.feature_assignment import (
     ResidualStreamState,
 )
 from modelscriptor.graph import Node, Concatenate, Linear, Add
+from modelscriptor.graph.misc import Placeholder
+from modelscriptor.modelscript.arithmetic_ops import multiply_scalar
 from modelscriptor.modelscript.inout_nodes import create_constant
+
+
+def placeholder_zero(d: int) -> Node:
+    # Create a node that has value zero, using only placeholders.
+    # This will get compiled on an attention layer.
+    p = Placeholder(d)
+    return Add(multiply_scalar(p, -1.0), p)
 
 
 class SkipNodeComponentStrategy(NodeComponentStrategy):
@@ -41,6 +50,11 @@ class SkipLayerComponent(Component):
         zero = create_constant(torch.zeros(len(node)))
 
         # We always have two skip strategies where we don't compile anything.
+        # strategies.append(
+        #     SkipNodeComponentStrategy(
+        #         skip_node=placeholder_zero(len(node)), in_node=node, out_node=node
+        #     )
+        # )
         strategies.append(
             SkipNodeComponentStrategy(skip_node=zero, in_node=node, out_node=node)
         )
