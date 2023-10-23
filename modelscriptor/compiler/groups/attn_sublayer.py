@@ -94,5 +94,3 @@ class AttnSubLayer(Group):
     def resize(self, new_d):
         self.d = new_d
         self.attn.resize(new_d)
-        self.in_state.resize(new_d)
-        self.out_state.resize(new_d)

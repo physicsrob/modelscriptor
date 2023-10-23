@@ -113,5 +113,3 @@ class FFNSubLayer(Group):
         self.linear2.resize(new_d)
         self.relu.resize(new_d)
         self.skip.resize(new_d)
-        self.in_state.resize(new_d)
-        self.out_state.resize(new_d)

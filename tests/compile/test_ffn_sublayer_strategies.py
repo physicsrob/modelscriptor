@@ -26,6 +26,7 @@ def compile_ffn(layer: FFNSubLayer, output_node: Node) -> FeatureAssignment:
     strategy.print()
     constraint.update(layer.get_constraints(strategy))
     feature_assignment = solve(constraint)
+    feature_assignment.print()
     layer.apply_strategy(feature_assignment, strategy)
     return feature_assignment
 

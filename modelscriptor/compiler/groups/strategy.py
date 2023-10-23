@@ -9,6 +9,7 @@ from modelscriptor.compiler.components.skip import (
 from modelscriptor.compiler.feature_assignment import (
     FeatureAssignmentConstraints,
     simplify_nodes,
+    solve,
 )
 from modelscriptor.compiler.utils import get_ancestor_nodes
 from modelscriptor.graph import Node, Concatenate, PosEncoding, Embedding
@@ -102,41 +103,46 @@ def get_strategies_for_component(
 
     # Sort the strategies and only keep the top-k
     group_strategies.sort(key=lambda s: s.get_score())
-    if not len(group_strategies):
-        print()
 
     return group_strategies[:strategy_count]
 
 
-def get_combined_strategies(node_to_strategies: Dict[Node, List[GroupStrategy]]):
+def get_combined_strategies(
+    node_to_strategies: Dict[Node, List[GroupStrategy]], max_strategies: int = 2
+) -> List[GroupStrategy]:
     # Given a dictionary of node -> strategies, this function returns a list of strategies
     # which are the combination of all strategies for each node.
     # For example, if node1 has strategies [s1, s2] and node2 has strategies [s3, s4], this
     # function will return [s1 + s3, s1 + s4, s2 + s3, s2 + s4]
 
-    # Double check that we're merging strategies with the same components.
-    all_components = [
-        strategy.components
-        for strategies in node_to_strategies.values()
-        for strategy in strategies
-    ]
-    assert all(
-        components == all_components[0] for components in all_components
-    ), "Components mismatch"
+    if len(node_to_strategies) == 1:
+        return next(iter(node_to_strategies.values()))
+    else:
+        node = next(iter(node_to_strategies.keys()))
+        strategies = node_to_strategies[node]
+        strategies.sort(key=lambda s: s.get_score())
+        strategies = strategies[:max_strategies]
 
-    combined_strategies = []
-
-    count = len([x for x in product(*node_to_strategies.values())])
-    for strategies in product(*node_to_strategies.values()):
-        combined = GroupStrategy(
-            strategies[0].components, strategies[0].component_names
+        other_node_to_strategies = {
+            n: s for n, s in node_to_strategies.items() if n != node
+        }
+        other_strategies = get_combined_strategies(
+            other_node_to_strategies, max_strategies
         )
-        for strategy in strategies:
-            combined.sub_strategies += strategy.sub_strategies
-            combined.dependent_nodes |= strategy.dependent_nodes
-        combined_strategies.append(combined)
-    combined_strategies.sort(key=lambda s: s.get_score())
-    return combined_strategies
+
+        # Calculate product
+        combined_strategies = []
+        for s1 in strategies:
+            for s2 in other_strategies:
+                combined = GroupStrategy(s1.components, s1.component_names)
+                combined.sub_strategies = s1.sub_strategies + s2.sub_strategies
+                combined.dependent_nodes = s1.dependent_nodes | s2.dependent_nodes
+                constraint = combined.get_constraints_for_strategy()
+                solvable = solve(constraint)
+                if solvable:
+                    combined_strategies.append(combined)
+        combined_strategies.sort(key=lambda s: s.get_score())
+        return combined_strategies[:max_strategies]
 
 
 def get_sequential_placement_strategies(
