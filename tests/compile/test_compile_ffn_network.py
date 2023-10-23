@@ -192,3 +192,13 @@ def test_compile_get_last_value():
     pos_encoding = create_pos_encoding()
     last_input = pos_encoding.get_last_value(value_input, delta_pos=-1)
     compiler_test(last_input, n_pos=5, input_values={"value": input_values})
+
+
+def test_multiple_concats():
+    c1 = create_constant(torch.tensor([1.0]))
+    c2 = create_constant(torch.tensor([1.0]))
+    c3 = create_constant(torch.tensor([1.0]))
+    add1 = add(concat([c1, c2]), create_constant(torch.tensor([2.0, 2.0])))
+    add2 = add(concat([c1, c3]), create_constant(torch.tensor([2.0, 2.0])))
+    add3 = add(add1, add2)
+    compiler_test(add3, n_pos=1, input_values={}, pos_encoding=create_pos_encoding())

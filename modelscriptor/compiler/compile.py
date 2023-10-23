@@ -1,4 +1,4 @@
-from typing import Union, Optional, Dict, Set, List
+from typing import Union, Optional, Dict, Set, List, Tuple
 
 from modelscriptor.compiler.feature_assignment import (
     FeatureAssignmentConstraints,
@@ -33,29 +33,29 @@ def is_compilation_complete(nodes: Set[Node]) -> bool:
     )
 
 
-def compile_network(
+def build_network(
     d: int,
     d_head: int,
     output_node: Node,
-    report_name: str = "",
     verbose: bool = True,
     pos_encoding: Optional[PosEncoding] = None,
-) -> HeadlessTransformer:
-    net = HeadlessTransformer(d, d_head, pos_encoding)
-
-    # Passes:
-    # First Pass: Choose strategy for each sublayer, build constraints
-    # Second pass: Assign feature, generate report.
-    # Third pass: Apply strategies
-
+) -> Tuple[
+    List[TransformerLayer], FeatureAssignmentConstraints, Dict[Group, GroupStrategy]
+]:
     #
-    # First Pass
-    #
-    sublayer_to_strategy: Dict[Group, GroupStrategy] = {}
+    # First Pass of compilation:  choose strategy for each sublayer, building constraints, and strategies.
+    # Returns tuple of:
+    # - List of transformer layers.
+    # - Feature assignment constraints
+    # - Dictionary mapping each sublayer to a strategy.
     constraints = FeatureAssignmentConstraints()
 
-    layer = net.add_layer()
+    # Define last layer.  We start from the end and work our way to the beginning.
+    layer = TransformerLayer(d, d_head, pos_encoding)
+    sublayer_to_strategy: Dict[Group, GroupStrategy] = {}
     constraints.add_node_to_state(output_node, layer.ffn.out_state)
+    print(f"Added constraint {output_node} in {layer.ffn.out_state}")
+    layers = [layer]
     to_compile_nodes: Set[Node] = {output_node}
 
     for layer_cnt in range(MAX_LAYERS):
@@ -64,31 +64,21 @@ def compile_network(
             strategies = sublayer.get_strategies(to_compile_nodes)
             if len(strategies):
                 strategy = strategies[0]
-                # print("Applying strategy:")
-                # strategy.print()
-                # if len(strategies) > 1:
-                #     print("Other strategies considered:")
-                #     for strategy in strategies[1:]:
-                #         strategy.print()
-
                 sublayer_to_strategy[sublayer] = strategy
                 constraints.update(sublayer.get_constraints(strategy))
 
                 to_compile_nodes = strategy.get_compilable_input_nodes(
                     include_skip=True
                 )
+                if not solve(constraints):
+                    print("Failed to solve constraints")
+                    raise CompilationError("Failed to solve constraints")
             else:
-                print("No strategy found")
-                breakpoint()
-            if not len(to_compile_nodes):
-                print()
-                breakpoint()
-                print()
+                raise CompilationError("No strategies found for nodes.")
 
         constraints.add_equivalency(layer.ffn.in_state, layer.attn.out_state)
 
         if prev_to_compile_nodes == to_compile_nodes:
-            breakpoint()
             raise CompilationError("Could not compile network.  Failed at stage 1.")
 
         if verbose:
@@ -99,28 +89,47 @@ def compile_network(
 
         if is_compilation_complete(to_compile_nodes):
             if verbose:
-                print("Compilation complete")
+                print("Stage 1 compilation complete")
             break
         else:
-            new_layer = net.add_layer()
             if verbose:
                 print("\n\nCreating new layer")
-            constraints.add_equivalency(layer.attn.in_state, new_layer.ffn.out_state)
-            layer = new_layer
+            layer = TransformerLayer(d, d_head, pos_encoding)
+            layers = [layer] + layers
+            constraints.add_equivalency(layers[1].attn.in_state, layer.ffn.out_state)
 
     if not is_compilation_complete(to_compile_nodes):
-        try:
-            net.feature_assignment = solve(constraints)
-            make_report(net, output_node, report_name + "_failed")
-        except:
-            pass
         raise CompilationError(f"Exceeded maximum number of layers {MAX_LAYERS}.")
+
+    return layers, constraints, sublayer_to_strategy
+
+
+def compile_network(
+    d: int,
+    d_head: int,
+    output_node: Node,
+    report_name: str = "",
+    verbose: bool = True,
+    pos_encoding: Optional[PosEncoding] = None,
+) -> HeadlessTransformer:
+    # Passes:
+    # First Pass: Choose strategy for each sublayer, build constraints
+    # Second pass: Assign feature, generate report.
+    # Third pass: Apply strategies
+
+    #
+    # First Pass
+    #
+    layers, constraints, sublayer_to_strategy = build_network(
+        d, d_head, output_node, verbose, pos_encoding
+    )
+    net = HeadlessTransformer(d, d_head, pos_encoding)
+    net.layers = layers
 
     #
     # Second pass: Assign Features
     #
     net.feature_assignment = solve(constraints)
-    net.constraints = constraints
 
     if not net.feature_assignment:
         raise CompilationError("Could not solve feature assignment problem.")
@@ -128,7 +137,7 @@ def compile_network(
     if not constraints.check_solution(net.feature_assignment):
         raise CompilationError("Feature assignment solution did not pass validation.")
 
-    print(net.feature_assignment)
+    net.feature_assignment.print()
 
     make_report(net, output_node, report_name)
 
@@ -152,61 +161,102 @@ def compile_transformer(
     verbose: bool = True,
     optimize: bool = True,
 ) -> Transformer:
-    headless_net = compile_network(
-        d=d,
-        d_head=d_head,
-        output_node=unembedding.inp,
-        report_name=report_name,
-        verbose=verbose,
-        pos_encoding=pos_encoding,
-    )
-    feature_assignment = headless_net.feature_assignment
-    assert feature_assignment
+    # Passes:
+    # First Pass: Choose strategy for each sublayer, build constraints
+    #       Part 2: Choose input layer strategies, add constraints
+    #       Part 3: Chose output layer strategies, add constraints
+    # Second pass: Assign feature, generate report.
+    # Third pass: Apply strategies
 
+    #
+    # First pass part 1: Choose strategies for primary layers
+    #
+    output_node = unembedding.inp
+    layers, constraints, sublayer_to_strategy = build_network(
+        d, d_head, output_node, verbose, pos_encoding
+    )
+    headless_net = HeadlessTransformer(d, d_head, pos_encoding)
+    headless_net.layers = layers
     net = Transformer(headless_net, unembedding.embedding.tokenizer)
 
-    # We need to update the input to have the same position as the output.
+    prelim_feature_assignment = solve(constraints)
 
-    # Get the nodes at the input to the transformer layer stack
-    in_state = net.headless_net.layers[0].attn.in_state
-    out_state = net.headless_net.layers[-1].ffn.out_state
+    if not prelim_feature_assignment:
+        raise CompilationError(
+            "Could not solve feature assignment problem for primary layers."
+        )
+
+    #
+    # First pass part 2: Add embedding layer.
+    #
+    in_state = layers[0].attn.in_state
+    out_state = layers[-1].ffn.out_state
+
+    first_strategy = sublayer_to_strategy[layers[0].attn]
+    to_compile_nodes = first_strategy.get_compilable_input_nodes(include_skip=True)
+    pos_strategies = []  # Strategies that will be placed on pos encoding component
+    embed_strategies = []  # Strategies that will be placed on the embedding component
 
     # Compile the input nodes (embedding, pos encoding, constants)
-    for node in feature_assignment.get_nodes(in_state):
-        pos_encoding_strategies = net.pos_encoding.get_strategies(node)
-        embed_node_strategies = net.embed.get_strategies(node)
-        if len(pos_encoding_strategies):
-            net.pos_encoding.apply_strategy(
-                feature_assignment, pos_encoding_strategies[0]
-            )
-        elif len(embed_node_strategies):
-            net.embed.apply_strategy(feature_assignment, embed_node_strategies[0])
+    for node in to_compile_nodes:
+        pos_strategies_for_node = net.pos_encoding.get_strategies(node)
+        embed_strategies_for_node = net.embed.get_strategies(node)
+        if len(pos_strategies_for_node):
+            pos_strategies.append(pos_strategies_for_node[0])
+            # constraints.update(
+            #     net.pos_encoding.get_constraints_for_strategy(
+            #         pos_strategies_for_node[0]
+            #     )
+            # )
+        elif len(embed_strategies_for_node):
+            embed_strategies.append(embed_strategies_for_node[0])
+            # constraints.update(
+            #     net.embed.get_constraints_for_strategy(embed_strategies_for_node[0])
+            # )
         else:
             raise CompilationError(
                 "Unsupport node type at input to transformer layer stack."
             )
 
-    # Check to see if input and output have the same allocation, as they must.
-    embed_node = next(
-        node
-        for node in feature_assignment.get_nodes(in_state)
-        if isinstance(node, Embedding)
-    )
-    out_node = unembedding.inp
-    if feature_assignment.get_node_indices(
-        in_state, embed_node
-    ) != feature_assignment.get_node_indices(out_state, out_node):
-        raise CompilationError("Input and output node must have the same allocation.")
-        # # Rewire
-        # layer = net.headless_net.add_layer(end=True)
-        # layer.attn.in_state.copy_from(out_state)
-        # # FIXME FIXME FIXME -- implement the rewrite here?
-        # from_indices = out_state.get_node_indices(out_node)
-        # to_indices = in_state.get_node_indices(embed_node)
-        # for from_idx, to_idx in zip(from_indices, to_indices):
-        #
-        #
-        # layer.ffn.in_state.copy_from(layer.attn.out_state)
-        # layer.ffn.out_state.copy_from(layer.attn.out_state)
+    # constraints.add_equivalency(in_state, net.pos_encoding.out_state)
+    # constraints.add_equivalency(in_state, net.embed.out_state)
+
+    #
+    # First pass part 3: Add last layer (unembedding)
+    #
+    embed_node = next(node for node in to_compile_nodes if isinstance(node, Embedding))
+    # constraints.add_shared_features_constraint(
+    #     in_state, embed_node, out_state, output_node
+    # )
+
+    #
+    # Second pass: Assign Features
+    #
+    net.feature_assignment = solve(constraints)
+
+    if not net.feature_assignment:
+        raise CompilationError("Could not solve feature assignment problem.")
+
+    if not constraints.check_solution(net.feature_assignment):
+        raise CompilationError("Feature assignment solution did not pass validation.")
+
+    print(net.feature_assignment)
+
+    make_report(net.headless_net, output_node, report_name)
+
+    #
+    # Third pass: Apply strategies
+    #
+    for layer in headless_net.layers:
+        for sublayer in [layer.ffn, layer.attn]:
+            strategy = sublayer_to_strategy[sublayer]
+            sublayer.apply_strategy(net.feature_assignment, strategy)
+
+    # Apply input strategies
+    for s in embed_strategies:
+        net.embed.apply_strategy(net.feature_assignment, s)
+
+    for s in pos_strategies:
+        net.pos_encoding.apply_strategy(net.feature_assignment, s)
 
     return net
