@@ -60,8 +60,12 @@ def build_network(
 
     for layer_cnt in range(MAX_LAYERS):
         prev_to_compile_nodes = to_compile_nodes
+        constraints.add_equivalency(layer.ffn.in_state, layer.attn.out_state)
         for sublayer in [layer.ffn, layer.attn]:
-            strategies = sublayer.get_strategies(to_compile_nodes)
+            if not solve(constraints):
+                print("Could not solve constraints")
+                breakpoint()
+            strategies = sublayer.get_strategies(to_compile_nodes, constraints)
             if len(strategies):
                 strategy = strategies[0]
                 sublayer_to_strategy[sublayer] = strategy
@@ -71,12 +75,11 @@ def build_network(
                     include_skip=True
                 )
                 if not solve(constraints):
+                    breakpoint()
                     print("Failed to solve constraints")
-                    raise CompilationError("Failed to solve constraints")
+                    # raise CompilationError("Failed to solve constraints")
             else:
                 raise CompilationError("No strategies found for nodes.")
-
-        constraints.add_equivalency(layer.ffn.in_state, layer.attn.out_state)
 
         if prev_to_compile_nodes == to_compile_nodes:
             raise CompilationError("Could not compile network.  Failed at stage 1.")

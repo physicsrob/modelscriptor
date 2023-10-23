@@ -82,11 +82,11 @@ class Constant(Node):
 
 class Placeholder(Node):
     # This node-type is length 0 placeholder
-    def __init__(self):
-        super().__init__(0, [])
+    def __init__(self, d: int = 0):
+        super().__init__(d, [])
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
-        return torch.zeros(0)
+        return torch.zeros(self.d)
 
 
 class ValueLogger(Node):

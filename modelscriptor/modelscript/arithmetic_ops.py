@@ -190,3 +190,14 @@ def relu_add(inp1: Node, inp2: Node) -> Node:
         output_proj=output_proj,
         output_bias=output_bias,
     )
+
+
+def multiply_scalar(inp: Node, scalar: float):
+    return ffn_layer(
+        input_node=inp,
+        input_proj=scalar * torch.eye(len(inp)),
+        input_bias=torch.zeros(len(inp)),
+        output_proj=torch.eye(len(inp)),
+        output_bias=torch.zeros(len(inp)),
+        name="multiply_scalar",
+    )

@@ -7,6 +7,7 @@ from modelscriptor.compiler.feature_assignment import (
     FeatureAssignmentConstraints,
     FeatureAssignment,
     ResidualStreamState,
+    solve,
 )
 from modelscriptor.compiler.groups.strategy import (
     GroupStrategy,
@@ -33,12 +34,21 @@ class Group:
     def get_strategies_for_node(self, node: Node) -> List[GroupStrategy]:
         ...
 
-    def get_strategies(self, nodes: Set[Node]) -> List[GroupStrategy]:
+    def get_strategies(
+        self, nodes: Set[Node], existing_constraints: FeatureAssignmentConstraints
+    ) -> List[GroupStrategy]:
         node_to_strategies = {
             node: self.get_strategies_for_node(node) for node in nodes
         }
         # For any given set of input/output nodes, we'll only keep one strategy.
-        return get_combined_strategies(node_to_strategies)
+        strategies = get_combined_strategies(node_to_strategies, existing_constraints)
+        result = []
+        for s in strategies:
+            constraint = self.get_constraints(s)
+            constraint.update(existing_constraints)
+            if solve(constraint):
+                result.append(s)
+        return result
 
     @abstractmethod
     def get_constraints(self, strategy: GroupStrategy) -> FeatureAssignmentConstraints:
