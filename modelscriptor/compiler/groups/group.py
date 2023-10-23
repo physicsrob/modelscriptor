@@ -34,29 +34,10 @@ class Group:
         ...
 
     def get_strategies(self, nodes: Set[Node]) -> List[GroupStrategy]:
-        node_to_strategies = {}
-        for node in nodes:
-            node_strategies = self.get_strategies_for_node(node)
-            node_strategies.sort(key=lambda s: s.get_score())
-
-            # For any given set of input/output nodes, we'll only keep one strategy.
-            existings_keys = set()
-            filtered_strategies = list()
-            for strategy in node_strategies:
-                key = tuple(
-                    sorted(
-                        strategy.get_compilable_input_nodes(include_skip=True),
-                        key=lambda n: n.node_id,
-                    )
-                )
-                if key in existings_keys:
-                    continue
-                existings_keys.add(key)
-                filtered_strategies.append(strategy)
-
-            # Filter out duplicate strategies
-            node_to_strategies[node] = filtered_strategies
-
+        node_to_strategies = {
+            node: self.get_strategies_for_node(node) for node in nodes
+        }
+        # For any given set of input/output nodes, we'll only keep one strategy.
         return get_combined_strategies(node_to_strategies)
 
     @abstractmethod
