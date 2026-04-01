@@ -1,6 +1,8 @@
+import pytest
+
+pytestmark = pytest.mark.skip(reason="Old CP-SAT solver removed; constraint tests no longer applicable")
+
 from modelscriptor.compiler.feature_assignment import (
-    solve,
-    FeatureAssignmentConstraints,
     ResidualStreamState,
 )
 from modelscriptor.graph import Node
