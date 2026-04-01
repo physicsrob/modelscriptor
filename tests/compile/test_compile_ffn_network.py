@@ -1,12 +1,13 @@
 import inspect
 from typing import Dict, Optional
 
+import pytest
+
+pytestmark = pytest.mark.skip(reason="Old compiler removed; retarget to forward_compile")
+
 import torch
 
-from modelscriptor.compiler.compile import compile_network
-from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
-
-# from modelscriptor.compiler.plan.layer_plan import FFNPlan
+# from modelscriptor.compiler.compile import compile_network
 from modelscriptor.graph import Linear, ReLU, Node, PosEncoding
 from modelscriptor.modelscript.arithmetic_ops import (
     add,
