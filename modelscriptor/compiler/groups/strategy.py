@@ -120,7 +120,6 @@ def get_combined_strategies(
     node = next(iter(node_to_strategies.keys()))
     if not solve(existing_constraints):
         print("Could not solve")
-        breakpoint()
         print()
 
     if len(node_to_strategies) == 1:
@@ -132,7 +131,6 @@ def get_combined_strategies(
                 strategies.append(s)
         if not len(strategies):
             print("Filtered out all strategies due to existing constraint")
-            breakpoint()
         return strategies
     else:
         strategies = node_to_strategies[node]
@@ -159,7 +157,6 @@ def get_combined_strategies(
                 if solvable:
                     combined_strategies.append(combined)
         if not len(combined_strategies):
-            breakpoint()
             print()
 
         combined_strategies.sort(key=lambda s: s.get_score())

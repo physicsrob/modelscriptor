@@ -64,7 +64,6 @@ def build_network(
         for sublayer in [layer.ffn, layer.attn]:
             if not solve(constraints):
                 print("Could not solve constraints")
-                breakpoint()
             strategies = sublayer.get_strategies(to_compile_nodes, constraints)
             if len(strategies):
                 strategy = strategies[0]
@@ -75,7 +74,6 @@ def build_network(
                     include_skip=True
                 )
                 if not solve(constraints):
-                    breakpoint()
                     print("Failed to solve constraints")
                     # raise CompilationError("Failed to solve constraints")
             else:

@@ -198,8 +198,6 @@ class FeatureAssignmentConstraints:
         ]
         for state1, nodes1, state2, nodes2 in shared_feature_constraints:
             for node in nodes1:
-                if node not in state_to_nodes[state1]:
-                    breakpoint()
                 assert node in state_to_nodes[state1]
             for node in nodes2:
                 assert node in state_to_nodes[state2]
@@ -219,7 +217,6 @@ class FeatureAssignmentConstraints:
                     all_features.extend(features)
 
             if len(all_features) != len(set(all_features)):
-                breakpoint()
                 return False  #  Duplicate feature assignments in state
 
         # Check shared_feature_constraints
@@ -229,24 +226,20 @@ class FeatureAssignmentConstraints:
 
             for node in nodes1:
                 if not solution.has_node(state1, node):
-                    breakpoint()
                     return False
                 features1.extend(solution.get_node_indices(state1, node))
 
             for node in nodes2:
                 if not solution.has_node(state2, node):
-                    breakpoint()
                     return False
                 features2.extend(solution.get_node_indices(state2, node))
 
             if features1 != features2:
-                breakpoint()
                 return False
 
         # Check state equivalency
         for state1, state2 in self._equivalent:
             if solution.mapping[state1] != solution.mapping[state2]:
-                breakpoint()
                 return False
 
         return True
@@ -327,7 +320,6 @@ def solve_ortools(
         for node in nodes:
             if (state, node) not in node_to_interval_var:
                 print(f"{(state,node)=} missing from node_to_interval_val")
-                breakpoint()
             model.Add(max_end_var >= node_to_interval_var[(state, node)].EndExpr())
     model.Minimize(max_end_var)
 
