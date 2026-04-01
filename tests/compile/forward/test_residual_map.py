@@ -3,7 +3,7 @@ import torch
 
 from modelscriptor.compiler.feature_assignment import ResidualStreamState
 from modelscriptor.compiler.forward.residual_map import ResidualStreamMap
-from modelscriptor.graph import Node
+from modelscriptor.graph import Node, Concatenate
 from modelscriptor.graph.misc import InputNode, Constant
 
 
@@ -125,3 +125,18 @@ def test_no_fragmentation():
     # No overlap with a or c
     assert not (set(indices) & set(rmap.get_indices(a)))
     assert not (set(indices) & set(rmap.get_indices(c)))
+
+
+def test_get_node_indices_concatenate():
+    """get_node_indices resolves Concatenate to its children's indices in order."""
+    rmap = ResidualStreamMap(64)
+    a = InputNode("a", 4)
+    b = InputNode("b", 3)
+
+    idx_a = rmap.allocate(a)
+    idx_b = rmap.allocate(b)
+
+    cat = Concatenate([a, b])
+    # Concatenate is NOT allocated — get_node_indices resolves through it
+    result = rmap.get_node_indices(cat)
+    assert result == idx_a + idx_b
