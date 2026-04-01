@@ -112,9 +112,19 @@ def test_adder_1digit():
         report_name="summed",
         verbose=True,
     )
-    # net = compile_transformer(
-    #     256, 16, out, pos_encoding, report_name="summed", optimize=False, verbose=False
-    # )
-    # TODO: Test end-to-end compute once compile_transformer is working.
-    # net.compute(["1", "+", "1", "="]) requires a Transformer (with embedding),
-    # but compile_network returns a HeadlessTransformer.
+    # Verify the compiled network produces correct sums
+    test_cases = [
+        (["1", "+", "1", "="], "2"),
+        (["2", "+", "3", "="], "5"),
+        (["0", "+", "0", "="], "0"),
+        (["4", "+", "5", "="], "9"),
+    ]
+    for tokens, expected in test_cases:
+        result = net.compute(n_pos=4, input_values={"embedding_input": tokens})
+        summed_output = result[summed]
+        # Find nearest embedding at the "=" position (position 3)
+        dists = torch.cdist(summed_output[3:4], embedding.table)
+        predicted = embedding.tokenizer.decode_id(dists.argmin().item())
+        assert predicted == expected, (
+            f"For {''.join(tokens)}: expected '{expected}' but got '{predicted}'"
+        )
