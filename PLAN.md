@@ -10,7 +10,7 @@ The forward compiler works from inputs toward outputs. It starts with a known-em
 
 ## Architecture
 
-New module: `modelscriptor/compiler/forward/` (does NOT modify existing backward compiler).
+New module: `modelscriptor/compiler/forward/`. The old backward compiler has been removed (strategy search, CP-SAT solver, Group base class, compile.py). Components and sublayers stripped to weight storage + forward pass only. OR-Tools dependency removed.
 
 Four new abstractions:
 1. **GraphAnalyzer** — pre-computes reverse deps, topological order, critical path lengths
@@ -18,7 +18,7 @@ Four new abstractions:
 3. **WeightWriter** — writes weight matrices into TransformerLayer components given scheduling decisions
 4. **LayerScheduler** — decides what to compute/cancel at each layer
 
-Reuses existing: `HeadlessTransformer`, `TransformerLayer`, `AttnSubLayer`, `FFNSubLayer`, all component classes (weight matrix shapes and forward passes), `FeatureAssignment` (as output bridge for `compute()`).
+Reuses existing: `HeadlessTransformer`, `TransformerLayer`, `AttnSubLayer`, `FFNSubLayer`, component classes (weight matrix shapes and forward passes), `FeatureAssignment` (as output bridge for `compute()`). Old end-to-end tests preserved as spec (19 skipped, retarget in Phase 4).
 
 ## Key Design Decisions
 
@@ -42,7 +42,7 @@ The transformer skip connection `out = in + f(in)` enables three primitives:
 
 ---
 
-## Phase 0: Graph Analysis
+## Phase 0: Graph Analysis — DONE
 
 **Goal**: Build graph metadata needed by the scheduler.
 
@@ -53,7 +53,7 @@ The transformer skip connection `out = in + f(in)` enables three primitives:
 - `tests/compile/forward/test_graph_analysis.py`
 
 **GraphAnalyzer class** (`graph_analysis.py`):
-- `__init__(output_node, input_nodes)` — builds reverse dep map, topo order, critical paths
+- `__init__(output_node)` — walks graph backward to discover all nodes, builds reverse dep map, topo order, critical paths
 - `get_consumers(node) -> Set[Node]` — reverse dependency map
 - `get_topological_order() -> List[Node]` — inputs first
 - `get_critical_path_length(node) -> int` — longest chain to output
@@ -71,11 +71,13 @@ Concatenate nodes are transparent — never placed in the residual stream, resol
 4. `test_adder_graph` — Load 3-digit adder, verify topo order valid, all nodes reachable
 5. `test_ready_nodes_progression` — iteratively add ready nodes, verify all eventually available
 
-**Gate**: All tests pass.
+**Implementation note**: Topo sort uses `set(node.inputs)` to avoid double-counting duplicate inputs (e.g. Attn nodes where query_in == key_in).
+
+**Gate**: All 5 tests pass.
 
 ---
 
-## Phase 1: Residual Stream Map
+## Phase 1: Residual Stream Map — DONE
 
 **Goal**: Set-based column allocator. No contiguity required — eliminates fragmentation.
 
@@ -92,6 +94,7 @@ Concatenate nodes are transparent — never placed in the residual stream, resol
 - `is_allocated(node) -> bool`
 - `get_free_count() -> int`
 - `get_allocated_nodes() -> Set[Node]`
+- `get_node_indices(node) -> List[int]` — like `get_indices` but resolves through Concatenate nodes (needed by weight writer for Attn inputs like `get_prev_value`'s `Concatenate([pos, cond])`)
 - `build_feature_assignment(in_state, out_state, input_nodes, output_node) -> FeatureAssignment`
 
 **`build_feature_assignment`** creates a FeatureAssignment with exactly two states populated:
@@ -107,14 +110,15 @@ Intermediate states (each sublayer's in/out) don't need population — the forwa
 4. `test_reassign` — allocate A, reassign to B, verify B has A's old columns
 5. `test_build_feature_assignment` — allocate nodes, build FeatureAssignment, verify `get_node_indices` correct
 6. `test_no_fragmentation` — allocate A(8), B(8), C(8), free B, allocate D(16): succeeds because columns need not be contiguous
+7. `test_get_node_indices_concatenate` — Concatenate resolved to children's indices in order
 
-**Gate**: All tests pass.
+**Gate**: All 7 tests pass.
 
 ---
 
-## Phase 2: Weight Writer
+## Phase 2: Weight Writer — DONE
 
-**Goal**: Given scheduling decisions + column assignments, write weights into a TransformerLayer's components. This is the bridge from abstract operations to physical weight matrices.
+**Goal**: Given scheduling decisions + column assignments, write weights into a TransformerLayer's components. This is the bridge from abstract operations to physical weight matrices. Direct matrix writes — no strategies, no FeatureAssignment.
 
 **Create**:
 - `modelscriptor/compiler/forward/weight_writer.py`
@@ -162,17 +166,28 @@ Weight matrix shapes (from existing components):
 
 *FFN — compute_bias*: Set `linear2.output_bias[target_cols] += bias_vector`. Used for the bias part of biased Linear nodes (zero-bias part computed via attention in same layer).
 
-**Tests** — each builds a small graph, creates one TransformerLayer, writes weights, runs the forward pass, and verifies output with `torch.allclose` against `node.compute()`:
+**Convention**: For add_into, `Add(dead_addend, live_addend)` — `inputs[0]` is dead (at `target_cols`), `inputs[1]` is live (copied via attention). The scheduler enforces this ordering.
 
-1. `test_attn_compute` — Attn node compiled on one head, verify output
-2. `test_linear_zero_bias` — Linear(zero-bias) compiled via attention head
-3. `test_cancel` — place values, cancel them, verify columns become zero
-4. `test_add_into` — Add(A,B) where A is dead, write B to A's columns, verify A+B
-5. `test_ffn_relu_chain` — Linear->ReLU->Linear compiled on FFN
-6. `test_ffn_constant` — Constant via bias, verify values appear
-7. `test_biased_linear_split` — Linear(bias!=0) split: attention for Wx + FFN for b, verify Wx+b
+**Tests** — each builds a small graph, creates one TransformerLayer, writes weights, runs the forward pass, and verifies output with `torch.allclose` against `node.compute()`. All attention tests use n_pos > 1 to exercise causal mask behavior.
 
-**Gate**: All 7 tests pass.
+1. `test_identity_layer` — no ops written, layer is pure identity via skip
+2. `test_attn_compute` — basic Attn node compiled on one head
+3. `test_attn_compute_small_d_head` — Attn node with d_head < layer d_head (padding)
+4. `test_attn_compute_shared_inputs` — Attn where query_in == key_in (get_last_value)
+5. `test_attn_compute_multiposition` — cross-position attention (get_prev_value with Concatenate key_in)
+6. `test_linear_zero_bias` — zero-bias Linear via current-position attention
+7. `test_linear_different_dims` — zero-bias Linear, input dim != output dim
+8. `test_cancel` — cancel a node, verify columns become zero
+9. `test_cancel_multiple` — cancel two nodes in same layer, different heads
+10. `test_add_into` — Add(A,B) where A is dead, verify A+B
+11. `test_ffn_relu_chain` — Linear->ReLU->Linear compiled on FFN
+12. `test_ffn_relu_chain_multiple` — two chains in same FFN, different slot ranges
+13. `test_ffn_constant` — constant via FFN output bias
+14. `test_biased_linear_split` — attention Wx + FFN b in same layer
+15. `test_non_contiguous_columns` — scattered column indices work correctly
+16. `test_mixed_layer` — attn ops + FFN ops in one layer compose correctly
+
+**Gate**: All 16 tests pass.
 
 ---
 
@@ -333,10 +348,20 @@ assert torch.allclose(expected, result[output_node], atol=1e-4)
 | `tests/compile/forward/test_forward_compile.py` | 4 |
 | `tests/compile/forward/test_forward_adder.py` | 5 |
 
-**No existing files modified.**
+**Old compiler files removed**: compile.py, report.py, group.py, strategy.py, skip.py, embedding/pos_encoding components, CP-SAT solver from feature_assignment.py. Components and sublayers stripped to weight storage + forward pass. Old strategy tests deleted; end-to-end tests skipped pending retarget.
 
 ## Verification
 
 After each phase: `pytest tests/compile/forward/ -v`
 After Phase 4+: `pytest tests/ -v` (ensure no regressions)
 After Phase 5: Full adder arithmetic verification + resource usage logging
+
+## Current Status
+
+**46 passing, 19 skipped** (as of Phase 2 completion)
+
+- Phase 0 (GraphAnalyzer): 5 tests passing
+- Phase 1 (ResidualStreamMap): 7 tests passing
+- Phase 2 (WeightWriter): 16 tests passing
+- Graph/modelscript: 18 tests passing
+- Old compiler end-to-end: 19 tests skipped (retarget in Phase 4)
