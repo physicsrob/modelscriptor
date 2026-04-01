@@ -8,7 +8,7 @@ from modelscriptor.compiler.feature_assignment import FeatureAssignment
 from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
 from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
-from modelscriptor.graph import Node, Constant, InputNode, PosEncoding, Concatenate
+from modelscriptor.graph import Node, Constant, InputNode, PosEncoding, Concatenate, Embedding
 from modelscriptor.graph.embedding import Tokenizer
 
 
@@ -65,6 +65,10 @@ class HeadlessTransformer:
             elif isinstance(node, Concatenate):
                 # This is a noop since the input node are guaranteed to be here too.
                 pass
+            elif isinstance(node, Embedding):
+                embedding_output = node.compute(n_pos, input_values)
+                for i, idx in enumerate(indices):
+                    res_stream[:, idx] = embedding_output[:, i]
             else:
                 assert False, "Unsupported node type"
         return res_stream
