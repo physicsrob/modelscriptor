@@ -112,6 +112,74 @@ Each node is modeled as an interval variable, and the solver's native
 `AddNoOverlap` constraint ensures no two nodes share columns within a state.
 
 
+## Compilation: Strategies and the Beam Search
+
+The compiler works backwards from the output node. At each layer, it asks:
+"How should I use this sublayer (FFN or Attention) to compute the nodes I need?"
+
+### What is a strategy?
+
+A **strategy** is a plan for how a single sublayer computes one node. Each
+sublayer is made of components wired in sequence:
+
+- **FFN sublayer:** linear1 → relu → linear2 → skip
+- **Attention sublayer:** attn → skip
+
+For each node, each component offers possible ways to handle it:
+
+- **Skip component:** Route the node through the residual skip connection
+  (bypass the computation path), or if the node is an `Add`, decompose it
+  into skip + computation. Always has options.
+- **Attention component:** Compute an `Attn` node with an attention head.
+  Pass any node through as identity (using an attention head that copies from
+  the current position). Handle zero constants for free.
+- **Linear component:** Apply the node's weight matrix, or pass through as
+  identity.
+- **ReLU component:** Apply ReLU to a `ReLU` node. No other options -- this
+  component is a bottleneck for non-ReLU nodes passing through the FFN.
+
+A strategy for one node is a choice at each component: "this node goes through
+the skip connection" or "this node gets computed by attention head #3" etc.
+
+### Combining strategies across nodes
+
+A sublayer must handle **all** its assigned nodes simultaneously. If there are
+22 nodes at a given layer, the compiler needs a joint strategy that satisfies
+all constraint-solver requirements (no feature index conflicts, etc.).
+
+`get_combined_strategies` does this via **beam search**. It processes nodes one
+at a time:
+
+1. Pick a node, take its top K strategies (sorted by a score that counts
+   ancestor nodes -- simpler dependencies are preferred)
+2. Recursively combine strategies for all remaining nodes
+3. Cross-product the two sets, check each combination against the OR-Tools
+   constraint solver
+4. Keep the top K results
+
+The beam width K (`max_strategies`, default 2) controls the trade-off between
+compilation speed and reliability. Each node typically has 3-5 strategies, so
+with 22 nodes the search space is ~4^22 ≈ 10^13. The beam search explores a
+tiny fraction.
+
+### Why this can fail
+
+The beam search is sensitive to **node processing order**. Nodes are currently
+processed in arbitrary dict-iteration order. If the globally-viable strategy
+happens to rank 3rd for the first node processed, a beam width of 2 prunes it
+and compilation fails with "No strategies found."
+
+Empirically, for a 22-node case from a 2-digit adder:
+- Random ordering at beam width 2: **1 in 20** orderings find a solution
+- Beam width 3: **all 20** orderings find a solution
+- "Fewest strategies first" ordering at beam width 2: succeeds deterministically
+
+The cost of increasing beam width is linear -- each increment of K adds
+roughly 80 constraint-solver calls (~2 seconds) at this graph size. But the
+constraint solver itself gets slower as more layers accumulate constraints, so
+full compilation time is super-linear in the number of layers.
+
+
 ## TODO List
 This list is a non-exhaustive list of all the things that needs to be done before this project is relatively feature complete.
 

@@ -3,8 +3,10 @@ from typing import Tuple
 import torch
 
 from modelscriptor.compiler.compile import compile_network, compile_transformer
+from modelscriptor.compiler.transformer import HeadlessTransformer
 from modelscriptor.graph import Node, Embedding
 from modelscriptor.modelscript.arithmetic_ops import concat
+from examples.adder import create_network_parts
 
 from modelscriptor.modelscript.inout_nodes import (
     create_embedding,
@@ -128,3 +130,63 @@ def test_adder_1digit():
         assert predicted == expected, (
             f"For {''.join(tokens)}: expected '{expected}' but got '{predicted}'"
         )
+
+
+def decode_token(embedding: Embedding, vector: torch.Tensor) -> str:
+    """Decode a single embedding vector to its nearest token."""
+    dists = torch.cdist(vector.unsqueeze(0), embedding.table)
+    return embedding.tokenizer.decode_id(dists.argmin().item())
+
+
+def run_autoregressive(
+    net: HeadlessTransformer,
+    output_node: Node,
+    embedding: Embedding,
+    input_tokens: list,
+    max_new_tokens: int = 10,
+) -> str:
+    """Run a compiled network autoregressively, appending output tokens until <eos>."""
+    tokens = list(input_tokens)
+    for _ in range(max_new_tokens):
+        result = net.compute(
+            n_pos=len(tokens), input_values={"embedding_input": tokens}
+        )
+        next_token = decode_token(embedding, result[output_node][-1])
+        if next_token == "<eos>":
+            break
+        tokens.append(next_token)
+    # Return only the generated portion (after the input)
+    return "".join(tokens[len(input_tokens) :])
+
+
+def test_adder_autoregressive():
+    """Compile the examples/adder network (1-digit) and verify autoregressive output."""
+    import examples.adder as adder_module
+
+    original_max_digits = adder_module.max_digits
+    try:
+        adder_module.max_digits = 1
+        output_node, pos_encoding, embedding = create_network_parts()
+        net = compile_network(
+            256,
+            16,
+            output_node,
+            pos_encoding=pos_encoding,
+            report_name="adder_autoregressive",
+            verbose=True,
+        )
+
+        test_cases = [
+            ("1+1=", "2"),
+            ("2+3=", "5"),
+            ("0+0=", "0"),
+            ("4+5=", "9"),
+        ]
+        for input_str, expected in test_cases:
+            tokens = ["<bos>"] + list(input_str)
+            result = run_autoregressive(net, output_node, embedding, tokens)
+            assert result == expected, (
+                f"For {input_str}: expected '{expected}' but got '{result}'"
+            )
+    finally:
+        adder_module.max_digits = original_max_digits

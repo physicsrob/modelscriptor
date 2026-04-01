@@ -173,7 +173,8 @@ class NumericSequence:
         ]
 
 
-def create_network() -> Unembedding:
+def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
+    """Build the 3-digit adder graph and return (output_node, pos_encoding, embedding)."""
     # Define our vocabulary -- these are the tokens that will be used for our netowrk.
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
@@ -199,12 +200,15 @@ def create_network() -> Unembedding:
     ]
     sum_digits = remove_leading_0s(embedding, sum_digits, max_removals=max_digits - 1)
 
-    return create_unembedding(
-        output_sequence(
-            pos_encoding,
-            is_end_of_second_num,
-            sum_digits,
-            embedding.get_embedding(" "),
-        ),
-        embedding,
+    output_node = output_sequence(
+        pos_encoding,
+        is_end_of_second_num,
+        sum_digits,
+        embedding.get_embedding(" "),
     )
+    return output_node, pos_encoding, embedding
+
+
+def create_network() -> Unembedding:
+    output_node, pos_encoding, embedding = create_network_parts()
+    return create_unembedding(output_node, embedding)
