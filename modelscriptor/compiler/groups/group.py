@@ -40,8 +40,21 @@ class Group:
         node_to_strategies = {
             node: self.get_strategies_for_node(node) for node in nodes
         }
-        # For any given set of input/output nodes, we'll only keep one strategy.
-        strategies = get_combined_strategies(node_to_strategies, existing_constraints)
+        # Process most-constrained nodes first (fewest strategies).
+        node_to_strategies = dict(
+            sorted(
+                node_to_strategies.items(),
+                key=lambda item: (len(item[1]), len(item[0])),
+            )
+        )
+        # Beam search with retry at increasing width.
+        strategies = []
+        for max_strategies in [2, 4, 8]:
+            strategies = get_combined_strategies(
+                node_to_strategies, existing_constraints, max_strategies
+            )
+            if strategies:
+                break
         result = []
         for s in strategies:
             constraint = self.get_constraints(s)
