@@ -83,9 +83,11 @@ columns [0-9] before the FFN layer, it's still at columns [0-9] after the skip
 connection. Any value that flows through a skip connection must keep its column
 assignment.
 
-**Concatenations must be contiguous.** When the computation graph concatenates
-two values, they must occupy adjacent columns in the residual stream, and the
-combined range must match across states.
+**Concatenation is logical, not physical.** When the computation graph
+concatenates two values (e.g., to feed them into a Linear node), they do *not*
+need to be adjacent in the residual stream. The compiler scatters the Linear
+node's weight matrix to whatever columns the inputs occupy. This is a key
+simplification -- it means concatenation adds no allocation constraints.
 
 **Minimize width.** We want the narrowest residual stream possible -- fewer
 columns means a smaller, faster transformer.
@@ -99,16 +101,15 @@ compilation involves:
   attention, before FFN, after FFN)
 - Skip connections that lock values to the same columns across states
 - The same value appearing in many states (it stays alive until consumed)
-- Concatenation constraints that force groups of values to be contiguous
 
 These cross-state constraints create a coupled packing problem. A column
 assignment that looks fine for one state might make another state impossible to
 pack. The assignment must be solved globally, considering all states and
 constraints simultaneously.
 
-This is the same class of problem as **register allocation** in a traditional
-compiler, where CPU registers must be assigned to program variables subject to
-liveness and interference constraints. Register allocation is NP-hard.
+The compiler uses Google's OR-Tools CP-SAT solver to find valid allocations.
+Each node is modeled as an interval variable, and the solver's native
+`AddNoOverlap` constraint ensures no two nodes share columns within a state.
 
 
 ## TODO List
