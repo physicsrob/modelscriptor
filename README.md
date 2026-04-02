@@ -13,6 +13,16 @@ they are a fixed computational substrate that can be *programmed* by setting
 weights directly, without any training.
 
 
+## Getting Started
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
+
+```bash
+uv sync          # install dependencies
+make test        # run tests
+make lint        # run black + mypy
+```
+
 ## Key Concepts
 
 ### Nodes
