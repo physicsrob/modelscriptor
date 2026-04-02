@@ -184,14 +184,18 @@ def _write_add_into(attn, op: AttnHeadOp, rmap: ResidualStreamMap,
                     pos_encoding: PosEncoding):
     """Add(dead, live): copy live's values to dead's columns via attention.
 
-    Convention: op.node is Add(dead_addend, live_addend).
-    inputs[0] is dead (at target_cols), inputs[1] is live (copied).
-    Skip connection adds: dead + live = Add(dead, live).
+    target_cols are the dead addend's columns (now owned by the Add node
+    after reassign). The live addend is whichever input is still allocated
+    in the residual map. Skip connection adds: dead + live = Add(dead, live).
     """
     node = op.node
     assert isinstance(node, Add)
 
-    live_addend = node.inputs[1]
+    # Determine which input is live (still allocated in residual map)
+    if rmap.is_allocated(node.inputs[0]):
+        live_addend = node.inputs[0]
+    else:
+        live_addend = node.inputs[1]
     d_head = attn.d_head
     d_live = len(live_addend)
 

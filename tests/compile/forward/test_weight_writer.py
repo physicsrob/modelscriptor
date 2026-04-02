@@ -333,14 +333,16 @@ def test_add_into():
     pos = _make_pos_encoding()
     a = InputNode("a", 4)
     b = InputNode("b", 4)
-    # Convention: Add(dead_addend, live_addend)
-    # inputs[0]=a is dead (at target_cols), inputs[1]=b is copied via attention
+    # inputs[0]=a is dead (at target_cols), inputs[1]=b is live (copied via attention)
     add_node = Add(a, b)
 
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     a_cols = rmap.allocate(a)  # A occupies these columns (will become Add result)
     rmap.allocate(b)
+
+    # Simulate scheduler: reassign dead addend's columns to the Add node
+    rmap.reassign(a, add_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="add_into", node=add_node, target_cols=a_cols)
@@ -349,13 +351,51 @@ def test_add_into():
     a_values = torch.randn(N_POS, 4)
     b_values = torch.randn(N_POS, 4)
     pe_values = pos.compute(N_POS, {})
-    res = _build_residual_stream(rmap, {pos: pe_values, a: a_values, b: b_values})
+    # a's columns now belong to add_node, but still hold a's values
+    res = _build_residual_stream(rmap, {pos: pe_values, add_node: a_values, b: b_values})
 
     # After attn sublayer: A's columns get A + B (skip adds A, attn writes B)
     out = layer.attn.forward(res)
     result = out[:, a_cols]
 
     expected = add_node.compute(N_POS, {"a": a_values, "b": b_values})
+    assert torch.allclose(result, expected, atol=1e-4)
+
+
+def test_add_into_dead_at_inputs1():
+    """Add(live, dead) where dead is inputs[1] — still works correctly.
+
+    This matches the adder's cond_add_vector pattern: Add(inp, chain_output)
+    where chain_output is dead but lives at inputs[1].
+    """
+    pos = _make_pos_encoding()
+    live = InputNode("live", 4)
+    dead = InputNode("dead", 4)
+    # Dead addend is inputs[1], not inputs[0]
+    add_node = Add(live, dead)
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(live)
+    dead_cols = rmap.allocate(dead)
+
+    # Simulate what the scheduler does: reassign dead's columns to the Add node
+    rmap.reassign(dead, add_node)
+
+    layer = TransformerLayer(D, D_HEAD, pos)
+    op = AttnHeadOp(op_type="add_into", node=add_node, target_cols=dead_cols)
+    write_attn_sublayer(layer, [op], rmap, pos)
+
+    live_values = torch.randn(N_POS, 4)
+    dead_values = torch.randn(N_POS, 4)
+    pe_values = pos.compute(N_POS, {})
+    # dead's columns now belong to add_node, but still hold dead's values
+    res = _build_residual_stream(rmap, {pos: pe_values, live: live_values, add_node: dead_values})
+
+    out = layer.attn.forward(res)
+    result = out[:, dead_cols]
+
+    expected = add_node.compute(N_POS, {"live": live_values, "dead": dead_values})
     assert torch.allclose(result, expected, atol=1e-4)
 
 
