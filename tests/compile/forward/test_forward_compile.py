@@ -16,7 +16,7 @@ from modelscriptor.modelscript.inout_nodes import (
     create_pos_encoding,
 )
 from modelscriptor.modelscript.arithmetic_ops import add, relu, concat, sum_nodes
-from modelscriptor.modelscript.logic_ops import cond_add_vector
+from modelscriptor.modelscript.logic_ops import cond_gate, cond_add_vector
 from modelscriptor.modelscript.map_select import select, map_to_table
 
 
@@ -132,3 +132,48 @@ def test_compile_map_to_table():
             [1.0, 1.0],  # expect 30.0
         ]),
     })
+
+
+# ---------------------------------------------------------------------------
+# Patterns that exercise untested code paths (pre-Phase 5 validation)
+# ---------------------------------------------------------------------------
+
+
+def test_compile_cond_gate():
+    """cond_gate — exercises standalone ReLU (Add -> ReLU -> Add pattern).
+
+    This is the key pattern from the adder that uses standalone ReLU.
+    cond_gate(cond, inp) = cond_add_vector(cond, relu(cond_add_vector(cond, inp, ...)), ...)
+    """
+    pos = create_pos_encoding()
+    cond = create_input("cond", 1)
+    inp = create_input("inp", 4)
+    out = cond_gate(cond, inp)
+
+    n_pos = 4
+    _verify(out, n_pos=n_pos, input_values={
+        "cond": torch.tensor([[1.0], [-1.0], [1.0], [-1.0]]),
+        "inp": torch.randn(n_pos, 4),
+    }, pos_encoding=pos)
+
+
+def test_compile_get_prev_value():
+    """pos_encoding.get_prev_value() — cross-position attention with Concatenate key_in.
+
+    get_prev_value returns the most recent value where cond was true.
+    Exercises Attn node with Concatenate([pos, cond]) as key_in.
+    """
+    pos = create_pos_encoding()
+    v = create_input("v", 4)
+    cond = create_input("cond", 1)
+    out = pos.get_prev_value(v, cond)
+
+    n_pos = 5
+    _verify(out, n_pos=n_pos, input_values={
+        "v": torch.tensor([[10.0, 20.0, 30.0, 40.0],
+                            [11.0, 21.0, 31.0, 41.0],
+                            [12.0, 22.0, 32.0, 42.0],
+                            [13.0, 23.0, 33.0, 43.0],
+                            [14.0, 24.0, 34.0, 44.0]]),
+        "cond": torch.tensor([[1.0], [0.0], [0.0], [1.0], [0.0]]),
+    }, pos_encoding=pos)
