@@ -345,7 +345,7 @@ assert torch.allclose(expected, result[output_node], atol=1e-4)
 
 ---
 
-## Phase 5: Adder Tests
+## Phase 5: Adder Tests — DONE
 
 **Goal**: Compile 1-digit and 3-digit adders, verify arithmetic correctness.
 
@@ -399,18 +399,25 @@ After Phase 5: Full adder arithmetic verification + resource usage logging
 
 ## Current Status
 
-**76 passing, 19 skipped** (as of Phase 4 completion)
+**86 passing, 19 skipped** (as of Phase 5 completion)
 
 - Phase 0 (GraphAnalyzer): 5 tests passing
 - Phase 1 (ResidualStreamMap): 7 tests passing
 - Phase 2 (WeightWriter): 19 tests passing
 - Phase 3 (LayerScheduler): 20 tests passing
-- Phase 4 (Forward Compile): 7 tests passing
+- Phase 4 (Forward Compile): 10 tests passing
+- Phase 5 (Adder): 5 tests passing
 - Graph/modelscript: 18 tests passing
 - Old compiler end-to-end: 19 tests skipped (retarget later or remove)
+
+**Compilation results:**
+- 1-digit adder: 51 nodes, 9 layers, peak ~101 columns used (of 1024)
+- 3-digit adder: 202 nodes, 29 layers, peak ~219 columns used (of 1024)
 
 **Integration fixes found in Phase 4:**
 - Auto-create pos_encoding when not provided (needed for attention ops)
 - Save input indices before scheduling loop (scheduling may free/reassign them)
 - Concatenate nodes can't be dead-for-add addends in scheduler
 - Weight writer add_into handles Concatenate live addends via get_node_indices
+
+**Note**: The adder does not handle overflow beyond max_digits (carry is discarded). 999+1 produces "0", not "1000". This is an adder graph limitation, not a compiler issue.

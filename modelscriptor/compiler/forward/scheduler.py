@@ -65,6 +65,28 @@ class LayerScheduler:
             ready, dead, free_adds, residual_map, computed_nodes
         )
 
+        # --- 2.5. Re-check readiness after attention ---
+        # Nodes computed by attention may unlock FFN-eligible nodes in the same
+        # layer (the FFN sublayer reads x + attn(x), so it sees attention results).
+        newly_ready = self.graph.get_ready_nodes(computed_nodes) - all_ready
+        for node in newly_ready:
+            if isinstance(node, Add):
+                a0, a1 = node.inputs
+                d0 = self._is_dead_for_add(a0, node, computed_nodes)
+                d1 = self._is_dead_for_add(a1, node, computed_nodes)
+                if not (d0 or d1):
+                    continue  # deferred add, skip
+            if isinstance(node, (Linear, ReLU, Constant)):
+                ready.add(node)
+
+        new_chains = self._detect_chains(ready)
+        for l1, relu, l2, d_int, exclusive in new_chains:
+            ready.discard(l2)
+            ready.discard(relu)
+            if exclusive:
+                ready.discard(l1)
+        chains.extend(new_chains)
+
         # --- 3. FFN sublayer ---
         ffn_ops = self._schedule_ffn_sublayer(
             ready, chains, biased_linears, residual_map, computed_nodes
