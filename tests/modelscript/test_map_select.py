@@ -4,7 +4,7 @@ from modelscriptor.modelscript.inout_nodes import (
     create_constant,
     create_embedding,
 )
-from modelscriptor.modelscript.map_select import select, map_to_table
+from modelscriptor.modelscript.map_select import select, map_to_table, switch
 
 import torch
 
@@ -20,6 +20,50 @@ def test_select():
         output = x.compute(n_pos=1, input_values={"cond": torch.tensor([[cond]])})
         expected_value = start + (offset if cond > 0 else 0)
         assert output.tolist() == [[expected_value]]
+
+
+def test_switch():
+    """Select one of three values based on which condition is true."""
+    c1 = create_input("c1", 1)
+    c2 = create_input("c2", 1)
+    c3 = create_input("c3", 1)
+    v1 = create_constant(torch.tensor([10.0, 20.0]))
+    v2 = create_constant(torch.tensor([30.0, 40.0]))
+    v3 = create_constant(torch.tensor([50.0, 60.0]))
+    out = switch([c1, c2, c3], [v1, v2, v3])
+
+    # Condition 1 true
+    result = out.compute(
+        n_pos=1,
+        input_values={
+            "c1": torch.tensor([[1.0]]),
+            "c2": torch.tensor([[-1.0]]),
+            "c3": torch.tensor([[-1.0]]),
+        },
+    )
+    assert torch.allclose(result, torch.tensor([[10.0, 20.0]]), atol=1e-4)
+
+    # Condition 2 true
+    result = out.compute(
+        n_pos=1,
+        input_values={
+            "c1": torch.tensor([[-1.0]]),
+            "c2": torch.tensor([[1.0]]),
+            "c3": torch.tensor([[-1.0]]),
+        },
+    )
+    assert torch.allclose(result, torch.tensor([[30.0, 40.0]]), atol=1e-4)
+
+    # Condition 3 true
+    result = out.compute(
+        n_pos=1,
+        input_values={
+            "c1": torch.tensor([[-1.0]]),
+            "c2": torch.tensor([[-1.0]]),
+            "c3": torch.tensor([[1.0]]),
+        },
+    )
+    assert torch.allclose(result, torch.tensor([[50.0, 60.0]]), atol=1e-4)
 
 
 def test_map_to_table():

@@ -3,3 +3,6 @@ __pycache__
 .venv
 *.egg-info
 .pytest_cache
+*.onnx
+*.vocab.json
+.claude/

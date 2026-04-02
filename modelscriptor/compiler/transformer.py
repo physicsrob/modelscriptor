@@ -1,8 +1,10 @@
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional, Union
 
 import torch
 
 from modelscriptor.compiler.feature_assignment import FeatureAssignment
+from modelscriptor.compiler.groups.attn_sublayer import AttnSubLayer
+from modelscriptor.compiler.groups.ffn_sublayer import FFNSubLayer
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
 from modelscriptor.graph import (
     Node,
@@ -44,7 +46,7 @@ class HeadlessTransformer:
     def get_input_res_stream(
         self,
         n_pos: int,
-        input_values: Dict[str, torch.Tensor],
+        input_values: Dict[str, Any],
     ):
         assert self.feature_assignment
         in_state = self.layers[0].attn.in_state
@@ -79,7 +81,11 @@ class HeadlessTransformer:
         res = inp
         all_states = {}
         for i, layer in enumerate(self.layers):
-            for sublayer, sublayer_name in [(layer.attn, "attn"), (layer.ffn, "ffn")]:
+            sublayer_pairs: List[tuple[Union[AttnSubLayer, FFNSubLayer], str]] = [
+                (layer.attn, "attn"),
+                (layer.ffn, "ffn"),
+            ]
+            for sublayer, sublayer_name in sublayer_pairs:
                 if return_states:
                     res, states = sublayer.forward(res, return_states=True)
                     prefixed_states = {
@@ -95,7 +101,7 @@ class HeadlessTransformer:
             return res
 
     def compute(
-        self, n_pos: int, input_values: Dict[str, torch.Tensor]
+        self, n_pos: int, input_values: Dict[str, Any]
     ) -> Dict[Node, torch.Tensor]:
         assert self.feature_assignment
 
