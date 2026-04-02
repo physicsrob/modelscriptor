@@ -21,7 +21,6 @@ from modelscriptor.graph import Linear, ReLU, Attn, Add, Concatenate
 from modelscriptor.graph.misc import InputNode, Constant
 from modelscriptor.graph.pos_encoding import PosEncoding
 
-
 D = 64
 D_HEAD = 16
 N_HEADS = D // D_HEAD  # 4
@@ -43,7 +42,9 @@ def _make_biased_linear(inp, d_out, name=""):
 
 def _make_relu_chain(inp, d_int, d_out, name=""):
     """L1 -> ReLU -> L2 chain. Returns (l2, relu, l1)."""
-    l1 = Linear(inp, torch.randn(len(inp), d_int), torch.randn(d_int), name=f"{name}_l1")
+    l1 = Linear(
+        inp, torch.randn(len(inp), d_int), torch.randn(d_int), name=f"{name}_l1"
+    )
     r = ReLU(l1, name=f"{name}_r")
     l2 = Linear(r, torch.randn(d_int, d_out), torch.randn(d_out), name=f"{name}_l2")
     return l2, r, l1
@@ -366,7 +367,9 @@ def test_ffn_slot_exhaustion():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, ffn_ops = scheduler.schedule_layer(rmap, computed)
 
-    total_slots = sum(len(op.ffn_slots) for op in ffn_ops if op.op_type == "compute_relu")
+    total_slots = sum(
+        len(op.ffn_slots) for op in ffn_ops if op.op_type == "compute_relu"
+    )
     assert total_slots <= D
 
     relu_ops = [op for op in ffn_ops if op.op_type == "compute_relu"]
@@ -647,9 +650,9 @@ def test_no_progress_raises_error():
     # Tiny d: just enough for pos + a + b, nothing spare
     small_d = D_HEAD + 4 + 4  # 24
     rmap = ResidualStreamMap(small_d)
-    rmap.allocate(pos)   # 16 cols
-    rmap.allocate(a)     # 4 cols
-    rmap.allocate(b)     # 4 cols
+    rmap.allocate(pos)  # 16 cols
+    rmap.allocate(a)  # 4 cols
+    rmap.allocate(b)  # 4 cols
     assert rmap.get_free_count() == 0
     computed = {pos, a, b}
     # a: consumers={add_node, a_consumer}, neither computed → not dead
@@ -659,6 +662,60 @@ def test_no_progress_raises_error():
     scheduler = LayerScheduler(graph, small_d, D_HEAD, pos)
     with pytest.raises(Exception):
         scheduler.schedule_layer(rmap, computed)
+
+
+def test_add_into_shared_addend_not_reassigned():
+    """Shared node used as live addend must not be reassigned as dead later.
+
+    Bug pattern: A shared Constant is an input to multiple Add nodes. All Adds
+    become free_adds in the same layer. The step 2a loop processes them
+    sequentially, adding each Add to computed_nodes. On the last Add, the shared
+    Constant's other consumers (the earlier Adds) are now computed, making the
+    Constant dead-for-add. The scheduler reassigns the Constant's columns to the
+    last Add — but the earlier Adds' ops still reference the Constant as their
+    live addend, and the weight writer needs its columns.
+
+    This is the exact bug from the calculator's switch() pattern.
+    """
+    pos = _make_pos_encoding()
+    shared = Constant(torch.randn(4))
+
+    # 3 Add nodes sharing the same Constant, each with a unique dead addend
+    dead_nodes = [InputNode(f"dead{i}", 4) for i in range(3)]
+    adds = [Add(shared, dn) for dn in dead_nodes]
+    # Wire into output so graph includes everything
+    out_cat = Concatenate(adds)
+    out = _make_linear(out_cat, 2, "out")
+
+    graph = GraphAnalyzer(out)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(shared)
+    for dn in dead_nodes:
+        rmap.allocate(dn)
+    computed = {pos, shared} | set(dead_nodes)
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    attn_ops, ffn_ops = scheduler.schedule_layer(rmap, computed)
+
+    add_into_ops = [op for op in attn_ops if op.op_type == "add_into"]
+    assert len(add_into_ops) == 3, f"Expected 3 add_into ops, got {len(add_into_ops)}"
+
+    # Replicate the weight writer's live-addend resolution:
+    # if a0 is allocated, live = a0; else live = a1.
+    # Then get_node_indices(live) must succeed.
+    for op in add_into_ops:
+        a0, a1 = op.node.inputs
+        live = a0 if rmap.is_allocated(a0) else a1
+        try:
+            rmap.get_node_indices(live)
+        except KeyError:
+            pytest.fail(
+                f"add_into live addend not in residual map — shared node "
+                f"was reassigned as dead addend in the same batch. "
+                f"a0={type(a0).__name__}(alloc={rmap.is_allocated(a0)}) "
+                f"a1={type(a1).__name__}(alloc={rmap.is_allocated(a1)})"
+            )
 
 
 def test_output_already_computed():

@@ -4,7 +4,14 @@ import torch
 
 from modelscriptor.compiler.feature_assignment import FeatureAssignment
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
-from modelscriptor.graph import Node, Constant, InputNode, PosEncoding, Concatenate, Embedding
+from modelscriptor.graph import (
+    Node,
+    Constant,
+    InputNode,
+    PosEncoding,
+    Concatenate,
+    Embedding,
+)
 
 
 class HeadlessTransformer:
