@@ -134,6 +134,20 @@ def test_compile_map_to_table():
     })
 
 
+def test_compile_sum_nodes():
+    """sum_nodes with 4 x 8-dim inputs -- Concatenate(32) -> Linear(32 -> 8).
+
+    The Linear's input dim (32) exceeds d_head (16), requiring multi-head
+    attention. This is the exact pattern from the adder's output_sequence.
+    """
+    inputs = [create_input(f"v{i}", 8) for i in range(4)]
+    out = sum_nodes(inputs)
+
+    n_pos = 3
+    input_values = {f"v{i}": torch.randn(n_pos, 8) for i in range(4)}
+    _verify(out, n_pos=n_pos, input_values=input_values)
+
+
 # ---------------------------------------------------------------------------
 # Patterns that exercise untested code paths (pre-Phase 5 validation)
 # ---------------------------------------------------------------------------

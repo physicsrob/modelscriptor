@@ -145,6 +145,36 @@ def test_schedule_zero_bias_linear():
     assert linear in computed
 
 
+def test_schedule_large_input_linear():
+    """Zero-bias Linear with input dim > d_head is still scheduled.
+
+    This is the sum_nodes pattern: Concatenate(4 × 8-dim) → Linear(32 → 8).
+    With d_input=32 and d_head=16, needs multiple attention heads.
+    """
+    pos = _make_pos_encoding()
+    inputs = [InputNode(f"x{i}", 8) for i in range(4)]
+    cat = Concatenate(inputs)
+    d_out = 8
+    W = torch.zeros(32, d_out)
+    for i in range(32):
+        W[i, i % d_out] = 1.0
+    linear = Linear(cat, W, torch.zeros(d_out), name="sum")
+
+    graph = GraphAnalyzer(linear)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    for inp in inputs:
+        rmap.allocate(inp)
+    computed = {pos} | set(inputs)
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    attn_ops, ffn_ops = scheduler.schedule_layer(rmap, computed)
+
+    linear_ops = [op for op in attn_ops if op.op_type == "compute_linear"]
+    assert any(op.node is linear for op in linear_ops)
+    assert linear in computed
+
+
 def test_schedule_biased_linear():
     """Biased Linear (len <= d_head) produces both AttnHeadOp and FFNOp in same layer."""
     pos = _make_pos_encoding()
