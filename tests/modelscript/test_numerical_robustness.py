@@ -18,7 +18,6 @@ from modelscriptor.modelscript.inout_nodes import create_constant, create_embedd
 from modelscriptor.modelscript.logic_ops import compare_to_vector
 from modelscriptor.modelscript.map_select import map_to_table, select
 
-
 VOCAB = [str(i) for i in range(10)] + ["+", "-", "*", "=", "<eos>", "<bos"]
 
 
@@ -50,7 +49,9 @@ def test_map_to_table_output_fidelity():
         result = looked_up.compute(n_pos=1, input_values={}).squeeze()
         true_emb = embedding.get_embedding(str(digit))
         dist = (result - true_emb).norm().item()
-        assert dist < 0.1, f"digit {digit}: map_to_table output dist={dist:.4f} from true embedding"
+        assert (
+            dist < 0.1
+        ), f"digit {digit}: map_to_table output dist={dist:.4f} from true embedding"
 
 
 def test_chained_map_to_table_output_fidelity():
@@ -134,11 +135,9 @@ def test_compare_to_vector_output_bounds_exact_input():
             inp = create_constant(embedding.get_embedding(str(i)))
             result = compare_to_vector(inp, embedding.get_embedding(str(j)))
             output = result.compute(n_pos=1, input_values={}).item()
-            assert -1.0 - 1e-3 <= output <= 1.0 + 1e-3, (
-                f"compare_to_vector({i}, {j}) = {output:.4f}, outside [-1, 1]"
-            )
-
-
+            assert (
+                -1.0 - 1e-3 <= output <= 1.0 + 1e-3
+            ), f"compare_to_vector({i}, {j}) = {output:.4f}, outside [-1, 1]"
 
 
 # ---------------------------------------------------------------------------
@@ -166,25 +165,25 @@ def test_compare_to_vector_after_select():
     selected = select(cond=cond_true, true_node=true_node, false_node=false_node)
     result = compare_to_vector(selected, e3)
     output = result.compute(n_pos=1, input_values={}).item()
-    assert output == pytest.approx(1.0, abs=0.1), (
-        f"compare_to_vector(select(true→3), 3) = {output:.4f}, expected ~1.0"
-    )
+    assert output == pytest.approx(
+        1.0, abs=0.1
+    ), f"compare_to_vector(select(true→3), 3) = {output:.4f}, expected ~1.0"
 
     # Also verify it rejects the wrong digit
     result_wrong = compare_to_vector(selected, e7)
     output_wrong = result_wrong.compute(n_pos=1, input_values={}).item()
-    assert output_wrong == pytest.approx(-1.0, abs=0.1), (
-        f"compare_to_vector(select(true→3), 7) = {output_wrong:.4f}, expected ~-1.0"
-    )
+    assert output_wrong == pytest.approx(
+        -1.0, abs=0.1
+    ), f"compare_to_vector(select(true→3), 7) = {output_wrong:.4f}, expected ~-1.0"
 
     # Condition = false → should select e7
     cond_false = create_constant(torch.tensor([-1.0]))
     selected_f = select(cond=cond_false, true_node=true_node, false_node=false_node)
     result_f = compare_to_vector(selected_f, e7)
     output_f = result_f.compute(n_pos=1, input_values={}).item()
-    assert output_f == pytest.approx(1.0, abs=0.1), (
-        f"compare_to_vector(select(false→7), 7) = {output_f:.4f}, expected ~1.0"
-    )
+    assert output_f == pytest.approx(
+        1.0, abs=0.1
+    ), f"compare_to_vector(select(false→7), 7) = {output_f:.4f}, expected ~1.0"
 
 
 def test_compare_to_vector_after_nested_select():
@@ -211,9 +210,9 @@ def test_compare_to_vector_after_nested_select():
 
     result = compare_to_vector(level2, e5)
     output = result.compute(n_pos=1, input_values={}).item()
-    assert output == pytest.approx(1.0, abs=0.1), (
-        f"compare_to_vector after 2 selects = {output:.4f}, expected ~1.0"
-    )
+    assert output == pytest.approx(
+        1.0, abs=0.1
+    ), f"compare_to_vector after 2 selects = {output:.4f}, expected ~1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -268,16 +267,20 @@ def test_sum_digits_on_map_to_table_output():
     prod_table_ones = {}
     for i in range(10):
         for j in range(10):
-            key = torch.cat([
-                embedding.get_embedding(str(i)),
-                embedding.get_embedding(str(j)),
-            ])
+            key = torch.cat(
+                [
+                    embedding.get_embedding(str(i)),
+                    embedding.get_embedding(str(j)),
+                ]
+            )
             prod_table_ones[key] = embedding.get_embedding(str((i * j) % 10))
 
-    inp = concat([
-        create_constant(embedding.get_embedding("3")),
-        create_constant(embedding.get_embedding("4")),
-    ])
+    inp = concat(
+        [
+            create_constant(embedding.get_embedding("3")),
+            create_constant(embedding.get_embedding("4")),
+        ]
+    )
     ones = map_to_table(inp, prod_table_ones, default=embedding.get_embedding("0"))
 
     zero = create_constant(embedding.get_embedding("0"))

@@ -6,7 +6,11 @@ from modelscriptor.modelscript.ffn_layer import ffn_layer
 import torch
 
 from modelscriptor.modelscript.arithmetic_ops import relu, sum_nodes, compare
-from modelscriptor.modelscript.const import turn_on_speed, embedding_turn_on_speed, big_offset
+from modelscriptor.modelscript.const import (
+    turn_on_speed,
+    embedding_turn_on_speed,
+    big_offset,
+)
 
 
 def bool_any_true(inp_list: List[Node]) -> Node:

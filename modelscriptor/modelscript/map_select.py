@@ -2,7 +2,11 @@ from modelscriptor.graph import Node, Concatenate
 from typing import List, Tuple, Dict
 import torch
 
-from modelscriptor.modelscript.const import big_offset, turn_on_speed, embedding_turn_on_speed
+from modelscriptor.modelscript.const import (
+    big_offset,
+    turn_on_speed,
+    embedding_turn_on_speed,
+)
 from modelscriptor.modelscript.logic_ops import cond_add_vector, cond_gate
 from modelscriptor.modelscript.arithmetic_ops import sum_nodes
 from modelscriptor.modelscript.ffn_layer import ffn_layer
