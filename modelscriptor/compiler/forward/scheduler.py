@@ -116,16 +116,16 @@ class LayerScheduler:
         compute_candidates = []
         for node in ready:
             if isinstance(node, Attn):
-                compute_candidates.append(("compute_attn", node))
+                compute_candidates.append(("compute_attn", node, 1))
             elif (isinstance(node, Linear)
-                  and not isinstance(node.inputs[0], ReLU)
-                  and len(node.inputs[0]) <= self.d_head):
-                compute_candidates.append(("compute_linear", node))
+                  and not isinstance(node.inputs[0], ReLU)):
+                n_heads = self._heads_for_linear(node)
+                compute_candidates.append(("compute_linear", node, n_heads))
 
         # Sort: Attn first, then by critical path
-        compute_candidates.sort(key=lambda pair: (
-            0 if pair[0] == "compute_attn" else 1,
-            -self.graph.get_critical_path_length(pair[1]),
+        compute_candidates.sort(key=lambda t: (
+            0 if t[0] == "compute_attn" else 1,
+            -self.graph.get_critical_path_length(t[1]),
         ))
 
         # Cancellation candidates
@@ -136,14 +136,14 @@ class LayerScheduler:
         cancel_candidates.sort(key=lambda n: -len(n))  # largest first
 
         # 2b-2d. Schedule compute ops with cancellation promotion
-        for op_type, node in compute_candidates:
-            if heads_used >= self.n_heads:
-                break
+        for op_type, node, n_heads_needed in compute_candidates:
+            if heads_used + n_heads_needed > self.n_heads:
+                continue
             target_cols = self._try_allocate(node, residual_map)
 
             # Promotion: cancel dead nodes to free space
             while (target_cols is None and cancel_candidates
-                   and heads_used < self.n_heads - 1):
+                   and heads_used + n_heads_needed < self.n_heads):
                 cn = cancel_candidates.pop(0)
                 attn_ops.append(
                     AttnHeadOp("cancel", cn, residual_map.get_indices(cn)))
@@ -155,7 +155,7 @@ class LayerScheduler:
                 continue
 
             attn_ops.append(AttnHeadOp(op_type, node, target_cols))
-            heads_used += 1
+            heads_used += n_heads_needed
             computed_nodes.add(node)
             ready.discard(node)
 
@@ -324,6 +324,11 @@ class LayerScheduler:
             if self._is_dead(node, computed_nodes):
                 dead.append(node)
         return dead
+
+    def _heads_for_linear(self, node: Linear) -> int:
+        """Number of attention heads needed for a standalone Linear."""
+        d_input = len(node.inputs[0])
+        return (d_input + self.d_head - 1) // self.d_head
 
     def _has_zero_bias(self, node: Linear) -> bool:
         return node.output_bias.abs().sum().item() == 0

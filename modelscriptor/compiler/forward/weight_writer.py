@@ -139,6 +139,11 @@ def _write_compute_linear(attn, op: AttnHeadOp, rmap: ResidualStreamMap,
     Q/K attend to current position via pos_encoding.
     V reads from the Linear's input columns.
     O applies the Linear's weight matrix to target columns.
+
+    For d_input > d_head, splits across multiple heads. Each head handles
+    a d_head-sized chunk of the input and applies the corresponding slice
+    of the weight matrix. Attention heads are additive, so results sum
+    to give the full W @ input.
     """
     node = op.node
     assert isinstance(node, Linear)
@@ -148,17 +153,26 @@ def _write_compute_linear(attn, op: AttnHeadOp, rmap: ResidualStreamMap,
     d_input = len(input_node)
 
     pe_idx = rmap.get_indices(pos_encoding)
-    v_idx = rmap.get_indices(input_node)
+    v_idx = rmap.get_node_indices(input_node)  # resolves through Concatenate
     o_idx = op.target_cols
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
-    v_mat = torch.eye(d_input, d_head)
-    # O = weight matrix padded: (d_head, d_output)
-    o_mat = F.pad(node.output_matrix, (0, 0, 0, d_head - d_input))
 
-    head = _allocate_head(attn)
-    _scatter_attn_head(attn, head, pe_idx, pe_idx, v_idx, o_idx,
-                       q_mat, k_mat, v_mat, o_mat, d_head)
+    # Split input across ceil(d_input / d_head) heads
+    for start in range(0, d_input, d_head):
+        end = min(start + d_head, d_input)
+        chunk_size = end - start
+
+        v_chunk_idx = v_idx[start:end]
+        v_mat = torch.eye(chunk_size, d_head)
+
+        # Weight matrix slice for this chunk: rows [start:end]
+        weight_slice = node.output_matrix[start:end, :]  # (chunk_size, d_output)
+        o_mat = F.pad(weight_slice, (0, 0, 0, d_head - chunk_size))
+
+        head = _allocate_head(attn)
+        _scatter_attn_head(attn, head, pe_idx, pe_idx, v_chunk_idx, o_idx,
+                           q_mat, k_mat, v_mat, o_mat, d_head)
 
 
 def _write_cancel(attn, op: AttnHeadOp, rmap: ResidualStreamMap,

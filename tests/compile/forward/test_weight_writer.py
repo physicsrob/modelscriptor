@@ -23,7 +23,7 @@ from modelscriptor.compiler.forward.weight_writer import (
     write_ffn_sublayer,
 )
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
-from modelscriptor.graph import Linear, ReLU, Attn, Add
+from modelscriptor.graph import Linear, ReLU, Attn, Add, Concatenate
 from modelscriptor.graph.misc import InputNode, Constant
 from modelscriptor.graph.pos_encoding import PosEncoding, attention_hardness
 
@@ -236,6 +236,47 @@ def test_linear_zero_bias():
     result = out[:, out_cols]
 
     expected = linear_node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(result, expected, atol=1e-4)
+
+
+def test_linear_large_input():
+    """Zero-bias Linear with input dim > d_head — requires multiple attention heads.
+
+    This is the sum_nodes pattern from the adder: Concatenate(4 × 8-dim) → Linear.
+    With d_input=32 and d_head=16, needs ceil(32/16) = 2 heads.
+    """
+    pos = _make_pos_encoding()
+    # 4 inputs of 8 dims each, concatenated → 32-dim input
+    inputs = [InputNode(f"x{i}", 8) for i in range(4)]
+    cat = Concatenate(inputs)
+    # Summing matrix: each output dim accumulates from all 4 inputs
+    d_out = 8
+    W = torch.zeros(32, d_out)
+    for i in range(32):
+        W[i, i % d_out] = 1.0
+    linear_node = Linear(cat, W, torch.zeros(d_out), name="sum")
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    for inp in inputs:
+        rmap.allocate(inp)
+    out_cols = rmap.allocate(linear_node)
+
+    layer = TransformerLayer(D, D_HEAD, pos)
+    op = AttnHeadOp(op_type="compute_linear", node=linear_node, target_cols=out_cols)
+    write_attn_sublayer(layer, [op], rmap, pos)
+
+    input_values = {f"x{i}": torch.randn(N_POS, 8) for i in range(4)}
+    pe_values = pos.compute(N_POS, {})
+    node_values = {pos: pe_values}
+    for inp in inputs:
+        node_values[inp] = input_values[inp.name]
+    res = _build_residual_stream(rmap, node_values)
+
+    out = layer.attn.forward(res)
+    result = out[:, out_cols]
+
+    expected = linear_node.compute(N_POS, input_values)
     assert torch.allclose(result, expected, atol=1e-4)
 
 
