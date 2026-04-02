@@ -21,7 +21,6 @@ from modelscriptor.graph import Linear, ReLU, Attn, Add, Concatenate
 from modelscriptor.graph.misc import InputNode, Constant
 from modelscriptor.graph.pos_encoding import PosEncoding
 
-
 D = 64
 D_HEAD = 16
 N_HEADS = D // D_HEAD  # 4
@@ -43,7 +42,9 @@ def _make_biased_linear(inp, d_out, name=""):
 
 def _make_relu_chain(inp, d_int, d_out, name=""):
     """L1 -> ReLU -> L2 chain. Returns (l2, relu, l1)."""
-    l1 = Linear(inp, torch.randn(len(inp), d_int), torch.randn(d_int), name=f"{name}_l1")
+    l1 = Linear(
+        inp, torch.randn(len(inp), d_int), torch.randn(d_int), name=f"{name}_l1"
+    )
     r = ReLU(l1, name=f"{name}_r")
     l2 = Linear(r, torch.randn(d_int, d_out), torch.randn(d_out), name=f"{name}_l2")
     return l2, r, l1
@@ -366,7 +367,9 @@ def test_ffn_slot_exhaustion():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, ffn_ops = scheduler.schedule_layer(rmap, computed)
 
-    total_slots = sum(len(op.ffn_slots) for op in ffn_ops if op.op_type == "compute_relu")
+    total_slots = sum(
+        len(op.ffn_slots) for op in ffn_ops if op.op_type == "compute_relu"
+    )
     assert total_slots <= D
 
     relu_ops = [op for op in ffn_ops if op.op_type == "compute_relu"]
@@ -647,9 +650,9 @@ def test_no_progress_raises_error():
     # Tiny d: just enough for pos + a + b, nothing spare
     small_d = D_HEAD + 4 + 4  # 24
     rmap = ResidualStreamMap(small_d)
-    rmap.allocate(pos)   # 16 cols
-    rmap.allocate(a)     # 4 cols
-    rmap.allocate(b)     # 4 cols
+    rmap.allocate(pos)  # 16 cols
+    rmap.allocate(a)  # 4 cols
+    rmap.allocate(b)  # 4 cols
     assert rmap.get_free_count() == 0
     computed = {pos, a, b}
     # a: consumers={add_node, a_consumer}, neither computed → not dead

@@ -86,7 +86,7 @@ class Placeholder(Node):
         super().__init__(d, [])
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
-        return torch.zeros(self.d)
+        return torch.zeros(self.d_output)
 
 
 class ValueLogger(Node):

@@ -16,11 +16,15 @@ from modelscriptor.modelscript.inout_nodes import (
     create_pos_encoding,
 )
 from modelscriptor.modelscript.arithmetic_ops import (
-    add, add_scalar, relu, relu_add, concat, sum_nodes,
+    add,
+    add_scalar,
+    relu,
+    relu_add,
+    concat,
+    sum_nodes,
 )
 from modelscriptor.modelscript.logic_ops import cond_gate, cond_add_vector
 from modelscriptor.modelscript.map_select import select, map_to_table
-
 
 D = 256
 D_HEAD = 16
@@ -29,8 +33,11 @@ D_HEAD = 16
 def _verify(output_node, n_pos, input_values, pos_encoding=None):
     """Compile and verify output matches node.compute()."""
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=output_node,
-        pos_encoding=pos_encoding, verbose=False,
+        d=D,
+        d_head=D_HEAD,
+        output_node=output_node,
+        pos_encoding=pos_encoding,
+        verbose=False,
     )
     assert net.feature_assignment is not None
 
@@ -39,9 +46,9 @@ def _verify(output_node, n_pos, input_values, pos_encoding=None):
     actual = result[output_node]
 
     expected = output_node.compute(n_pos, input_values)
-    assert torch.allclose(actual, expected, atol=1e-4), (
-        f"Max diff: {(actual - expected).abs().max().item():.6f}"
-    )
+    assert torch.allclose(
+        actual, expected, atol=1e-4
+    ), f"Max diff: {(actual - expected).abs().max().item():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -78,10 +85,14 @@ def test_compile_add():
     a = create_input("a", 4)
     b = create_input("b", 4)
     out = add(a, b)
-    _verify(out, n_pos=3, input_values={
-        "a": torch.randn(3, 4),
-        "b": torch.randn(3, 4),
-    })
+    _verify(
+        out,
+        n_pos=3,
+        input_values={
+            "a": torch.randn(3, 4),
+            "b": torch.randn(3, 4),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -97,11 +108,15 @@ def test_compile_select():
     out = select(cond, true_val, false_val)
 
     n_pos = 3
-    _verify(out, n_pos=n_pos, input_values={
-        "cond": torch.tensor([[1.0], [-1.0], [1.0]]),
-        "true_val": torch.randn(n_pos, 4),
-        "false_val": torch.randn(n_pos, 4),
-    })
+    _verify(
+        out,
+        n_pos=n_pos,
+        input_values={
+            "cond": torch.tensor([[1.0], [-1.0], [1.0]]),
+            "true_val": torch.randn(n_pos, 4),
+            "false_val": torch.randn(n_pos, 4),
+        },
+    )
 
 
 def test_compile_get_last_value():
@@ -111,9 +126,14 @@ def test_compile_get_last_value():
     out = pos.get_last_value(v, delta_pos=-1)
 
     n_pos = 5
-    _verify(out, n_pos=n_pos, input_values={
-        "v": torch.randn(n_pos, 4),
-    }, pos_encoding=pos)
+    _verify(
+        out,
+        n_pos=n_pos,
+        input_values={
+            "v": torch.randn(n_pos, 4),
+        },
+        pos_encoding=pos,
+    )
 
 
 def test_compile_map_to_table():
@@ -127,13 +147,19 @@ def test_compile_map_to_table():
     out = map_to_table(x, table, default=torch.tensor([0.0]))
 
     n_pos = 3
-    _verify(out, n_pos=n_pos, input_values={
-        "x": torch.tensor([
-            [1.0, 0.0],  # expect 10.0
-            [0.0, 1.0],  # expect 20.0
-            [1.0, 1.0],  # expect 30.0
-        ]),
-    })
+    _verify(
+        out,
+        n_pos=n_pos,
+        input_values={
+            "x": torch.tensor(
+                [
+                    [1.0, 0.0],  # expect 10.0
+                    [0.0, 1.0],  # expect 20.0
+                    [1.0, 1.0],  # expect 30.0
+                ]
+            ),
+        },
+    )
 
 
 def test_compile_sum_nodes():
@@ -167,10 +193,15 @@ def test_compile_cond_gate():
     out = cond_gate(cond, inp)
 
     n_pos = 4
-    _verify(out, n_pos=n_pos, input_values={
-        "cond": torch.tensor([[1.0], [-1.0], [1.0], [-1.0]]),
-        "inp": torch.randn(n_pos, 4),
-    }, pos_encoding=pos)
+    _verify(
+        out,
+        n_pos=n_pos,
+        input_values={
+            "cond": torch.tensor([[1.0], [-1.0], [1.0], [-1.0]]),
+            "inp": torch.randn(n_pos, 4),
+        },
+        pos_encoding=pos,
+    )
 
 
 def test_compile_get_prev_value():
@@ -185,14 +216,23 @@ def test_compile_get_prev_value():
     out = pos.get_prev_value(v, cond)
 
     n_pos = 5
-    _verify(out, n_pos=n_pos, input_values={
-        "v": torch.tensor([[10.0, 20.0, 30.0, 40.0],
-                            [11.0, 21.0, 31.0, 41.0],
-                            [12.0, 22.0, 32.0, 42.0],
-                            [13.0, 23.0, 33.0, 43.0],
-                            [14.0, 24.0, 34.0, 44.0]]),
-        "cond": torch.tensor([[1.0], [0.0], [0.0], [1.0], [0.0]]),
-    }, pos_encoding=pos)
+    _verify(
+        out,
+        n_pos=n_pos,
+        input_values={
+            "v": torch.tensor(
+                [
+                    [10.0, 20.0, 30.0, 40.0],
+                    [11.0, 21.0, 31.0, 41.0],
+                    [12.0, 22.0, 32.0, 42.0],
+                    [13.0, 23.0, 33.0, 43.0],
+                    [14.0, 24.0, 34.0, 44.0],
+                ]
+            ),
+            "cond": torch.tensor([[1.0], [0.0], [0.0], [1.0], [0.0]]),
+        },
+        pos_encoding=pos,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -220,10 +260,14 @@ def test_compile_add_relu():
     a = add(v1, v2)
     r1 = relu(a)
     out = relu(r1)
-    _verify(out, n_pos=n_pos, input_values={
-        "v1": torch.randn(n_pos, 4) - 0.5,
-        "v2": torch.randn(n_pos, 4) - 0.5,
-    })
+    _verify(
+        out,
+        n_pos=n_pos,
+        input_values={
+            "v1": torch.randn(n_pos, 4) - 0.5,
+            "v2": torch.randn(n_pos, 4) - 0.5,
+        },
+    )
 
 
 def test_compile_add_scalar():
@@ -238,14 +282,19 @@ def test_compile_cond_add_vector():
     cond = create_input("cond", 1)
     x = create_constant(torch.tensor([15.0, 25.0]))
     out = cond_add_vector(
-        cond, x,
+        cond,
+        x,
         true_vector=torch.tensor([100.0, 0.0]),
         false_vector=torch.tensor([0.0, 100.0]),
     )
     for cond_val in [-1.0, 1.0]:
-        _verify(out, n_pos=1, input_values={
-            "cond": torch.tensor([[cond_val]]),
-        })
+        _verify(
+            out,
+            n_pos=1,
+            input_values={
+                "cond": torch.tensor([[cond_val]]),
+            },
+        )
 
 
 def test_compile_relu_add():
@@ -254,10 +303,14 @@ def test_compile_relu_add():
     v2 = create_input("v2", 3)
     out = relu_add(v1, v2)
     for _ in range(3):
-        _verify(out, n_pos=1, input_values={
-            "v1": (100.0 * (torch.rand(1, 3) - 0.5)),
-            "v2": (100.0 * (torch.rand(1, 3) - 0.5)),
-        })
+        _verify(
+            out,
+            n_pos=1,
+            input_values={
+                "v1": (100.0 * (torch.rand(1, 3) - 0.5)),
+                "v2": (100.0 * (torch.rand(1, 3) - 0.5)),
+            },
+        )
 
 
 def test_compile_multiple_concats():
