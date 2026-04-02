@@ -1,5 +1,6 @@
 """Tests for the V1 embedding-space calculator."""
 
+import pytest
 import torch
 
 from modelscriptor.compiler.forward.compile import forward_compile
@@ -67,19 +68,34 @@ def _check(net, output_node, embedding, input_str, expected):
 
 
 # ---------------------------------------------------------------------------
+# Fixtures — compile once per digit count, share across tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def calc_1digit():
+    return _compile(1)
+
+
+@pytest.fixture(scope="module")
+def calc_3digit():
+    return _compile(3, d=2048)
+
+
+# ---------------------------------------------------------------------------
 # Phase 1: Addition
 # ---------------------------------------------------------------------------
 
 
-def test_calc_addition_1digit():
-    net, output_node, embedding = _compile(1)
+def test_calc_addition_1digit(calc_1digit):
+    net, output_node, embedding = calc_1digit
     _check(net, output_node, embedding, "1+1=", "2")
     _check(net, output_node, embedding, "4+5=", "9")
     _check(net, output_node, embedding, "0+0=", "0")
 
 
-def test_calc_addition_3digit():
-    net, output_node, embedding = _compile(3, d=2048)
+def test_calc_addition_3digit(calc_3digit):
+    net, output_node, embedding = calc_3digit
     _check(net, output_node, embedding, "1+1=", "2")
     _check(net, output_node, embedding, "123+456=", "579")
     _check(net, output_node, embedding, "99+1=", "100")
@@ -87,43 +103,43 @@ def test_calc_addition_3digit():
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Subtraction (will fail until implemented)
+# Phase 2: Subtraction
 # ---------------------------------------------------------------------------
 
 
-def test_calc_subtraction_1digit():
-    net, output_node, embedding = _compile(1)
+def test_calc_subtraction_1digit(calc_1digit):
+    net, output_node, embedding = calc_1digit
     _check(net, output_node, embedding, "5-3=", "2")
     _check(net, output_node, embedding, "9-0=", "9")
     _check(net, output_node, embedding, "0-0=", "0")
 
 
-def test_calc_subtraction_3digit():
-    net, output_node, embedding = _compile(3, d=2048)
+def test_calc_subtraction_3digit(calc_3digit):
+    net, output_node, embedding = calc_3digit
     _check(net, output_node, embedding, "456-123=", "333")
     _check(net, output_node, embedding, "100-100=", "0")
 
 
-def test_calc_subtraction_negative():
-    net, output_node, embedding = _compile(3, d=2048)
+def test_calc_subtraction_negative(calc_3digit):
+    net, output_node, embedding = calc_3digit
     _check(net, output_node, embedding, "1-5=", "-4")
     _check(net, output_node, embedding, "100-999=", "-899")
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: Multiplication (will fail until implemented)
+# Phase 3: Multiplication
 # ---------------------------------------------------------------------------
 
 
-def test_calc_multiplication_1digit():
-    net, output_node, embedding = _compile(1)
+def test_calc_multiplication_1digit(calc_1digit):
+    net, output_node, embedding = calc_1digit
     _check(net, output_node, embedding, "2*3=", "6")
     _check(net, output_node, embedding, "9*9=", "81")
     _check(net, output_node, embedding, "0*5=", "0")
 
 
-def test_calc_multiplication_3digit():
-    net, output_node, embedding = _compile(3, d=2048)
+def test_calc_multiplication_3digit(calc_3digit):
+    net, output_node, embedding = calc_3digit
     _check(net, output_node, embedding, "12*34=", "408")
     _check(net, output_node, embedding, "123*456=", "56088")
     _check(net, output_node, embedding, "100*100=", "10000")
