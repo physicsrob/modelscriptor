@@ -74,9 +74,11 @@ def render_component(component: Component):
     return template.render(
         component_name=repr(component),
         in_state=render_res_state(component.in_state, name="Input"),
-        skip_state=render_res_state(component.skip_state, name="Skip")
-        if isinstance(component, SkipLayerComponent)
-        else None,
+        skip_state=(
+            render_res_state(component.skip_state, name="Skip")
+            if isinstance(component, SkipLayerComponent)
+            else None
+        ),
         out_state=render_res_state(component.out_state, name="Output"),
         nodes=[render_node(n) for n in component.out_state.get_nodes()],
     )

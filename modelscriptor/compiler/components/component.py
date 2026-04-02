@@ -41,16 +41,13 @@ class Component(Generic[T], ABC):
         self.out_state.print("in ")
 
     @abstractmethod
-    def get_strategies(self, node: Node) -> List[T]:
-        ...
+    def get_strategies(self, node: Node) -> List[T]: ...
 
     @abstractmethod
-    def apply_strategy(self, strategy: T):
-        ...
+    def apply_strategy(self, strategy: T): ...
 
     @abstractmethod
-    def num_params(self) -> int:
-        ...
+    def num_params(self) -> int: ...
 
     def resize(self, new_d):
         self.d = new_d

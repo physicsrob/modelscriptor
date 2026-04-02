@@ -50,9 +50,7 @@ class TestDigitsToNumber:
         node = digits_to_number(embedding, [embedding, embedding, embedding])
         # For a single-position evaluation, all three digits see the same token.
         # With input "5", result should be 5*100 + 5*10 + 5*1 = 555
-        result = node.compute(
-            n_pos=1, input_values={"embedding_input": ["5"]}
-        )
+        result = node.compute(n_pos=1, input_values={"embedding_input": ["5"]})
         assert abs(result[0, 0].item() - 555.0) < 1.0
 
 
@@ -65,9 +63,9 @@ class TestThermometerFloorDiv:
                 n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
             )
             expected = x // 10
-            assert abs(result[0, 0].item() - expected) < 0.1, (
-                f"floor({x}/10): expected {expected}, got {result[0, 0].item()}"
-            )
+            assert (
+                abs(result[0, 0].item() - expected) < 0.1
+            ), f"floor({x}/10): expected {expected}, got {result[0, 0].item()}"
 
     def test_div_by_100(self):
         inp = create_input("x", 1)
@@ -77,9 +75,9 @@ class TestThermometerFloorDiv:
                 n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
             )
             expected = x // 100
-            assert abs(result[0, 0].item() - expected) < 0.1, (
-                f"floor({x}/100): expected {expected}, got {result[0, 0].item()}"
-            )
+            assert (
+                abs(result[0, 0].item() - expected) < 0.1
+            ), f"floor({x}/100): expected {expected}, got {result[0, 0].item()}"
 
     def test_div_by_1000(self):
         inp = create_input("x", 1)
@@ -89,9 +87,9 @@ class TestThermometerFloorDiv:
                 n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
             )
             expected = x // 1000
-            assert abs(result[0, 0].item() - expected) < 0.1, (
-                f"floor({x}/1000): expected {expected}, got {result[0, 0].item()}"
-            )
+            assert (
+                abs(result[0, 0].item() - expected) < 0.1
+            ), f"floor({x}/1000): expected {expected}, got {result[0, 0].item()}"
 
 
 class TestNumberToDigitScalars:
@@ -110,9 +108,9 @@ class TestNumberToDigitScalars:
                 result = digit_node.compute(
                     n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
                 )
-                assert abs(result[0, 0].item() - expected[i]) < 0.2, (
-                    f"x={x}, digit[{i}]: expected {expected[i]}, got {result[0, 0].item()}"
-                )
+                assert (
+                    abs(result[0, 0].item() - expected[i]) < 0.2
+                ), f"x={x}, digit[{i}]: expected {expected[i]}, got {result[0, 0].item()}"
 
     def test_two_digit_extraction(self):
         inp = create_input("x", 1)
@@ -123,9 +121,9 @@ class TestNumberToDigitScalars:
                 result = digit_node.compute(
                     n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
                 )
-                assert abs(result[0, 0].item() - expected[i]) < 0.2, (
-                    f"x={x}, digit[{i}]: expected {expected[i]}, got {result[0, 0].item()}"
-                )
+                assert (
+                    abs(result[0, 0].item() - expected[i]) < 0.2
+                ), f"x={x}, digit[{i}]: expected {expected[i]}, got {result[0, 0].item()}"
 
 
 class TestScalarToEmbedding:
@@ -137,9 +135,9 @@ class TestScalarToEmbedding:
                 n_pos=1, input_values={"x": torch.tensor([[float(digit)]])}
             )
             expected = embedding.get_embedding(str(digit))
-            assert torch.allclose(result[0], expected, atol=0.1), (
-                f"digit={digit}: max diff={torch.max(torch.abs(result[0] - expected)).item()}"
-            )
+            assert torch.allclose(
+                result[0], expected, atol=0.1
+            ), f"digit={digit}: max diff={torch.max(torch.abs(result[0] - expected)).item()}"
 
 
 class TestEndToEnd:
@@ -189,6 +187,6 @@ class TestEndToEnd:
                 n_pos=len(in_tokens),
                 input_values={"embedding_input": in_tokens},
             )
-            assert out[-1] == expected_first, (
-                f"{a}+{b}=: first token expected '{expected_first}', got '{out[-1]}'"
-            )
+            assert (
+                out[-1] == expected_first
+            ), f"{a}+{b}=: first token expected '{expected_first}', got '{out[-1]}'"
