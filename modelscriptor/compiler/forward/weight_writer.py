@@ -67,6 +67,8 @@ def write_ffn_sublayer(
             _write_compute_constant(layer.ffn, op)
         elif op.op_type == "compute_bias":
             _write_compute_bias(layer.ffn, op)
+        elif op.op_type == "compute_standalone_relu":
+            _write_compute_standalone_relu(layer.ffn, op, residual_map)
         else:
             raise ValueError(f"Unknown ffn op_type: {op.op_type}")
 
@@ -261,3 +263,30 @@ def _write_compute_bias(ffn, op: FFNOp):
     assert isinstance(node, Linear)
     for i, col in enumerate(op.target_cols):
         ffn.linear2.output_bias[col] += node.output_bias[i]
+
+
+def _write_compute_standalone_relu(ffn, op: FFNOp, rmap: ResidualStreamMap):
+    """Compile a standalone ReLU through the FFN.
+
+    linear1: identity mapping from input columns to FFN slots (bias=0)
+    relu: applied elementwise (built-in)
+    linear2: identity mapping from FFN slots to output columns (bias=0)
+
+    The skip connection preserves the input. Output columns (initially zero)
+    receive relu(input_value).
+    """
+    relu_node = op.node
+    assert isinstance(relu_node, ReLU)
+
+    input_node = relu_node.inputs[0]
+    in_idx = rmap.get_node_indices(input_node)
+    ffn_slots = op.ffn_slots
+    out_idx = op.target_cols
+
+    # linear1: input columns → FFN slots (identity, zero bias)
+    for in_col, slot in zip(in_idx, ffn_slots):
+        ffn.linear1.output_matrix[in_col, slot] = 1.0
+
+    # linear2: FFN slots → output columns (identity, zero bias)
+    for slot, out_col in zip(ffn_slots, out_idx):
+        ffn.linear2.output_matrix[slot, out_col] = 1.0

@@ -134,7 +134,7 @@ class AttnHeadOp:
 
 @dataclass
 class FFNOp:
-    op_type: str  # "compute_relu", "compute_constant", "compute_bias"
+    op_type: str  # "compute_relu", "compute_constant", "compute_bias", "compute_standalone_relu"
     node: Node
     target_cols: List[int]
     ffn_slots: List[int]  # which internal FFN dimensions this op uses
@@ -162,6 +162,8 @@ Weight matrix shapes (from existing components):
 
 *FFN — compute_relu*: For a `Linear1 -> ReLU -> Linear2` chain: `linear1.output_matrix` reads from input columns to FFN slots (applying Linear1's weight), `linear1.output_bias` at those slots from Linear1's bias, `linear2.output_matrix` maps from FFN slots to target columns (applying Linear2's weight), `linear2.output_bias` at target columns from Linear2's bias.
 
+*FFN — compute_standalone_relu*: For a standalone ReLU (not part of an L→R→L chain): `linear1.output_matrix` maps identity from input columns to FFN slots (bias=0), ReLU applied in FFN slots, `linear2.output_matrix` maps identity from FFN slots to target columns (bias=0). Skip connection preserves input; output columns get `relu(input_value)`. Costs `len(ReLU)` FFN slots.
+
 *FFN — compute_constant*: Set `linear2.output_bias[target_cols] = constant.value`.
 
 *FFN — compute_bias*: Set `linear2.output_bias[target_cols] += bias_vector`. Used for the bias part of biased Linear nodes (zero-bias part computed via attention in same layer).
@@ -182,12 +184,14 @@ Weight matrix shapes (from existing components):
 10. `test_add_into` — Add(A,B) where A is dead, verify A+B
 11. `test_ffn_relu_chain` — Linear->ReLU->Linear compiled on FFN
 12. `test_ffn_relu_chain_multiple` — two chains in same FFN, different slot ranges
-13. `test_ffn_constant` — constant via FFN output bias
-14. `test_biased_linear_split` — attention Wx + FFN b in same layer
-15. `test_non_contiguous_columns` — scattered column indices work correctly
-16. `test_mixed_layer` — attn ops + FFN ops in one layer compose correctly
+13. `test_ffn_standalone_relu` — standalone ReLU via FFN identity linear1/linear2
+14. `test_ffn_standalone_relu_preserves_input` — standalone ReLU doesn't corrupt input columns
+15. `test_ffn_constant` — constant via FFN output bias
+16. `test_biased_linear_split` — attention Wx + FFN b in same layer
+17. `test_non_contiguous_columns` — scattered column indices work correctly
+18. `test_mixed_layer` — attn ops + FFN ops in one layer compose correctly
 
-**Gate**: All 16 tests pass.
+**Gate**: All 18 tests pass.
 
 ---
 
@@ -222,23 +226,56 @@ Weight matrix shapes (from existing components):
 
 3. FFN sublayer (budget: d internal slots):
    a. Linear->ReLU->Linear chains from ready — critical-path priority
-   b. Constants from ready — free (bias only, no slot cost)
-   c. Bias writes for biased Linears scheduled in step 2d — no slot cost
+   b. Standalone ReLU from ready (not part of chain) — costs len(ReLU) FFN slots
+   c. Constants from ready — free (bias only, no slot cost)
+   d. Bias writes for biased Linears scheduled in step 2d — no slot cost
 
 4. Update residual_map and computed_nodes
 
 5. Progress check: if no nodes computed or cancelled this layer, raise error
 ```
 
-**Tests**:
-1. `test_schedule_attn_node` — Attn node gets assigned to attention head
-2. `test_schedule_relu_chain` — L->R->L gets assigned to FFN
-3. `test_schedule_cancellation` — dead node gets cancelled
-4. `test_schedule_free_add` — Add with dead addend becomes add_into
-5. `test_schedule_deferred_add` — Add with no dead addend is NOT scheduled
-6. `test_schedule_critical_path` — longer chain scheduled before shorter
+**Tests** — each test verifies observable behavior (ops returned, state changes, errors raised), not internal heuristics or ordering strategies. Efficiency/priority tests belong at the integration level (Phase 4/5).
 
-**Gate**: All 6 tests pass.
+*Basic op routing — correct node type produces correct op type:*
+1. `test_schedule_attn_node` — Attn node produces AttnHeadOp with op_type="compute_attn"
+2. `test_schedule_relu_chain` — L->R->L chain produces FFNOp with op_type="compute_relu"; all 3 nodes (L1, ReLU, L2) are marked computed
+3. `test_schedule_constant` — Constant node produces FFNOp with op_type="compute_constant", no FFN slots consumed
+4. `test_schedule_zero_bias_linear` — Zero-bias Linear (len <= d_head) produces AttnHeadOp with op_type="compute_linear"
+5. `test_schedule_biased_linear` — Biased Linear (len <= d_head) produces both AttnHeadOp("compute_linear") and FFNOp("compute_bias") in same layer
+6. `test_schedule_cancellation` — dead node (all consumers computed) produces AttnHeadOp with op_type="cancel"
+
+*Add node behavior:*
+7. `test_schedule_free_add` — Add with one dead addend produces AttnHeadOp with op_type="add_into"
+8. `test_schedule_deferred_add` — Add where neither addend is dead is NOT scheduled (not in returned ops)
+9. `test_schedule_add_both_addends_dead` — Add where both addends are dead: produces add_into without error
+
+*Resource limits — scheduler respects budgets:*
+10. `test_head_budget_exhaustion` — more ready attn ops than n_heads: only n_heads ops returned, remainder deferred (use small d/d_head to force)
+11. `test_ffn_slot_exhaustion` — more L->R->L chains than FFN slots: only chains that fit are returned, remainder deferred
+
+*Column pressure:*
+12. `test_schedule_under_column_pressure` — residual stream nearly full, dead nodes exist, ready nodes need space: returned ops include both cancellations and new computes (scheduler makes progress without deadlocking)
+
+*Multi-layer state progression:*
+13. `test_multi_layer_progression` — graph requiring 2-3 layers (e.g., chained L->R->L->L->R->L): call schedule_layer twice, verify first call schedules first chain, second call schedules second chain, computed_nodes grows correctly
+14. `test_deferred_add_resolves_later` — Add(A,B) deferred in layer 1 (both alive), A's consumers computed in layer 1 making A dead, layer 2 schedules add_into
+
+*Concatenate interaction:*
+15. `test_scheduling_with_concatenate_input` — node whose input is Concatenate([A, B, C]): becomes ready only when A, B, C are all computed (not the Concatenate itself)
+
+*Mixed operations:*
+16. `test_mixed_attn_and_ffn` — graph with both Attn nodes and L->R->L chains ready simultaneously: returns both AttnHeadOps and FFNOps in same layer
+
+*L->R->L chain edge cases and standalone ReLU:*
+17. `test_schedule_standalone_relu` — standalone ReLU (not part of chain, e.g., ReLU feeding into Add) produces FFNOp("compute_standalone_relu") with correct FFN slots
+18. `test_relu_chain_broken_by_fanout` — L1 has consumers besides its ReLU (can't claim L1 exclusively for chain): scheduler handles these nodes correctly (either schedules individually or uses alternative strategy)
+
+*Error cases:*
+19. `test_no_progress_raises_error` — all remaining nodes need more columns than exist and nothing can be cancelled: raises clear error, not infinite loop
+20. `test_output_already_computed` — output_node already in computed_nodes: schedule_layer returns empty ops (nothing to do)
+
+**Gate**: All 20 tests pass.
 
 ---
 
@@ -358,10 +395,11 @@ After Phase 5: Full adder arithmetic verification + resource usage logging
 
 ## Current Status
 
-**46 passing, 19 skipped** (as of Phase 2 completion)
+**48 passing, 19 skipped** (as of Phase 2 completion + standalone ReLU)
 
 - Phase 0 (GraphAnalyzer): 5 tests passing
 - Phase 1 (ResidualStreamMap): 7 tests passing
-- Phase 2 (WeightWriter): 16 tests passing
+- Phase 2 (WeightWriter): 18 tests passing
+- Phase 3 (LayerScheduler): 20 tests planned
 - Graph/modelscript: 18 tests passing
 - Old compiler end-to-end: 19 tests skipped (retarget in Phase 4)
