@@ -46,10 +46,10 @@ def _build(digits):
     return output_node, pos_encoding, embedding
 
 
-def _compile(digits):
+def _compile(digits, d=D):
     output_node, pos_encoding, embedding = _build(digits)
     net = forward_compile(
-        d=D,
+        d=d,
         d_head=D_HEAD,
         output_node=output_node,
         pos_encoding=pos_encoding,
@@ -79,7 +79,7 @@ def test_calc_addition_1digit():
 
 
 def test_calc_addition_3digit():
-    net, output_node, embedding = _compile(3)
+    net, output_node, embedding = _compile(3, d=2048)
     _check(net, output_node, embedding, "1+1=", "2")
     _check(net, output_node, embedding, "123+456=", "579")
     _check(net, output_node, embedding, "99+1=", "100")
@@ -99,13 +99,13 @@ def test_calc_subtraction_1digit():
 
 
 def test_calc_subtraction_3digit():
-    net, output_node, embedding = _compile(3)
+    net, output_node, embedding = _compile(3, d=2048)
     _check(net, output_node, embedding, "456-123=", "333")
     _check(net, output_node, embedding, "100-100=", "0")
 
 
 def test_calc_subtraction_negative():
-    net, output_node, embedding = _compile(3)
+    net, output_node, embedding = _compile(3, d=2048)
     _check(net, output_node, embedding, "1-5=", "-4")
     _check(net, output_node, embedding, "100-999=", "-899")
 
@@ -123,7 +123,7 @@ def test_calc_multiplication_1digit():
 
 
 def test_calc_multiplication_3digit():
-    net, output_node, embedding = _compile(3)
+    net, output_node, embedding = _compile(3, d=2048)
     _check(net, output_node, embedding, "12*34=", "408")
     _check(net, output_node, embedding, "123*456=", "56088")
     _check(net, output_node, embedding, "100*100=", "10000")

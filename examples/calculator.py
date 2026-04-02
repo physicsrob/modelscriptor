@@ -54,16 +54,16 @@ def subtract_digits(
     for A in range(10):
         for B in range(10):
             for borrow in [0, 1]:
-                entry_key = torch.cat([
-                    embedding.get_embedding(str(A)),
-                    embedding.get_embedding(str(B)),
-                    torch.tensor([1.0 if borrow else -1.0]),
-                ])
+                entry_key = torch.cat(
+                    [
+                        embedding.get_embedding(str(A)),
+                        embedding.get_embedding(str(B)),
+                        torch.tensor([1.0 if borrow else -1.0]),
+                    ]
+                )
                 diff = A - B - borrow
                 result_table[entry_key] = embedding.get_embedding(str(diff % 10))
-                borrow_table[entry_key] = torch.tensor(
-                    [1.0 if diff < 0 else -1.0]
-                )
+                borrow_table[entry_key] = torch.tensor([1.0 if diff < 0 else -1.0])
 
     key = concat([num1, num2, borrow_in])
     return (
@@ -89,10 +89,12 @@ def compare_digit_pair(embedding: Embedding, a: Node, b: Node) -> Node:
     table = {}
     for i in range(10):
         for j in range(10):
-            key = torch.cat([
-                embedding.get_embedding(str(i)),
-                embedding.get_embedding(str(j)),
-            ])
+            key = torch.cat(
+                [
+                    embedding.get_embedding(str(i)),
+                    embedding.get_embedding(str(j)),
+                ]
+            )
             if i > j:
                 table[key] = torch.tensor([1.0])
             elif i < j:
@@ -102,7 +104,9 @@ def compare_digit_pair(embedding: Embedding, a: Node, b: Node) -> Node:
     return map_to_table(concat([a, b]), table, default=torch.tensor([0.0]))
 
 
-def compare_digit_seqs(embedding: Embedding, seq1: List[Node], seq2: List[Node]) -> Node:
+def compare_digit_seqs(
+    embedding: Embedding, seq1: List[Node], seq2: List[Node]
+) -> Node:
     """Returns 1.0 if seq1 >= seq2, -1.0 if seq1 < seq2.
 
     Folds from MSB to LSB: the first non-equal digit determines the result.
@@ -127,6 +131,7 @@ def compare_digit_seqs(embedding: Embedding, seq1: List[Node], seq2: List[Node])
 
     # Collapse to boolean: >= 0 means a >= b (treat equal as positive)
     from modelscriptor.modelscript.arithmetic_ops import compare
+
     return compare(result, thresh=-0.5, true_level=1.0, false_level=-1.0)
 
 
@@ -135,18 +140,18 @@ def compare_digit_seqs(embedding: Embedding, seq1: List[Node], seq2: List[Node])
 # ---------------------------------------------------------------------------
 
 
-def multiply_digit_pair(
-    embedding: Embedding, a: Node, b: Node
-) -> Tuple[Node, Node]:
+def multiply_digit_pair(embedding: Embedding, a: Node, b: Node) -> Tuple[Node, Node]:
     """Returns (tens_digit, ones_digit) embeddings for a*b."""
     tens_table = {}
     ones_table = {}
     for i in range(10):
         for j in range(10):
-            key = torch.cat([
-                embedding.get_embedding(str(i)),
-                embedding.get_embedding(str(j)),
-            ])
+            key = torch.cat(
+                [
+                    embedding.get_embedding(str(i)),
+                    embedding.get_embedding(str(j)),
+                ]
+            )
             product = i * j
             tens_table[key] = embedding.get_embedding(str(product // 10))
             ones_table[key] = embedding.get_embedding(str(product % 10))
@@ -186,7 +191,9 @@ def multiply_digit_seqs(
         for i in reversed(range(n)):
             tens, ones = products[i, j]
             # Add ones digit to running sum with carry
-            digit_sum, carry = sum_digits(embedding, ones, carry_digit if i < n - 1 else zero, carry)
+            digit_sum, carry = sum_digits(
+                embedding, ones, carry_digit if i < n - 1 else zero, carry
+            )
             row_digits.append(digit_sum)
             carry_digit = tens
         # Final carry + last tens digit
@@ -251,41 +258,40 @@ def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
     eos_embed = create_constant(embedding.get_embedding("<eos>"))
     minus_embed = create_constant(embedding.get_embedding("-"))
 
-    # Each operation builds its result as digits + eos, with leading zeros
-    # removed using at most max_digits-1 levels (same as the adder).
-    # Chaining more levels of remove_leading_0s causes compilation errors
-    # due to numerical amplification in compare_to_vector.
-    #
-    # Strategy: all operations produce max_digits+1 elements (digits + eos),
-    # with up to max_digits-1 leading zeros removed. The switch selects
-    # between these same-length sequences.
-    seq_len = max_digits + 2  # digits + eos (positive), sign + digits + eos (negative)
+    # Multiplication produces up to 2*max_digits digits, so seq_len must
+    # accommodate that. Addition and subtraction produce shorter results
+    # but are padded with eos to match.
+    seq_len = 2 * max_digits + 2  # max result digits + eos padding
 
     # --- Addition ---
     add_result = sum_digit_seqs(embedding, first_num_digits, second_num_digits)
-    add_seq = add_result + [eos_embed, eos_embed]
+    add_seq = add_result + [eos_embed] * (max_digits + 2)
     add_seq = remove_leading_0s(embedding, add_seq, max_removals=max_digits - 1)
 
     # --- Subtraction ---
     is_a_gte_b = compare_digit_seqs(embedding, first_num_digits, second_num_digits)
-    bigger = [select(is_a_gte_b, a, b) for a, b in zip(first_num_digits, second_num_digits)]
-    smaller = [select(is_a_gte_b, b, a) for a, b in zip(first_num_digits, second_num_digits)]
+    bigger = [
+        select(is_a_gte_b, a, b) for a, b in zip(first_num_digits, second_num_digits)
+    ]
+    smaller = [
+        select(is_a_gte_b, b, a) for a, b in zip(first_num_digits, second_num_digits)
+    ]
     sub_abs = subtract_digit_seqs(embedding, bigger, smaller)
-    # Positive case: same format as addition
-    sub_pos = sub_abs + [eos_embed, eos_embed]
+    # Positive case: digits + eos padding
+    sub_pos = sub_abs + [eos_embed] * (max_digits + 2)
     sub_pos = remove_leading_0s(embedding, sub_pos, max_removals=max_digits - 1)
-    # Negative case: "-" then clean absolute value (trimmed to fit seq_len)
+    # Negative case: "-" then clean absolute value + eos padding
     sub_abs_clean = remove_leading_0s(
-        embedding, sub_abs + [eos_embed], max_removals=max_digits - 1
+        embedding, sub_abs + [eos_embed] * (max_digits + 1), max_removals=max_digits - 1
     )
-    # Take first seq_len-1 elements after sign to fit within seq_len
     sub_neg = [minus_embed] + sub_abs_clean[: seq_len - 1]
     # Select between positive and negative
     sub_seq = [select(is_a_gte_b, sub_pos[i], sub_neg[i]) for i in range(seq_len)]
 
-    # --- Multiplication (placeholder — chained map_to_table amplifies errors) ---
-    mul_seq = [zero_embed] * max_digits + [eos_embed, eos_embed]
-    mul_seq = remove_leading_0s(embedding, mul_seq, max_removals=max_digits - 1)
+    # --- Multiplication ---
+    mul_result = multiply_digit_seqs(embedding, first_num_digits, second_num_digits)
+    mul_seq = mul_result + [eos_embed, eos_embed]
+    mul_seq = remove_leading_0s(embedding, mul_seq, max_removals=2 * max_digits - 1)
 
     # --- Dispatch ---
     result_digits = []
