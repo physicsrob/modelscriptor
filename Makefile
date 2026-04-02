@@ -2,13 +2,13 @@
 compile: adder.onnx
 
 adder.onnx: compile_adder.py examples/adder.py modelscriptor/compiler/*.py modelscriptor/graph/*.py
-	python compile_adder.py
+	uv run python compile_adder.py
 
 .PHONY: lint
 lint:
-	black .
-	mypy .
+	uv run black .
+	uv run mypy .
 
 .PHONY: test
 test:
-	pytest tests
+	uv run pytest tests
