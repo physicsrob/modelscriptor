@@ -2,8 +2,13 @@ from modelscriptor.graph import Node, Concatenate
 from typing import List, Tuple, Dict
 import torch
 
-from modelscriptor.modelscript.const import big_offset, turn_on_speed
-from modelscriptor.modelscript.logic_ops import cond_add_vector
+from modelscriptor.modelscript.const import (
+    big_offset,
+    turn_on_speed,
+    embedding_turn_on_speed,
+)
+from modelscriptor.modelscript.logic_ops import cond_add_vector, cond_gate
+from modelscriptor.modelscript.arithmetic_ops import sum_nodes
 from modelscriptor.modelscript.ffn_layer import ffn_layer
 
 
@@ -31,11 +36,12 @@ def map_to_table(
     assert len(default) == d_value
 
     d_int = len(key_to_value)
+    speed = embedding_turn_on_speed
     # We'll use 1 FFN entry per item in the table, and an overall output bias of the default value
     # So roughly speaking:
     # input_proj will be (d_int x d_key), where input_proj[i, :] = table.keys()[i]
-    # input_bias will be (d_int), where input_bias[i] = 1.0/turn_on_speed - (table.keys()[i] @ table.keys()[i])
-    # output_proj will be (d_int, d_value), where output_proj[i, :] = turn_on_speed * (table.values()[i] - default)
+    # input_bias will be (d_int), where input_bias[i] = 1.0/speed - (table.keys()[i] @ table.keys()[i])
+    # output_proj will be (d_int, d_value), where output_proj[i, :] = speed * (table.values()[i] - default)
     # output_bias will be (d_value), equal to default
 
     input_proj = torch.zeros(d_int, d_key)
@@ -44,8 +50,8 @@ def map_to_table(
 
     for i, (key, value) in enumerate(key_to_value.items()):
         input_proj[i, :] = key
-        input_bias[i] = 1.0 / turn_on_speed - (key @ key)
-        output_proj[i, :] = turn_on_speed * (value - default)
+        input_bias[i] = 1.0 / speed - (key @ key)
+        output_proj[i, :] = speed * (value - default)
 
     return ffn_layer(
         input_node=inp,
@@ -56,21 +62,20 @@ def map_to_table(
     )
 
 
-def select_from_list(
-    cond_value_list: List[Tuple[Node, Node]], default: torch.Tensor
-) -> Node:
+def switch(conditions: List[Node], values: List[Node]) -> Node:
     """
-    Uses a list of conditions to determine which value to select from a table.
+    Select one of N values based on which condition is true.
+
+    Assumes exactly one condition is true (1.0), rest are false (-1.0).
 
     Args:
-        cond_value_list (List[Tuple[Node, Node]]): List of tuples where each tuple consists of a condition and its
-            corresponding value.
-        default (torch.Tensor): Default tensor to return if none of the conditions in the table are met.
+        conditions (List[Node]): Boolean condition nodes (each length 1).
+        values (List[Node]): Value nodes (all same length).
 
     Returns:
-        Node: Output node with the selected value based on the conditions.
+        Node: The value whose corresponding condition is true.
     """
-    raise NotImplementedError()
+    return sum_nodes([cond_gate(c, v) for c, v in zip(conditions, values)])
 
 
 def select(cond: Node, true_node: Node, false_node: Node) -> Node:
@@ -121,4 +126,5 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
         input_bias=input_bias,
         output_proj=output_proj,
         output_bias=output_bias,
+        name="select",
     )

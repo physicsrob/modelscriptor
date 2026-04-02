@@ -20,7 +20,7 @@ def create_input(name: str, d: int) -> Node:
     return InputNode(name, d)
 
 
-def create_constant(vector: torch.Tensor) -> Node:
+def create_constant(vector: torch.Tensor, name: str = "") -> Node:
     """
     Create a node with a constant value.
 
@@ -30,7 +30,7 @@ def create_constant(vector: torch.Tensor) -> Node:
     Returns:
     - Node: Node with the specified constant value.
     """
-    return Constant(vector)
+    return Constant(vector, name)
 
 
 def create_embedding(vocab: List[str]) -> Embedding:
