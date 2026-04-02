@@ -193,7 +193,10 @@ def _write_compute_linear(
 def _write_cancel(
     attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
 ):
-    """Cancel a node: V=identity, O=-identity. Skip adds x + (-x) = 0."""
+    """Cancel a node: V=identity, O=-identity. Skip adds x + (-x) = 0.
+
+    Splits across multiple heads for nodes wider than d_head.
+    """
     node = op.node
     d_head = attn.d_head
     d_node = len(node)
@@ -202,23 +205,29 @@ def _write_cancel(
     node_idx = op.target_cols
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
-    v_mat = torch.eye(d_node, d_head)
-    o_mat = -torch.eye(d_head, d_node)
 
-    head = _allocate_head(attn)
-    _scatter_attn_head(
-        attn,
-        head,
-        pe_idx,
-        pe_idx,
-        node_idx,
-        node_idx,
-        q_mat,
-        k_mat,
-        v_mat,
-        o_mat,
-        d_head,
-    )
+    for start in range(0, d_node, d_head):
+        end = min(start + d_head, d_node)
+        chunk_size = end - start
+
+        chunk_idx = node_idx[start:end]
+        v_mat = torch.eye(chunk_size, d_head)
+        o_mat = -torch.eye(d_head, chunk_size)
+
+        head = _allocate_head(attn)
+        _scatter_attn_head(
+            attn,
+            head,
+            pe_idx,
+            pe_idx,
+            chunk_idx,
+            chunk_idx,
+            q_mat,
+            k_mat,
+            v_mat,
+            o_mat,
+            d_head,
+        )
 
 
 def _write_add_into(
@@ -229,6 +238,8 @@ def _write_add_into(
     target_cols are the dead addend's columns (now owned by the Add node
     after reassign). The live addend is whichever input is still allocated
     in the residual map. Skip connection adds: dead + live = Add(dead, live).
+
+    Splits across multiple heads for operands wider than d_head.
     """
     node = op.node
     assert isinstance(node, Add)
@@ -250,13 +261,31 @@ def _write_add_into(
     o_idx = op.target_cols  # dead addend's columns
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
-    v_mat = torch.eye(d_live, d_head)
-    o_mat = torch.eye(d_head, d_live)
 
-    head = _allocate_head(attn)
-    _scatter_attn_head(
-        attn, head, pe_idx, pe_idx, v_idx, o_idx, q_mat, k_mat, v_mat, o_mat, d_head
-    )
+    for start in range(0, d_live, d_head):
+        end = min(start + d_head, d_live)
+        chunk_size = end - start
+
+        v_chunk_idx = v_idx[start:end]
+        o_chunk_idx = o_idx[start:end]
+
+        v_mat = torch.eye(chunk_size, d_head)
+        o_mat = torch.eye(d_head, chunk_size)
+
+        head = _allocate_head(attn)
+        _scatter_attn_head(
+            attn,
+            head,
+            pe_idx,
+            pe_idx,
+            v_chunk_idx,
+            o_chunk_idx,
+            q_mat,
+            k_mat,
+            v_mat,
+            o_mat,
+            d_head,
+        )
 
 
 # ---------------------------------------------------------------------------
