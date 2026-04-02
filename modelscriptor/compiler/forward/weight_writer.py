@@ -41,6 +41,7 @@ def write_attn_sublayer(
 ):
     """Write attention head operations into a layer's AttnLayerComponent."""
     attn = layer.attn.attn
+    assert pos_encoding is not None, "pos_encoding required for attention ops"
     for op in ops:
         if op.op_type == "compute_attn":
             _write_compute_attn(attn, op, residual_map)

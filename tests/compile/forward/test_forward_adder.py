@@ -17,7 +17,7 @@ D_HEAD = 16
 def decode_token(embedding: Embedding, vector: torch.Tensor) -> str:
     """Decode a single embedding vector to its nearest token."""
     dists = torch.cdist(vector.unsqueeze(0), embedding.table)
-    return embedding.tokenizer.decode_id(dists.argmin().item())
+    return embedding.tokenizer.decode_id(int(dists.argmin().item()))
 
 
 def run_autoregressive(

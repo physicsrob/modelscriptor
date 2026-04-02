@@ -63,9 +63,17 @@ def map_to_table(
 
 
 def switch(conditions: List[Node], values: List[Node]) -> Node:
-    """Select one of N values based on which condition is true.
+    """
+    Select one of N values based on which condition is true.
 
     Assumes exactly one condition is true (1.0), rest are false (-1.0).
+
+    Args:
+        conditions (List[Node]): Boolean condition nodes (each length 1).
+        values (List[Node]): Value nodes (all same length).
+
+    Returns:
+        Node: The value whose corresponding condition is true.
     """
     return sum_nodes([cond_gate(c, v) for c, v in zip(conditions, values)])
 

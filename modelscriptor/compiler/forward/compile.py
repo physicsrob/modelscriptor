@@ -60,7 +60,9 @@ def forward_compile(
     scheduler = LayerScheduler(graph, d, d_head, pos_encoding)
 
     # Save input indices before scheduling (scheduling may free/reassign them)
-    input_indices = {pos_encoding: residual_map.get_indices(pos_encoding)}
+    input_indices: dict[Node, list[int]] = {
+        pos_encoding: residual_map.get_indices(pos_encoding)
+    }
     for node in input_nodes:
         input_indices[node] = residual_map.get_indices(node)
 
