@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from modelscriptor.compiler.forward.residual_map import ResidualStreamMap
 from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
-from modelscriptor.graph import Node, Linear, Attn, Add
+from modelscriptor.graph import Node, Linear, Attn, Add, Concatenate
 from modelscriptor.graph.misc import Constant
 from modelscriptor.graph.pos_encoding import PosEncoding, attention_hardness
 from modelscriptor.graph.relu import ReLU
@@ -191,16 +191,20 @@ def _write_add_into(attn, op: AttnHeadOp, rmap: ResidualStreamMap,
     node = op.node
     assert isinstance(node, Add)
 
-    # Determine which input is live (still allocated in residual map)
-    if rmap.is_allocated(node.inputs[0]):
-        live_addend = node.inputs[0]
+    # Determine which input is live (still has values in the residual stream).
+    # After scheduler's reassign, the dead addend is no longer individually
+    # allocated. The live addend is either a regular allocated node or a
+    # Concatenate (whose children are allocated).
+    a0, a1 = node.inputs
+    if rmap.is_allocated(a0) or isinstance(a0, Concatenate):
+        live_addend = a0
     else:
-        live_addend = node.inputs[1]
+        live_addend = a1
     d_head = attn.d_head
     d_live = len(live_addend)
 
     pe_idx = rmap.get_indices(pos_encoding)
-    v_idx = rmap.get_indices(live_addend)
+    v_idx = rmap.get_node_indices(live_addend)  # resolves through Concatenate
     o_idx = op.target_cols  # dead addend's columns
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)

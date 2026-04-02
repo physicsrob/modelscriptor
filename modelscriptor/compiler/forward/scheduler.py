@@ -300,8 +300,14 @@ class LayerScheduler:
 
     def _is_dead_for_add(self, addend: Node, add_node: Add,
                          computed_nodes: Set[Node]) -> bool:
-        """True if all effective consumers of addend, except add_node, are computed."""
+        """True if all effective consumers of addend, except add_node, are computed.
+
+        Concatenate nodes can't be dead addends — they aren't allocated in the
+        residual stream, so their columns can't be reused for add_into.
+        """
         if addend is self.pos_encoding:
+            return False
+        if isinstance(addend, Concatenate):
             return False
         effective = self._get_effective_consumers(addend)
         return (effective - {add_node}).issubset(computed_nodes)

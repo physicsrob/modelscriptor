@@ -387,6 +387,10 @@ assert torch.allclose(expected, result[output_node], atol=1e-4)
 
 **Old compiler files removed**: compile.py, report.py, group.py, strategy.py, skip.py, embedding/pos_encoding components, CP-SAT solver from feature_assignment.py. Components and sublayers stripped to weight storage + forward pass. Old strategy tests deleted; end-to-end tests skipped pending retarget.
 
+## Future Optimizations
+
+**Constants as deferred allocations**: Currently, Constants are pre-allocated as input nodes, consuming residual stream columns for the entire compilation. For space efficiency, Constants could instead be scheduled via FFN `compute_constant` when first needed by a downstream node, then cancelled when dead. The weight writer and scheduler already support this path. Low priority — with d=1024, the adder's Constants consume <8% of the stream.
+
 ## Verification
 
 After each phase: `pytest tests/compile/forward/ -v`
@@ -395,11 +399,11 @@ After Phase 5: Full adder arithmetic verification + resource usage logging
 
 ## Current Status
 
-**48 passing, 19 skipped** (as of Phase 2 completion + standalone ReLU)
+**69 passing, 19 skipped** (as of Phase 3 completion)
 
 - Phase 0 (GraphAnalyzer): 5 tests passing
 - Phase 1 (ResidualStreamMap): 7 tests passing
-- Phase 2 (WeightWriter): 18 tests passing
-- Phase 3 (LayerScheduler): 20 tests planned
+- Phase 2 (WeightWriter): 19 tests passing
+- Phase 3 (LayerScheduler): 20 tests passing
 - Graph/modelscript: 18 tests passing
 - Old compiler end-to-end: 19 tests skipped (retarget in Phase 4)
