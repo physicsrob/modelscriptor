@@ -1,4 +1,11 @@
-from modelscriptor.modelscript.arithmetic_ops import add_scalar, relu_add, compare
+from modelscriptor.modelscript.arithmetic_ops import (
+    add_scalar,
+    relu_add,
+    compare,
+    negate,
+    subtract,
+    multiply_scalar,
+)
 from modelscriptor.modelscript.inout_nodes import create_input
 import torch
 
@@ -23,6 +30,32 @@ def test_relu_add():
         )
         expected_value = torch.clamp(val1, min=0) + torch.clamp(val2, min=0)
         assert (output == expected_value).all()
+
+
+def test_negate():
+    x = create_input("x", 3)
+    out = negate(x)
+    vals = torch.tensor([[1.0, -2.0, 3.0]])
+    result = out.compute(n_pos=1, input_values={"x": vals})
+    assert torch.allclose(result, -vals)
+
+
+def test_subtract():
+    a = create_input("a", 3)
+    b = create_input("b", 3)
+    out = subtract(a, b)
+    va = torch.tensor([[5.0, 10.0, 15.0]])
+    vb = torch.tensor([[1.0, 3.0, 5.0]])
+    result = out.compute(n_pos=1, input_values={"a": va, "b": vb})
+    assert torch.allclose(result, va - vb)
+
+
+def test_multiply_scalar():
+    x = create_input("x", 2)
+    out = multiply_scalar(x, 3.0)
+    vals = torch.tensor([[2.0, -4.0]])
+    result = out.compute(n_pos=1, input_values={"x": vals})
+    assert torch.allclose(result, 3.0 * vals)
 
 
 def test_compare():

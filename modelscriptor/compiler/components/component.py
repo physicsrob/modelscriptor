@@ -1,58 +1,30 @@
-from typing import Set, Dict, List, NamedTuple, TypeVar, Generic
 from abc import ABC, abstractmethod
 
-import torch
-
-from modelscriptor.compiler.res_state import ResState
-from modelscriptor.graph import Node, Concatenate, Linear
+from modelscriptor.compiler.feature_assignment import ResidualStreamState
 
 
-class NodeComponentStrategy:
-    # Represents the way a node passes through and is transformed by one component
-    in_nodes: List[Node]  # Input nodes used for this computation
-    out_node: Node  # Output node fhor this computation
+class Component(ABC):
+    """Base class for transformer layer components.
 
-    def __init__(self, in_nodes: List[Node], out_node: Node):
-        self.in_nodes = in_nodes
-        self.out_node = out_node
+    Holds weight tensors and implements the forward pass.
+    """
 
-    def __repr__(self):
-        return (
-            f"NodeComponentStrategy(in_nodes={self.in_nodes}, out_node={self.out_node})"
-        )
-
-
-T = TypeVar("T", bound=NodeComponentStrategy)
-
-
-class Component(Generic[T], ABC):
     d: int
-    in_state: ResState
-    out_state: ResState
+    in_state: ResidualStreamState
+    out_state: ResidualStreamState
+    name: str
 
-    def __init__(self, d):
+    def __init__(self, d: int, name: str = ""):
         self.d = d
-        self.in_state = ResState(d)
-        self.out_state = ResState(d)
-
-    def print(self):
-        print(f"{repr(self)}")
-        self.in_state.print("in ")
-        self.out_state.print("in ")
+        self.name = name
+        self.in_state = ResidualStreamState(name=f"{self} in_state")
+        self.out_state = ResidualStreamState(name=f"{self} out_state")
 
     @abstractmethod
-    def get_strategies(self, node: Node) -> List[T]: ...
-
-    @abstractmethod
-    def apply_strategy(self, strategy: T): ...
+    def forward(self, inp): ...
 
     @abstractmethod
     def num_params(self) -> int: ...
 
     def resize(self, new_d):
         self.d = new_d
-        self.in_state.resize(new_d)
-        self.out_state.resize(new_d)
-
-    def get_min_width(self):
-        return max(self.in_state.get_min_width(), self.out_state.get_min_width())

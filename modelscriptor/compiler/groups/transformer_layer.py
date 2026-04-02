@@ -9,7 +9,12 @@ class TransformerLayer:
     attn: AttnSubLayer
     ffn: FFNSubLayer
 
-    def __init__(self, d: int, d_head: int, pos_encoding: Optional[PosEncoding] = None):
+    def __init__(
+        self,
+        d: int,
+        d_head: int,
+        pos_encoding: Optional[PosEncoding] = None,
+    ):
         self.attn = AttnSubLayer(d, d_head, pos_encoding)
         self.ffn = FFNSubLayer(d)
 
