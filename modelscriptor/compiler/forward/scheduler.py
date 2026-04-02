@@ -9,6 +9,7 @@ Mutates residual_map (allocate, free, reassign) and computed_nodes (add).
 
 from typing import List, Optional, Set, Tuple
 
+from modelscriptor.compiler.feature_assignment import simplify_nodes
 from modelscriptor.compiler.forward.graph_analysis import GraphAnalyzer
 from modelscriptor.compiler.forward.residual_map import ResidualStreamMap
 from modelscriptor.compiler.forward.weight_writer import AttnHeadOp, FFNOp
@@ -134,14 +135,15 @@ class LayerScheduler:
             d1 = self._is_dead_for_add(a1, add_node, computed_snapshot)
             dead_addend = a0 if d0 else a1
             live_addend = a1 if d0 else a0
-            if len(live_addend) > self.d_head:
+            n_heads = (len(live_addend) + self.d_head - 1) // self.d_head
+            if heads_used + n_heads > self.n_heads:
                 continue
             target_cols = residual_map.get_indices(dead_addend)
             attn_ops.append(AttnHeadOp("add_into", add_node, target_cols))
             residual_map.reassign(dead_addend, add_node)
             computed_nodes.add(add_node)
             add_into_live_addends.add(live_addend)
-            heads_used += 1
+            heads_used += n_heads
 
         # Build compute candidates: Attn nodes, then standalone Linears
         compute_candidates = []
@@ -152,21 +154,30 @@ class LayerScheduler:
                 n_heads = self._heads_for_linear(node)
                 compute_candidates.append(("compute_linear", node, n_heads))
 
-        # Sort: Attn first, then by critical path
-        compute_candidates.sort(
-            key=lambda t: (
-                0 if t[0] == "compute_attn" else 1,
-                -self.graph.get_critical_path_length(t[1]),
+        # Sort: Attn first; under column pressure prefer nodes that free columns,
+        # otherwise maximize parallelism via critical path.
+        under_pressure = residual_map.get_free_count() < self.d // 4
+        if under_pressure:
+            compute_candidates.sort(
+                key=lambda t: (
+                    0 if t[0] == "compute_attn" else 1,
+                    self._net_column_cost(t[1], computed_nodes, residual_map),
+                    -self.graph.get_critical_path_length(t[1]),
+                )
             )
-        )
+        else:
+            compute_candidates.sort(
+                key=lambda t: (
+                    0 if t[0] == "compute_attn" else 1,
+                    -self.graph.get_critical_path_length(t[1]),
+                )
+            )
 
         # Cancellation candidates (exclude live addends of add_into ops)
         cancel_candidates = [
             n
             for n in dead
-            if len(n) <= self.d_head
-            and n is not self.pos_encoding
-            and n not in add_into_live_addends
+            if n is not self.pos_encoding and n not in add_into_live_addends
         ]
         cancel_candidates.sort(key=lambda n: -len(n))  # largest first
 
@@ -183,9 +194,12 @@ class LayerScheduler:
                 and heads_used + n_heads_needed < self.n_heads
             ):
                 cn = cancel_candidates.pop(0)
+                cn_heads = (len(cn) + self.d_head - 1) // self.d_head
+                if heads_used + n_heads_needed + cn_heads > self.n_heads:
+                    continue
                 attn_ops.append(AttnHeadOp("cancel", cn, residual_map.get_indices(cn)))
                 residual_map.free(cn)
-                heads_used += 1
+                heads_used += cn_heads
                 target_cols = self._try_allocate(node, residual_map)
 
             if target_cols is None:
@@ -205,11 +219,12 @@ class LayerScheduler:
 
         # 2e. Remaining cancellations
         for cn in cancel_candidates:
-            if heads_used >= self.n_heads:
-                break
+            cn_heads = (len(cn) + self.d_head - 1) // self.d_head
+            if heads_used + cn_heads > self.n_heads:
+                continue
             attn_ops.append(AttnHeadOp("cancel", cn, residual_map.get_indices(cn)))
             residual_map.free(cn)
-            heads_used += 1
+            heads_used += cn_heads
 
         return attn_ops, biased_linears
 
@@ -224,7 +239,16 @@ class LayerScheduler:
         next_slot = 0
 
         # 3a. L->R->L chains
-        chains.sort(key=lambda c: -self.graph.get_critical_path_length(c[2]))
+        under_pressure = residual_map.get_free_count() < self.d // 4
+        if under_pressure:
+            chains.sort(
+                key=lambda c: (
+                    self._chain_net_column_cost(c, computed_nodes, residual_map),
+                    -self.graph.get_critical_path_length(c[2]),
+                )
+            )
+        else:
+            chains.sort(key=lambda c: -self.graph.get_critical_path_length(c[2]))
         for l1, relu, l2, d_int, exclusive in chains:
             if next_slot + d_int > self.d:
                 continue
@@ -243,7 +267,16 @@ class LayerScheduler:
         # 3b. Standalone ReLU (not part of chain)
         standalone_relus = sorted(
             [n for n in ready if isinstance(n, ReLU)],
-            key=self._critical_path_key,
+            key=(
+                (
+                    lambda n: (
+                        self._net_column_cost(n, computed_nodes, residual_map),
+                        self._critical_path_key(n),
+                    )
+                )
+                if under_pressure
+                else self._critical_path_key
+            ),
         )
         for node in standalone_relus:
             d_relu = len(node)
@@ -321,6 +354,57 @@ class LayerScheduler:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _net_column_cost(
+        self, node: Node, computed_nodes: Set[Node], residual_map: ResidualStreamMap
+    ) -> int:
+        """Net residual stream columns consumed by scheduling this node.
+
+        Positive = net consumer, negative = net freer (frees more than it allocates).
+        """
+        cost = len(node)
+        for inp in node.inputs:
+            leaves = simplify_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
+            for leaf in leaves:
+                if leaf is self.pos_encoding:
+                    continue
+                if not residual_map.is_allocated(leaf):
+                    continue
+                remaining = (
+                    self._get_effective_consumers(leaf) - computed_nodes - {node}
+                )
+                if not remaining:
+                    cost -= len(leaf)
+        return cost
+
+    def _chain_net_column_cost(
+        self,
+        chain: tuple,
+        computed_nodes: Set[Node],
+        residual_map: ResidualStreamMap,
+    ) -> int:
+        """Net column cost of an L1->ReLU->L2 chain.
+
+        Only L2 is allocated in the residual stream (L1/ReLU use FFN slots).
+        Non-exclusive L1 is also allocated separately.
+        """
+        l1, relu, l2, d_int, exclusive = chain
+        cost = len(l2)
+        if not exclusive and not residual_map.is_allocated(l1):
+            cost += len(l1)
+
+        hypothetical = computed_nodes | {l1, relu, l2}
+        for inp in l1.inputs:
+            leaves = simplify_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
+            for leaf in leaves:
+                if leaf is self.pos_encoding:
+                    continue
+                if not residual_map.is_allocated(leaf):
+                    continue
+                remaining = self._get_effective_consumers(leaf) - hypothetical
+                if not remaining:
+                    cost -= len(leaf)
+        return cost
 
     def _get_effective_consumers(self, node: Node) -> Set[Node]:
         """Get consumers, resolving through Concatenate nodes."""

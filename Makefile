@@ -1,8 +1,11 @@
 .PHONY: compile
-compile: adder.onnx
+compile: adder.onnx calculator.onnx
 
 adder.onnx: compile_adder.py examples/adder.py modelscriptor/compiler/*.py modelscriptor/graph/*.py
 	uv run python compile_adder.py
+
+calculator.onnx: compile_calculator.py examples/calculator.py examples/adder.py modelscriptor/compiler/*.py modelscriptor/graph/*.py
+	uv run python compile_calculator.py
 
 .PHONY: lint
 lint:
