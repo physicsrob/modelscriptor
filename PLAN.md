@@ -279,7 +279,7 @@ Weight matrix shapes (from existing components):
 
 ---
 
-## Phase 4: Forward Compiler (Small Graphs)
+## Phase 4: Forward Compiler (Small Graphs) — DONE
 
 **Goal**: Wire everything together. Test on small graphs that the backward compiler handles.
 
@@ -399,11 +399,18 @@ After Phase 5: Full adder arithmetic verification + resource usage logging
 
 ## Current Status
 
-**69 passing, 19 skipped** (as of Phase 3 completion)
+**76 passing, 19 skipped** (as of Phase 4 completion)
 
 - Phase 0 (GraphAnalyzer): 5 tests passing
 - Phase 1 (ResidualStreamMap): 7 tests passing
 - Phase 2 (WeightWriter): 19 tests passing
 - Phase 3 (LayerScheduler): 20 tests passing
+- Phase 4 (Forward Compile): 7 tests passing
 - Graph/modelscript: 18 tests passing
-- Old compiler end-to-end: 19 tests skipped (retarget in Phase 4)
+- Old compiler end-to-end: 19 tests skipped (retarget later or remove)
+
+**Integration fixes found in Phase 4:**
+- Auto-create pos_encoding when not provided (needed for attention ops)
+- Save input indices before scheduling loop (scheduling may free/reassign them)
+- Concatenate nodes can't be dead-for-add addends in scheduler
+- Weight writer add_into handles Concatenate live addends via get_node_indices
