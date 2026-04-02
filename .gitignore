@@ -5,3 +5,4 @@ __pycache__
 .pytest_cache
 *.onnx
 *.vocab.json
+.claude/
