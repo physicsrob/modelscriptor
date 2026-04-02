@@ -1,0 +1,190 @@
+"""Calculator V2: Scalar-space +, -, * on positive integers.
+
+All three operations work in scalar space — digit embeddings are converted
+to plain numbers, arithmetic is performed on scalars, then results are
+converted back to digit embeddings.
+
+  "12*34="
+  → [embed("1"), embed("2")], [embed("3"), embed("4")]   parse digits
+  → 12.0, 34.0                                           digits_to_number
+  → 408.0                                                multiply_integers
+  → [4.0, 0.0, 8.0]                                      number_to_digit_scalars
+  → [embed("4"), embed("0"), embed("8")]                  scalar_to_embedding
+
+Addition and subtraction are trivial in scalar space (one Add/Subtract node).
+Multiplication uses the polarization identity: a*b = ((a+b)² - (a-b)²) / 4,
+where squaring is implemented via thermometer coding (see arithmetic_ops.py).
+"""
+
+from typing import Tuple, List
+
+import torch
+
+from modelscriptor.graph import Node, Embedding, PosEncoding
+from modelscriptor.graph.embedding import Unembedding
+from modelscriptor.modelscript.arithmetic_ops import (
+    add_scaled_nodes,
+    negate,
+    compare,
+    relu_add,
+    multiply_integers,
+)
+from modelscriptor.modelscript.inout_nodes import (
+    create_constant,
+    create_embedding,
+    create_pos_encoding,
+    create_unembedding,
+)
+from modelscriptor.modelscript.logic_ops import (
+    compare_to_vector,
+    bool_any_true,
+    bool_all_true,
+    bool_not,
+)
+from modelscriptor.modelscript.map_select import select, switch
+
+from examples.adder import (
+    NumericSequence,
+    remove_leading_0s,
+    output_sequence,
+)
+from examples.adder_v2 import (
+    digits_to_number,
+    number_to_digit_scalars,
+    scalar_to_embedding,
+)
+
+
+def create_network_parts(
+    max_digits: int = 3,
+) -> Tuple[Node, PosEncoding, Embedding]:
+    """Build the calculator graph and return (output_node, pos_encoding, embedding).
+
+    Parses "A op B=" where op is +, -, or *, then outputs result digits
+    autoregressively. Subtraction can produce negative results (prefixed with "-").
+
+    Three phases:
+      1. Parse: detect operator, extract digit embeddings for A and B
+      2. Compute: all three operations in scalar space, dispatch by operator
+      3. Output: emit result digits left-to-right, then <eos>
+    """
+    vocab = list(
+        " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
+    ) + ["<bos", "<eos>", "default"]
+    embedding = create_embedding(vocab=vocab)
+    pos_encoding = create_pos_encoding()
+
+    # --- Phase 1: Parse operands and operator ---
+    num_seq = NumericSequence(pos_encoding, embedding, max_digits)
+
+    # Detect which operator token appears
+    is_plus = compare_to_vector(embedding, embedding.get_embedding("+"))
+    is_minus = compare_to_vector(embedding, embedding.get_embedding("-"))
+    is_times = compare_to_vector(embedding, embedding.get_embedding("*"))
+    is_operator = bool_any_true([is_plus, is_minus, is_times])
+    is_equals = compare_to_vector(embedding, embedding.get_embedding("="))
+
+    # Guard: only detect operators before "=" — output tokens like "-" must
+    # not re-trigger operator signals during autoregressive decoding.
+    has_seen_equals = pos_encoding.get_prev_value(is_equals, is_equals)
+    before_equals = bool_not(has_seen_equals)
+    is_operator_input = bool_all_true([is_operator, before_equals])
+
+    # Latch which operator was seen (captured at the operator position)
+    which_plus = pos_encoding.get_prev_value(is_plus, is_operator_input)
+    which_minus = pos_encoding.get_prev_value(is_minus, is_operator_input)
+    which_times = pos_encoding.get_prev_value(is_times, is_operator_input)
+
+    # Extract operand digits (MSB first)
+    first_num_digits = num_seq.get_digits_at_event(is_operator_input)
+    second_num_digits = num_seq.get_digits_at_event(is_equals)
+
+    # Convert digit embeddings to scalar numbers (shared across all operations)
+    number_a = digits_to_number(embedding, first_num_digits)
+    number_b = digits_to_number(embedding, second_num_digits)
+
+    eos_embed = create_constant(embedding.get_embedding("<eos>"))
+    minus_embed = create_constant(embedding.get_embedding("-"))
+
+    # Multiplication produces up to 2*max_digits digits; all sequences
+    # are padded to this length so switch() can select element-by-element.
+    seq_len = 2 * max_digits + 2
+
+    # --- Phase 2a: Addition (scalar-space) ---
+    # Use add_scaled_nodes (Linear) instead of add (Add node) because
+    # number_a and number_b are shared across all three operation paths.
+    # Add nodes require one input to be "dead" for scheduling, which
+    # deadlocks when inputs have multiple consumers.
+    # Result can overflow by one digit (e.g. 999+999=1998)
+    add_result = add_scaled_nodes(1.0, number_a, 1.0, number_b)
+    max_result_add = 2 * (10**max_digits - 1)
+    add_digit_scalars = number_to_digit_scalars(
+        add_result, max_digits + 1, max_result_add
+    )
+    add_digit_embeds = [scalar_to_embedding(d, embedding) for d in add_digit_scalars]
+    add_seq = add_digit_embeds + [eos_embed] * (max_digits + 1)
+    add_seq = remove_leading_0s(embedding, add_seq, max_removals=max_digits)
+
+    # --- Phase 2b: Subtraction (scalar-space) ---
+    # Result can be negative (e.g. 100-999=-899)
+    sub_result = add_scaled_nodes(1.0, number_a, -1.0, number_b)
+    # compare returns true_level when inp > thresh; result > -0.5 means NOT negative
+    is_negative = compare(sub_result, thresh=-0.5, true_level=-1.0, false_level=1.0)
+    # |result| via ReLU: ReLU(x) + ReLU(-x) = |x|
+    abs_result = relu_add(sub_result, negate(sub_result))
+    max_abs = 10**max_digits - 1
+    sub_digit_scalars = number_to_digit_scalars(abs_result, max_digits, max_abs)
+    sub_digit_embeds = [scalar_to_embedding(d, embedding) for d in sub_digit_scalars]
+
+    # Positive case: digits + eos padding
+    sub_pos = sub_digit_embeds + [eos_embed] * (max_digits + 2)
+    sub_pos = remove_leading_0s(embedding, sub_pos, max_removals=max_digits - 1)
+
+    # Negative case: "-" then digits + eos padding, remove leading zeros from digits
+    sub_abs_clean = remove_leading_0s(
+        embedding,
+        sub_digit_embeds + [eos_embed] * (max_digits + 1),
+        max_removals=max_digits - 1,
+    )
+    sub_neg = [minus_embed] + sub_abs_clean[: seq_len - 1]
+
+    # Select between positive and negative per position
+    sub_seq = [select(is_negative, sub_neg[i], sub_pos[i]) for i in range(seq_len)]
+
+    # --- Phase 2c: Multiplication (scalar-space via polarization) ---
+    # a*b = ((a+b)² - (a-b)²) / 4, using thermometer squaring
+    mul_result = multiply_integers(
+        number_a, number_b, max_value=10**max_digits - 1
+    )
+    max_result_mul = (10**max_digits - 1) ** 2  # e.g. 999²=998001
+    num_mul_digits = 2 * max_digits
+    mul_digit_scalars = number_to_digit_scalars(
+        mul_result, num_mul_digits, max_result_mul
+    )
+    mul_digit_embeds = [scalar_to_embedding(d, embedding) for d in mul_digit_scalars]
+    mul_seq = mul_digit_embeds + [eos_embed, eos_embed]
+    mul_seq = remove_leading_0s(embedding, mul_seq, max_removals=2 * max_digits - 1)
+
+    # --- Phase 3: Dispatch by operator and output ---
+    result_digits = []
+    for i in range(seq_len):
+        result_digits.append(
+            switch(
+                [which_plus, which_minus, which_times],
+                [add_seq[i], sub_seq[i], mul_seq[i]],
+            )
+        )
+
+    output_node = output_sequence(
+        pos_encoding,
+        is_equals,
+        result_digits,
+        embedding.get_embedding(" "),
+    )
+    return output_node, pos_encoding, embedding
+
+
+def create_network(max_digits: int = 3) -> Unembedding:
+    """Create a calculator network: parses "A op B=", outputs result autoregressively."""
+    output_node, pos_encoding, embedding = create_network_parts(max_digits)
+    return create_unembedding(output_node, embedding)
