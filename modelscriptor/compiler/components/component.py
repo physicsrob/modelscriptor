@@ -21,12 +21,10 @@ class Component(ABC):
         self.out_state = ResidualStreamState(name=f"{self} out_state")
 
     @abstractmethod
-    def forward(self, inp):
-        ...
+    def forward(self, inp): ...
 
     @abstractmethod
-    def num_params(self) -> int:
-        ...
+    def num_params(self) -> int: ...
 
     def resize(self, new_d):
         self.d = new_d

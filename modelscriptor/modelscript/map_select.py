@@ -3,7 +3,8 @@ from typing import List, Tuple, Dict
 import torch
 
 from modelscriptor.modelscript.const import big_offset, turn_on_speed
-from modelscriptor.modelscript.logic_ops import cond_add_vector
+from modelscriptor.modelscript.logic_ops import cond_add_vector, cond_gate
+from modelscriptor.modelscript.arithmetic_ops import sum_nodes
 from modelscriptor.modelscript.ffn_layer import ffn_layer
 
 
@@ -56,21 +57,12 @@ def map_to_table(
     )
 
 
-def select_from_list(
-    cond_value_list: List[Tuple[Node, Node]], default: torch.Tensor
-) -> Node:
-    """
-    Uses a list of conditions to determine which value to select from a table.
+def switch(conditions: List[Node], values: List[Node]) -> Node:
+    """Select one of N values based on which condition is true.
 
-    Args:
-        cond_value_list (List[Tuple[Node, Node]]): List of tuples where each tuple consists of a condition and its
-            corresponding value.
-        default (torch.Tensor): Default tensor to return if none of the conditions in the table are met.
-
-    Returns:
-        Node: Output node with the selected value based on the conditions.
+    Assumes exactly one condition is true (1.0), rest are false (-1.0).
     """
-    raise NotImplementedError()
+    return sum_nodes([cond_gate(c, v) for c, v in zip(conditions, values)])
 
 
 def select(cond: Node, true_node: Node, false_node: Node) -> Node:

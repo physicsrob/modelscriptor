@@ -37,7 +37,7 @@ def run_autoregressive(
         if next_token == "<eos>":
             break
         tokens.append(next_token)
-    return "".join(tokens[len(input_tokens):])
+    return "".join(tokens[len(input_tokens) :])
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +47,7 @@ def run_autoregressive(
 
 def _build_1digit():
     import examples.adder as adder_module
+
     original = adder_module.max_digits
     try:
         adder_module.max_digits = 1
@@ -60,8 +61,11 @@ def test_1digit_adder():
     """Compile 1-digit adder and verify arithmetic at the '=' position."""
     output_node, pos_encoding, embedding = _build_1digit()
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=output_node,
-        pos_encoding=pos_encoding, verbose=True,
+        d=D,
+        d_head=D_HEAD,
+        output_node=output_node,
+        pos_encoding=pos_encoding,
+        verbose=True,
     )
 
     test_cases = [
@@ -75,17 +79,20 @@ def test_1digit_adder():
     for input_str, expected in test_cases:
         tokens = ["<bos"] + list(input_str)
         result = run_autoregressive(net, output_node, embedding, tokens)
-        assert result == expected, (
-            f"For {input_str}: expected '{expected}' but got '{result}'"
-        )
+        assert (
+            result == expected
+        ), f"For {input_str}: expected '{expected}' but got '{result}'"
 
 
 def test_1digit_layer_count():
     """Verify 1-digit adder compiles in a reasonable number of layers."""
     output_node, pos_encoding, embedding = _build_1digit()
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=output_node,
-        pos_encoding=pos_encoding, verbose=False,
+        d=D,
+        d_head=D_HEAD,
+        output_node=output_node,
+        pos_encoding=pos_encoding,
+        verbose=False,
     )
     n_layers = len(net.layers)
     print(f"1-digit adder: {n_layers} layers")
@@ -106,8 +113,11 @@ def test_3digit_adder():
     """Compile 3-digit adder, verify arithmetic at the position after '='."""
     output_node, pos_encoding, embedding = _build_3digit()
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=output_node,
-        pos_encoding=pos_encoding, verbose=True,
+        d=D,
+        d_head=D_HEAD,
+        output_node=output_node,
+        pos_encoding=pos_encoding,
+        verbose=True,
     )
 
     test_cases = [
@@ -121,17 +131,20 @@ def test_3digit_adder():
     for input_str, expected in test_cases:
         tokens = ["<bos"] + list(input_str)
         result = run_autoregressive(net, output_node, embedding, tokens)
-        assert result == expected, (
-            f"For {input_str}: expected '{expected}' but got '{result}'"
-        )
+        assert (
+            result == expected
+        ), f"For {input_str}: expected '{expected}' but got '{result}'"
 
 
 def test_3digit_autoregressive():
     """Run 3-digit adder autoregressively and verify complete output sequences."""
     output_node, pos_encoding, embedding = _build_3digit()
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=output_node,
-        pos_encoding=pos_encoding, verbose=False,
+        d=D,
+        d_head=D_HEAD,
+        output_node=output_node,
+        pos_encoding=pos_encoding,
+        verbose=False,
     )
 
     test_cases = [
@@ -144,17 +157,20 @@ def test_3digit_autoregressive():
     for input_str, expected in test_cases:
         tokens = ["<bos"] + list(input_str)
         result = run_autoregressive(net, output_node, embedding, tokens)
-        assert result == expected, (
-            f"For {input_str}: expected '{expected}' but got '{result}'"
-        )
+        assert (
+            result == expected
+        ), f"For {input_str}: expected '{expected}' but got '{result}'"
 
 
 def test_3digit_resource_usage():
     """Log layers and peak column utilization for the 3-digit adder."""
     output_node, pos_encoding, embedding = _build_3digit()
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=output_node,
-        pos_encoding=pos_encoding, verbose=True,
+        d=D,
+        d_head=D_HEAD,
+        output_node=output_node,
+        pos_encoding=pos_encoding,
+        verbose=True,
     )
     n_layers = len(net.layers)
     print(f"3-digit adder: {n_layers} layers, d={D}, d_head={D_HEAD}")
