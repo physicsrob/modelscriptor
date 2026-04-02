@@ -61,6 +61,7 @@ def test_module_forward_matches_compiled():
     net, output_node, pos_encoding, embedding = _compile_1digit()
     module = to_module(net, embedding, output_node)
     module.eval()
+    device = next(module.parameters()).device
 
     test_inputs = [
         ["<bos", "1", "+", "2", "="],
@@ -80,6 +81,7 @@ def test_module_forward_matches_compiled():
         token_ids = torch.tensor(
             [embedding.tokenizer.get_token_id(t) for t in tokens],
             dtype=torch.long,
+            device=device,
         )
         logits = module(token_ids)  # (seq_len, vocab_size)
 
@@ -93,8 +95,8 @@ def test_module_forward_matches_compiled():
                 res = layer_pair[1](res)
             actual_emb = res[:, module.output_gather_indices]
 
-        assert torch.allclose(actual_emb, expected_emb, atol=1e-4), (
-            f"Max diff: {(actual_emb - expected_emb).abs().max().item():.6f} "
+        assert torch.allclose(actual_emb.cpu(), expected_emb.cpu(), atol=1e-4), (
+            f"Max diff: {(actual_emb.cpu() - expected_emb.cpu()).abs().max().item():.6f} "
             f"for tokens {tokens}"
         )
 
@@ -107,6 +109,7 @@ def test_module_forward_matches_compiled():
 def test_attention_layer_matches_component():
     """_AttentionLayer produces same output as AttnLayerComponent + skip."""
     net, output_node, pos_encoding, embedding = _compile_1digit()
+    device = net.device
 
     layer = net.layers[0]
     attn_comp = layer.attn.attn
@@ -121,9 +124,10 @@ def test_attention_layer_matches_component():
     causal_mask = torch.triu(torch.ones(512, 512, dtype=torch.bool), diagonal=1)
 
     attn_mod = _AttentionLayer(W_Q, W_K, W_V, W_O, n_heads, d_head, causal_mask)
+    attn_mod.to(device)
     attn_mod.eval()
 
-    inp = torch.randn(8, D)
+    inp = torch.randn(8, D, device=device)
 
     # Original: attn component forward + skip
     expected = attn_comp.forward(inp) + inp
@@ -132,8 +136,8 @@ def test_attention_layer_matches_component():
     actual = attn_mod(inp)
 
     assert torch.allclose(
-        actual, expected, atol=1e-5
-    ), f"Attention max diff: {(actual - expected).abs().max().item():.6f}"
+        actual.cpu(), expected.cpu(), atol=1e-5
+    ), f"Attention max diff: {(actual.cpu() - expected.cpu()).abs().max().item():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +148,7 @@ def test_attention_layer_matches_component():
 def test_ffn_layer_matches_component():
     """_FFNLayer produces same output as FFNSubLayer.forward()."""
     net, output_node, pos_encoding, embedding = _compile_1digit()
+    device = net.device
 
     layer = net.layers[0]
     ffn_comp = layer.ffn
@@ -154,16 +159,17 @@ def test_ffn_layer_matches_component():
     b2 = ffn_comp.linear2.output_bias.clone()
 
     ffn_mod = _FFNLayer(W1, b1, W2, b2)
+    ffn_mod.to(device)
     ffn_mod.eval()
 
-    inp = torch.randn(8, D)
+    inp = torch.randn(8, D, device=device)
 
     expected = ffn_comp.forward(inp)
     actual = ffn_mod(inp)
 
     assert torch.allclose(
-        actual, expected, atol=1e-5
-    ), f"FFN max diff: {(actual - expected).abs().max().item():.6f}"
+        actual.cpu(), expected.cpu(), atol=1e-5
+    ), f"FFN max diff: {(actual.cpu() - expected.cpu()).abs().max().item():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +182,7 @@ def test_input_scatter_matches_get_input_res_stream():
     net, output_node, pos_encoding, embedding = _compile_1digit()
     module = to_module(net, embedding, output_node)
     module.eval()
+    device = next(module.parameters()).device
 
     tokens = ["<bos", "1", "+", "2", "="]
 
@@ -189,6 +196,7 @@ def test_input_scatter_matches_get_input_res_stream():
     token_ids = torch.tensor(
         [embedding.tokenizer.get_token_id(t) for t in tokens],
         dtype=torch.long,
+        device=device,
     )
     with torch.no_grad():
         embedded = module.token_embedding(token_ids)
@@ -200,8 +208,8 @@ def test_input_scatter_matches_get_input_res_stream():
         )
 
     assert torch.allclose(
-        actual, expected, atol=1e-5
-    ), f"Input scatter max diff: {(actual - expected).abs().max().item():.6f}"
+        actual.cpu(), expected.cpu(), atol=1e-5
+    ), f"Input scatter max diff: {(actual.cpu() - expected.cpu()).abs().max().item():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +222,7 @@ def test_output_gather_matches_decode():
     net, output_node, pos_encoding, embedding = _compile_1digit()
     module = to_module(net, embedding, output_node)
     module.eval()
+    device = next(module.parameters()).device
 
     tokens = ["<bos", "1", "+", "2", "="]
 
@@ -225,13 +234,14 @@ def test_output_gather_matches_decode():
     ht_output = result[output_node]  # (seq_len, d_embed)
     ht_token_ids = []
     for pos in range(len(tokens)):
-        dists = torch.cdist(ht_output[pos].unsqueeze(0), embedding.table)
+        dists = torch.cdist(ht_output[pos].unsqueeze(0).cpu(), embedding.table)
         ht_token_ids.append(dists.argmin().item())
 
     # Module path: logits argmax
     token_ids = torch.tensor(
         [embedding.tokenizer.get_token_id(t) for t in tokens],
         dtype=torch.long,
+        device=device,
     )
     with torch.no_grad():
         logits = module(token_ids)
@@ -249,9 +259,10 @@ def test_output_gather_matches_decode():
 
 def _module_generate(module, tokenizer, input_text, max_new_tokens=10):
     """Run autoregressive generation using the nn.Module."""
+    device = next(module.parameters()).device
     tokens = ["<bos"] + list(input_text)
     token_ids = torch.tensor(
-        [tokenizer.get_token_id(t) for t in tokens], dtype=torch.long
+        [tokenizer.get_token_id(t) for t in tokens], dtype=torch.long, device=device
     )
     for _ in range(max_new_tokens):
         with torch.no_grad():
@@ -260,7 +271,7 @@ def _module_generate(module, tokenizer, input_text, max_new_tokens=10):
         next_token = tokenizer.decode_id(next_id)
         if next_token == "<eos>":
             break
-        token_ids = torch.cat([token_ids, torch.tensor([next_id])])
+        token_ids = torch.cat([token_ids, torch.tensor([next_id], device=device)])
     return "".join(tokenizer.decode_id(tid.item()) for tid in token_ids[len(tokens) :])
 
 
@@ -326,10 +337,13 @@ def test_module_state_dict_roundtrip():
     net, output_node, pos_encoding, embedding = _compile_1digit()
     module1 = to_module(net, embedding, output_node)
     module1.eval()
+    device = next(module1.parameters()).device
 
     tokens = ["<bos", "3", "+", "6", "="]
     token_ids = torch.tensor(
-        [embedding.tokenizer.get_token_id(t) for t in tokens], dtype=torch.long
+        [embedding.tokenizer.get_token_id(t) for t in tokens],
+        dtype=torch.long,
+        device=device,
     )
 
     with torch.no_grad():
@@ -356,9 +370,10 @@ def test_variable_sequence_lengths():
     net, output_node, pos_encoding, embedding = _compile_1digit()
     module = to_module(net, embedding, output_node)
     module.eval()
+    device = next(module.parameters()).device
 
     for length in [1, 5, 10, 20]:
-        token_ids = torch.zeros(length, dtype=torch.long)
+        token_ids = torch.zeros(length, dtype=torch.long, device=device)
         with torch.no_grad():
             logits = module(token_ids)
         assert logits.shape == (
@@ -452,18 +467,20 @@ def test_onnx_export_and_inference():
         )
         module = to_module(net, embedding, output_node)
         module.eval()
+        device = next(module.parameters()).device
 
         tokens = ["<bos", "1", "+", "2", "="]
         token_ids = torch.tensor(
             [embedding.tokenizer.get_token_id(t) for t in tokens],
             dtype=torch.long,
+            device=device,
         )
 
         with torch.no_grad():
-            pt_logits = module(token_ids).numpy()
+            pt_logits = module(token_ids).cpu().numpy()
 
         session = onnxruntime.InferenceSession(onnx_path)
-        onnx_logits = session.run(None, {"token_ids": token_ids.numpy()})[0]
+        onnx_logits = session.run(None, {"token_ids": token_ids.cpu().numpy()})[0]
 
         assert (
             pt_logits.argmax(axis=-1).tolist() == onnx_logits.argmax(axis=-1).tolist()

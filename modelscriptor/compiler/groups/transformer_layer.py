@@ -18,5 +18,10 @@ class TransformerLayer:
         self.attn = AttnSubLayer(d, d_head, pos_encoding)
         self.ffn = FFNSubLayer(d)
 
+    def to(self, device):
+        self.attn.to(device)
+        self.ffn.to(device)
+        return self
+
     def num_params(self):
         return self.attn.num_params() + self.ffn.num_params()

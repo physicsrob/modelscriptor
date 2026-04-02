@@ -15,6 +15,7 @@ Conventions:
 import torch
 import torch.nn.functional as F
 
+import modelscriptor.compiler.device as device_mod
 from modelscriptor.compiler.forward.residual_map import ResidualStreamMap
 from modelscriptor.compiler.forward.weight_writer import (
     AttnHeadOp,
@@ -40,9 +41,11 @@ def _build_residual_stream(
     residual_map: ResidualStreamMap, node_values: dict
 ) -> torch.Tensor:
     """Build a residual stream tensor with known values at each node's columns."""
-    res = torch.zeros(N_POS, D)
+    device = device_mod.get_device(verbose=False)
+    res = torch.zeros(N_POS, D, device=device)
     for node, values in node_values.items():
         indices = residual_map.get_indices(node)
+        values = values.to(res.device)
         for i, idx in enumerate(indices):
             res[:, idx] = values[:, i]
     return res
@@ -56,7 +59,9 @@ def _build_residual_stream(
 def test_identity_layer():
     """A layer with no ops written is pure identity via skip connections."""
     layer = TransformerLayer(D, D_HEAD)
-    inp = torch.randn(N_POS, D)
+    device = device_mod.get_device(verbose=False)
+    layer.to(device)
+    inp = torch.randn(N_POS, D, device=device)
     out = layer.attn.forward(inp)
     out = layer.ffn.forward(out)
     assert torch.allclose(inp, out, atol=1e-6)
@@ -91,6 +96,7 @@ def test_attn_compute():
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="compute_attn", node=attn_node, target_cols=out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     # Build input residual stream
     v_values = torch.randn(N_POS, len(value_in))
@@ -102,7 +108,7 @@ def test_attn_compute():
     result = out[:, out_cols]
 
     expected = attn_node.compute(N_POS, {"v": v_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 def test_attn_compute_small_d_head():
@@ -129,6 +135,7 @@ def test_attn_compute_small_d_head():
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="compute_attn", node=attn_node, target_cols=out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     v_values = torch.randn(N_POS, len(value_in))
     pe_values = pos.compute(N_POS, {})
@@ -138,7 +145,7 @@ def test_attn_compute_small_d_head():
     result = out[:, out_cols]
 
     expected = attn_node.compute(N_POS, {"v": v_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 def test_attn_compute_shared_inputs():
@@ -157,6 +164,7 @@ def test_attn_compute_shared_inputs():
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="compute_attn", node=attn_node, target_cols=out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     v_values = torch.randn(N_POS, len(value_in))
     pe_values = pos.compute(N_POS, {})
@@ -166,7 +174,7 @@ def test_attn_compute_shared_inputs():
     result = out[:, out_cols]
 
     expected = attn_node.compute(N_POS, {"v": v_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 def test_attn_compute_multiposition():
@@ -186,6 +194,7 @@ def test_attn_compute_multiposition():
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="compute_attn", node=attn_node, target_cols=out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     v_values = torch.tensor(
         [
@@ -214,7 +223,7 @@ def test_attn_compute_multiposition():
     result = out[:, out_cols]
 
     expected = attn_node.compute(N_POS, {"v": v_values, "c": c_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +246,7 @@ def test_linear_zero_bias():
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="compute_linear", node=linear_node, target_cols=out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
     pe_values = pos.compute(N_POS, {})
@@ -246,7 +256,7 @@ def test_linear_zero_bias():
     result = out[:, out_cols]
 
     expected = linear_node.compute(N_POS, {"x": x_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 def test_linear_large_input():
@@ -275,6 +285,7 @@ def test_linear_large_input():
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="compute_linear", node=linear_node, target_cols=out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     input_values = {f"x{i}": torch.randn(N_POS, 8) for i in range(4)}
     pe_values = pos.compute(N_POS, {})
@@ -287,7 +298,7 @@ def test_linear_large_input():
     result = out[:, out_cols]
 
     expected = linear_node.compute(N_POS, input_values)
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 def test_linear_different_dims():
@@ -305,6 +316,7 @@ def test_linear_different_dims():
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="compute_linear", node=linear_node, target_cols=out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 8)
     pe_values = pos.compute(N_POS, {})
@@ -314,7 +326,7 @@ def test_linear_different_dims():
     result = out[:, out_cols]
 
     expected = linear_node.compute(N_POS, {"x": x_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +346,7 @@ def test_cancel():
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="cancel", node=x, target_cols=x_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
     pe_values = pos.compute(N_POS, {})
@@ -343,7 +356,7 @@ def test_cancel():
     out = layer.attn.forward(res)
     result = out[:, x_cols]
 
-    assert torch.allclose(result, torch.zeros_like(result), atol=1e-4)
+    assert torch.allclose(result.cpu(), torch.zeros_like(result.cpu()), atol=1e-4)
 
 
 def test_cancel_multiple():
@@ -363,6 +376,7 @@ def test_cancel_multiple():
         AttnHeadOp(op_type="cancel", node=b, target_cols=b_cols),
     ]
     write_attn_sublayer(layer, ops, rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 3)
     b_values = torch.randn(N_POS, 5)
@@ -370,8 +384,8 @@ def test_cancel_multiple():
     res = _build_residual_stream(rmap, {pos: pe_values, a: a_values, b: b_values})
 
     out = layer.attn.forward(res)
-    assert torch.allclose(out[:, a_cols], torch.zeros(N_POS, 3), atol=1e-4)
-    assert torch.allclose(out[:, b_cols], torch.zeros(N_POS, 5), atol=1e-4)
+    assert torch.allclose(out[:, a_cols].cpu(), torch.zeros(N_POS, 3), atol=1e-4)
+    assert torch.allclose(out[:, b_cols].cpu(), torch.zeros(N_POS, 5), atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +412,7 @@ def test_add_into():
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="add_into", node=add_node, target_cols=a_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 4)
     b_values = torch.randn(N_POS, 4)
@@ -412,7 +427,7 @@ def test_add_into():
     result = out[:, a_cols]
 
     expected = add_node.compute(N_POS, {"a": a_values, "b": b_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 def test_add_into_dead_at_inputs1():
@@ -438,6 +453,7 @@ def test_add_into_dead_at_inputs1():
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="add_into", node=add_node, target_cols=dead_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     live_values = torch.randn(N_POS, 4)
     dead_values = torch.randn(N_POS, 4)
@@ -451,7 +467,7 @@ def test_add_into_dead_at_inputs1():
     result = out[:, dead_cols]
 
     expected = add_node.compute(N_POS, {"live": live_values, "dead": dead_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +497,7 @@ def test_ffn_relu_chain():
         op_type="compute_relu", node=l2, target_cols=out_cols, ffn_slots=ffn_slots
     )
     write_ffn_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
     res = _build_residual_stream(rmap, {x: x_values})
@@ -490,7 +507,7 @@ def test_ffn_relu_chain():
     result = out[:, out_cols]
 
     expected = l2.compute(N_POS, {"x": x_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 def test_ffn_relu_chain_multiple():
@@ -530,6 +547,7 @@ def test_ffn_relu_chain_multiple():
         ),
     ]
     write_ffn_sublayer(layer, ops, rmap)
+    layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
     y_values = torch.randn(N_POS, 3)
@@ -539,8 +557,8 @@ def test_ffn_relu_chain_multiple():
 
     expected1 = l1b.compute(N_POS, {"x": x_values})
     expected2 = l2b.compute(N_POS, {"y": y_values})
-    assert torch.allclose(out[:, out1_cols], expected1, atol=1e-4)
-    assert torch.allclose(out[:, out2_cols], expected2, atol=1e-4)
+    assert torch.allclose(out[:, out1_cols].cpu(), expected1, atol=1e-4)
+    assert torch.allclose(out[:, out2_cols].cpu(), expected2, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +585,7 @@ def test_ffn_standalone_relu():
         ffn_slots=ffn_slots,
     )
     write_ffn_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
 
     # Input with mix of positive and negative values to exercise ReLU
     x_values = torch.tensor(
@@ -583,7 +602,7 @@ def test_ffn_standalone_relu():
     result = out[:, out_cols]
 
     expected = relu_node.compute(N_POS, {"x": x_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 def test_ffn_standalone_relu_preserves_input():
@@ -605,6 +624,7 @@ def test_ffn_standalone_relu_preserves_input():
         ffn_slots=ffn_slots,
     )
     write_ffn_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.tensor(
         [
@@ -619,7 +639,7 @@ def test_ffn_standalone_relu_preserves_input():
     out = layer.ffn.forward(res)
 
     # Input columns should be preserved by the skip connection
-    assert torch.allclose(out[:, x_cols], x_values, atol=1e-4)
+    assert torch.allclose(out[:, x_cols].cpu(), x_values, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -640,14 +660,16 @@ def test_ffn_constant():
         op_type="compute_constant", node=const, target_cols=out_cols, ffn_slots=[]
     )
     write_ffn_sublayer(layer, [op], rmap)
+    device = device_mod.get_device(verbose=False)
+    layer.to(device)
 
-    res = torch.zeros(N_POS, D)
+    res = torch.zeros(N_POS, D, device=device)
 
     out = layer.ffn.forward(res)
     result = out[:, out_cols]
 
     expected = const.compute(N_POS, {})
-    assert torch.allclose(result, expected, atol=1e-6)
+    assert torch.allclose(result.cpu(), expected, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -681,6 +703,7 @@ def test_biased_linear_split():
         op_type="compute_bias", node=linear_node, target_cols=out_cols, ffn_slots=[]
     )
     write_ffn_sublayer(layer, [ffn_op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
     pe_values = pos.compute(N_POS, {})
@@ -692,7 +715,7 @@ def test_biased_linear_split():
     result = out[:, out_cols]
 
     expected = linear_node.compute(N_POS, {"x": x_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +747,7 @@ def test_non_contiguous_columns():
     layer = TransformerLayer(D, D_HEAD, pos)
     op = AttnHeadOp(op_type="compute_linear", node=linear_node, target_cols=out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
     pe_values = pos.compute(N_POS, {})
@@ -733,7 +757,7 @@ def test_non_contiguous_columns():
     result = out[:, out_cols]
 
     expected = linear_node.compute(N_POS, {"x": x_values})
-    assert torch.allclose(result, expected, atol=1e-4)
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +797,7 @@ def test_mixed_layer():
         op_type="compute_constant", node=const, target_cols=const_cols, ffn_slots=[]
     )
     write_ffn_sublayer(layer, [ffn_op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
     pe_values = pos.compute(N_POS, {})
@@ -784,8 +809,8 @@ def test_mixed_layer():
 
     # Check attention result
     expected_attn = lin_attn.compute(N_POS, {"x": x_values})
-    assert torch.allclose(out[:, attn_out_cols], expected_attn, atol=1e-4)
+    assert torch.allclose(out[:, attn_out_cols].cpu(), expected_attn, atol=1e-4)
 
     # Check FFN result
     expected_const = const.compute(N_POS, {})
-    assert torch.allclose(out[:, const_cols], expected_const, atol=1e-4)
+    assert torch.allclose(out[:, const_cols].cpu(), expected_const, atol=1e-4)

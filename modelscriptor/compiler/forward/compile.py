@@ -7,6 +7,9 @@ given input values.
 
 from typing import Optional
 
+import torch
+
+from modelscriptor.compiler.device import get_device
 from modelscriptor.compiler.feature_assignment import FeatureAssignment
 from modelscriptor.compiler.forward.graph_analysis import GraphAnalyzer
 from modelscriptor.compiler.forward.residual_map import ResidualStreamMap
@@ -27,6 +30,7 @@ def forward_compile(
     pos_encoding: Optional[PosEncoding] = None,
     verbose: bool = True,
     max_layers: int = 100,
+    device: Optional[str] = "auto",
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -37,6 +41,8 @@ def forward_compile(
         pos_encoding: Positional encoding node (required for attention ops).
         verbose: Print compilation progress.
         max_layers: Safety limit on number of layers.
+        device: Target device — "auto" (default) uses GPU if available,
+                "cpu"/"cuda" to force, or None to skip moving.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -112,5 +118,10 @@ def forward_compile(
         fa.assign(in_state, node, indices)
     fa.assign(out_state, output_node, residual_map.get_indices(output_node))
     net.feature_assignment = fa
+
+    if device == "auto":
+        net.to(get_device(verbose=verbose))
+    elif device is not None:
+        net.to(torch.device(device))
 
     return net

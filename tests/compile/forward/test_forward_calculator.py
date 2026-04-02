@@ -12,7 +12,7 @@ D_HEAD = 16
 
 
 def decode_token(embedding: Embedding, vector: torch.Tensor) -> str:
-    dists = torch.cdist(vector.unsqueeze(0), embedding.table)
+    dists = torch.cdist(vector.unsqueeze(0).cpu(), embedding.table)
     return embedding.tokenizer.decode_id(dists.argmin().item())
 
 
@@ -74,12 +74,14 @@ def _check(net, output_node, embedding, input_str, expected):
 
 @pytest.fixture(scope="module")
 def calc_1digit():
-    return _compile(1)
+    net, output_node, embedding = _compile(1)
+    return net, output_node, embedding
 
 
 @pytest.fixture(scope="module")
 def calc_3digit():
-    return _compile(3, d=2048)
+    net, output_node, embedding = _compile(3, d=2048)
+    return net, output_node, embedding
 
 
 # ---------------------------------------------------------------------------
