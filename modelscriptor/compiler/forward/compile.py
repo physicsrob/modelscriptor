@@ -60,13 +60,17 @@ def forward_compile(
     scheduler = LayerScheduler(graph, d, d_head, pos_encoding)
 
     # Save input indices before scheduling (scheduling may free/reassign them)
-    input_indices = {pos_encoding: residual_map.get_indices(pos_encoding)}
+    input_indices: dict[Node, list[int]] = {
+        pos_encoding: residual_map.get_indices(pos_encoding)
+    }
     for node in input_nodes:
         input_indices[node] = residual_map.get_indices(node)
 
     if verbose:
-        print(f"Forward compile: {len(graph.get_all_nodes())} nodes, "
-              f"{len(input_nodes)} inputs, d={d}, d_head={d_head}")
+        print(
+            f"Forward compile: {len(graph.get_all_nodes())} nodes, "
+            f"{len(input_nodes)} inputs, d={d}, d_head={d_head}"
+        )
 
     # 3. Layer loop
     for i in range(max_layers):
@@ -83,8 +87,10 @@ def forward_compile(
             n_ffn = len(ffn_ops)
             n_computed = len(computed)
             free = residual_map.get_free_count()
-            print(f"  Layer {i}: {n_attn} attn ops, {n_ffn} ffn ops, "
-                  f"{n_computed} computed, {free} free cols")
+            print(
+                f"  Layer {i}: {n_attn} attn ops, {n_ffn} ffn ops, "
+                f"{n_computed} computed, {free} free cols"
+            )
     else:
         raise RuntimeError(
             f"Compilation did not converge in {max_layers} layers. "

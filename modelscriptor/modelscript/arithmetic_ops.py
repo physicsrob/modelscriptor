@@ -192,12 +192,44 @@ def relu_add(inp1: Node, inp2: Node) -> Node:
     )
 
 
-def multiply_scalar(inp: Node, scalar: float):
-    return ffn_layer(
-        input_node=inp,
-        input_proj=scalar * torch.eye(len(inp)),
-        input_bias=torch.zeros(len(inp)),
-        output_proj=torch.eye(len(inp)),
-        output_bias=torch.zeros(len(inp)),
-        name="multiply_scalar",
-    )
+def negate(inp: Node) -> Node:
+    """
+    Negates the input node (multiplies by -1).
+
+    Args:
+        inp (Node): Node to negate.
+
+    Returns:
+        Node: Node with negated values.
+    """
+    d = len(inp)
+    return Linear(inp, -torch.eye(d), name="negate")
+
+
+def subtract(inp1: Node, inp2: Node) -> Node:
+    """
+    Subtracts inp2 from inp1 element-wise.
+
+    Args:
+        inp1 (Node): Node to subtract from.
+        inp2 (Node): Node to subtract.
+
+    Returns:
+        Node: Node resulting from inp1 - inp2.
+    """
+    return add(inp1, negate(inp2))
+
+
+def multiply_scalar(inp: Node, scalar: float) -> Node:
+    """
+    Multiplies each entry of the input node by a scalar.
+
+    Args:
+        inp (Node): Node to scale.
+        scalar (float): Scalar multiplier.
+
+    Returns:
+        Node: Node with scaled values.
+    """
+    d = len(inp)
+    return Linear(inp, scalar * torch.eye(d), name="multiply_scalar")

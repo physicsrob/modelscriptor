@@ -19,8 +19,9 @@ from modelscriptor.graph.relu import ReLU
 
 
 class LayerScheduler:
-    def __init__(self, graph: GraphAnalyzer, d: int, d_head: int,
-                 pos_encoding: PosEncoding):
+    def __init__(
+        self, graph: GraphAnalyzer, d: int, d_head: int, pos_encoding: PosEncoding
+    ):
         self.graph = graph
         self.d = d
         self.d_head = d_head
@@ -111,8 +112,9 @@ class LayerScheduler:
     # Attention sublayer
     # ------------------------------------------------------------------
 
-    def _schedule_attn_sublayer(self, ready, dead, free_adds, residual_map,
-                                computed_nodes):
+    def _schedule_attn_sublayer(
+        self, ready, dead, free_adds, residual_map, computed_nodes
+    ):
         attn_ops = []
         biased_linears = []
         heads_used = 0
@@ -139,21 +141,21 @@ class LayerScheduler:
         for node in ready:
             if isinstance(node, Attn):
                 compute_candidates.append(("compute_attn", node, 1))
-            elif (isinstance(node, Linear)
-                  and not isinstance(node.inputs[0], ReLU)):
+            elif isinstance(node, Linear) and not isinstance(node.inputs[0], ReLU):
                 n_heads = self._heads_for_linear(node)
                 compute_candidates.append(("compute_linear", node, n_heads))
 
         # Sort: Attn first, then by critical path
-        compute_candidates.sort(key=lambda t: (
-            0 if t[0] == "compute_attn" else 1,
-            -self.graph.get_critical_path_length(t[1]),
-        ))
+        compute_candidates.sort(
+            key=lambda t: (
+                0 if t[0] == "compute_attn" else 1,
+                -self.graph.get_critical_path_length(t[1]),
+            )
+        )
 
         # Cancellation candidates
         cancel_candidates = [
-            n for n in dead
-            if len(n) <= self.d_head and n is not self.pos_encoding
+            n for n in dead if len(n) <= self.d_head and n is not self.pos_encoding
         ]
         cancel_candidates.sort(key=lambda n: -len(n))  # largest first
 
@@ -164,11 +166,13 @@ class LayerScheduler:
             target_cols = self._try_allocate(node, residual_map)
 
             # Promotion: cancel dead nodes to free space
-            while (target_cols is None and cancel_candidates
-                   and heads_used + n_heads_needed < self.n_heads):
+            while (
+                target_cols is None
+                and cancel_candidates
+                and heads_used + n_heads_needed < self.n_heads
+            ):
                 cn = cancel_candidates.pop(0)
-                attn_ops.append(
-                    AttnHeadOp("cancel", cn, residual_map.get_indices(cn)))
+                attn_ops.append(AttnHeadOp("cancel", cn, residual_map.get_indices(cn)))
                 residual_map.free(cn)
                 heads_used += 1
                 target_cols = self._try_allocate(node, residual_map)
@@ -181,16 +185,18 @@ class LayerScheduler:
             computed_nodes.add(node)
             ready.discard(node)
 
-            if (op_type == "compute_linear" and isinstance(node, Linear)
-                    and not self._has_zero_bias(node)):
+            if (
+                op_type == "compute_linear"
+                and isinstance(node, Linear)
+                and not self._has_zero_bias(node)
+            ):
                 biased_linears.append(node)
 
         # 2e. Remaining cancellations
         for cn in cancel_candidates:
             if heads_used >= self.n_heads:
                 break
-            attn_ops.append(
-                AttnHeadOp("cancel", cn, residual_map.get_indices(cn)))
+            attn_ops.append(AttnHeadOp("cancel", cn, residual_map.get_indices(cn)))
             residual_map.free(cn)
             heads_used += 1
 
@@ -200,8 +206,9 @@ class LayerScheduler:
     # FFN sublayer
     # ------------------------------------------------------------------
 
-    def _schedule_ffn_sublayer(self, ready, chains, biased_linears,
-                               residual_map, computed_nodes):
+    def _schedule_ffn_sublayer(
+        self, ready, chains, biased_linears, residual_map, computed_nodes
+    ):
         ffn_ops = []
         next_slot = 0
 
@@ -236,8 +243,9 @@ class LayerScheduler:
                 continue
             ffn_slots = list(range(next_slot, next_slot + d_relu))
             next_slot += d_relu
-            ffn_ops.append(FFNOp("compute_standalone_relu", node,
-                                 target_cols, ffn_slots))
+            ffn_ops.append(
+                FFNOp("compute_standalone_relu", node, target_cols, ffn_slots)
+            )
             computed_nodes.add(node)
 
         # 3c. Constants (no slot cost)
@@ -320,8 +328,9 @@ class LayerScheduler:
             return False
         return self._get_effective_consumers(node).issubset(computed_nodes)
 
-    def _is_dead_for_add(self, addend: Node, add_node: Add,
-                         computed_nodes: Set[Node]) -> bool:
+    def _is_dead_for_add(
+        self, addend: Node, add_node: Add, computed_nodes: Set[Node]
+    ) -> bool:
         """True if all effective consumers of addend, except add_node, are computed.
 
         Concatenate nodes can't be dead addends — they aren't allocated in the
@@ -334,8 +343,9 @@ class LayerScheduler:
         effective = self._get_effective_consumers(addend)
         return (effective - {add_node}).issubset(computed_nodes)
 
-    def _find_dead_nodes(self, residual_map: ResidualStreamMap,
-                         computed_nodes: Set[Node]) -> List[Node]:
+    def _find_dead_nodes(
+        self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
+    ) -> List[Node]:
         graph_nodes = self.graph.get_all_nodes()
         dead = []
         for node in residual_map.get_allocated_nodes():
@@ -355,8 +365,9 @@ class LayerScheduler:
     def _has_zero_bias(self, node: Linear) -> bool:
         return node.output_bias.abs().sum().item() == 0
 
-    def _try_allocate(self, node: Node,
-                      residual_map: ResidualStreamMap) -> Optional[List[int]]:
+    def _try_allocate(
+        self, node: Node, residual_map: ResidualStreamMap
+    ) -> Optional[List[int]]:
         if len(node) > residual_map.get_free_count():
             return None
         return residual_map.allocate(node)

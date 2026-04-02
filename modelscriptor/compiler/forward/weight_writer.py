@@ -41,6 +41,7 @@ def write_attn_sublayer(
 ):
     """Write attention head operations into a layer's AttnLayerComponent."""
     attn = layer.attn.attn
+    assert pos_encoding is not None, "pos_encoding required for attention ops"
     for op in ops:
         if op.op_type == "compute_attn":
             _write_compute_attn(attn, op, residual_map)
@@ -78,8 +79,9 @@ def write_ffn_sublayer(
 # ---------------------------------------------------------------------------
 
 
-def _scatter_attn_head(attn, head, q_idx, k_idx, v_idx, o_idx,
-                       q_mat, k_mat, v_mat, o_mat, d_head):
+def _scatter_attn_head(
+    attn, head, q_idx, k_idx, v_idx, o_idx, q_mat, k_mat, v_mat, o_mat, d_head
+):
     """Scatter strategy matrices into one attention head's weight tensors."""
     for i, idx in enumerate(q_idx):
         attn.query_matrix[head, idx, :d_head] = q_mat[i, :d_head]
@@ -120,8 +122,9 @@ def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
     o_mat = F.pad(node.output_matrix, (0, 0, 0, layer_d_head - node_d_head))
 
     head = _allocate_head(attn)
-    _scatter_attn_head(attn, head, q_idx, k_idx, v_idx, o_idx,
-                       q_mat, k_mat, v_mat, o_mat, layer_d_head)
+    _scatter_attn_head(
+        attn, head, q_idx, k_idx, v_idx, o_idx, q_mat, k_mat, v_mat, o_mat, layer_d_head
+    )
 
 
 def _current_pos_attn_matrices(pos_encoding, d_head):
@@ -132,8 +135,9 @@ def _current_pos_attn_matrices(pos_encoding, d_head):
     return q_mat, k_mat
 
 
-def _write_compute_linear(attn, op: AttnHeadOp, rmap: ResidualStreamMap,
-                          pos_encoding: PosEncoding):
+def _write_compute_linear(
+    attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
+):
     """Compile a zero-bias Linear via current-position attention.
 
     Q/K attend to current position via pos_encoding.
@@ -171,12 +175,24 @@ def _write_compute_linear(attn, op: AttnHeadOp, rmap: ResidualStreamMap,
         o_mat = F.pad(weight_slice, (0, 0, 0, d_head - chunk_size))
 
         head = _allocate_head(attn)
-        _scatter_attn_head(attn, head, pe_idx, pe_idx, v_chunk_idx, o_idx,
-                           q_mat, k_mat, v_mat, o_mat, d_head)
+        _scatter_attn_head(
+            attn,
+            head,
+            pe_idx,
+            pe_idx,
+            v_chunk_idx,
+            o_idx,
+            q_mat,
+            k_mat,
+            v_mat,
+            o_mat,
+            d_head,
+        )
 
 
-def _write_cancel(attn, op: AttnHeadOp, rmap: ResidualStreamMap,
-                  pos_encoding: PosEncoding):
+def _write_cancel(
+    attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
+):
     """Cancel a node: V=identity, O=-identity. Skip adds x + (-x) = 0."""
     node = op.node
     d_head = attn.d_head
@@ -190,12 +206,24 @@ def _write_cancel(attn, op: AttnHeadOp, rmap: ResidualStreamMap,
     o_mat = -torch.eye(d_head, d_node)
 
     head = _allocate_head(attn)
-    _scatter_attn_head(attn, head, pe_idx, pe_idx, node_idx, node_idx,
-                       q_mat, k_mat, v_mat, o_mat, d_head)
+    _scatter_attn_head(
+        attn,
+        head,
+        pe_idx,
+        pe_idx,
+        node_idx,
+        node_idx,
+        q_mat,
+        k_mat,
+        v_mat,
+        o_mat,
+        d_head,
+    )
 
 
-def _write_add_into(attn, op: AttnHeadOp, rmap: ResidualStreamMap,
-                    pos_encoding: PosEncoding):
+def _write_add_into(
+    attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
+):
     """Add(dead, live): copy live's values to dead's columns via attention.
 
     target_cols are the dead addend's columns (now owned by the Add node
@@ -226,8 +254,9 @@ def _write_add_into(attn, op: AttnHeadOp, rmap: ResidualStreamMap,
     o_mat = torch.eye(d_head, d_live)
 
     head = _allocate_head(attn)
-    _scatter_attn_head(attn, head, pe_idx, pe_idx, v_idx, o_idx,
-                       q_mat, k_mat, v_mat, o_mat, d_head)
+    _scatter_attn_head(
+        attn, head, pe_idx, pe_idx, v_idx, o_idx, q_mat, k_mat, v_mat, o_mat, d_head
+    )
 
 
 # ---------------------------------------------------------------------------

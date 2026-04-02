@@ -3,7 +3,14 @@ from typing import Dict, List, Set
 
 from modelscriptor.compiler.feature_assignment import simplify_nodes
 from modelscriptor.compiler.utils import get_ancestor_nodes
-from modelscriptor.graph import Node, Concatenate, Constant, InputNode, PosEncoding, Embedding
+from modelscriptor.graph import (
+    Node,
+    Concatenate,
+    Constant,
+    InputNode,
+    PosEncoding,
+    Embedding,
+)
 
 
 class GraphAnalyzer:

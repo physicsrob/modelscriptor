@@ -27,7 +27,6 @@ from modelscriptor.graph import Linear, ReLU, Attn, Add, Concatenate
 from modelscriptor.graph.misc import InputNode, Constant
 from modelscriptor.graph.pos_encoding import PosEncoding, attention_hardness
 
-
 D = 64
 D_HEAD = 16
 N_POS = 4
@@ -37,7 +36,9 @@ def _make_pos_encoding():
     return PosEncoding(d_pos=D_HEAD)
 
 
-def _build_residual_stream(residual_map: ResidualStreamMap, node_values: dict) -> torch.Tensor:
+def _build_residual_stream(
+    residual_map: ResidualStreamMap, node_values: dict
+) -> torch.Tensor:
     """Build a residual stream tensor with known values at each node's columns."""
     res = torch.zeros(N_POS, D)
     for node, values in node_values.items():
@@ -186,19 +187,28 @@ def test_attn_compute_multiposition():
     op = AttnHeadOp(op_type="compute_attn", node=attn_node, target_cols=out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
 
-    v_values = torch.tensor([[10.0, 20.0, 30.0, 40.0],
-                              [11.0, 21.0, 31.0, 41.0],
-                              [12.0, 22.0, 32.0, 42.0],
-                              [13.0, 23.0, 33.0, 43.0]])
+    v_values = torch.tensor(
+        [
+            [10.0, 20.0, 30.0, 40.0],
+            [11.0, 21.0, 31.0, 41.0],
+            [12.0, 22.0, 32.0, 42.0],
+            [13.0, 23.0, 33.0, 43.0],
+        ]
+    )
     c_values = torch.tensor([[1.0], [0.0], [0.0], [1.0]])
     pe_values = pos.compute(N_POS, {})
 
     # get_prev_value needs Concatenate([pos, cond]) as key_in
     # We need to also place the concatenated node's children
     concat_node = attn_node.inputs[1]  # key_in is Concatenate([pos, cond])
-    res = _build_residual_stream(rmap, {
-        pos: pe_values, value_in: v_values, cond_in: c_values,
-    })
+    res = _build_residual_stream(
+        rmap,
+        {
+            pos: pe_values,
+            value_in: v_values,
+            cond_in: c_values,
+        },
+    )
 
     out = layer.attn.forward(res)
     result = out[:, out_cols]
@@ -393,7 +403,9 @@ def test_add_into():
     b_values = torch.randn(N_POS, 4)
     pe_values = pos.compute(N_POS, {})
     # a's columns now belong to add_node, but still hold a's values
-    res = _build_residual_stream(rmap, {pos: pe_values, add_node: a_values, b: b_values})
+    res = _build_residual_stream(
+        rmap, {pos: pe_values, add_node: a_values, b: b_values}
+    )
 
     # After attn sublayer: A's columns get A + B (skip adds A, attn writes B)
     out = layer.attn.forward(res)
@@ -431,7 +443,9 @@ def test_add_into_dead_at_inputs1():
     dead_values = torch.randn(N_POS, 4)
     pe_values = pos.compute(N_POS, {})
     # dead's columns now belong to add_node, but still hold dead's values
-    res = _build_residual_stream(rmap, {pos: pe_values, live: live_values, add_node: dead_values})
+    res = _build_residual_stream(
+        rmap, {pos: pe_values, live: live_values, add_node: dead_values}
+    )
 
     out = layer.attn.forward(res)
     result = out[:, dead_cols]
@@ -463,7 +477,9 @@ def test_ffn_relu_chain():
     ffn_slots = list(range(0, 8))  # 8 internal FFN slots for the 8-dim intermediate
 
     layer = TransformerLayer(D, D_HEAD)
-    op = FFNOp(op_type="compute_relu", node=l2, target_cols=out_cols, ffn_slots=ffn_slots)
+    op = FFNOp(
+        op_type="compute_relu", node=l2, target_cols=out_cols, ffn_slots=ffn_slots
+    )
     write_ffn_sublayer(layer, [op], rmap)
 
     x_values = torch.randn(N_POS, 4)
@@ -500,10 +516,18 @@ def test_ffn_relu_chain_multiple():
 
     layer = TransformerLayer(D, D_HEAD)
     ops = [
-        FFNOp(op_type="compute_relu", node=l1b, target_cols=out1_cols,
-              ffn_slots=list(range(0, 6))),
-        FFNOp(op_type="compute_relu", node=l2b, target_cols=out2_cols,
-              ffn_slots=list(range(6, 11))),
+        FFNOp(
+            op_type="compute_relu",
+            node=l1b,
+            target_cols=out1_cols,
+            ffn_slots=list(range(0, 6)),
+        ),
+        FFNOp(
+            op_type="compute_relu",
+            node=l2b,
+            target_cols=out2_cols,
+            ffn_slots=list(range(6, 11)),
+        ),
     ]
     write_ffn_sublayer(layer, ops, rmap)
 
@@ -536,15 +560,23 @@ def test_ffn_standalone_relu():
     ffn_slots = list(range(0, 4))  # 4 slots for 4-dim ReLU
 
     layer = TransformerLayer(D, D_HEAD)
-    op = FFNOp(op_type="compute_standalone_relu", node=relu_node,
-               target_cols=out_cols, ffn_slots=ffn_slots)
+    op = FFNOp(
+        op_type="compute_standalone_relu",
+        node=relu_node,
+        target_cols=out_cols,
+        ffn_slots=ffn_slots,
+    )
     write_ffn_sublayer(layer, [op], rmap)
 
     # Input with mix of positive and negative values to exercise ReLU
-    x_values = torch.tensor([[1.0, -2.0, 3.0, -4.0],
-                              [-1.0, 2.0, -3.0, 4.0],
-                              [0.5, -0.5, 0.0, 1.0],
-                              [-0.1, 0.1, -0.2, 0.2]])
+    x_values = torch.tensor(
+        [
+            [1.0, -2.0, 3.0, -4.0],
+            [-1.0, 2.0, -3.0, 4.0],
+            [0.5, -0.5, 0.0, 1.0],
+            [-0.1, 0.1, -0.2, 0.2],
+        ]
+    )
     res = _build_residual_stream(rmap, {x: x_values})
 
     out = layer.ffn.forward(res)
@@ -566,14 +598,22 @@ def test_ffn_standalone_relu_preserves_input():
     ffn_slots = list(range(0, 4))
 
     layer = TransformerLayer(D, D_HEAD)
-    op = FFNOp(op_type="compute_standalone_relu", node=relu_node,
-               target_cols=out_cols, ffn_slots=ffn_slots)
+    op = FFNOp(
+        op_type="compute_standalone_relu",
+        node=relu_node,
+        target_cols=out_cols,
+        ffn_slots=ffn_slots,
+    )
     write_ffn_sublayer(layer, [op], rmap)
 
-    x_values = torch.tensor([[1.0, -2.0, 3.0, -4.0],
-                              [-1.0, 2.0, -3.0, 4.0],
-                              [0.5, -0.5, 0.0, 1.0],
-                              [-0.1, 0.1, -0.2, 0.2]])
+    x_values = torch.tensor(
+        [
+            [1.0, -2.0, 3.0, -4.0],
+            [-1.0, 2.0, -3.0, 4.0],
+            [0.5, -0.5, 0.0, 1.0],
+            [-0.1, 0.1, -0.2, 0.2],
+        ]
+    )
     res = _build_residual_stream(rmap, {x: x_values})
 
     out = layer.ffn.forward(res)
@@ -596,7 +636,9 @@ def test_ffn_constant():
     out_cols = rmap.allocate(const)
 
     layer = TransformerLayer(D, D_HEAD)
-    op = FFNOp(op_type="compute_constant", node=const, target_cols=out_cols, ffn_slots=[])
+    op = FFNOp(
+        op_type="compute_constant", node=const, target_cols=out_cols, ffn_slots=[]
+    )
     write_ffn_sublayer(layer, [op], rmap)
 
     res = torch.zeros(N_POS, D)
@@ -629,11 +671,15 @@ def test_biased_linear_split():
     layer = TransformerLayer(D, D_HEAD, pos)
 
     # Attention writes Wx (zero-bias part)
-    attn_op = AttnHeadOp(op_type="compute_linear", node=linear_node, target_cols=out_cols)
+    attn_op = AttnHeadOp(
+        op_type="compute_linear", node=linear_node, target_cols=out_cols
+    )
     write_attn_sublayer(layer, [attn_op], rmap, pos)
 
     # FFN adds bias
-    ffn_op = FFNOp(op_type="compute_bias", node=linear_node, target_cols=out_cols, ffn_slots=[])
+    ffn_op = FFNOp(
+        op_type="compute_bias", node=linear_node, target_cols=out_cols, ffn_slots=[]
+    )
     write_ffn_sublayer(layer, [ffn_op], rmap)
 
     x_values = torch.randn(N_POS, 4)
@@ -666,10 +712,10 @@ def test_non_contiguous_columns():
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)  # takes first 16 cols
     dummy1 = InputNode("d1", 2)
-    rmap.allocate(x)    # takes next 4
+    rmap.allocate(x)  # takes next 4
     d1_cols = rmap.allocate(dummy1)  # takes next 2
     out_cols = rmap.allocate(linear_node)  # takes next 3
-    rmap.free(dummy1)   # frees 2 cols in the middle
+    rmap.free(dummy1)  # frees 2 cols in the middle
 
     # Verify output cols are non-contiguous with input cols
     # (they're in different regions of the stream)
@@ -717,11 +763,15 @@ def test_mixed_layer():
     layer = TransformerLayer(D, D_HEAD, pos)
 
     # Write attention ops
-    attn_op = AttnHeadOp(op_type="compute_linear", node=lin_attn, target_cols=attn_out_cols)
+    attn_op = AttnHeadOp(
+        op_type="compute_linear", node=lin_attn, target_cols=attn_out_cols
+    )
     write_attn_sublayer(layer, [attn_op], rmap, pos)
 
     # Write FFN ops
-    ffn_op = FFNOp(op_type="compute_constant", node=const, target_cols=const_cols, ffn_slots=[])
+    ffn_op = FFNOp(
+        op_type="compute_constant", node=const, target_cols=const_cols, ffn_slots=[]
+    )
     write_ffn_sublayer(layer, [ffn_op], rmap)
 
     x_values = torch.randn(N_POS, 4)

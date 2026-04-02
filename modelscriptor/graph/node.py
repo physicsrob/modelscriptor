@@ -2,7 +2,6 @@ from typing import List, Dict, Optional
 
 import torch
 
-
 global_node_id = 0
 
 
