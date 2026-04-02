@@ -399,16 +399,16 @@ After Phase 5: Full adder arithmetic verification + resource usage logging
 
 ## Current Status
 
-**86 passing, 19 skipped** (as of Phase 5 completion)
+**92 passing, 0 skipped**
 
 - Phase 0 (GraphAnalyzer): 5 tests passing
 - Phase 1 (ResidualStreamMap): 7 tests passing
 - Phase 2 (WeightWriter): 19 tests passing
 - Phase 3 (LayerScheduler): 20 tests passing
-- Phase 4 (Forward Compile): 10 tests passing
+- Phase 4 (Forward Compile): 16 tests passing
 - Phase 5 (Adder): 5 tests passing
 - Graph/modelscript: 18 tests passing
-- Old compiler end-to-end: 19 tests skipped (retarget later or remove)
+- Old compiler tests: retargeted or deleted
 
 **Compilation results:**
 - 1-digit adder: 51 nodes, 9 layers, peak ~101 columns used (of 1024)

@@ -15,7 +15,9 @@ from modelscriptor.modelscript.inout_nodes import (
     create_constant,
     create_pos_encoding,
 )
-from modelscriptor.modelscript.arithmetic_ops import add, relu, concat, sum_nodes
+from modelscriptor.modelscript.arithmetic_ops import (
+    add, add_scalar, relu, relu_add, concat, sum_nodes,
+)
 from modelscriptor.modelscript.logic_ops import cond_gate, cond_add_vector
 from modelscriptor.modelscript.map_select import select, map_to_table
 
@@ -191,3 +193,79 @@ def test_compile_get_prev_value():
                             [14.0, 24.0, 34.0, 44.0]]),
         "cond": torch.tensor([[1.0], [0.0], [0.0], [1.0], [0.0]]),
     }, pos_encoding=pos)
+
+
+# ---------------------------------------------------------------------------
+# Retargeted from old compiler tests (unique patterns)
+# ---------------------------------------------------------------------------
+
+
+def test_compile_repeated_adds():
+    """Chain of adds on constants — exercises Add scheduling."""
+    c1 = create_constant(torch.tensor([1.0]))
+    c2 = create_constant(torch.tensor([1.0]))
+    c3 = create_constant(torch.tensor([1.0]))
+    c4 = create_constant(torch.tensor([1.0]))
+    a1 = add(c1, c2)
+    a2 = add(c3, c4)
+    out = add(a1, a2)
+    _verify(out, n_pos=2, input_values={})
+
+
+def test_compile_add_relu():
+    """Add -> ReLU -> ReLU — chained standalone ReLUs."""
+    v1 = create_input("v1", 4)
+    v2 = create_input("v2", 4)
+    n_pos = 2
+    a = add(v1, v2)
+    r1 = relu(a)
+    out = relu(r1)
+    _verify(out, n_pos=n_pos, input_values={
+        "v1": torch.randn(n_pos, 4) - 0.5,
+        "v2": torch.randn(n_pos, 4) - 0.5,
+    })
+
+
+def test_compile_add_scalar():
+    """add_scalar — FFN bias-only addition via Add."""
+    v = create_input("v", 1)
+    out = add_scalar(v, 100.0)
+    _verify(out, n_pos=1, input_values={"v": torch.tensor([[1.0]])})
+
+
+def test_compile_cond_add_vector():
+    """cond_add_vector — FFN multiplexer + Add."""
+    cond = create_input("cond", 1)
+    x = create_constant(torch.tensor([15.0, 25.0]))
+    out = cond_add_vector(
+        cond, x,
+        true_vector=torch.tensor([100.0, 0.0]),
+        false_vector=torch.tensor([0.0, 100.0]),
+    )
+    for cond_val in [-1.0, 1.0]:
+        _verify(out, n_pos=1, input_values={
+            "cond": torch.tensor([[cond_val]]),
+        })
+
+
+def test_compile_relu_add():
+    """relu_add — fused ReLU(a+b) via concatenate + FFN."""
+    v1 = create_input("v1", 3)
+    v2 = create_input("v2", 3)
+    out = relu_add(v1, v2)
+    for _ in range(3):
+        _verify(out, n_pos=1, input_values={
+            "v1": (100.0 * (torch.rand(1, 3) - 0.5)),
+            "v2": (100.0 * (torch.rand(1, 3) - 0.5)),
+        })
+
+
+def test_compile_multiple_concats():
+    """Shared constants across multiple concat -> add paths."""
+    c1 = create_constant(torch.tensor([1.0]))
+    c2 = create_constant(torch.tensor([1.0]))
+    c3 = create_constant(torch.tensor([1.0]))
+    add1 = add(concat([c1, c2]), create_constant(torch.tensor([2.0, 2.0])))
+    add2 = add(concat([c1, c3]), create_constant(torch.tensor([2.0, 2.0])))
+    out = add(add1, add2)
+    _verify(out, n_pos=1, input_values={})
