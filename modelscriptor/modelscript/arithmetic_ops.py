@@ -233,3 +233,103 @@ def multiply_scalar(inp: Node, scalar: float) -> Node:
     """
     d = len(inp)
     return Linear(inp, scalar * torch.eye(d), name="multiply_scalar")
+
+
+def thermometer_square(inp: Node, max_value: int) -> Node:
+    """Compute x² for a non-negative integer x in [0, max_value].
+
+    Uses the odd-number identity: x² = 1 + 3 + 5 + ... + (2x-1).
+    Place a detector at each integer k = 1..max_value. Each detector
+    contributes (2k-1) when x >= k, so the sum is x².
+
+        x=0 → no detectors fire                → 0
+        x=3 → detectors 1,2,3 fire: 1+3+5      → 9
+        x=5 → detectors 1..5 fire: 1+3+5+7+9   → 25
+
+    Same paired-ReLU step as thermometer_floor_div in adder_v2, but
+    the output weight is (2k-1) instead of 1.0.
+
+    Only exact for non-negative integers. For non-integers, the step
+    functions fire based on floor(x), giving floor(x)² instead of x².
+
+    Args:
+        inp: 1D scalar node with integer value in [0, max_value].
+        max_value: Upper bound on input (determines number of detectors).
+
+    Returns:
+        1D scalar node containing x².
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    assert max_value >= 1, "max_value must be at least 1"
+
+    d_int = 2 * max_value  # Two ReLU units per threshold detector
+    input_proj = torch.zeros(d_int, 1)
+    input_bias = torch.zeros(d_int)
+    output_proj = torch.zeros(d_int, 1)
+
+    for k in range(1, max_value + 1):
+        threshold = k - 0.5  # Half-integer: 0.5, 1.5, 2.5, ...
+        row = 2 * (k - 1)
+
+        # Paired ReLU: ReLU(s*x - s*threshold) - ReLU(s*x - s*threshold - 1)
+        input_proj[row, 0] = turn_on_speed
+        input_proj[row + 1, 0] = turn_on_speed
+        input_bias[row] = -turn_on_speed * threshold
+        input_bias[row + 1] = -turn_on_speed * threshold - 1.0
+
+        # Odd-number weight: detector k contributes (2k-1) instead of 1.0
+        weight = 2.0 * k - 1.0
+        output_proj[row, 0] = weight
+        output_proj[row + 1, 0] = -weight
+
+    return ffn_layer(
+        input_node=inp,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=torch.zeros(1),
+        name="thermometer_square",
+    )
+
+
+def multiply_integers(inp1: Node, inp2: Node, max_value: int) -> Node:
+    """Multiply two non-negative integer scalars using the polarization identity.
+
+    a * b = ((a+b)² - (a-b)²) / 4
+
+    Both inputs must be 1D scalar nodes with integer values in [0, max_value].
+    This identity is exact for all reals, but thermometer_square is only exact
+    for non-negative integers, so the inputs must be integers.
+
+    Implementation:
+        s = a + b                          range [0, 2*max_value], Linear (free)
+        d = a - b                          range [-max_value, max_value], Linear (free)
+        |d| = ReLU(d) + ReLU(-d)           1 FFN layer (relu_add)
+        s² = thermometer_square(s)         1 FFN layer
+        |d|² = thermometer_square(|d|)     1 FFN layer
+        result = (s² - |d|²) / 4          Linear (free)
+
+    Total cost: 3 FFN layers.
+
+    Args:
+        inp1: 1D scalar node, integer value in [0, max_value].
+        inp2: 1D scalar node, integer value in [0, max_value].
+        max_value: Upper bound on each input.
+
+    Returns:
+        1D scalar node containing inp1 * inp2.
+    """
+    assert len(inp1) == 1, "Input must be a 1D scalar node"
+    assert len(inp2) == 1, "Input must be a 1D scalar node"
+
+    # Use add_scaled_nodes (Linear) instead of add/subtract (Add) so the
+    # compiler can schedule these even when inputs are shared across paths.
+    s = add_scaled_nodes(1.0, inp1, 1.0, inp2)  # a+b
+    d = add_scaled_nodes(1.0, inp1, -1.0, inp2)  # a-b (may be negative)
+    abs_d = relu_add(d, negate(d))  # |a-b| = ReLU(d) + ReLU(-d)
+
+    sq_sum = thermometer_square(s, 2 * max_value)  # (a+b)²
+    sq_diff = thermometer_square(abs_d, max_value)  # (a-b)²
+
+    # a*b = ((a+b)² - (a-b)²) / 4
+    return add_scaled_nodes(0.25, sq_sum, -0.25, sq_diff)

@@ -5,6 +5,8 @@ from modelscriptor.modelscript.arithmetic_ops import (
     negate,
     subtract,
     multiply_scalar,
+    thermometer_square,
+    multiply_integers,
 )
 from modelscriptor.modelscript.inout_nodes import create_input
 import torch
@@ -70,3 +72,62 @@ def test_compare():
                     n_pos=1, input_values={"value": torch.tensor([[test_val]])}
                 )
                 assert output.item() == true_level if delta > 0 else false_level
+
+
+def test_thermometer_square():
+    x = create_input("x", 1)
+    sq = thermometer_square(x, max_value=9)
+    for val in range(10):
+        result = sq.compute(n_pos=1, input_values={"x": torch.tensor([[float(val)]])})
+        expected = val * val
+        assert abs(result.item() - expected) < 0.01, (
+            f"{val}² = {expected}, got {result.item()}"
+        )
+
+
+def test_thermometer_square_large():
+    """Test with max_value=18 (needed for digit a+b range in multiply_integers)."""
+    x = create_input("x", 1)
+    sq = thermometer_square(x, max_value=18)
+    for val in [0, 1, 9, 10, 17, 18]:
+        result = sq.compute(n_pos=1, input_values={"x": torch.tensor([[float(val)]])})
+        expected = val * val
+        assert abs(result.item() - expected) < 0.01, (
+            f"{val}² = {expected}, got {result.item()}"
+        )
+
+
+def test_multiply_integers_all_digit_pairs():
+    """Verify a*b for all 100 single-digit pairs."""
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    prod = multiply_integers(a, b, max_value=9)
+    for i in range(10):
+        for j in range(10):
+            result = prod.compute(
+                n_pos=1,
+                input_values={
+                    "a": torch.tensor([[float(i)]]),
+                    "b": torch.tensor([[float(j)]]),
+                },
+            )
+            expected = i * j
+            assert abs(result.item() - expected) < 0.5, (
+                f"{i}*{j} = {expected}, got {result.item()}"
+            )
+
+
+def test_multiply_integers_zero():
+    """0 * anything = 0."""
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    prod = multiply_integers(a, b, max_value=9)
+    for val in [0, 5, 9]:
+        result = prod.compute(
+            n_pos=1,
+            input_values={
+                "a": torch.tensor([[0.0]]),
+                "b": torch.tensor([[float(val)]]),
+            },
+        )
+        assert abs(result.item()) < 0.1, f"0*{val} should be 0, got {result.item()}"
