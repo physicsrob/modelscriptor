@@ -439,6 +439,69 @@ def test_ffn_relu_chain_multiple():
 
 
 # ---------------------------------------------------------------------------
+# FFN — compute_standalone_relu
+# ---------------------------------------------------------------------------
+
+
+def test_ffn_standalone_relu():
+    """Standalone ReLU compiled via FFN with identity linear1/linear2."""
+    x = InputNode("x", 4)
+    relu_node = ReLU(x, name="standalone_relu")
+
+    rmap = ResidualStreamMap(D)
+    x_cols = rmap.allocate(x)
+    out_cols = rmap.allocate(relu_node)
+
+    ffn_slots = list(range(0, 4))  # 4 slots for 4-dim ReLU
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = FFNOp(op_type="compute_standalone_relu", node=relu_node,
+               target_cols=out_cols, ffn_slots=ffn_slots)
+    write_ffn_sublayer(layer, [op], rmap)
+
+    # Input with mix of positive and negative values to exercise ReLU
+    x_values = torch.tensor([[1.0, -2.0, 3.0, -4.0],
+                              [-1.0, 2.0, -3.0, 4.0],
+                              [0.5, -0.5, 0.0, 1.0],
+                              [-0.1, 0.1, -0.2, 0.2]])
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.ffn.forward(res)
+    result = out[:, out_cols]
+
+    expected = relu_node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(result, expected, atol=1e-4)
+
+
+def test_ffn_standalone_relu_preserves_input():
+    """Standalone ReLU doesn't corrupt the input node's columns."""
+    x = InputNode("x", 4)
+    relu_node = ReLU(x, name="standalone_relu")
+
+    rmap = ResidualStreamMap(D)
+    x_cols = rmap.allocate(x)
+    out_cols = rmap.allocate(relu_node)
+
+    ffn_slots = list(range(0, 4))
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = FFNOp(op_type="compute_standalone_relu", node=relu_node,
+               target_cols=out_cols, ffn_slots=ffn_slots)
+    write_ffn_sublayer(layer, [op], rmap)
+
+    x_values = torch.tensor([[1.0, -2.0, 3.0, -4.0],
+                              [-1.0, 2.0, -3.0, 4.0],
+                              [0.5, -0.5, 0.0, 1.0],
+                              [-0.1, 0.1, -0.2, 0.2]])
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.ffn.forward(res)
+
+    # Input columns should be preserved by the skip connection
+    assert torch.allclose(out[:, x_cols], x_values, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
 # FFN — compute_constant
 # ---------------------------------------------------------------------------
 
