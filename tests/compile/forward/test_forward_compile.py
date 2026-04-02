@@ -47,8 +47,8 @@ def _verify(output_node, n_pos, input_values, pos_encoding=None):
 
     expected = output_node.compute(n_pos, input_values)
     assert torch.allclose(
-        actual, expected, atol=1e-4
-    ), f"Max diff: {(actual - expected).abs().max().item():.6f}"
+        actual.cpu(), expected, atol=1e-4
+    ), f"Max diff: {(actual.cpu() - expected).abs().max().item():.6f}"
 
 
 # ---------------------------------------------------------------------------

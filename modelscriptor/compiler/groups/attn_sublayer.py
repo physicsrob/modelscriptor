@@ -39,6 +39,10 @@ class AttnSubLayer:
     def num_params(self):
         return self.attn.num_params()
 
+    def to(self, device):
+        self.attn.to(device)
+        return self
+
     def resize(self, new_d):
         self.d = new_d
         self.attn.resize(new_d)

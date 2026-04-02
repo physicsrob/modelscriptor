@@ -38,6 +38,12 @@ class FFNSubLayer:
     def num_params(self):
         return self.linear1.num_params() + self.linear2.num_params()
 
+    def to(self, device):
+        self.linear1.to(device)
+        self.relu.to(device)
+        self.linear2.to(device)
+        return self
+
     def resize(self, new_d):
         self.d = new_d
         self.linear1.resize(new_d)

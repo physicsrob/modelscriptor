@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 
+import torch
+
 from modelscriptor.compiler.feature_assignment import ResidualStreamState
 
 
@@ -28,3 +30,11 @@ class Component(ABC):
 
     def resize(self, new_d):
         self.d = new_d
+
+    def to(self, device):
+        """Move all tensor attributes to the given device."""
+        for attr_name in list(vars(self)):
+            val = getattr(self, attr_name)
+            if isinstance(val, torch.Tensor):
+                setattr(self, attr_name, val.to(device))
+        return self

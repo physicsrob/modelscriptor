@@ -5,11 +5,12 @@ with all operations expressed as pure tensor ops (ONNX-compatible).
 """
 
 import math
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 
+from modelscriptor.compiler.device import get_device
 from modelscriptor.compiler.transformer import HeadlessTransformer
 from modelscriptor.graph import Node, Constant, PosEncoding, Embedding, Concatenate
 from modelscriptor.graph.embedding import Tokenizer
@@ -165,6 +166,7 @@ def to_module(
     embedding: Embedding,
     output_node: Node,
     max_seq_len: int = 512,
+    device: Optional[str] = "auto",
 ) -> CompiledTransformerModule:
     """Convert a compiled HeadlessTransformer to an nn.Module.
 
@@ -173,6 +175,8 @@ def to_module(
         embedding: The Embedding node used for tokenization.
         output_node: The graph node whose value is the model output.
         max_seq_len: Maximum sequence length (for precomputed pos encoding and causal mask).
+        device: Target device — "auto" (default) uses GPU if available,
+                "cpu"/"cuda" to force, or None to skip moving.
 
     Returns:
         A CompiledTransformerModule that accepts token_ids and returns logits.
@@ -262,7 +266,7 @@ def to_module(
     )
     token_emb.weight = nn.Parameter(embedding.table.clone())
 
-    return CompiledTransformerModule(
+    module = CompiledTransformerModule(
         layers=layer_modules,
         token_embedding=token_emb,
         embedding_proj=embedding_proj,
@@ -273,3 +277,10 @@ def to_module(
         unembed_table=embedding.table.clone(),
         tokenizer=embedding.tokenizer,
     )
+
+    if device == "auto":
+        module.to(get_device(verbose=False))
+    elif device is not None:
+        module.to(torch.device(device))
+
+    return module

@@ -39,7 +39,7 @@ class AttnLayerComponent(Component):
         assert inp.shape[1] == self.d
         n_pos = inp.shape[0]
 
-        output = torch.zeros(n_pos, self.d)
+        output = torch.zeros(n_pos, self.d, device=inp.device)
 
         # Apply the attention heads
         for n_head in range(self.n_heads):

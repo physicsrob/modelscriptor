@@ -16,7 +16,7 @@ D_HEAD = 16
 
 def decode_token(embedding: Embedding, vector: torch.Tensor) -> str:
     """Decode a single embedding vector to its nearest token."""
-    dists = torch.cdist(vector.unsqueeze(0), embedding.table)
+    dists = torch.cdist(vector.unsqueeze(0).cpu(), embedding.table)
     return embedding.tokenizer.decode_id(int(dists.argmin().item()))
 
 
@@ -68,6 +68,7 @@ def test_1digit_adder():
         verbose=True,
     )
 
+
     test_cases = [
         ("1+1=", "2"),
         ("2+3=", "5"),
@@ -94,6 +95,7 @@ def test_1digit_layer_count():
         pos_encoding=pos_encoding,
         verbose=False,
     )
+
     n_layers = len(net.layers)
     print(f"1-digit adder: {n_layers} layers")
     assert n_layers <= 20, f"Too many layers: {n_layers}"
@@ -119,6 +121,7 @@ def test_3digit_adder():
         pos_encoding=pos_encoding,
         verbose=True,
     )
+
 
     test_cases = [
         ("1+1=", "2"),
@@ -147,6 +150,7 @@ def test_3digit_autoregressive():
         verbose=False,
     )
 
+
     test_cases = [
         ("1+2=", "3"),
         ("99+1=", "100"),
@@ -172,6 +176,7 @@ def test_3digit_resource_usage():
         pos_encoding=pos_encoding,
         verbose=True,
     )
+
     n_layers = len(net.layers)
     print(f"3-digit adder: {n_layers} layers, d={D}, d_head={D_HEAD}")
     # Sanity bound — should compile in well under 100 layers

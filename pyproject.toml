@@ -17,5 +17,13 @@ dev = [
     "pytest",
 ]
 
+[tool.uv]
+index = [
+    { name = "pytorch-cu124", url = "https://download.pytorch.org/whl/cu124", explicit = true },
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
 [tool.mypy]
 ignore_missing_imports = true

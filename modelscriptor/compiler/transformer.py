@@ -35,6 +35,17 @@ class HeadlessTransformer:
         self.layers = []
         self.feature_assignment = None
 
+    @property
+    def device(self) -> torch.device:
+        if self.layers:
+            return self.layers[0].attn.attn.query_matrix.device
+        return torch.device("cpu")
+
+    def to(self, device) -> "HeadlessTransformer":
+        for layer in self.layers:
+            layer.to(device)
+        return self
+
     def add_layer(self, end: bool = False) -> TransformerLayer:
         layer = TransformerLayer(self.d, self.d_head, self.pos_encoding)
         if not end:
@@ -105,7 +116,7 @@ class HeadlessTransformer:
     ) -> Dict[Node, torch.Tensor]:
         assert self.feature_assignment
 
-        res = self.forward(self.get_input_res_stream(n_pos, input_values))
+        res = self.forward(self.get_input_res_stream(n_pos, input_values).to(self.device))
         result = {}
         out_state = self.layers[-1].ffn.out_state
 

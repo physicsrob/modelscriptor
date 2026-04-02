@@ -74,11 +74,12 @@ def compile_to_onnx(
         output_node=output_node,
         pos_encoding=pos_encoding,
         verbose=verbose,
+        device=None,
     )
 
     if verbose:
         print("Converting to nn.Module...")
-    module = to_module(net, embedding, output_node, max_seq_len=max_seq_len)
+    module = to_module(net, embedding, output_node, max_seq_len=max_seq_len, device=None)
     module.eval()
 
     n_params = sum(p.numel() for p in module.parameters())
