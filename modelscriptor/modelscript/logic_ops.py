@@ -6,7 +6,7 @@ from modelscriptor.modelscript.ffn_layer import ffn_layer
 import torch
 
 from modelscriptor.modelscript.arithmetic_ops import relu, sum_nodes, compare
-from modelscriptor.modelscript.const import turn_on_speed, big_offset
+from modelscriptor.modelscript.const import turn_on_speed, embedding_turn_on_speed, big_offset
 
 
 def bool_any_true(inp_list: List[Node]) -> Node:
@@ -76,11 +76,12 @@ def compare_to_vector(inp: Node, vector: torch.Tensor) -> Node:
     # If value1 == c, result is 1
     # else result is -1
     # We'll use a FFN:
-    # y = 2.0*turn_on_speed * max(1.0/turn_on_speed + c @ value - c @ c, 0) - 1.0
+    # y = 2.0*speed * max(1.0/speed + c @ value - c @ c, 0) - 1.0
     # d_int = 1
+    speed = embedding_turn_on_speed
     input_proj = vector.unsqueeze(0)  # We're dotting vector into value
-    input_bias = 1.0 / turn_on_speed - vector @ vector
-    output_proj = torch.tensor([[2.0 * turn_on_speed]])
+    input_bias = 1.0 / speed - vector @ vector
+    output_proj = torch.tensor([[2.0 * speed]])
     output_bias = torch.tensor([-1.0])
     return ffn_layer(
         input_node=inp,

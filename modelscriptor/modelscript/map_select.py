@@ -2,7 +2,7 @@ from modelscriptor.graph import Node, Concatenate
 from typing import List, Tuple, Dict
 import torch
 
-from modelscriptor.modelscript.const import big_offset, turn_on_speed
+from modelscriptor.modelscript.const import big_offset, turn_on_speed, embedding_turn_on_speed
 from modelscriptor.modelscript.logic_ops import cond_add_vector, cond_gate
 from modelscriptor.modelscript.arithmetic_ops import sum_nodes
 from modelscriptor.modelscript.ffn_layer import ffn_layer
@@ -32,11 +32,12 @@ def map_to_table(
     assert len(default) == d_value
 
     d_int = len(key_to_value)
+    speed = embedding_turn_on_speed
     # We'll use 1 FFN entry per item in the table, and an overall output bias of the default value
     # So roughly speaking:
     # input_proj will be (d_int x d_key), where input_proj[i, :] = table.keys()[i]
-    # input_bias will be (d_int), where input_bias[i] = 1.0/turn_on_speed - (table.keys()[i] @ table.keys()[i])
-    # output_proj will be (d_int, d_value), where output_proj[i, :] = turn_on_speed * (table.values()[i] - default)
+    # input_bias will be (d_int), where input_bias[i] = 1.0/speed - (table.keys()[i] @ table.keys()[i])
+    # output_proj will be (d_int, d_value), where output_proj[i, :] = speed * (table.values()[i] - default)
     # output_bias will be (d_value), equal to default
 
     input_proj = torch.zeros(d_int, d_key)
@@ -45,8 +46,8 @@ def map_to_table(
 
     for i, (key, value) in enumerate(key_to_value.items()):
         input_proj[i, :] = key
-        input_bias[i] = 1.0 / turn_on_speed - (key @ key)
-        output_proj[i, :] = turn_on_speed * (value - default)
+        input_bias[i] = 1.0 / speed - (key @ key)
+        output_proj[i, :] = speed * (value - default)
 
     return ffn_layer(
         input_node=inp,
