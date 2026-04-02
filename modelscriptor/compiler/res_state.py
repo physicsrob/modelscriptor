@@ -5,8 +5,7 @@ from modelscriptor.graph import Node, Concatenate
 from modelscriptor.graph.misc import Placeholder
 
 
-class AllocationError(Exception):
-    ...
+class AllocationError(Exception): ...
 
 
 class ResState:

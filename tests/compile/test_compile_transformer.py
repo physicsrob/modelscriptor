@@ -14,7 +14,6 @@ from modelscriptor.modelscript.inout_nodes import (
 from modelscriptor.modelscript.logic_ops import compare_to_vector
 from modelscriptor.modelscript.map_select import select, map_to_table
 
-
 # def test_compile_embedding():
 #     vocab = ["1", "2", "3", "was1", "was2", "was3", "default"]
 #     embedding = create_embedding(vocab=vocab)
