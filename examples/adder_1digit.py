@@ -11,7 +11,7 @@ from modelscriptor.modelscript.inout_nodes import (
     create_pos_encoding,
     create_unembedding,
 )
-from modelscriptor.modelscript.logic_ops import compare_to_vector
+from modelscriptor.modelscript.logic_ops import equals_vector
 from modelscriptor.modelscript.map_select import map_to_table, select
 
 
@@ -73,14 +73,14 @@ def create_network() -> Unembedding:
     current_num = select(cond=is_num, true_node=embedding, false_node=zero_constant)
 
     # Define a flag for the end of the first number (when we hit the + symbol).
-    is_first_num = compare_to_vector(inp=embedding, vector=embedding.get_embedding("+"))
+    is_first_num = equals_vector(inp=embedding, vector=embedding.get_embedding("+"))
 
     # Define a flag for the end of the second number (when we hit the = symbol).
-    is_second_num = compare_to_vector(
+    is_second_num = equals_vector(
         inp=embedding, vector=embedding.get_embedding("=")
     )
 
-    just_completed_num = pos_encoding.get_last_value(current_num, delta_pos=-1)
+    just_completed_num = pos_encoding.attend_to_offset(current_num, delta_pos=-1)
     first_num = pos_encoding.get_prev_value(just_completed_num, is_first_num)
     second_num = pos_encoding.get_prev_value(just_completed_num, is_second_num)
 

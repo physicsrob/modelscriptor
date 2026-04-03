@@ -3,7 +3,7 @@ from typing import Dict, List, Set
 from modelscriptor.compiler.feature_assignment import (
     FeatureAssignment,
     ResidualStreamState,
-    simplify_nodes,
+    flatten_concat_nodes,
 )
 from modelscriptor.graph import Node, Concatenate
 
@@ -48,7 +48,7 @@ class ResidualStreamMap:
     def get_indices(self, node: Node) -> List[int]:
         return self._node_to_indices[node]
 
-    def get_node_indices(self, node: Node) -> List[int]:
+    def resolve_indices(self, node: Node) -> List[int]:
         """Get column indices for a node, resolving through Concatenate.
 
         Unlike get_indices(), this handles Concatenate nodes by gathering
@@ -57,7 +57,7 @@ class ResidualStreamMap:
         """
         if isinstance(node, Concatenate):
             indices = []
-            for child in simplify_nodes([node]):
+            for child in flatten_concat_nodes([node]):
                 indices += self.get_indices(child)
             return indices
         return self.get_indices(node)

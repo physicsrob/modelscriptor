@@ -12,7 +12,7 @@ from modelscriptor.modelscript.inout_nodes import (
     create_unembedding,
 )
 from modelscriptor.modelscript.logic_ops import (
-    compare_to_vector,
+    equals_vector,
     cond_gate,
     bool_not,
     bool_all_true,
@@ -105,7 +105,7 @@ def remove_leading_0s(
     if max_removals == 0:
         return seq
 
-    is_leading_zero = compare_to_vector(inp=seq[0], vector=embedding.get_embedding("0"))
+    is_leading_zero = equals_vector(inp=seq[0], vector=embedding.get_embedding("0"))
 
     out = []
     seq = seq + [seq[-1]]
@@ -131,7 +131,7 @@ def output_sequence(
     out_values = []
     for i, value in enumerate(seq):
         delta = -i
-        trigger = pos_encoding.get_last_value(trigger_condition, delta_pos=delta)
+        trigger = pos_encoding.attend_to_offset(trigger_condition, delta_pos=delta)
         out_values.append(cond_gate(trigger, value))
 
     return select(
@@ -147,7 +147,7 @@ class NumericSequence:
         zero_constant = create_constant(embedding.get_embedding("0"))
         is_digit = check_is_digit(embedding)
         is_num_start = bool_all_true(
-            [is_digit, bool_not(pos_encoding.get_last_value(is_digit))]
+            [is_digit, bool_not(pos_encoding.attend_to_offset(is_digit))]
         )
 
         current_digits: List[Node] = [embedding]
@@ -156,13 +156,13 @@ class NumericSequence:
                 select(
                     cond=is_num_start,
                     true_node=zero_constant,
-                    false_node=pos_encoding.get_last_value(current_digits[-1]),
+                    false_node=pos_encoding.attend_to_offset(current_digits[-1]),
                 )
             )
 
         # We always reference digit values one sequence position after.
         self.digit_values = [
-            pos_encoding.get_last_value(digit) for digit in current_digits
+            pos_encoding.attend_to_offset(digit) for digit in current_digits
         ]
 
     def get_digits_at_event(self, termination_event: Node) -> List[Node]:
@@ -184,12 +184,12 @@ def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
 
     num_seq = NumericSequence(pos_encoding, embedding, max_digits)
 
-    is_end_of_first_num = compare_to_vector(
+    is_end_of_first_num = equals_vector(
         inp=embedding, vector=embedding.get_embedding("+")
     )
 
     # Define a flag for the end of the second number (when we hit the = symbol).
-    is_end_of_second_num = compare_to_vector(
+    is_end_of_second_num = equals_vector(
         inp=embedding, vector=embedding.get_embedding("=")
     )
 

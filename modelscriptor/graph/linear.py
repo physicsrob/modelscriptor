@@ -5,12 +5,16 @@ import torch
 
 
 class Linear(Node):
-    # This is a base type which can be implemented as either a FFN or an Attention Head (attending
-    # to the current token), or optimized to within one of the above.
-    # TODO: Consider updating FFN and AttnHead.
-    # e.g. add ReLU layer
-    # FFN = LinearBLock(ReLU(LinearBlock(input_node, ...), ...)
-    # AttnHead = Attn(LinearBlock(query_in, ...), LinearBlock(key_in, ...), LinearBlock(value_in, ...)
+    """Affine transform: ``y = x @ output_matrix + output_bias``.
+
+    The compiler may realise this as either an FFN slice or an attention
+    head attending to the current position, depending on context.
+
+    Attributes:
+        output_matrix: Weight matrix, shape ``(d_input, d_output)``.
+        output_bias: Bias vector, shape ``(d_output,)``.
+    """
+
     output_matrix: torch.Tensor  # d_input x d_output
     output_bias: torch.Tensor  # d_output
 

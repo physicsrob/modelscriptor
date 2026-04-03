@@ -17,6 +17,12 @@ from modelscriptor.graph import (
 
 
 class HeadlessTransformer:
+    """Stack of transformer layers without embedding or unembedding heads.
+
+    Produced by the forward compiler. Use ``compute()`` to run the
+    transformer on graph-level inputs and retrieve output node values.
+    """
+
     layers: List[TransformerLayer]
     d: int
     d_head: int
@@ -46,12 +52,12 @@ class HeadlessTransformer:
             layer.to(device)
         return self
 
-    def add_layer(self, end: bool = False) -> TransformerLayer:
+    def add_layer(self, append: bool = False) -> TransformerLayer:
         layer = TransformerLayer(self.d, self.d_head, self.pos_encoding)
-        if not end:
-            self.layers = [layer] + self.layers
-        else:
+        if append:
             self.layers.append(layer)
+        else:
+            self.layers = [layer] + self.layers
         return layer
 
     def get_input_res_stream(
@@ -114,6 +120,11 @@ class HeadlessTransformer:
     def compute(
         self, n_pos: int, input_values: Dict[str, Any]
     ) -> Dict[Node, torch.Tensor]:
+        """Run the transformer on graph-level inputs.
+
+        Returns a dict mapping each output Node to its value tensor
+        of shape ``(n_pos, node.d_output)``.
+        """
         assert self.feature_assignment
 
         res = self.forward(self.get_input_res_stream(n_pos, input_values).to(self.device))

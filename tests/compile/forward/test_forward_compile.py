@@ -121,11 +121,11 @@ def test_compile_select():
     )
 
 
-def test_compile_get_last_value():
-    """pos_encoding.get_last_value() — attention-based position lookup."""
+def test_compile_attend_to_offset():
+    """pos_encoding.attend_to_offset() — attention-based position lookup."""
     pos = create_pos_encoding()
     v = create_input("v", 4)
-    out = pos.get_last_value(v, delta_pos=-1)
+    out = pos.attend_to_offset(v, delta_pos=-1)
 
     n_pos = 5
     _verify(
@@ -416,7 +416,7 @@ def test_compile_switch_with_attention_conditions():
     can be incorrectly cancelled.
     """
     from modelscriptor.modelscript.map_select import switch
-    from modelscriptor.modelscript.logic_ops import compare_to_vector
+    from modelscriptor.modelscript.logic_ops import equals_vector
 
     pos = create_pos_encoding()
     embedding_dim = 8
@@ -424,7 +424,7 @@ def test_compile_switch_with_attention_conditions():
     v2 = create_constant(torch.randn(embedding_dim))
     v3 = create_constant(torch.randn(embedding_dim))
 
-    # Conditions via attention — like compare_to_vector + get_prev_value
+    # Conditions via attention — like equals_vector + get_prev_value
     flag = create_input("flag", 1)
     c1 = pos.get_prev_value(flag, flag)
     c2 = pos.get_prev_value(flag, flag)

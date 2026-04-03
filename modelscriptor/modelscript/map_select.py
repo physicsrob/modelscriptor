@@ -4,12 +4,12 @@ import torch
 
 from modelscriptor.modelscript.const import (
     big_offset,
-    turn_on_speed,
-    embedding_turn_on_speed,
+    step_sharpness,
+    embedding_step_sharpness,
 )
 from modelscriptor.modelscript.logic_ops import cond_add_vector, cond_gate
 from modelscriptor.modelscript.arithmetic_ops import sum_nodes
-from modelscriptor.modelscript.ffn_layer import ffn_layer
+from modelscriptor.modelscript.linear_relu_linear import linear_relu_linear
 
 
 def map_to_table(
@@ -36,7 +36,7 @@ def map_to_table(
     assert len(default) == d_value
 
     d_int = len(key_to_value)
-    speed = embedding_turn_on_speed
+    speed = embedding_step_sharpness
     # We'll use 1 FFN entry per item in the table, and an overall output bias of the default value
     # So roughly speaking:
     # input_proj will be (d_int x d_key), where input_proj[i, :] = table.keys()[i]
@@ -53,7 +53,7 @@ def map_to_table(
         input_bias[i] = 1.0 / speed - (key @ key)
         output_proj[i, :] = speed * (value - default)
 
-    return ffn_layer(
+    return linear_relu_linear(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,
@@ -120,7 +120,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
         output_proj[i, i] = 1.0
         output_proj[len(true_node) + i, i] = 1.0
 
-    return ffn_layer(
+    return linear_relu_linear(
         input_node=x,
         input_proj=input_proj,
         input_bias=input_bias,

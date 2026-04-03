@@ -3,6 +3,14 @@ from modelscriptor.graph import Node
 
 
 class Attn(Node):
+    """Single causal attention head with explicit Q/K/V/O weight matrices.
+
+    Computes causal (lower-triangular masked) attention:
+    ``softmax(Q @ K^T, masked) @ V @ O``
+
+    Inputs are three nodes: ``query_in``, ``key_in``, ``value_in``.
+    """
+
     # query_matrix shape (d_query_in, d_head)
     query_matrix: torch.Tensor
 

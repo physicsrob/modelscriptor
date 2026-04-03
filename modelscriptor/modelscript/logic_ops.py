@@ -1,14 +1,14 @@
 from typing import List
 
 from modelscriptor.graph import Node, Add
-from modelscriptor.modelscript.ffn_layer import ffn_layer
+from modelscriptor.modelscript.linear_relu_linear import linear_relu_linear
 
 import torch
 
 from modelscriptor.modelscript.arithmetic_ops import relu, sum_nodes, compare
 from modelscriptor.modelscript.const import (
-    turn_on_speed,
-    embedding_turn_on_speed,
+    step_sharpness,
+    embedding_step_sharpness,
     big_offset,
 )
 
@@ -66,7 +66,7 @@ def bool_not(inp: Node) -> Node:
     return compare(inp, thresh=0.0, true_level=-1.0, false_level=1.0)
 
 
-def compare_to_vector(inp: Node, vector: torch.Tensor) -> Node:
+def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     """
     Compares a node's value to a vector tensor.
 
@@ -82,12 +82,12 @@ def compare_to_vector(inp: Node, vector: torch.Tensor) -> Node:
     # We'll use a FFN:
     # y = 2.0*speed * max(1.0/speed + c @ value - c @ c, 0) - 1.0
     # d_int = 1
-    speed = embedding_turn_on_speed
+    speed = embedding_step_sharpness
     input_proj = vector.unsqueeze(0)  # We're dotting vector into value
     input_bias = 1.0 / speed - vector @ vector
     output_proj = torch.tensor([[2.0 * speed]])
     output_bias = torch.tensor([-1.0])
-    return ffn_layer(
+    return linear_relu_linear(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,
@@ -105,25 +105,25 @@ def cond_add_vector(
     If the value from the `cond` node is true, this function adds the `true_vector` to the `input_node`.
     If the value from the `cond` node is false, it adds the `false_vector` to the `input_node`.
 
-    Parameters:
-    - cond (Node): A boolean input node that determines which vector gets added to the `input_node`.
-    - inp (Node): The node whose values are to be modified based on the condition.
-    - true_vector (torch.Tensor): The vector to add if the condition is true.
-    - false_vector (torch.Tensor): The vector to add if the condition is false.
+    Args:
+        cond (Node): A boolean input node that determines which vector gets added.
+        inp (Node): The node whose values are to be modified based on the condition.
+        true_vector (torch.Tensor): The vector to add if the condition is true.
+        false_vector (torch.Tensor): The vector to add if the condition is false.
 
     Returns:
-    - Node: A new node with the modified values based on the condition and input vectors.
+        Node: A new node with the modified values based on the condition and input vectors.
     """
     assert len(cond) == 1
     assert len(true_vector) == len(false_vector) == len(inp)
 
     # We need 2 FFN entries, we'll use the equation:
-    # y= c * [max(turn_on_speed*x, 0) - max(turn_on_speed*x - 1, 0)]
+    # y= c * [max(step_sharpness*x, 0) - max(step_sharpness*x - 1, 0)]
     # And rely on the residual connection
 
     d_input = len(inp)
 
-    input_proj = torch.tensor([[turn_on_speed], [turn_on_speed]])
+    input_proj = torch.tensor([[step_sharpness], [step_sharpness]])
     input_bias = torch.tensor([0.0, -1.0])
     output_proj = torch.zeros((2, d_input))
     output_bias = false_vector
@@ -134,7 +134,7 @@ def cond_add_vector(
 
     return Add(
         inp,
-        ffn_layer(
+        linear_relu_linear(
             input_node=cond,
             input_proj=input_proj,
             input_bias=input_bias,

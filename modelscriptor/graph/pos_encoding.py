@@ -24,7 +24,7 @@ class PosEncoding(Node):
     def compute(self, n_pos: int, input_values: dict):
         return self.get_pos_encoding(n_pos)
 
-    def get_last_value(self, value: Node, delta_pos=-1) -> Node:
+    def attend_to_offset(self, value: Node, delta_pos=-1) -> Node:
         if delta_pos == 0:
             # NOOP -- supporting this simplifies some use cases.
             return value

@@ -31,12 +31,12 @@ class Concatenate(Node):
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         return torch.cat([x.compute(n_pos, input_values) for x in self.inputs], dim=-1)
 
-    def simplify_inputs(self: Node) -> List[Node]:
+    def flatten_inputs(self: Node) -> List[Node]:
         # Flatten concatenation and return the list of nodes
         inputs = []
         for n in self.inputs:
             if isinstance(n, Concatenate):
-                inputs += n.simplify_inputs()
+                inputs += n.flatten_inputs()
             else:
                 inputs.append(n)
         return inputs
@@ -81,7 +81,8 @@ class Constant(Node):
 
 
 class Placeholder(Node):
-    # This node-type is length 0 placeholder
+    """Zero-width sentinel used as a stand-in when a real node is not yet available."""
+
     def __init__(self, d: int = 0):
         super().__init__(d, [])
 

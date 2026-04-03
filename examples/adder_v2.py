@@ -27,15 +27,15 @@ from modelscriptor.modelscript.arithmetic_ops import (
     add_scaled_nodes,
     sum_nodes,
 )
-from modelscriptor.modelscript.const import turn_on_speed
-from modelscriptor.modelscript.ffn_layer import ffn_layer
+from modelscriptor.modelscript.const import step_sharpness
+from modelscriptor.modelscript.linear_relu_linear import linear_relu_linear
 from modelscriptor.modelscript.inout_nodes import (
     create_constant,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
 )
-from modelscriptor.modelscript.logic_ops import compare_to_vector
+from modelscriptor.modelscript.logic_ops import equals_vector
 from modelscriptor.modelscript.map_select import map_to_table
 
 from examples.adder import (
@@ -101,7 +101,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
         x < threshold → both ReLUs output 0              → 0
         x > threshold → both ramp up equally, offset by 1 → 1
 
-    The speed s (turn_on_speed=10) makes the ramp steep so it saturates
+    The speed s (step_sharpness=10) makes the ramp steep so it saturates
     quickly. Two ReLU units per detector → d_int = 2*n.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
@@ -119,16 +119,16 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
         row = 2 * k
 
         # Paired ReLU: ReLU(s*x - s*threshold) - ReLU(s*x - s*threshold - 1)
-        input_proj[row, 0] = turn_on_speed
-        input_proj[row + 1, 0] = turn_on_speed
-        input_bias[row] = -turn_on_speed * threshold
-        input_bias[row + 1] = -turn_on_speed * threshold - 1.0
+        input_proj[row, 0] = step_sharpness
+        input_proj[row + 1, 0] = step_sharpness
+        input_bias[row] = -step_sharpness * threshold
+        input_bias[row + 1] = -step_sharpness * threshold - 1.0
 
         # First ReLU contributes +1, second cancels the ramp → net step of 1.0
         output_proj[row, 0] = 1.0
         output_proj[row + 1, 0] = -1.0
 
-    return ffn_layer(
+    return linear_relu_linear(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,
@@ -197,10 +197,10 @@ def scalar_to_embedding(inp: Node, embedding: Embedding) -> Node:
         row = 2 * k
 
         # Same paired-ReLU step function as thermometer_floor_div
-        input_proj[row, 0] = turn_on_speed
-        input_proj[row + 1, 0] = turn_on_speed
-        input_bias[row] = -turn_on_speed * threshold
-        input_bias[row + 1] = -turn_on_speed * threshold - 1.0
+        input_proj[row, 0] = step_sharpness
+        input_proj[row + 1, 0] = step_sharpness
+        input_bias[row] = -step_sharpness * threshold
+        input_bias[row + 1] = -step_sharpness * threshold - 1.0
 
         # Instead of contributing 1.0, contribute the embedding delta
         delta = embedding.get_embedding(str(k + 1)) - embedding.get_embedding(str(k))
@@ -210,7 +210,7 @@ def scalar_to_embedding(inp: Node, embedding: Embedding) -> Node:
     # Start from embed("0"); deltas telescope up to embed(d)
     output_bias = embedding.get_embedding(str(0)).clone()
 
-    return ffn_layer(
+    return linear_relu_linear(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,
@@ -238,10 +238,10 @@ def create_network(max_digits: int = 3) -> Unembedding:
     # get_digits_at_event captures the window when the trigger token appears.
     num_seq = NumericSequence(pos_encoding, embedding, max_digits)
 
-    is_end_of_first_num = compare_to_vector(
+    is_end_of_first_num = equals_vector(
         inp=embedding, vector=embedding.get_embedding("+")
     )
-    is_end_of_second_num = compare_to_vector(
+    is_end_of_second_num = equals_vector(
         inp=embedding, vector=embedding.get_embedding("=")
     )
 

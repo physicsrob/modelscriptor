@@ -5,7 +5,7 @@ import torch
 from modelscriptor.graph.relu import ReLU
 
 
-def ffn_layer(
+def linear_relu_linear(
     input_node: Node,
     input_proj: torch.Tensor,
     input_bias: torch.Tensor,
@@ -13,6 +13,23 @@ def ffn_layer(
     output_bias: torch.Tensor,
     name: str = "",
 ) -> Node:
+    """Build a ``Linear -> ReLU -> Linear`` subgraph.
+
+    This is the fundamental building block for piecewise-linear
+    functions in the computation graph. The compiler maps each call
+    to one FFN sublayer in the compiled transformer.
+
+    Args:
+        input_node: Upstream node whose output feeds into the first Linear.
+        input_proj: First-layer weight matrix, shape ``(d_intermediate, d_input)``.
+        input_bias: First-layer bias, shape ``(d_intermediate,)``.
+        output_proj: Second-layer weight matrix, shape ``(d_intermediate, d_output)``.
+        output_bias: Second-layer bias, shape ``(d_output,)``.
+        name: Label prefix for the sub-nodes (for debugging).
+
+    Returns:
+        The final Linear node (output of the two-layer subgraph).
+    """
     if len(input_proj.shape) == 1:
         input_proj = input_proj.unsqueeze(0)
     if len(input_bias.shape) == 0:

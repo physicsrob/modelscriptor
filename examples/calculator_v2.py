@@ -37,7 +37,7 @@ from modelscriptor.modelscript.inout_nodes import (
     create_unembedding,
 )
 from modelscriptor.modelscript.logic_ops import (
-    compare_to_vector,
+    equals_vector,
     bool_any_true,
     bool_all_true,
     bool_not,
@@ -79,11 +79,11 @@ def create_network_parts(
     num_seq = NumericSequence(pos_encoding, embedding, max_digits)
 
     # Detect which operator token appears
-    is_plus = compare_to_vector(embedding, embedding.get_embedding("+"))
-    is_minus = compare_to_vector(embedding, embedding.get_embedding("-"))
-    is_times = compare_to_vector(embedding, embedding.get_embedding("*"))
+    is_plus = equals_vector(embedding, embedding.get_embedding("+"))
+    is_minus = equals_vector(embedding, embedding.get_embedding("-"))
+    is_times = equals_vector(embedding, embedding.get_embedding("*"))
     is_operator = bool_any_true([is_plus, is_minus, is_times])
-    is_equals = compare_to_vector(embedding, embedding.get_embedding("="))
+    is_equals = equals_vector(embedding, embedding.get_embedding("="))
 
     # Guard: only detect operators before "=" — output tokens like "-" must
     # not re-trigger operator signals during autoregressive decoding.
