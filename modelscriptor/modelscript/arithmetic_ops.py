@@ -322,10 +322,8 @@ def multiply_integers(inp1: Node, inp2: Node, max_value: int) -> Node:
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"
 
-    # Use add_scaled_nodes (Linear) instead of add/subtract (Add) so the
-    # compiler can schedule these even when inputs are shared across paths.
-    s = add_scaled_nodes(1.0, inp1, 1.0, inp2)  # a+b
-    d = add_scaled_nodes(1.0, inp1, -1.0, inp2)  # a-b (may be negative)
+    s = add(inp1, inp2)  # a+b
+    d = subtract(inp1, inp2)  # a-b (may be negative)
     abs_d = relu_add(d, negate(d))  # |a-b| = ReLU(d) + ReLU(-d)
 
     sq_sum = thermometer_square(s, 2 * max_value)  # (a+b)²
