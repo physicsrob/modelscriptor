@@ -478,3 +478,49 @@ def test_compile_add_shared_inputs():
         },
         max_layers=10,  # Deadlock manifests immediately; don't spin for 100 layers
     )
+
+
+def test_compile_add_shared_inputs_wide():
+    """Shared-input Add deadlock with wider vectors (multi-head compute_add)."""
+    x = create_input("x", 8)
+    y = create_input("y", 8)
+
+    sum1 = add(x, y)
+    sum2 = add(x, y)
+    output = add_scaled_nodes(1.0, sum1, 1.0, sum2)
+
+    _verify(
+        output,
+        n_pos=2,
+        input_values={
+            "x": torch.randn(2, 8),
+            "y": torch.randn(2, 8),
+        },
+        max_layers=10,
+    )
+
+
+def test_compile_three_adds_shared_inputs():
+    """Three Add nodes sharing the same inputs — the calculator pattern.
+
+    This mirrors calculator_v2: number_a and number_b feed add, subtract,
+    and multiply paths, each creating Add nodes on the shared operands.
+    """
+    x = create_input("x", 1)
+    y = create_input("y", 1)
+
+    s1 = add(x, y)  # addition path
+    s2 = add(x, y)  # subtraction path (subtract creates add+negate)
+    s3 = add(x, y)  # multiplication path
+
+    output = sum_nodes([s1, s2, s3])
+
+    _verify(
+        output,
+        n_pos=2,
+        input_values={
+            "x": torch.tensor([[3.0], [7.0]]),
+            "y": torch.tensor([[4.0], [2.0]]),
+        },
+        max_layers=10,
+    )

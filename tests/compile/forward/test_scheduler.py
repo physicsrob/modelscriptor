@@ -293,6 +293,35 @@ def test_schedule_deferred_add_via_compute():
     assert add_node in computed
 
 
+def test_schedule_add_into_preferred_over_compute_add():
+    """When one input is dead, add_into is used (not compute_add).
+
+    add_into reuses existing columns (free), while compute_add allocates new
+    ones. The scheduler should prefer the cheaper option.
+    """
+    pos = _make_pos_encoding()
+    a = InputNode("a", 4)
+    b = InputNode("b", 4)
+    add_node = Add(a, b)
+    # Give b another consumer so it's NOT dead-for-add, but a IS dead-for-add
+    b_other = _make_linear(b, 2, "b_other")
+    out = Add(add_node, b_other)
+
+    graph = GraphAnalyzer(out)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(a)
+    rmap.allocate(b)
+    computed = {pos, a, b}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    attn_ops, ffn_ops = scheduler.schedule_layer(rmap, computed)
+
+    add_ops = [op for op in attn_ops if op.node is add_node]
+    assert len(add_ops) == 1
+    assert add_ops[0].op_type == "add_into"  # NOT compute_add
+
+
 def test_schedule_add_both_addends_dead():
     """Add where both addends are dead-for-add: produces add_into without error.
 

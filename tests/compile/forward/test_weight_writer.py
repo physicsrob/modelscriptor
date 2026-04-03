@@ -471,6 +471,79 @@ def test_add_into_dead_at_inputs1():
 
 
 # ---------------------------------------------------------------------------
+# Attention — compute_add
+# ---------------------------------------------------------------------------
+
+
+def test_compute_add():
+    """Add(a, b) with neither input dead — copies both via separate heads."""
+    pos = _make_pos_encoding()
+    a = InputNode("a", 4)
+    b = InputNode("b", 4)
+    add_node = Add(a, b)
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(a)
+    rmap.allocate(b)
+    out_cols = rmap.allocate(add_node)
+
+    layer = TransformerLayer(D, D_HEAD, pos)
+    op = AttnHeadOp(op_type="compute_add", node=add_node, target_cols=out_cols)
+    write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
+
+    a_values = torch.randn(N_POS, 4)
+    b_values = torch.randn(N_POS, 4)
+    pe_values = pos.compute(N_POS, {})
+    res = _build_residual_stream(rmap, {pos: pe_values, a: a_values, b: b_values})
+
+    out = layer.attn.forward(res)
+    result = out[:, out_cols]
+
+    expected = add_node.compute(N_POS, {"a": a_values, "b": b_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+def test_compute_add_wide():
+    """compute_add with vectors wider than d_head — requires multiple head groups."""
+    pos = _make_pos_encoding()
+    # 20 > D_HEAD=16, so needs 2 heads per input (4 heads total)
+    a = InputNode("a", 20)
+    b = InputNode("b", 20)
+    add_node = Add(a, b)
+
+    d_wide = 128  # Need room for pos(16) + a(20) + b(20) + out(20)
+    rmap = ResidualStreamMap(d_wide)
+    rmap.allocate(pos)
+    rmap.allocate(a)
+    rmap.allocate(b)
+    out_cols = rmap.allocate(add_node)
+
+    layer = TransformerLayer(d_wide, D_HEAD, pos)
+    op = AttnHeadOp(op_type="compute_add", node=add_node, target_cols=out_cols)
+    write_attn_sublayer(layer, [op], rmap, pos)
+    layer.to(device_mod.get_device(verbose=False))
+
+    a_values = torch.randn(N_POS, 20)
+    b_values = torch.randn(N_POS, 20)
+    pe_values = pos.compute(N_POS, {})
+    device = device_mod.get_device(verbose=False)
+    res = torch.zeros(N_POS, d_wide, device=device)
+    for node, values in {pos: pe_values, a: a_values, b: b_values}.items():
+        indices = rmap.get_indices(node)
+        values = values.to(res.device)
+        for i, idx in enumerate(indices):
+            res[:, idx] = values[:, i]
+
+    out = layer.attn.forward(res)
+    result = out[:, out_cols]
+
+    expected = add_node.compute(N_POS, {"a": a_values, "b": b_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
 # FFN — compute_relu
 # ---------------------------------------------------------------------------
 
