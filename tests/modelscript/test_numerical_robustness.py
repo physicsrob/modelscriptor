@@ -258,7 +258,7 @@ def test_sum_digits_on_map_to_table_output():
     This directly tests the multiplication carry chain:
     multiply_digit_pair → sum_digits.
     """
-    from examples.adder import sum_digits
+    from modelscriptor.modelscript.embedding_arithmetic import sum_digits
 
     embedding = _make_digit_embedding()
 
@@ -313,7 +313,7 @@ def test_sum_digits_on_map_to_table_output():
 
 def test_remove_leading_0s_single_level():
     """remove_leading_0s with max_removals=1 should work."""
-    from examples.adder import remove_leading_0s
+    from modelscriptor.modelscript.sequence_ops import remove_leading_0s
 
     embedding = _make_digit_embedding()
     e0 = embedding.get_embedding("0")
@@ -334,7 +334,7 @@ def test_remove_leading_0s_two_levels():
     This requires equals_vector to work on select output (level 2 checks
     whether the shifted sequence still has a leading zero).
     """
-    from examples.adder import remove_leading_0s
+    from modelscriptor.modelscript.sequence_ops import remove_leading_0s
 
     embedding = _make_digit_embedding()
     e0 = embedding.get_embedding("0")
@@ -351,7 +351,7 @@ def test_remove_leading_0s_two_levels():
 
 def test_remove_leading_0s_three_levels():
     """remove_leading_0s with max_removals=3 — needed for multiplication results."""
-    from examples.adder import remove_leading_0s
+    from modelscriptor.modelscript.sequence_ops import remove_leading_0s
 
     embedding = _make_digit_embedding()
     e0 = embedding.get_embedding("0")
@@ -372,7 +372,7 @@ def test_remove_leading_0s_three_levels():
 
 def test_remove_leading_0s_no_removal_needed():
     """remove_leading_0s should leave a sequence alone when there are no leading zeros."""
-    from examples.adder import remove_leading_0s
+    from modelscriptor.modelscript.sequence_ops import remove_leading_0s
 
     embedding = _make_digit_embedding()
     e4 = embedding.get_embedding("4")

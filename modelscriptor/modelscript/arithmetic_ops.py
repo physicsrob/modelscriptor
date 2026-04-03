@@ -235,6 +235,76 @@ def multiply_scalar(inp: Node, scalar: float) -> Node:
     return Linear(inp, scalar * torch.eye(d), name="multiply_scalar")
 
 
+def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
+    """Compute floor(inp / divisor) using thermometer coding in a single FFN layer.
+
+    Places a detector at each multiple of the divisor. Each detector outputs
+    1.0 when the input crosses that multiple. The sum of all detectors gives
+    the floor division result — like mercury rising in a thermometer.
+
+        threshold  9.5 → fires when x >= 10  (contributes 1.0)
+        threshold 19.5 → fires when x >= 20  (contributes 1.0)
+        ...
+        threshold 89.5 → fires when x >= 90  (contributes 1.0)
+
+        x = 35 → first 3 detectors fire → output = 3 = floor(35/10)
+
+    Half-integer thresholds (9.5 not 10.0) ensure clean separation for
+    integer inputs: x=9 is well below 9.5, x=10 is well above.
+
+    Each detector is a paired ReLU that produces a 0-or-1 step:
+
+        detector(x) = ReLU(s*(x - threshold)) - ReLU(s*(x - threshold) - 1)
+
+        x < threshold → both ReLUs output 0              → 0
+        x > threshold → both ramp up equally, offset by 1 → 1
+
+    The speed s (step_sharpness) makes the ramp steep so it saturates
+    quickly. Two ReLU units per detector → d_int = 2*n.
+
+    Args:
+        inp: 1D scalar node with integer value in [0, max_value].
+        divisor: The divisor for floor division.
+        max_value: Upper bound on input (determines number of detectors).
+
+    Returns:
+        1D scalar node containing floor(inp / divisor).
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    n = max_value // divisor
+    if n == 0:
+        from modelscriptor.modelscript.inout_nodes import create_constant
+
+        return create_constant(torch.tensor([0.0]))
+
+    d_int = 2 * n  # Two ReLU units per threshold detector
+    input_proj = torch.zeros(d_int, 1)
+    input_bias = torch.zeros(d_int)
+    output_proj = torch.zeros(d_int, 1)
+
+    for k in range(n):
+        threshold = (k + 1) * divisor - 0.5  # Half-integer: 9.5, 19.5, ...
+        row = 2 * k
+
+        # Paired ReLU: ReLU(s*x - s*threshold) - ReLU(s*x - s*threshold - 1)
+        input_proj[row, 0] = step_sharpness
+        input_proj[row + 1, 0] = step_sharpness
+        input_bias[row] = -step_sharpness * threshold
+        input_bias[row + 1] = -step_sharpness * threshold - 1.0
+
+        # First ReLU contributes +1, second cancels the ramp → net step of 1.0
+        output_proj[row, 0] = 1.0
+        output_proj[row + 1, 0] = -1.0
+
+    return linear_relu_linear(
+        input_node=inp,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=torch.zeros(1),
+    )
+
+
 def _thermometer_square_chunk(
     inp: Node, k_start: int, k_end: int, name: str
 ) -> Node:

@@ -1,3 +1,13 @@
+"""1-digit adder: the simplest example of programming a transformer.
+
+Parses "A+B=" where A and B are single digits, and outputs their sum.
+All arithmetic is done via a single 100-entry lookup table that maps
+every (A, B) pair to (A+B) mod 10.
+
+This example keeps its helpers inline for self-containment — see
+embedding_arithmetic for the general multi-digit versions.
+"""
+
 from typing import Tuple
 
 import torch
@@ -53,37 +63,31 @@ def sum_numbers(embedding: Embedding, num1: Node, num2: Node) -> Tuple[Node, Nod
 
 
 def create_network() -> Unembedding:
-    # Define our vocabulary -- these are the tokens that will be used for our netowrk.
+    # --- Phase 1: Vocabulary and parsing ---
     vocab = list(
         "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
     ) + ["<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     pos_encoding = create_pos_encoding()
 
-    #
-    # Make network that adds 1 digit numbers
-    #
-
-    # Define current number.
+    # Determine the current digit (default to "0" for non-digit tokens).
     zero_constant = create_constant(embedding.get_embedding("0"))
     is_num = check_is_num(embedding_value=embedding, embedding=embedding)
-
-    # current_num is the embedding of the current character if it is a number,
-    # otherwise it is the embedding of 0.
     current_num = select(cond=is_num, true_node=embedding, false_node=zero_constant)
 
-    # Define a flag for the end of the first number (when we hit the + symbol).
+    # Detect operator positions: "+" ends the first number, "=" ends the second.
     is_first_num = equals_vector(inp=embedding, vector=embedding.get_embedding("+"))
+    is_second_num = equals_vector(inp=embedding, vector=embedding.get_embedding("="))
 
-    # Define a flag for the end of the second number (when we hit the = symbol).
-    is_second_num = equals_vector(
-        inp=embedding, vector=embedding.get_embedding("=")
-    )
-
+    # --- Phase 2: Capture operands and compute ---
+    # Look one position back to get the digit that just completed.
     just_completed_num = pos_encoding.attend_to_offset(current_num, delta_pos=-1)
+    # Latch: remember the digit at "+", carry it forward to all later positions.
     first_num = pos_encoding.get_prev_value(just_completed_num, is_first_num)
+    # Latch: remember the digit at "=".
     second_num = pos_encoding.get_prev_value(just_completed_num, is_second_num)
 
-    # Figure out how to calculate output index.
     summed, carry = sum_numbers(embedding, first_num, second_num)
+
+    # --- Phase 3: Output ---
     return create_unembedding(summed, embedding)
