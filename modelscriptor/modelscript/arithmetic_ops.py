@@ -235,7 +235,40 @@ def multiply_scalar(inp: Node, scalar: float) -> Node:
     return Linear(inp, scalar * torch.eye(d), name="multiply_scalar")
 
 
-def thermometer_square(inp: Node, max_value: int) -> Node:
+def _thermometer_square_chunk(
+    inp: Node, k_start: int, k_end: int, name: str
+) -> Node:
+    """Compute partial sum of odd-number detectors for k in [k_start, k_end)."""
+    n_detectors = k_end - k_start
+    d_int = 2 * n_detectors
+    input_proj = torch.zeros(d_int, 1)
+    input_bias = torch.zeros(d_int)
+    output_proj = torch.zeros(d_int, 1)
+
+    for i, k in enumerate(range(k_start, k_end)):
+        threshold = k - 0.5
+        row = 2 * i
+
+        input_proj[row, 0] = step_sharpness
+        input_proj[row + 1, 0] = step_sharpness
+        input_bias[row] = -step_sharpness * threshold
+        input_bias[row + 1] = -step_sharpness * threshold - 1.0
+
+        weight = 2.0 * k - 1.0
+        output_proj[row, 0] = weight
+        output_proj[row + 1, 0] = -weight
+
+    return linear_relu_linear(
+        input_node=inp,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=torch.zeros(1),
+        name=name,
+    )
+
+
+def thermometer_square(inp: Node, max_value: int, d_max: int = 1024) -> Node:
     """Compute x² for a non-negative integer x in [0, max_value].
 
     Uses the odd-number identity: x² = 1 + 3 + 5 + ... + (2x-1).
@@ -252,9 +285,15 @@ def thermometer_square(inp: Node, max_value: int) -> Node:
     Only exact for non-negative integers. For non-integers, the step
     functions fire based on floor(x), giving floor(x)² instead of x².
 
+    When max_value requires more than d_max ReLU units (2 per detector),
+    the computation is split into multiple FFN layers whose partial
+    sums are added together.
+
     Args:
         inp: 1D scalar node with integer value in [0, max_value].
         max_value: Upper bound on input (determines number of detectors).
+        d_max: Maximum ReLU units per FFN layer. Detectors are split
+            into chunks of d_max // 2 to stay within this budget.
 
     Returns:
         1D scalar node containing x².
@@ -262,34 +301,19 @@ def thermometer_square(inp: Node, max_value: int) -> Node:
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= 1, "max_value must be at least 1"
 
-    d_int = 2 * max_value  # Two ReLU units per threshold detector
-    input_proj = torch.zeros(d_int, 1)
-    input_bias = torch.zeros(d_int)
-    output_proj = torch.zeros(d_int, 1)
+    chunk_size = d_max // 2  # detectors per chunk (2 ReLUs each)
+    chunks = []
+    for start in range(1, max_value + 1, chunk_size):
+        end = min(start + chunk_size, max_value + 1)
+        chunks.append(
+            _thermometer_square_chunk(
+                inp, start, end, name=f"thermometer_square_{start}_{end}"
+            )
+        )
 
-    for k in range(1, max_value + 1):
-        threshold = k - 0.5  # Half-integer: 0.5, 1.5, 2.5, ...
-        row = 2 * (k - 1)
-
-        # Paired ReLU: ReLU(s*x - s*threshold) - ReLU(s*x - s*threshold - 1)
-        input_proj[row, 0] = step_sharpness
-        input_proj[row + 1, 0] = step_sharpness
-        input_bias[row] = -step_sharpness * threshold
-        input_bias[row + 1] = -step_sharpness * threshold - 1.0
-
-        # Odd-number weight: detector k contributes (2k-1) instead of 1.0
-        weight = 2.0 * k - 1.0
-        output_proj[row, 0] = weight
-        output_proj[row + 1, 0] = -weight
-
-    return linear_relu_linear(
-        input_node=inp,
-        input_proj=input_proj,
-        input_bias=input_bias,
-        output_proj=output_proj,
-        output_bias=torch.zeros(1),
-        name="thermometer_square",
-    )
+    if len(chunks) == 1:
+        return chunks[0]
+    return sum_nodes(chunks)
 
 
 def multiply_integers(inp1: Node, inp2: Node, max_value: int) -> Node:
