@@ -1,0 +1,130 @@
+from torchwright.graph import Node, Concatenate
+from typing import List, Tuple, Dict
+import torch
+
+from torchwright.ops.const import (
+    big_offset,
+    step_sharpness,
+    embedding_step_sharpness,
+)
+from torchwright.ops.logic_ops import cond_add_vector, cond_gate
+from torchwright.ops.arithmetic_ops import sum_nodes
+from torchwright.ops.linear_relu_linear import linear_relu_linear
+
+
+def map_to_table(
+    inp: Node, key_to_value: Dict[torch.Tensor, torch.Tensor], default: torch.Tensor
+) -> Node:
+    """
+    Maps the value of the input node to a lookup table.
+
+    Args:
+        inp (Node): Node whose values will be looked up.
+        key_to_value (Dict[torch.Tensor, torch.Tensor]): Lookup table mapping from keys to values.
+        default (torch.Tensor): Default tensor to return if the input value doesn't exist in the table.
+
+    Returns:
+        Node: Output node with mapped values.
+    """
+    d_keys = {len(x) for x in key_to_value.keys()}
+    d_values = {len(x) for x in key_to_value.values()}
+    assert len(d_keys) == 1
+    assert len(d_values) == 1
+    d_key = d_keys.pop()
+    d_value = d_values.pop()
+    assert len(inp) == d_key
+    assert len(default) == d_value
+
+    d_int = len(key_to_value)
+    speed = embedding_step_sharpness
+    # We'll use 1 FFN entry per item in the table, and an overall output bias of the default value
+    # So roughly speaking:
+    # input_proj will be (d_int x d_key), where input_proj[i, :] = table.keys()[i]
+    # input_bias will be (d_int), where input_bias[i] = 1.0/speed - (table.keys()[i] @ table.keys()[i])
+    # output_proj will be (d_int, d_value), where output_proj[i, :] = speed * (table.values()[i] - default)
+    # output_bias will be (d_value), equal to default
+
+    input_proj = torch.zeros(d_int, d_key)
+    input_bias = torch.zeros(d_int)
+    output_proj = torch.zeros(d_int, d_value)
+
+    for i, (key, value) in enumerate(key_to_value.items()):
+        input_proj[i, :] = key
+        input_bias[i] = 1.0 / speed - (key @ key)
+        output_proj[i, :] = speed * (value - default)
+
+    return linear_relu_linear(
+        input_node=inp,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=default,
+    )
+
+
+def switch(conditions: List[Node], values: List[Node]) -> Node:
+    """
+    Select one of N values based on which condition is true.
+
+    Assumes exactly one condition is true (1.0), rest are false (-1.0).
+
+    Args:
+        conditions (List[Node]): Boolean condition nodes (each length 1).
+        values (List[Node]): Value nodes (all same length).
+
+    Returns:
+        Node: The value whose corresponding condition is true.
+    """
+    return sum_nodes([cond_gate(c, v) for c, v in zip(conditions, values)])
+
+
+def select(cond: Node, true_node: Node, false_node: Node) -> Node:
+    """
+    Outputs one of two nodes based on a boolean condition.
+
+    Args:
+        cond (Node): Condition node that outputs either true or false.
+        true_node (Node): Node to be outputted if the condition is true.
+        false_node (Node): Node to be outputted if the condition is false.
+
+    Returns:
+        Node: Either true_node or false_node based on the condition.
+    """
+    assert len(cond) == 1  # Condition must be length 1
+    assert len(true_node) == len(false_node)
+
+    # Strategy:
+    # - Concatenate(true_node; false_node)
+    # - Add [offset ... offset;  -offset ... -offset] if cond is true
+    # - Add [-offset ... -offset;  offset ... offset] if cond is false
+    # - Rectify
+    # - Merge the two halves by summing
+    # - Subtract offset
+    true_offset = torch.tensor(
+        ([big_offset] * len(true_node)) + ([-big_offset] * len(true_node))
+    )
+    false_offset = torch.tensor(
+        ([-big_offset] * len(true_node)) + ([big_offset] * len(true_node))
+    )
+    x: Node = Concatenate([true_node, false_node])
+    x = cond_add_vector(cond, x, true_offset, false_offset)
+
+    # Splits the input node into two equal-length vectors, apply ReLU to each,
+    # and sum them with offset.
+    input_proj = torch.eye(len(x))
+    input_bias = torch.zeros(len(x))
+    output_proj = torch.zeros((len(x), len(true_node)))
+    output_bias = torch.tensor([-big_offset] * len(true_node))
+
+    for i in range(len(true_node)):
+        output_proj[i, i] = 1.0
+        output_proj[len(true_node) + i, i] = 1.0
+
+    return linear_relu_linear(
+        input_node=x,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=output_bias,
+        name="select",
+    )

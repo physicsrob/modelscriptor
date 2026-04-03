@@ -12,17 +12,17 @@ from typing import Tuple
 
 import torch
 
-from modelscriptor.graph import Node, Embedding
-from modelscriptor.graph.embedding import Unembedding
-from modelscriptor.modelscript.arithmetic_ops import concat
-from modelscriptor.modelscript.inout_nodes import (
+from torchwright.graph import Node, Embedding
+from torchwright.graph.embedding import Unembedding
+from torchwright.ops.arithmetic_ops import concat
+from torchwright.ops.inout_nodes import (
     create_constant,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
 )
-from modelscriptor.modelscript.logic_ops import equals_vector
-from modelscriptor.modelscript.map_select import map_to_table, select
+from torchwright.ops.logic_ops import equals_vector
+from torchwright.ops.map_select import map_to_table, select
 
 
 def check_is_num(embedding_value: Node, embedding: Embedding) -> Node:

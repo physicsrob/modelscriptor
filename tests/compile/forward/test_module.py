@@ -12,14 +12,14 @@ import pytest
 import torch
 import torch.nn as nn
 
-from modelscriptor.compiler.forward.compile import forward_compile
-from modelscriptor.compiler.module import (
+from torchwright.compiler.forward.compile import forward_compile
+from torchwright.compiler.module import (
     CompiledTransformerModule,
     _AttentionLayer,
     _FFNLayer,
     to_module,
 )
-from modelscriptor.graph import Embedding
+from torchwright.graph import Embedding
 
 from examples.adder import create_network_parts
 
@@ -432,7 +432,7 @@ onnxruntime = pytest.importorskip("onnxruntime")
 
 def test_onnx_export_and_inference():
     """Export to ONNX via compile_to_onnx, load with onnxruntime, verify output matches PyTorch."""
-    from modelscriptor.compiler.export import compile_to_onnx
+    from torchwright.compiler.export import compile_to_onnx
 
     output_node, pos_encoding, embedding = _build_1digit()
 
@@ -494,8 +494,8 @@ def test_onnx_export_and_inference():
 
 def test_onnx_repl_generate():
     """Test the standalone REPL generate function against an ONNX model."""
-    from modelscriptor.compiler.export import compile_to_onnx
-    from modelscriptor.compiler.repl import generate, _Vocab
+    from torchwright.compiler.export import compile_to_onnx
+    from torchwright.compiler.repl import generate, _Vocab
 
     output_node, pos_encoding, embedding = _build_1digit()
 

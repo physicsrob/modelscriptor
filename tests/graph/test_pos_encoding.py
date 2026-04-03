@@ -1,5 +1,5 @@
-from modelscriptor.graph import PosEncoding, InputNode
-from modelscriptor.graph.pos_encoding import get_pos_delta_matrix
+from torchwright.graph import PosEncoding, InputNode
+from torchwright.graph.pos_encoding import get_pos_delta_matrix
 import torch
 
 atol = 1.0e-4  # Absolute tolerance for comparing tensors

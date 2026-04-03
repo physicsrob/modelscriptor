@@ -7,7 +7,7 @@ both in single-pass (prefill) and token-by-token (autoregressive) modes.
 import pytest
 import torch
 
-from modelscriptor.compiler.forward.compile import forward_compile
+from torchwright.compiler.forward.compile import forward_compile
 
 D = 1024
 D_HEAD = 16

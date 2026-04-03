@@ -20,9 +20,9 @@ from typing import Tuple, List
 
 import torch
 
-from modelscriptor.graph import Node, Embedding, PosEncoding
-from modelscriptor.graph.embedding import Unembedding
-from modelscriptor.modelscript.arithmetic_ops import (
+from torchwright.graph import Node, Embedding, PosEncoding
+from torchwright.graph.embedding import Unembedding
+from torchwright.ops.arithmetic_ops import (
     add,
     subtract,
     negate,
@@ -30,25 +30,25 @@ from modelscriptor.modelscript.arithmetic_ops import (
     relu_add,
     multiply_integers,
 )
-from modelscriptor.modelscript.inout_nodes import (
+from torchwright.ops.inout_nodes import (
     create_constant,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
 )
-from modelscriptor.modelscript.logic_ops import (
+from torchwright.ops.logic_ops import (
     equals_vector,
     bool_any_true,
     bool_all_true,
     bool_not,
 )
-from modelscriptor.modelscript.map_select import select, switch
-from modelscriptor.modelscript.scalar_encoding import (
+from torchwright.ops.map_select import select, switch
+from torchwright.ops.scalar_encoding import (
     digits_to_number,
     number_to_digit_scalars,
     scalar_to_embedding,
 )
-from modelscriptor.modelscript.sequence_ops import (
+from torchwright.ops.sequence_ops import (
     NumericSequence,
     output_sequence,
     remove_leading_0s,

@@ -1,4 +1,4 @@
-# ModelScriptor Roadmap
+# TorchWright Roadmap
 
 The goal of this roadmap is to build a solid, proven foundation. Each phase
 proves a specific capability of the compiler before moving on.

@@ -1,5 +1,5 @@
 [project]
-name = "modelscriptor"
+name = "torchwright"
 version = "0.1.0"
 description = "A compiler that transforms computation graphs into transformer neural network weights"
 requires-python = ">=3.10"
@@ -28,7 +28,7 @@ torch = { index = "pytorch-cu124" }
 [tool.pytest.ini_options]
 
 [tool.coverage.run]
-source = ["modelscriptor"]
+source = ["torchwright"]
 
 [tool.coverage.report]
 show_missing = true

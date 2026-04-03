@@ -1,8 +1,8 @@
-![CI](https://github.com/physicsrob/modelscriptor/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/physicsrob/torchwright/actions/workflows/ci.yml/badge.svg)
 
-# ModelScriptor
+# TorchWright
 
-ModelScriptor is a compiler that transforms computation graphs into transformer
+TorchWright is a compiler that transforms computation graphs into transformer
 neural network weights. You define what you want the transformer to compute
 using high-level operations (arithmetic, logic, attention, table lookups), and
 the compiler produces actual weight matrices that run in a standard transformer
@@ -26,7 +26,7 @@ make lint        # run black + mypy
 
 ## Examples
 
-ModelScriptor has been used to compile several non-trivial programs into
+TorchWright has been used to compile several non-trivial programs into
 transformer weights:
 
 **Multi-digit adder** (`examples/adder.py`) -- Parses "123+456=" and outputs
@@ -172,9 +172,9 @@ operations which free columns (cancellations and add-into) over new
 computations.
 
 
-## The ModelScript Layer
+## The Ops Layer
 
-The `modelscriptor/modelscript/` package provides high-level operations built
+The `torchwright/ops/` package provides high-level operations built
 on top of the raw graph nodes. These are what examples typically use:
 
 - **Arithmetic**: `add_scalar`, `negate`, `subtract`, `multiply_scalar`
@@ -190,9 +190,9 @@ on top of the raw graph nodes. These are what examples typically use:
 ## Architecture
 
 ```
-modelscriptor/
+torchwright/
 ├── graph/              # Computation graph: nodes, embeddings, attention, etc.
-├── modelscript/        # High-level operations (arithmetic, logic, tables)
+├── ops/                # High-level operations (arithmetic, logic, tables)
 └── compiler/
     ├── forward/        # The forward compiler
     │   ├── compile.py        # Main entry point (forward_compile)

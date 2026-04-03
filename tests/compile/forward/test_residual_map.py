@@ -1,10 +1,10 @@
 import pytest
 import torch
 
-from modelscriptor.compiler.feature_assignment import ResidualStreamState
-from modelscriptor.compiler.forward.residual_map import ResidualStreamMap
-from modelscriptor.graph import Node, Concatenate
-from modelscriptor.graph.misc import InputNode, Constant
+from torchwright.compiler.feature_assignment import ResidualStreamState
+from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.graph import Node, Concatenate
+from torchwright.graph.misc import InputNode, Constant
 
 
 def test_allocate_and_free():

@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from modelscriptor.modelscript.inout_nodes import create_embedding, create_input
-from modelscriptor.modelscript.arithmetic_ops import thermometer_floor_div
-from modelscriptor.modelscript.scalar_encoding import (
+from torchwright.ops.inout_nodes import create_embedding, create_input
+from torchwright.ops.arithmetic_ops import thermometer_floor_div
+from torchwright.ops.scalar_encoding import (
     digit_to_scaled_scalar,
     digits_to_number,
     number_to_digit_scalars,
