@@ -39,33 +39,18 @@ class AttnLayerComponent(Component):
         assert inp.shape[1] == self.d
         n_pos = inp.shape[0]
 
-        output = torch.zeros(n_pos, self.d, device=inp.device)
+        # All heads in parallel via batched ops
+        Q = torch.einsum('pd,hdk->hpk', inp, self.query_matrix)
+        K = torch.einsum('pd,hdk->hpk', inp, self.key_matrix)
+        V = torch.einsum('pd,hdk->hpk', inp, self.value_matrix)
 
-        # Apply the attention heads
-        for n_head in range(self.n_heads):
-            query_values = (
-                inp @ self.query_matrix[n_head]
-            )  # query_values shape is (n_pos, d_head)
+        attn_logits = torch.bmm(Q, K.transpose(1, 2))  # (n_heads, n_pos, n_pos)
+        mask = torch.triu(torch.ones(n_pos, n_pos, device=inp.device), diagonal=1).bool()
+        attn_logits.masked_fill_(mask.unsqueeze(0), -1000.0)
+        attn = torch.softmax(attn_logits, dim=2)
 
-            key_values = (
-                inp @ self.key_matrix[n_head]
-            )  # key_values shape is (n_pos, d_head)
-
-            attn_logits = (
-                query_values @ key_values.t()
-            )  # attn_logits shape is (n_pos, n_pos)
-
-            # Apply attention mask
-            mask = torch.triu(torch.ones_like(attn_logits), diagonal=1)
-            attn_logits = torch.where(
-                mask == 1, -1000 * torch.ones_like(attn_logits), attn_logits
-            )
-            attn = torch.softmax(attn_logits, dim=1)  # attn shape is (n_pos, n_pos)
-            value_values = (
-                inp @ self.value_matrix[n_head]
-            )  # value_values shape is (n_pos, d_head)
-            values = attn @ value_values  # values shape is now (n_pos, d_head)
-            output += values @ self.output_matrix[n_head]
+        weighted = torch.bmm(attn, V)  # (n_heads, n_pos, d_head)
+        output = torch.einsum('hpk,hkd->pd', weighted, self.output_matrix)
 
         return output
 
