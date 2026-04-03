@@ -23,7 +23,8 @@ import torch
 from modelscriptor.graph import Node, Embedding, PosEncoding
 from modelscriptor.graph.embedding import Unembedding
 from modelscriptor.modelscript.arithmetic_ops import (
-    add_scaled_nodes,
+    add,
+    subtract,
     negate,
     compare,
     relu_add,
@@ -111,12 +112,8 @@ def create_network_parts(
     seq_len = 2 * max_digits + 2
 
     # --- Phase 2a: Addition (scalar-space) ---
-    # Use add_scaled_nodes (Linear) instead of add (Add node) because
-    # number_a and number_b are shared across all three operation paths.
-    # Add nodes require one input to be "dead" for scheduling, which
-    # deadlocks when inputs have multiple consumers.
     # Result can overflow by one digit (e.g. 999+999=1998)
-    add_result = add_scaled_nodes(1.0, number_a, 1.0, number_b)
+    add_result = add(number_a, number_b)
     max_result_add = 2 * (10**max_digits - 1)
     add_digit_scalars = number_to_digit_scalars(
         add_result, max_digits + 1, max_result_add
@@ -127,7 +124,7 @@ def create_network_parts(
 
     # --- Phase 2b: Subtraction (scalar-space) ---
     # Result can be negative (e.g. 100-999=-899)
-    sub_result = add_scaled_nodes(1.0, number_a, -1.0, number_b)
+    sub_result = subtract(number_a, number_b)
     # compare returns true_level when inp > thresh; result > -0.5 means NOT negative
     is_negative = compare(sub_result, thresh=-0.5, true_level=-1.0, false_level=1.0)
     # |result| via ReLU: ReLU(x) + ReLU(-x) = |x|

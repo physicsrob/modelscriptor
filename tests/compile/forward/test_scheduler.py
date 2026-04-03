@@ -261,10 +261,12 @@ def test_schedule_free_add():
     assert add_node in computed
 
 
-def test_schedule_deferred_add():
-    """Add where neither addend is dead-for-add is NOT scheduled.
+def test_schedule_deferred_add_via_compute():
+    """Add where neither addend is dead-for-add is scheduled via compute_add.
 
-    Both a and b have non-Add consumers that aren't computed yet.
+    Both a and b have non-Add consumers that aren't computed yet, so add_into
+    can't reuse columns. Instead, compute_add copies both inputs to fresh
+    columns via attention.
     """
     pos = _make_pos_encoding()
     a = InputNode("a", 4)
@@ -285,9 +287,10 @@ def test_schedule_deferred_add():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, ffn_ops = scheduler.schedule_layer(rmap, computed)
 
-    all_op_nodes = [op.node for op in attn_ops] + [op.node for op in ffn_ops]
-    assert add_node not in all_op_nodes
-    assert add_node not in computed
+    add_ops = [op for op in attn_ops if op.node is add_node]
+    assert len(add_ops) == 1
+    assert add_ops[0].op_type == "compute_add"
+    assert add_node in computed
 
 
 def test_schedule_add_both_addends_dead():
@@ -449,11 +452,11 @@ def test_multi_layer_progression():
     assert l2b in computed
 
 
-def test_deferred_add_resolves_later():
-    """Add deferred in layer 1, resolved via add_into once addend consumers are computed.
+def test_deferred_add_fires_via_compute_add():
+    """Add where neither addend is dead fires via compute_add in the first layer.
 
-    Both addends have non-Add consumers (relu chains). Once those chains are computed,
-    the addends become dead-for-add and the Add fires.
+    Both addends have non-Add consumers (relu chains), so add_into can't be used.
+    The compute_add path copies both inputs to fresh columns alongside the chains.
     """
     pos = _make_pos_encoding()
     a = InputNode("a", 4)
@@ -473,18 +476,7 @@ def test_deferred_add_resolves_later():
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
 
-    # Layer 1: chains scheduled, Add deferred (addends not dead-for-add yet)
-    scheduler.schedule_layer(rmap, computed)
-    assert add_node not in computed
-
-    # Ensure both chains complete (may need extra layers if they didn't fit)
-    for _ in range(5):
-        if a_chain in computed and b_chain in computed:
-            break
-        scheduler.schedule_layer(rmap, computed)
-    assert a_chain in computed and b_chain in computed
-
-    # Now addends are dead-for-add → Add fires
+    # Layer 1: chains AND the Add are scheduled (Add via compute_add)
     scheduler.schedule_layer(rmap, computed)
     assert add_node in computed
 

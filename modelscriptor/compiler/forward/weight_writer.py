@@ -20,7 +20,7 @@ from modelscriptor.graph.relu import ReLU
 
 @dataclass
 class AttnHeadOp:
-    op_type: str  # "compute_attn", "compute_linear", "cancel", "add_into"
+    op_type: str  # "compute_attn", "compute_linear", "compute_add", "cancel", "add_into"
     node: Node
     target_cols: List[int]
 
@@ -49,6 +49,8 @@ def write_attn_sublayer(
             _write_compute_linear(attn, op, residual_map, pos_encoding)
         elif op.op_type == "cancel":
             _write_cancel(attn, op, residual_map, pos_encoding)
+        elif op.op_type == "compute_add":
+            _write_compute_add(attn, op, residual_map, pos_encoding)
         elif op.op_type == "add_into":
             _write_add_into(attn, op, residual_map, pos_encoding)
         else:
@@ -188,6 +190,56 @@ def _write_compute_linear(
             o_mat,
             d_head,
         )
+
+
+def _write_compute_add(
+    attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
+):
+    """Compute Add(a, b) by copying both inputs to fresh columns via attention.
+
+    Used when neither input is dead (so add_into can't reuse columns).
+    Allocates new output columns and uses two groups of attention heads:
+    one to copy a, one to copy b. Since attention heads are additive,
+    the result in the output columns is 0 + a + b = a + b.
+    """
+    node = op.node
+    assert isinstance(node, Add)
+
+    a0, a1 = node.inputs
+    d_head = attn.d_head
+    d_output = len(node)
+
+    pe_idx = rmap.get_indices(pos_encoding)
+    o_idx = op.target_cols
+    q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
+
+    # Copy each input to the output columns via separate heads.
+    for input_node in [a0, a1]:
+        v_idx = rmap.get_node_indices(input_node)
+        for start in range(0, d_output, d_head):
+            end = min(start + d_head, d_output)
+            chunk_size = end - start
+
+            v_chunk_idx = v_idx[start:end]
+            o_chunk_idx = o_idx[start:end]
+
+            v_mat = torch.eye(chunk_size, d_head)
+            o_mat = torch.eye(d_head, chunk_size)
+
+            head = _allocate_head(attn)
+            _scatter_attn_head(
+                attn,
+                head,
+                pe_idx,
+                pe_idx,
+                v_chunk_idx,
+                o_chunk_idx,
+                q_mat,
+                k_mat,
+                v_mat,
+                o_mat,
+                d_head,
+            )
 
 
 def _write_cancel(

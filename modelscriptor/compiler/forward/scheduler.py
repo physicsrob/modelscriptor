@@ -37,6 +37,7 @@ class LayerScheduler:
 
         ready = set()
         free_adds = []
+        deferred_adds = []
         for node in all_ready:
             if isinstance(node, Add):
                 a0, a1 = node.inputs
@@ -44,7 +45,8 @@ class LayerScheduler:
                 d1 = self._is_dead_for_add(a1, node, computed_nodes)
                 if d0 or d1:
                     free_adds.append(node)
-                # else: deferred, skip
+                else:
+                    deferred_adds.append(node)
             elif isinstance(node, (Attn, Linear, ReLU, Constant)):
                 ready.add(node)
             # else: skip unschedulable source nodes (InputNode, Embedding, etc.)
@@ -60,11 +62,13 @@ class LayerScheduler:
             if exclusive:
                 ready.discard(l1)
 
-        had_schedulable = bool(ready) or bool(free_adds) or bool(chains)
+        had_schedulable = (
+            bool(ready) or bool(free_adds) or bool(deferred_adds) or bool(chains)
+        )
 
         # --- 2. Attention sublayer ---
         attn_ops, biased_linears = self._schedule_attn_sublayer(
-            ready, dead, free_adds, residual_map, computed_nodes
+            ready, dead, free_adds, deferred_adds, residual_map, computed_nodes
         )
 
         # --- 2.5. Re-check readiness after attention ---
@@ -114,7 +118,7 @@ class LayerScheduler:
     # ------------------------------------------------------------------
 
     def _schedule_attn_sublayer(
-        self, ready, dead, free_adds, residual_map, computed_nodes
+        self, ready, dead, free_adds, deferred_adds, residual_map, computed_nodes
     ):
         attn_ops = []
         biased_linears = []
@@ -145,7 +149,7 @@ class LayerScheduler:
             add_into_live_addends.add(live_addend)
             heads_used += n_heads
 
-        # Build compute candidates: Attn nodes, then standalone Linears
+        # Build compute candidates: Attn nodes, standalone Linears, deferred Adds
         compute_candidates = []
         for node in ready:
             if isinstance(node, Attn):
@@ -153,6 +157,11 @@ class LayerScheduler:
             elif isinstance(node, Linear) and not isinstance(node.inputs[0], ReLU):
                 n_heads = self._heads_for_linear(node)
                 compute_candidates.append(("compute_linear", node, n_heads))
+        # Deferred Adds: neither input is dead, so we can't use add_into.
+        # Instead, copy both inputs to fresh columns via two groups of heads.
+        for node in deferred_adds:
+            n_heads = 2 * self._heads_for_node(node)
+            compute_candidates.append(("compute_add", node, n_heads))
 
         # Sort: Attn first; under column pressure prefer nodes that free columns,
         # otherwise maximize parallelism via critical path.
@@ -451,6 +460,10 @@ class LayerScheduler:
             if self._is_dead(node, computed_nodes):
                 dead.append(node)
         return dead
+
+    def _heads_for_node(self, node: Node) -> int:
+        """Number of attention heads needed to copy a node's output."""
+        return (len(node) + self.d_head - 1) // self.d_head
 
     def _heads_for_linear(self, node: Linear) -> int:
         """Number of attention heads needed for a standalone Linear."""

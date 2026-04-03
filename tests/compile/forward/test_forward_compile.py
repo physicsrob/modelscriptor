@@ -18,6 +18,7 @@ from modelscriptor.modelscript.inout_nodes import (
 from modelscriptor.modelscript.arithmetic_ops import (
     add,
     add_scalar,
+    add_scaled_nodes,
     relu,
     relu_add,
     concat,
@@ -30,7 +31,7 @@ D = 256
 D_HEAD = 16
 
 
-def _verify(output_node, n_pos, input_values, pos_encoding=None):
+def _verify(output_node, n_pos, input_values, pos_encoding=None, max_layers=100):
     """Compile and verify output matches node.compute()."""
     net = forward_compile(
         d=D,
@@ -38,6 +39,7 @@ def _verify(output_node, n_pos, input_values, pos_encoding=None):
         output_node=output_node,
         pos_encoding=pos_encoding,
         verbose=False,
+        max_layers=max_layers,
     )
     assert net.feature_assignment is not None
 
@@ -438,4 +440,41 @@ def test_compile_switch_with_attention_conditions():
             "flag": torch.tensor([[1.0], [-1.0], [1.0]]),
         },
         pos_encoding=pos,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scheduler deadlock: Add nodes with shared inputs
+# ---------------------------------------------------------------------------
+
+
+def test_compile_add_shared_inputs():
+    """Multiple Add nodes sharing the same inputs must not deadlock the scheduler.
+
+    The scheduler only schedules Add via add_into when one input is "dead"
+    (all its other consumers already computed). When two Add nodes share both
+    inputs, neither input can become dead because each has the other Add as
+    an unconsumed consumer — a circular dependency.
+
+    This is the minimal reproduction: x and y feed two separate Add nodes,
+    whose results are combined via a Linear (add_scaled_nodes).
+    """
+    x = create_input("x", 1)
+    y = create_input("y", 1)
+
+    # Two Add nodes sharing both inputs — deadlocks if not handled
+    sum1 = add(x, y)
+    sum2 = add(x, y)
+
+    # Combine via Linear (not Add) so the output itself isn't blocked
+    output = add_scaled_nodes(1.0, sum1, 1.0, sum2)
+
+    _verify(
+        output,
+        n_pos=2,
+        input_values={
+            "x": torch.tensor([[3.0], [7.0]]),
+            "y": torch.tensor([[4.0], [2.0]]),
+        },
+        max_layers=10,  # Deadlock manifests immediately; don't spin for 100 layers
     )
