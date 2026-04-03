@@ -5,7 +5,6 @@ description = "A compiler that transforms computation graphs into transformer ne
 requires-python = ">=3.10"
 dependencies = [
     "torch",
-    "ortools",
     "onnx",
     "onnxruntime",
 ]

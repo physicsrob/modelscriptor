@@ -23,6 +23,29 @@ make test        # run tests
 make lint        # run black + mypy
 ```
 
+
+## Examples
+
+ModelScriptor has been used to compile several non-trivial programs into
+transformer weights:
+
+**Multi-digit adder** (`examples/adder.py`) -- Parses "123+456=" and outputs
+"579" autoregressively. Digit-by-digit addition with carry propagation, exactly
+like pencil-and-paper arithmetic. The 3-digit version compiles to a 29-layer
+transformer with d=1024.
+
+**Calculator** (`examples/calculator.py`) -- Supports +, -, * on positive
+integers up to 3 digits. Subtraction handles negative results; multiplication
+uses long multiplication with partial product rows. Compiles to 38 layers with
+d=2048.
+
+Both examples can be compiled to ONNX for portable inference:
+
+```bash
+make compile     # produces adder.onnx and calculator.onnx
+```
+
+
 ## Key Concepts
 
 ### Nodes
@@ -64,22 +87,21 @@ A simple 1-layer transformer has states at each boundary:
 At each state, some set of nodes are **alive** -- their values are sitting in
 the residual stream, either because they were just computed or because they're
 being passed through for later use. The compiler tracks which nodes are alive at
-each state, and the solver assigns each alive node to specific columns in the
-residual stream at that state.
+each state, and assigns each alive node to specific columns in the residual
+stream at that state.
 
 
 ## The Residual Stream Allocation Problem
 
-A transformer's residual stream is a fixed-width vector (say, 256 floats) that
+A transformer's residual stream is a fixed-width vector (say, 1024 floats) that
 carries all information between layers. Think of it as a shared whiteboard with
 numbered columns. At every point between layers, everything the transformer
 "knows" must be written somewhere on this whiteboard.
 
-Each value in the computation graph occupies a contiguous range of columns. For
-example, if your computation involves an input (10 floats), a linear
-transformation result (10 floats), a ReLU result (10 floats), and a final
-output (10 floats), each of these needs its own non-overlapping slice of the
-residual stream.
+Each value in the computation graph occupies a set of columns. For example, if
+your computation involves an input (10 floats), a linear transformation result
+(10 floats), a ReLU result (10 floats), and a final output (10 floats), each
+of these needs its own non-overlapping columns in the residual stream.
 
 ### The rules
 
@@ -99,112 +121,87 @@ need to be adjacent in the residual stream. The compiler scatters the Linear
 node's weight matrix to whatever columns the inputs occupy. This is a key
 simplification -- it means concatenation adds no allocation constraints.
 
-**Minimize width.** We want the narrowest residual stream possible -- fewer
-columns means a smaller, faster transformer.
-
-### Why this is hard
-
-With one layer and one state, you'd just pack things greedily. But a real
-compilation involves:
-
-- Multiple layers, each with multiple states (before attention, after
-  attention, before FFN, after FFN)
-- Skip connections that lock values to the same columns across states
-- The same value appearing in many states (it stays alive until consumed)
-
-These cross-state constraints create a coupled packing problem. A column
-assignment that looks fine for one state might make another state impossible to
-pack. The assignment must be solved globally, considering all states and
-constraints simultaneously.
-
-The compiler uses Google's OR-Tools CP-SAT solver to find valid allocations.
-Each node is modeled as an interval variable, and the solver's native
-`AddNoOverlap` constraint ensures no two nodes share columns within a state.
+**Columns need not be contiguous.** A node's columns can be scattered anywhere
+in the residual stream. The weight writer gathers and scatters via index lists,
+so physical adjacency is never required. This eliminates fragmentation entirely.
 
 
-## Compilation: Strategies and the Beam Search
+## How Compilation Works
 
-The compiler works backwards from the output node. At each layer, it asks:
-"How should I use this sublayer (FFN or Attention) to compute the nodes I need?"
+The compiler works **forward** from inputs to outputs, building the transformer
+one layer at a time. At each layer, a scheduler decides what to compute using
+the attention sublayer and FFN sublayer, then a weight writer sets the
+corresponding weight matrices.
 
-### What is a strategy?
+### The three primitives
 
-A **strategy** is a plan for how a single sublayer computes one node. Each
-sublayer is made of components wired in sequence:
+The transformer skip connection `out = in + f(in)` enables three operations:
 
-- **FFN sublayer:** linear1 → relu → linear2 → skip
-- **Attention sublayer:** attn → skip
+| Operation | Mechanism | Cost |
+|-----------|-----------|------|
+| **Write** to free columns | `0 + f(in) = f(in)` | 1 attention head or FFN slots |
+| **Add** into existing columns | `dead + live = Add(dead, live)` via skip | 1 attention head |
+| **Cancel** a dead node | `v + (-v) = 0` | 1 attention head |
 
-For each node, each component offers possible ways to handle it:
+### What each sublayer computes
 
-- **Skip component:** Route the node through the residual skip connection
-  (bypass the computation path), or if the node is an `Add`, decompose it
-  into skip + computation. Always has options.
-- **Attention component:** Compute an `Attn` node with an attention head.
-  Pass any node through as identity (using an attention head that copies from
-  the current position). Handle zero constants for free.
-- **Linear component:** Apply the node's weight matrix, or pass through as
-  identity.
-- **ReLU component:** Apply ReLU to a `ReLU` node. No other options -- this
-  component is a bottleneck for non-ReLU nodes passing through the FFN.
+**Attention sublayer** (budget: d/d_head heads per layer):
+- Attention nodes (cross-position lookups)
+- Zero-bias Linear nodes (current-position attention applies the weight matrix)
+- Add-into operations (reuses a dead addend's columns)
+- Cancellations (frees columns for reuse)
 
-A strategy for one node is a choice at each component: "this node goes through
-the skip connection" or "this node gets computed by attention head #3" etc.
+**FFN sublayer** (budget: d internal slots):
+- Linear → ReLU → Linear chains
+- Standalone ReLU nodes
+- Constants (via output bias, no slot cost)
+- Bias terms for Linear nodes computed in the attention sublayer
 
-### Combining strategies across nodes
+### Column allocation
 
-A sublayer must handle **all** its assigned nodes simultaneously. If there are
-22 nodes at a given layer, the compiler needs a joint strategy that satisfies
-all constraint-solver requirements (no feature index conflicts, etc.).
+The compiler uses a simple greedy allocator -- no constraint solver needed.
+Nodes are assigned to whatever columns are free at the time they're computed.
+When a node is dead (all downstream consumers have been computed), its columns
+are either cancelled (freeing them) or reused in-place by an Add operation.
 
-`get_combined_strategies` does this via **beam search**. It processes nodes one
-at a time:
+### Pressure-aware scheduling
 
-1. Pick a node, take its top K strategies (sorted by a score that counts
-   ancestor nodes -- simpler dependencies are preferred)
-2. Recursively combine strategies for all remaining nodes
-3. Cross-product the two sets, check each combination against the OR-Tools
-   constraint solver
-4. Keep the top K results
-
-The beam width K (`max_strategies`, default 2) controls the trade-off between
-compilation speed and reliability. Each node typically has 3-5 strategies, so
-with 22 nodes the search space is ~4^22 ≈ 10^13. The beam search explores a
-tiny fraction.
-
-### Why this can fail
-
-The beam search is sensitive to **node processing order**. Nodes are currently
-processed in arbitrary dict-iteration order. If the globally-viable strategy
-happens to rank 3rd for the first node processed, a beam width of 2 prunes it
-and compilation fails with "No strategies found."
-
-Empirically, for a 22-node case from a 2-digit adder:
-- Random ordering at beam width 2: **1 in 20** orderings find a solution
-- Beam width 3: **all 20** orderings find a solution
-- "Fewest strategies first" ordering at beam width 2: succeeds deterministically
-
-The cost of increasing beam width is linear -- each increment of K adds
-roughly 80 constraint-solver calls (~2 seconds) at this graph size. But the
-constraint solver itself gets slower as more layers accumulate constraints, so
-full compilation time is super-linear in the number of layers.
+When free columns drop below 25% of the residual stream width, the scheduler
+switches from critical-path priority to a pressure mode that prioritizes
+operations which free columns (cancellations and add-into) over new
+computations.
 
 
-## TODO List
-This list is a non-exhaustive list of all the things that needs to be done before this project is relatively feature complete.
+## The ModelScript Layer
 
-Immediately:
-- Remove group strategy optimization -- it's only necessary because we aren't compiling zero nodes.
-- Compile zero nodes to free up space -- can get away with just doing it in the attention layers
-- Copy the output to the input in the last attention layer
+The `modelscriptor/modelscript/` package provides high-level operations built
+on top of the raw graph nodes. These are what examples typically use:
+
+- **Arithmetic**: `add_scalar`, `negate`, `subtract`, `multiply_scalar`
+- **Logic**: `equals_vector`, `bool_not`, `bool_all_true`, `bool_any_true`
+- **Table lookups**: `map_to_table` -- maps an embedding-valued input to an
+  embedding-valued output via an FFN lookup table
+- **Selection**: `select` (if/else), `switch` (multi-way dispatch)
+- **Sequence operations**: `output_sequence`, `remove_leading_0s`
+- **Embedding arithmetic**: `sum_digits`, `sum_digit_seqs` -- digit-by-digit
+  addition with carry propagation in embedding space
 
 
-- [ ] Implement embedding / deembedding compilation
-- [ ] Separate tokenizer from embedding
-- [ ] Export to ONNX
+## Architecture
 
-Recently complete:
-- [x] Implement attn compilation in attention sublayer
-- [x] Refactor compilation scoring
-- [x] Include compilation statistics (number of parameters, efficiency, etc)
-- [x] Better pass-through support for attention layers; We shouldn't require one head per zero.
+```
+modelscriptor/
+├── graph/              # Computation graph: nodes, embeddings, attention, etc.
+├── modelscript/        # High-level operations (arithmetic, logic, tables)
+└── compiler/
+    ├── forward/        # The forward compiler
+    │   ├── compile.py        # Main entry point (forward_compile)
+    │   ├── graph_analysis.py # Topological order, consumers, critical paths
+    │   ├── residual_map.py   # Greedy column allocator
+    │   ├── scheduler.py      # Layer-by-layer operation scheduling
+    │   └── weight_writer.py  # Writes weight matrices into transformer layers
+    ├── components/     # Transformer component abstractions (attn, linear, relu)
+    ├── groups/         # Sublayer and layer groupings
+    ├── export.py       # ONNX export
+    └── transformer.py  # HeadlessTransformer (the compiled artifact)
+```
