@@ -36,6 +36,11 @@ class AttnSubLayer:
         else:
             return x
 
+    def forward_cached(self, inp, past_kv=None):
+        x, new_kv = self.attn.forward_cached(inp, past_kv)
+        x = x + inp
+        return x, new_kv
+
     def num_params(self):
         return self.attn.num_params()
 
