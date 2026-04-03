@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -53,6 +53,47 @@ class AttnLayerComponent(Component):
         output = torch.einsum('hpk,hkd->pd', weighted, self.output_matrix)
 
         return output
+
+    def forward_cached(
+        self,
+        inp: torch.Tensor,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Forward pass with KV cache.
+
+        Args:
+            inp: (n_new, d) — new positions only (full seq on prefill, 1 on generation)
+            past_kv: None or (K, V) each (n_heads, n_past, d_head)
+
+        Returns:
+            output: (n_new, d)
+            new_kv: (K, V) each (n_heads, n_past+n_new, d_head)
+        """
+        Q = torch.einsum('pd,hdk->hpk', inp, self.query_matrix)
+        K_new = torch.einsum('pd,hdk->hpk', inp, self.key_matrix)
+        V_new = torch.einsum('pd,hdk->hpk', inp, self.value_matrix)
+
+        if past_kv is not None:
+            K = torch.cat([past_kv[0], K_new], dim=1)
+            V = torch.cat([past_kv[1], V_new], dim=1)
+        else:
+            K, V = K_new, V_new
+
+        n_new = inp.shape[0]
+        n_total = K.shape[1]
+
+        attn_logits = torch.bmm(Q, K.transpose(1, 2))  # (n_heads, n_new, n_total)
+        mask = torch.triu(
+            torch.ones(n_new, n_total, device=inp.device),
+            diagonal=n_total - n_new + 1,
+        ).bool()
+        attn_logits.masked_fill_(mask.unsqueeze(0), -1000.0)
+        attn = torch.softmax(attn_logits, dim=2)
+
+        weighted = torch.bmm(attn, V)  # (n_heads, n_new, d_head)
+        output = torch.einsum('hpk,hkd->pd', weighted, self.output_matrix)
+
+        return output, (K, V)
 
     def num_params(self) -> int:
         return (
