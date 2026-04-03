@@ -64,15 +64,14 @@ def _check(net, output_node, embedding, input_str, expected):
 
 @pytest.fixture(scope="module")
 def calc_1digit():
-    # Scalar-space thermometer FFNs need more width than V1's embedding-space approach
-    net, output_node, embedding = _compile(1, d=2048)
+    net, output_node, embedding = _compile(1, d=1024)
     return net, output_node, embedding
 
 
 @pytest.fixture(scope="module")
 def calc_3digit():
-    # 3-digit multiply: thermometer_square(s, 1998) alone has ~4000 ReLU units
-    net, output_node, embedding = _compile(3, d=4096)
+    # thermometer_square now splits across layers, so d=1024 suffices
+    net, output_node, embedding = _compile(3, d=1024)
     return net, output_node, embedding
 
 
