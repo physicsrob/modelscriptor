@@ -5,7 +5,7 @@ ResidualStreamMap. No strategies, no FeatureAssignment — just scatter writes.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import torch
 import torch.nn.functional as F
@@ -20,14 +20,14 @@ from modelscriptor.graph.relu import ReLU
 
 @dataclass
 class AttnHeadOp:
-    op_type: str  # "compute_attn", "compute_linear", "compute_add", "cancel", "add_into"
+    op_type: Literal["compute_attn", "compute_linear", "compute_add", "cancel", "add_into"]
     node: Node
     target_cols: List[int]
 
 
 @dataclass
 class FFNOp:
-    op_type: str  # "compute_relu", "compute_constant", "compute_bias"
+    op_type: Literal["compute_relu", "compute_standalone_relu", "compute_constant", "compute_bias"]
     node: Node
     target_cols: List[int]
     ffn_slots: List[int] = field(default_factory=list)
@@ -109,9 +109,9 @@ def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
     assert isinstance(node, Attn)
 
     query_in, key_in, value_in = node.inputs
-    q_idx = rmap.get_node_indices(query_in)
-    k_idx = rmap.get_node_indices(key_in)
-    v_idx = rmap.get_node_indices(value_in)
+    q_idx = rmap.resolve_indices(query_in)
+    k_idx = rmap.resolve_indices(key_in)
+    v_idx = rmap.resolve_indices(value_in)
     o_idx = op.target_cols
 
     # Pad node matrices to layer d_head if needed
@@ -159,7 +159,7 @@ def _write_compute_linear(
     d_input = len(input_node)
 
     pe_idx = rmap.get_indices(pos_encoding)
-    v_idx = rmap.get_node_indices(input_node)  # resolves through Concatenate
+    v_idx = rmap.resolve_indices(input_node)  # resolves through Concatenate
     o_idx = op.target_cols
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
@@ -215,7 +215,7 @@ def _write_compute_add(
 
     # Copy each input to the output columns via separate heads.
     for input_node in [a0, a1]:
-        v_idx = rmap.get_node_indices(input_node)
+        v_idx = rmap.resolve_indices(input_node)
         for start in range(0, d_output, d_head):
             end = min(start + d_head, d_output)
             chunk_size = end - start
@@ -309,7 +309,7 @@ def _write_add_into(
     d_live = len(live_addend)
 
     pe_idx = rmap.get_indices(pos_encoding)
-    v_idx = rmap.get_node_indices(live_addend)  # resolves through Concatenate
+    v_idx = rmap.resolve_indices(live_addend)  # resolves through Concatenate
     o_idx = op.target_cols  # dead addend's columns
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
@@ -360,7 +360,7 @@ def _write_compute_relu(ffn, op: FFNOp, rmap: ResidualStreamMap):
     assert isinstance(l1_node, Linear)
 
     input_node = l1_node.inputs[0]
-    in_idx = rmap.get_node_indices(input_node)
+    in_idx = rmap.resolve_indices(input_node)
     ffn_slots = op.ffn_slots
     out_idx = op.target_cols
 
@@ -411,7 +411,7 @@ def _write_compute_standalone_relu(ffn, op: FFNOp, rmap: ResidualStreamMap):
     assert isinstance(relu_node, ReLU)
 
     input_node = relu_node.inputs[0]
-    in_idx = rmap.get_node_indices(input_node)
+    in_idx = rmap.resolve_indices(input_node)
     ffn_slots = op.ffn_slots
     out_idx = op.target_cols
 

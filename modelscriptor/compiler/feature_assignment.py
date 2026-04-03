@@ -47,18 +47,18 @@ class FeatureAssignment:
         elif isinstance(node, Concatenate):
             # Concatenate is a logical grouping — gather children's indices in order.
             indices = []
-            for child in simplify_nodes([node]):
+            for child in flatten_concat_nodes([node]):
                 indices += self.get_node_indices(state, child)
             return indices
         return self.mapping[state][node]
 
 
-def simplify_nodes(nodes: List[Node]) -> List[Node]:
+def flatten_concat_nodes(nodes: List[Node]) -> List[Node]:
     """Flatten Concatenate nodes to leaf children, remove Placeholder."""
     simplified_other_nodes = []
     for n in nodes:
         if isinstance(n, Concatenate):
-            simplified_other_nodes += simplify_nodes(n.inputs)
+            simplified_other_nodes += flatten_concat_nodes(n.inputs)
         elif isinstance(n, Placeholder):
             pass
         else:

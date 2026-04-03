@@ -149,12 +149,12 @@ def test_attn_compute_small_d_head():
 
 
 def test_attn_compute_shared_inputs():
-    """Attn node where query_in == key_in (like get_last_value)."""
+    """Attn node where query_in == key_in (like attend_to_offset)."""
     pos = _make_pos_encoding()
     value_in = InputNode("v", 4)
 
-    # get_last_value pattern: query and key both use pos_encoding
-    attn_node = pos.get_last_value(value_in, delta_pos=-1)
+    # attend_to_offset pattern: query and key both use pos_encoding
+    attn_node = pos.attend_to_offset(value_in, delta_pos=-1)
 
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)

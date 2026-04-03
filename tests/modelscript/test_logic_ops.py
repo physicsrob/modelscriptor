@@ -1,7 +1,7 @@
 from modelscriptor.graph.spherical_codes import index_to_vector
 from modelscriptor.modelscript.inout_nodes import create_constant, create_input
 from modelscriptor.modelscript.logic_ops import (
-    compare_to_vector,
+    equals_vector,
     cond_add_vector,
     cond_gate,
     bool_any_true,
@@ -12,12 +12,12 @@ from modelscriptor.modelscript.logic_ops import (
 import torch
 
 
-def test_compare_to_vector():
+def test_equals_vector():
     for i in range(10):
         for j in range(10):
             x = create_constant(index_to_vector(i))
             c = index_to_vector(j)
-            y = compare_to_vector(x, c)
+            y = equals_vector(x, c)
             output = y.compute(n_pos=1, input_values={})
             expected_output = torch.tensor(1.0 if i == j else -1.0)
             assert torch.allclose(output, expected_output, atol=1.0e-3)

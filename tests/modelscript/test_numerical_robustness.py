@@ -1,8 +1,8 @@
-"""Tests for numerical robustness when chaining map_to_table, compare_to_vector, and select.
+"""Tests for numerical robustness when chaining map_to_table, equals_vector, and select.
 
 These tests capture the core blocker for calculator multiplication: when the output
 of one operation (map_to_table, select) feeds into another operation that uses
-turn_on_speed-scaled dot products, small Euclidean errors get amplified into
+step_sharpness-scaled dot products, small Euclidean errors get amplified into
 incorrect results.
 
 The tests are written to FAIL against the current implementation and PASS once the
@@ -15,7 +15,7 @@ import torch
 from modelscriptor.graph import Embedding
 from modelscriptor.modelscript.arithmetic_ops import concat
 from modelscriptor.modelscript.inout_nodes import create_constant, create_embedding
-from modelscriptor.modelscript.logic_ops import compare_to_vector
+from modelscriptor.modelscript.logic_ops import equals_vector
 from modelscriptor.modelscript.map_select import map_to_table, select
 
 VOCAB = [str(i) for i in range(10)] + ["+", "-", "*", "=", "<eos>", "<bos"]
@@ -70,27 +70,27 @@ def test_chained_map_to_table_output_fidelity():
 
 
 # ---------------------------------------------------------------------------
-# compare_to_vector after map_to_table
+# equals_vector after map_to_table
 # ---------------------------------------------------------------------------
 
 
-def test_compare_to_vector_after_map_to_table():
-    """compare_to_vector should recognize an embedding that went through map_to_table."""
+def test_equals_vector_after_map_to_table():
+    """equals_vector should recognize an embedding that went through map_to_table."""
     embedding = _make_digit_embedding()
     table = _digit_identity_table(embedding)
 
     for digit in range(10):
         inp = create_constant(embedding.get_embedding(str(digit)))
         looked_up = map_to_table(inp, table, default=embedding.get_embedding("0"))
-        result = compare_to_vector(looked_up, embedding.get_embedding(str(digit)))
+        result = equals_vector(looked_up, embedding.get_embedding(str(digit)))
         output = result.compute(n_pos=1, input_values={}).item()
         assert output == pytest.approx(
             1.0, abs=0.1
-        ), f"digit {digit}: compare_to_vector={output:.4f}, expected ~1.0"
+        ), f"digit {digit}: equals_vector={output:.4f}, expected ~1.0"
 
 
-def test_compare_to_vector_after_map_to_table_rejects_wrong_digit():
-    """compare_to_vector should reject wrong digits even after map_to_table."""
+def test_equals_vector_after_map_to_table_rejects_wrong_digit():
+    """equals_vector should reject wrong digits even after map_to_table."""
     embedding = _make_digit_embedding()
     table = _digit_identity_table(embedding)
 
@@ -98,15 +98,15 @@ def test_compare_to_vector_after_map_to_table_rejects_wrong_digit():
     looked_up = map_to_table(inp, table, default=embedding.get_embedding("0"))
 
     for wrong_digit in [0, 1, 2, 3, 4, 6, 7, 8, 9]:
-        result = compare_to_vector(looked_up, embedding.get_embedding(str(wrong_digit)))
+        result = equals_vector(looked_up, embedding.get_embedding(str(wrong_digit)))
         output = result.compute(n_pos=1, input_values={}).item()
         assert output == pytest.approx(
             -1.0, abs=0.1
-        ), f"wrong digit {wrong_digit}: compare_to_vector={output:.4f}, expected ~-1.0"
+        ), f"wrong digit {wrong_digit}: equals_vector={output:.4f}, expected ~-1.0"
 
 
-def test_compare_to_vector_after_double_map_to_table():
-    """compare_to_vector should work after two chained map_to_table lookups."""
+def test_equals_vector_after_double_map_to_table():
+    """equals_vector should work after two chained map_to_table lookups."""
     embedding = _make_digit_embedding()
     table = _digit_identity_table(embedding)
 
@@ -114,42 +114,42 @@ def test_compare_to_vector_after_double_map_to_table():
         inp = create_constant(embedding.get_embedding(str(digit)))
         first = map_to_table(inp, table, default=embedding.get_embedding("0"))
         second = map_to_table(first, table, default=embedding.get_embedding("0"))
-        result = compare_to_vector(second, embedding.get_embedding(str(digit)))
+        result = equals_vector(second, embedding.get_embedding(str(digit)))
         output = result.compute(n_pos=1, input_values={}).item()
         assert output == pytest.approx(
             1.0, abs=0.1
-        ), f"digit {digit}: compare_to_vector after double lookup={output:.4f}"
+        ), f"digit {digit}: equals_vector after double lookup={output:.4f}"
 
 
 # ---------------------------------------------------------------------------
-# compare_to_vector output bounds
+# equals_vector output bounds
 # ---------------------------------------------------------------------------
 
 
-def test_compare_to_vector_output_bounds_exact_input():
-    """compare_to_vector output should be in [-1, 1] for exact embeddings."""
+def test_equals_vector_output_bounds_exact_input():
+    """equals_vector output should be in [-1, 1] for exact embeddings."""
     embedding = _make_digit_embedding()
 
     for i in range(10):
         for j in range(10):
             inp = create_constant(embedding.get_embedding(str(i)))
-            result = compare_to_vector(inp, embedding.get_embedding(str(j)))
+            result = equals_vector(inp, embedding.get_embedding(str(j)))
             output = result.compute(n_pos=1, input_values={}).item()
             assert (
                 -1.0 - 1e-3 <= output <= 1.0 + 1e-3
-            ), f"compare_to_vector({i}, {j}) = {output:.4f}, outside [-1, 1]"
+            ), f"equals_vector({i}, {j}) = {output:.4f}, outside [-1, 1]"
 
 
 # ---------------------------------------------------------------------------
-# compare_to_vector after select
+# equals_vector after select
 # ---------------------------------------------------------------------------
 
 
-def test_compare_to_vector_after_select():
-    """compare_to_vector should work on select output (the remove_leading_0s path).
+def test_equals_vector_after_select():
+    """equals_vector should work on select output (the remove_leading_0s path).
 
     select with an exact boolean condition should produce exact embeddings,
-    so compare_to_vector should work. This is the simpler chain that
+    so equals_vector should work. This is the simpler chain that
     remove_leading_0s relies on.
     """
     embedding = _make_digit_embedding()
@@ -163,31 +163,31 @@ def test_compare_to_vector_after_select():
     # Condition = true → should select e3
     cond_true = create_constant(torch.tensor([1.0]))
     selected = select(cond=cond_true, true_node=true_node, false_node=false_node)
-    result = compare_to_vector(selected, e3)
+    result = equals_vector(selected, e3)
     output = result.compute(n_pos=1, input_values={}).item()
     assert output == pytest.approx(
         1.0, abs=0.1
-    ), f"compare_to_vector(select(true→3), 3) = {output:.4f}, expected ~1.0"
+    ), f"equals_vector(select(true→3), 3) = {output:.4f}, expected ~1.0"
 
     # Also verify it rejects the wrong digit
-    result_wrong = compare_to_vector(selected, e7)
+    result_wrong = equals_vector(selected, e7)
     output_wrong = result_wrong.compute(n_pos=1, input_values={}).item()
     assert output_wrong == pytest.approx(
         -1.0, abs=0.1
-    ), f"compare_to_vector(select(true→3), 7) = {output_wrong:.4f}, expected ~-1.0"
+    ), f"equals_vector(select(true→3), 7) = {output_wrong:.4f}, expected ~-1.0"
 
     # Condition = false → should select e7
     cond_false = create_constant(torch.tensor([-1.0]))
     selected_f = select(cond=cond_false, true_node=true_node, false_node=false_node)
-    result_f = compare_to_vector(selected_f, e7)
+    result_f = equals_vector(selected_f, e7)
     output_f = result_f.compute(n_pos=1, input_values={}).item()
     assert output_f == pytest.approx(
         1.0, abs=0.1
-    ), f"compare_to_vector(select(false→7), 7) = {output_f:.4f}, expected ~1.0"
+    ), f"equals_vector(select(false→7), 7) = {output_f:.4f}, expected ~1.0"
 
 
-def test_compare_to_vector_after_nested_select():
-    """compare_to_vector should work after two levels of select (remove_leading_0s depth=2)."""
+def test_equals_vector_after_nested_select():
+    """equals_vector should work after two levels of select (remove_leading_0s depth=2)."""
     embedding = _make_digit_embedding()
 
     e0 = embedding.get_embedding("0")
@@ -208,11 +208,11 @@ def test_compare_to_vector_after_nested_select():
         false_node=create_constant(e9),
     )
 
-    result = compare_to_vector(level2, e5)
+    result = equals_vector(level2, e5)
     output = result.compute(n_pos=1, input_values={}).item()
     assert output == pytest.approx(
         1.0, abs=0.1
-    ), f"compare_to_vector after 2 selects = {output:.4f}, expected ~1.0"
+    ), f"equals_vector after 2 selects = {output:.4f}, expected ~1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +331,7 @@ def test_remove_leading_0s_single_level():
 def test_remove_leading_0s_two_levels():
     """remove_leading_0s with max_removals=2 should work.
 
-    This requires compare_to_vector to work on select output (level 2 checks
+    This requires equals_vector to work on select output (level 2 checks
     whether the shifted sequence still has a leading zero).
     """
     from examples.adder import remove_leading_0s

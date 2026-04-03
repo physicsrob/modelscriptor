@@ -59,7 +59,7 @@ def test_schedule_attn_node():
     """Attn node produces AttnHeadOp('compute_attn')."""
     pos = _make_pos_encoding()
     v = InputNode("v", 4)
-    attn_node = pos.get_last_value(v, delta_pos=-1)
+    attn_node = pos.attend_to_offset(v, delta_pos=-1)
 
     graph = GraphAnalyzer(attn_node)
     rmap = ResidualStreamMap(D)
@@ -560,7 +560,7 @@ def test_mixed_attn_and_ffn():
     pos = _make_pos_encoding()
     v = InputNode("v", 4)
     x = InputNode("x", 4)
-    attn_node = pos.get_last_value(v, delta_pos=-1)
+    attn_node = pos.attend_to_offset(v, delta_pos=-1)
     l2, r, l1 = _make_relu_chain(x, 8, 3, "chain")
     out_cat = Concatenate([attn_node, l2])
     out = _make_linear(out_cat, 1, "out")
@@ -724,12 +724,12 @@ def test_add_into_shared_addend_not_reassigned():
 
     # Replicate the weight writer's live-addend resolution:
     # if a0 is allocated, live = a0; else live = a1.
-    # Then get_node_indices(live) must succeed.
+    # Then resolve_indices(live) must succeed.
     for op in add_into_ops:
         a0, a1 = op.node.inputs
         live = a0 if rmap.is_allocated(a0) else a1
         try:
-            rmap.get_node_indices(live)
+            rmap.resolve_indices(live)
         except KeyError:
             pytest.fail(
                 f"add_into live addend not in residual map — shared node "

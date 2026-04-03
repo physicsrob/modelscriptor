@@ -83,7 +83,7 @@ def forward_compile(
         if output_node in computed:
             break
 
-        layer = net.add_layer(end=True)
+        layer = net.add_layer(append=True)
         attn_ops, ffn_ops = scheduler.schedule_layer(residual_map, computed)
         write_attn_sublayer(layer, attn_ops, residual_map, pos_encoding)
         write_ffn_sublayer(layer, ffn_ops, residual_map)
@@ -108,7 +108,7 @@ def forward_compile(
 
     # Ensure at least one layer exists for FeatureAssignment states
     if not net.layers:
-        net.add_layer(end=True)
+        net.add_layer(append=True)
 
     # 4. Build FeatureAssignment bridge from saved input indices
     in_state = net.layers[0].attn.in_state

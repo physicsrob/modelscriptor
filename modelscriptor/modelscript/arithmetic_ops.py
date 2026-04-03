@@ -4,9 +4,9 @@ from modelscriptor.graph import Node, Add, Concatenate, Linear
 import torch
 
 from modelscriptor.graph.relu import ReLU
-from modelscriptor.modelscript.ffn_layer import ffn_layer
+from modelscriptor.modelscript.linear_relu_linear import linear_relu_linear
 
-from modelscriptor.modelscript.const import turn_on_speed, big_offset
+from modelscriptor.modelscript.const import step_sharpness, big_offset
 
 
 def add_scalar(inp: Node, scalar: float) -> Node:
@@ -22,7 +22,7 @@ def add_scalar(inp: Node, scalar: float) -> Node:
     """
     return Add(
         inp,
-        ffn_layer(
+        linear_relu_linear(
             input_node=inp,
             input_proj=torch.tensor([0.0] * len(inp)),
             input_bias=torch.zeros(1),
@@ -67,17 +67,17 @@ def compare(
 
     # We need 2 FFN entries, we'll use the equation:
     # y= (true_level-false_level) * [
-    #   max(turn_on_speed*x - turn_on_speed*thresh, 0) - max(turn_on_speed*x - turn_on_speed*thresh - 1, 0)
+    #   max(step_sharpness*x - step_sharpness*thresh, 0) - max(step_sharpness*x - step_sharpness*thresh - 1, 0)
     # ] + false_level
 
     d_input = len(inp)
 
-    input_proj = torch.tensor([[turn_on_speed], [turn_on_speed]])
-    input_bias = torch.tensor([-turn_on_speed * thresh, -turn_on_speed * thresh - 1.0])
+    input_proj = torch.tensor([[step_sharpness], [step_sharpness]])
+    input_bias = torch.tensor([-step_sharpness * thresh, -step_sharpness * thresh - 1.0])
     output_proj = torch.tensor([[true_level - false_level], [false_level - true_level]])
     output_bias = false_level * torch.ones(1)
 
-    return ffn_layer(
+    return linear_relu_linear(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,
@@ -99,14 +99,14 @@ def concat(inp_list: List[Node]) -> Node:
     return Concatenate(inp_list)
 
 
-def add_scaled_nodes(c1: float, inp1: Node, c2: float, inp2: Node) -> Node:
+def add_scaled_nodes(scale1: float, inp1: Node, scale2: float, inp2: Node) -> Node:
     """
     Computes the linear combination of two nodes using specified coefficients.
 
     Args:
-        c1 (float): Coefficient for the first node.
+        scale1 (float): Coefficient for the first node.
         inp1 (Node): First node.
-        c2 (float): Coefficient for the second node.
+        scale2 (float): Coefficient for the second node.
         inp2 (Node): Second node.
 
     Returns:
@@ -118,8 +118,8 @@ def add_scaled_nodes(c1: float, inp1: Node, c2: float, inp2: Node) -> Node:
     concat = Concatenate([inp1, inp2])
     M = torch.zeros(len(concat), d)
     for i in range(d):
-        M[i, i] = c1
-        M[d + i, i] = c2
+        M[i, i] = scale1
+        M[d + i, i] = scale2
 
     return Linear(concat, M)
 
@@ -183,7 +183,7 @@ def relu_add(inp1: Node, inp2: Node) -> Node:
         output_proj[i, i] = 1.0
         output_proj[len(inp1) + i, i] = 1.0
 
-    return ffn_layer(
+    return linear_relu_linear(
         input_node=x,
         input_proj=input_proj,
         input_bias=input_bias,
@@ -272,17 +272,17 @@ def thermometer_square(inp: Node, max_value: int) -> Node:
         row = 2 * (k - 1)
 
         # Paired ReLU: ReLU(s*x - s*threshold) - ReLU(s*x - s*threshold - 1)
-        input_proj[row, 0] = turn_on_speed
-        input_proj[row + 1, 0] = turn_on_speed
-        input_bias[row] = -turn_on_speed * threshold
-        input_bias[row + 1] = -turn_on_speed * threshold - 1.0
+        input_proj[row, 0] = step_sharpness
+        input_proj[row + 1, 0] = step_sharpness
+        input_bias[row] = -step_sharpness * threshold
+        input_bias[row + 1] = -step_sharpness * threshold - 1.0
 
         # Odd-number weight: detector k contributes (2k-1) instead of 1.0
         weight = 2.0 * k - 1.0
         output_proj[row, 0] = weight
         output_proj[row + 1, 0] = -weight
 
-    return ffn_layer(
+    return linear_relu_linear(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,

@@ -9,7 +9,7 @@ Mutates residual_map (allocate, free, reassign) and computed_nodes (add).
 
 from typing import List, Optional, Set, Tuple
 
-from modelscriptor.compiler.feature_assignment import simplify_nodes
+from modelscriptor.compiler.feature_assignment import flatten_concat_nodes
 from modelscriptor.compiler.forward.graph_analysis import GraphAnalyzer
 from modelscriptor.compiler.forward.residual_map import ResidualStreamMap
 from modelscriptor.compiler.forward.weight_writer import AttnHeadOp, FFNOp
@@ -20,6 +20,21 @@ from modelscriptor.graph.relu import ReLU
 
 
 class LayerScheduler:
+    """Decides what operations to schedule in one transformer layer.
+
+    Given the current residual-stream allocation and which nodes have
+    been computed, picks attention and FFN operations for the next layer.
+
+    Key concepts:
+        - **dead node**: all downstream consumers are already computed,
+          so its residual-stream columns can be reclaimed.
+        - **pressure**: free columns are below 25% of ``d`` — the
+          scheduler prioritises operations that free columns over those
+          on the critical path.
+        - **free add**: an ``Add`` where one input is dead — the dead
+          input's columns are reused in-place (no allocation needed).
+    """
+
     def __init__(
         self, graph: GraphAnalyzer, d: int, d_head: int, pos_encoding: PosEncoding
     ):
@@ -32,6 +47,21 @@ class LayerScheduler:
     def schedule_layer(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
     ) -> Tuple[List[AttnHeadOp], List[FFNOp]]:
+        """Schedule one transformer layer's worth of operations.
+
+        Phases:
+            1. Classify ready nodes (free adds, deferred adds, compute-ready).
+            2. Attention sublayer: free adds, compute ops (Attn/Linear/Add),
+               cancellations of dead nodes.
+            3. FFN sublayer: Linear->ReLU->Linear chains, standalone ReLUs,
+               constants, bias writes for biased Linears.
+
+        Mutates ``residual_map`` (allocate/free/reassign) and
+        ``computed_nodes`` (add newly computed nodes).
+
+        Returns:
+            ``(attn_ops, ffn_ops)`` lists for the weight writer.
+        """
         # --- 1. Classify ready nodes ---
         all_ready = self.graph.get_ready_nodes(computed_nodes)
 
@@ -373,7 +403,7 @@ class LayerScheduler:
         """
         cost = len(node)
         for inp in node.inputs:
-            leaves = simplify_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
+            leaves = flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
             for leaf in leaves:
                 if leaf is self.pos_encoding:
                     continue
@@ -404,7 +434,7 @@ class LayerScheduler:
 
         hypothetical = computed_nodes | {l1, relu, l2}
         for inp in l1.inputs:
-            leaves = simplify_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
+            leaves = flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
             for leaf in leaves:
                 if leaf is self.pos_encoding:
                     continue

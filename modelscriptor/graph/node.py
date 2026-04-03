@@ -6,6 +6,19 @@ global_node_id = 0
 
 
 class Node:
+    """Base class for all computation graph nodes.
+
+    Each node represents one operation in a dataflow graph that will be
+    compiled into transformer weights. Nodes are connected by their
+    ``inputs`` list (upstream dependencies).
+
+    Attributes:
+        d_output: Width of this node's output vector.
+        inputs: Upstream nodes whose outputs feed into this node.
+        node_id: Auto-incremented unique identifier.
+        name: Optional human-readable label (for debugging / repr).
+    """
+
     inputs: List["Node"]
     d_output: int
     node_id: int

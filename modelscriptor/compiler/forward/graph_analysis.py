@@ -1,7 +1,7 @@
 from collections import defaultdict, deque
 from typing import Dict, List, Set
 
-from modelscriptor.compiler.feature_assignment import simplify_nodes
+from modelscriptor.compiler.feature_assignment import flatten_concat_nodes
 from modelscriptor.compiler.utils import get_ancestor_nodes
 from modelscriptor.graph import (
     Node,
@@ -86,7 +86,7 @@ class GraphAnalyzer:
         """
         for inp in node.inputs:
             if isinstance(inp, Concatenate):
-                for leaf in simplify_nodes([inp]):
+                for leaf in flatten_concat_nodes([inp]):
                     if leaf not in available:
                         return False
             else:
