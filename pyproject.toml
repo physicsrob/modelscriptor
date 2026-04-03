@@ -27,8 +27,6 @@ index = [
 torch = { index = "pytorch-cu124" }
 
 [tool.pytest.ini_options]
-# Coverage: run with `pytest --cov` to enable
-cov_config = "pyproject.toml"
 
 [tool.coverage.run]
 source = ["modelscriptor"]
