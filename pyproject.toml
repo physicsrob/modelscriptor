@@ -15,6 +15,7 @@ dev = [
     "black",
     "mypy",
     "pytest",
+    "pytest-cov",
 ]
 
 [tool.uv]
@@ -24,6 +25,16 @@ index = [
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu124" }
+
+[tool.pytest.ini_options]
+# Coverage: run with `pytest --cov` to enable
+cov_config = "pyproject.toml"
+
+[tool.coverage.run]
+source = ["modelscriptor"]
+
+[tool.coverage.report]
+show_missing = true
 
 [tool.mypy]
 ignore_missing_imports = true
