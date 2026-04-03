@@ -14,26 +14,26 @@ from typing import Tuple, List
 
 import torch
 
-from modelscriptor.graph import Node, Embedding, PosEncoding
-from modelscriptor.modelscript.inout_nodes import (
+from torchwright.graph import Node, Embedding, PosEncoding
+from torchwright.ops.inout_nodes import (
     create_constant,
     create_embedding,
     create_pos_encoding,
 )
-from modelscriptor.modelscript.logic_ops import (
+from torchwright.ops.logic_ops import (
     equals_vector,
     bool_not,
     bool_all_true,
     bool_any_true,
 )
-from modelscriptor.modelscript.map_select import select, switch
-from modelscriptor.modelscript.embedding_arithmetic import (
+from torchwright.ops.map_select import select, switch
+from torchwright.ops.embedding_arithmetic import (
     sum_digit_seqs,
     subtract_digit_seqs,
     compare_digit_seqs,
     multiply_digit_seqs,
 )
-from modelscriptor.modelscript.sequence_ops import (
+from torchwright.ops.sequence_ops import (
     NumericSequence,
     output_sequence,
     remove_leading_0s,

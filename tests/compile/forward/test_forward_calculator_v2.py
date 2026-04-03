@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from modelscriptor.compiler.forward.compile import forward_compile
-from modelscriptor.compiler.transformer import HeadlessTransformer
-from modelscriptor.graph import Node, Embedding
+from torchwright.compiler.forward.compile import forward_compile
+from torchwright.compiler.transformer import HeadlessTransformer
+from torchwright.graph import Node, Embedding
 
 D = 1024
 D_HEAD = 16

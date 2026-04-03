@@ -1,8 +1,8 @@
 import torch
 
-from modelscriptor.compiler.forward.graph_analysis import GraphAnalyzer
-from modelscriptor.graph import Linear, ReLU, Add, Concatenate
-from modelscriptor.graph.misc import InputNode, Constant
+from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+from torchwright.graph import Linear, ReLU, Add, Concatenate
+from torchwright.graph.misc import InputNode, Constant
 from examples.adder import create_network_parts
 
 

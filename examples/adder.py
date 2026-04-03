@@ -13,17 +13,17 @@ from typing import Tuple
 
 import torch
 
-from modelscriptor.graph import Node, Embedding, PosEncoding
-from modelscriptor.graph.embedding import Unembedding
-from modelscriptor.modelscript.inout_nodes import (
+from torchwright.graph import Node, Embedding, PosEncoding
+from torchwright.graph.embedding import Unembedding
+from torchwright.ops.inout_nodes import (
     create_constant,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
 )
-from modelscriptor.modelscript.logic_ops import equals_vector
-from modelscriptor.modelscript.embedding_arithmetic import sum_digit_seqs
-from modelscriptor.modelscript.sequence_ops import (
+from torchwright.ops.logic_ops import equals_vector
+from torchwright.ops.embedding_arithmetic import sum_digit_seqs
+from torchwright.ops.sequence_ops import (
     NumericSequence,
     output_sequence,
     remove_leading_0s,

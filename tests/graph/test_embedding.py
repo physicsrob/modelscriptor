@@ -1,4 +1,4 @@
-from modelscriptor.graph import Embedding
+from torchwright.graph import Embedding
 import torch
 
 

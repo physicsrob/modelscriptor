@@ -15,18 +15,18 @@ Conventions:
 import torch
 import torch.nn.functional as F
 
-import modelscriptor.compiler.device as device_mod
-from modelscriptor.compiler.forward.residual_map import ResidualStreamMap
-from modelscriptor.compiler.forward.weight_writer import (
+import torchwright.compiler.device as device_mod
+from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.compiler.forward.weight_writer import (
     AttnHeadOp,
     FFNOp,
     write_attn_sublayer,
     write_ffn_sublayer,
 )
-from modelscriptor.compiler.groups.transformer_layer import TransformerLayer
-from modelscriptor.graph import Linear, ReLU, Attn, Add, Concatenate
-from modelscriptor.graph.misc import InputNode, Constant
-from modelscriptor.graph.pos_encoding import PosEncoding, attention_hardness
+from torchwright.compiler.groups.transformer_layer import TransformerLayer
+from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
+from torchwright.graph.misc import InputNode, Constant
+from torchwright.graph.pos_encoding import PosEncoding, attention_hardness
 
 D = 64
 D_HEAD = 16

@@ -6,16 +6,16 @@ the output matches node.compute() with torch.allclose.
 
 import torch
 
-from modelscriptor.compiler.forward.compile import forward_compile
-from modelscriptor.graph import Linear, ReLU, Add, Concatenate
-from modelscriptor.graph.misc import InputNode, Constant
-from modelscriptor.graph.pos_encoding import PosEncoding
-from modelscriptor.modelscript.inout_nodes import (
+from torchwright.compiler.forward.compile import forward_compile
+from torchwright.graph import Linear, ReLU, Add, Concatenate
+from torchwright.graph.misc import InputNode, Constant
+from torchwright.graph.pos_encoding import PosEncoding
+from torchwright.ops.inout_nodes import (
     create_input,
     create_constant,
     create_pos_encoding,
 )
-from modelscriptor.modelscript.arithmetic_ops import (
+from torchwright.ops.arithmetic_ops import (
     add,
     add_scalar,
     add_scaled_nodes,
@@ -24,8 +24,8 @@ from modelscriptor.modelscript.arithmetic_ops import (
     concat,
     sum_nodes,
 )
-from modelscriptor.modelscript.logic_ops import cond_gate, cond_add_vector
-from modelscriptor.modelscript.map_select import select, map_to_table
+from torchwright.ops.logic_ops import cond_gate, cond_add_vector
+from torchwright.ops.map_select import select, map_to_table
 
 D = 256
 D_HEAD = 16
@@ -333,7 +333,7 @@ def test_compile_switch():
     Exercises the case where cond_gate creates Add(inp, chain_output) nodes
     whose live addends must survive cancellation during compilation.
     """
-    from modelscriptor.modelscript.map_select import switch
+    from torchwright.ops.map_select import switch
 
     cond1 = create_input("c1", 1)
     cond2 = create_input("c2", 1)
@@ -374,8 +374,8 @@ def test_compile_multi_switch_shared_constants():
     operations. The shared constants + many cond_gate chains create a graph where
     add_into live addends can be incorrectly freed.
     """
-    from modelscriptor.modelscript.map_select import switch
-    from modelscriptor.modelscript.logic_ops import cond_gate
+    from torchwright.ops.map_select import switch
+    from torchwright.ops.logic_ops import cond_gate
 
     pos = create_pos_encoding()
     flag = create_input("flag", 1)
@@ -415,8 +415,8 @@ def test_compile_switch_with_attention_conditions():
     graph triggers multi-layer scheduling where add_into live addends
     can be incorrectly cancelled.
     """
-    from modelscriptor.modelscript.map_select import switch
-    from modelscriptor.modelscript.logic_ops import equals_vector
+    from torchwright.ops.map_select import switch
+    from torchwright.ops.logic_ops import equals_vector
 
     pos = create_pos_encoding()
     embedding_dim = 8

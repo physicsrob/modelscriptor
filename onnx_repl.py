@@ -1,11 +1,11 @@
-"""REPL for an ONNX-compiled modelscriptor model.
+"""REPL for an ONNX-compiled torchwright model.
 
 Usage:
     python compile_interact.py model.onnx
 """
 
 import argparse
-from modelscriptor.compiler.repl import run_repl
+from torchwright.compiler.repl import run_repl
 
 
 def main():

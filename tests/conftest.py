@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from modelscriptor.compiler.device import set_device
+from torchwright.compiler.device import set_device
 
 
 def pytest_addoption(parser):

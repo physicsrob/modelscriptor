@@ -13,13 +13,13 @@ Conventions:
 import pytest
 import torch
 
-from modelscriptor.compiler.forward.graph_analysis import GraphAnalyzer
-from modelscriptor.compiler.forward.residual_map import ResidualStreamMap
-from modelscriptor.compiler.forward.scheduler import LayerScheduler
-from modelscriptor.compiler.forward.weight_writer import AttnHeadOp, FFNOp
-from modelscriptor.graph import Linear, ReLU, Attn, Add, Concatenate
-from modelscriptor.graph.misc import InputNode, Constant
-from modelscriptor.graph.pos_encoding import PosEncoding
+from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.compiler.forward.scheduler import LayerScheduler
+from torchwright.compiler.forward.weight_writer import AttnHeadOp, FFNOp
+from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
+from torchwright.graph.misc import InputNode, Constant
+from torchwright.graph.pos_encoding import PosEncoding
 
 D = 64
 D_HEAD = 16
