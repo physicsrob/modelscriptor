@@ -12,8 +12,8 @@ converted back to digit embeddings.
   → [embed("4"), embed("0"), embed("8")]                  scalar_to_embedding
 
 Addition and subtraction are trivial in scalar space (one Add/Subtract node).
-Multiplication uses the polarization identity: a*b = ((a+b)² - (a-b)²) / 4,
-where squaring is implemented via thermometer coding (see arithmetic_ops.py).
+Multiplication uses the polarization identity: a*b = ((a+b)^2 - (a-b)^2) / 4,
+where squaring is implemented via thermometer coding (see arithmetic_ops).
 """
 
 from typing import Tuple, List
@@ -43,16 +43,15 @@ from modelscriptor.modelscript.logic_ops import (
     bool_not,
 )
 from modelscriptor.modelscript.map_select import select, switch
-
-from examples.adder import (
-    NumericSequence,
-    remove_leading_0s,
-    output_sequence,
-)
-from examples.adder_v2 import (
+from modelscriptor.modelscript.scalar_encoding import (
     digits_to_number,
     number_to_digit_scalars,
     scalar_to_embedding,
+)
+from modelscriptor.modelscript.sequence_ops import (
+    NumericSequence,
+    output_sequence,
+    remove_leading_0s,
 )
 
 
@@ -91,7 +90,8 @@ def create_network_parts(
     before_equals = bool_not(has_seen_equals)
     is_operator_input = bool_all_true([is_operator, before_equals])
 
-    # Latch which operator was seen (captured at the operator position)
+    # Latch which operator was seen (captured at the operator position,
+    # carried forward to all later positions via attention).
     which_plus = pos_encoding.get_prev_value(is_plus, is_operator_input)
     which_minus = pos_encoding.get_prev_value(is_minus, is_operator_input)
     which_times = pos_encoding.get_prev_value(is_times, is_operator_input)
@@ -149,11 +149,11 @@ def create_network_parts(
     sub_seq = [select(is_negative, sub_neg[i], sub_pos[i]) for i in range(seq_len)]
 
     # --- Phase 2c: Multiplication (scalar-space via polarization) ---
-    # a*b = ((a+b)² - (a-b)²) / 4, using thermometer squaring
+    # a*b = ((a+b)^2 - (a-b)^2) / 4, using thermometer squaring
     mul_result = multiply_integers(
         number_a, number_b, max_value=10**max_digits - 1
     )
-    max_result_mul = (10**max_digits - 1) ** 2  # e.g. 999²=998001
+    max_result_mul = (10**max_digits - 1) ** 2  # e.g. 999^2=998001
     num_mul_digits = 2 * max_digits
     mul_digit_scalars = number_to_digit_scalars(
         mul_result, num_mul_digits, max_result_mul
@@ -163,6 +163,7 @@ def create_network_parts(
     mul_seq = remove_leading_0s(embedding, mul_seq, max_removals=2 * max_digits - 1)
 
     # --- Phase 3: Dispatch by operator and output ---
+    # switch() selects the result corresponding to whichever operator was used.
     result_digits = []
     for i in range(seq_len):
         result_digits.append(

@@ -2,14 +2,13 @@ import pytest
 import torch
 
 from modelscriptor.modelscript.inout_nodes import create_embedding, create_input
-from examples.adder_v2 import (
+from modelscriptor.modelscript.arithmetic_ops import thermometer_floor_div
+from modelscriptor.modelscript.scalar_encoding import (
     digit_to_scaled_scalar,
     digits_to_number,
-    thermometer_floor_div,
     number_to_digit_scalars,
     scalar_to_embedding,
 )
-
 
 @pytest.fixture
 def embedding():
