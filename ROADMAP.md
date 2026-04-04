@@ -45,9 +45,10 @@ compiler capabilities.
   +, -, *. Tests tokenization, operator dispatch, and arithmetic. Compiles to
   38 layers at d=2048.
 
-- [ ] **Balanced parentheses checker.** Input a token sequence, output whether
+- [x] **Balanced parentheses checker.** Input a token sequence, output whether
   parentheses are balanced. Tests attention (looking back in sequence) and
-  counting.
+  counting. Uses parallel prefix sum (Hillis-Steele) with position-gated
+  OOB handling. Compiles to 51 layers at d=1024.
 
 - [ ] **String pattern matcher.** Input a token sequence, output whether it
   matches a pattern. Tests attention, logic ops, and conditional branching.

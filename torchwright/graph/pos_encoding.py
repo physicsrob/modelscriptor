@@ -24,6 +24,20 @@ class PosEncoding(Node):
     def compute(self, n_pos: int, input_values: dict):
         return self.get_pos_encoding(n_pos)
 
+    def get_position_scalar(self) -> "Linear":
+        """Approximate position index as a 1D scalar node.
+
+        Extracts the slowest-frequency sin component of the positional
+        encoding and scales it back to position space.  The result equals
+        ``pos`` to within 0.5 for positions 0-310 (d_pos=16).
+        """
+        from torchwright.graph.linear import Linear
+
+        freq = math.exp((self.d_pos - 2) * -(math.log(10000.0) / self.d_pos))
+        weight = torch.zeros(self.d_pos, 1)
+        weight[self.d_pos - 2, 0] = 1.0 / freq
+        return Linear(self, weight, name="position_scalar")
+
     def attend_to_offset(self, value: Node, delta_pos=-1) -> Node:
         if delta_pos == 0:
             # NOOP -- supporting this simplifies some use cases.
