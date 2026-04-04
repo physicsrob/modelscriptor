@@ -1,16 +1,16 @@
 """Token balance checker — equal counts of 'a' and 'b'.
 
 Parses a variable-length sequence of 'a' and 'b' tokens terminated by
-'?', and outputs 'Y' if the counts are equal, 'N' otherwise.
+'\\n', and outputs 'Y' if the counts are equal, 'N' otherwise.
 
 This is an intermediate example that validates the parallel prefix sum
 strategy (Hillis-Steele with position-gated OOB handling) before the
 full balanced-parentheses checker builds on top of it.
 
-    Input:  <bos> a b a b ?
+    Input:  <bos> a b a b \n
     Output: Y
 
-    Input:  <bos> a a b ?
+    Input:  <bos> a a b \n
     Output: N
 """
 
@@ -45,7 +45,7 @@ def create_network_parts(
     Args:
         n_stages: Prefix-sum doubling stages (handles up to 2**n_stages positions).
     """
-    vocab = list("ab?YN ") + ["<bos>", "<eos>"]
+    vocab = list("abYN ") + ["\n", "<bos>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
     pos_encoding = create_pos_encoding()
     embed = embedding.get_embedding
@@ -65,7 +65,7 @@ def create_network_parts(
     depth_is_zero = bool_all_true([depth_ge_zero, depth_le_zero])
 
     # --- Output at trigger ---
-    is_trigger = equals_vector(embedding, embed("?"))
+    is_trigger = equals_vector(embedding, embed("\n"))
     result = select(
         depth_is_zero,
         create_constant(embed("Y")),

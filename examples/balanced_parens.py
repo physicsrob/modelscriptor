@@ -1,7 +1,7 @@
 """Balanced parentheses checker.
 
 Parses a variable-length sequence of '(' and ')' tokens terminated by
-'?', and outputs 'Y' if the parentheses are balanced, 'N' otherwise.
+'\\n', and outputs 'Y' if the parentheses are balanced, 'N' otherwise.
 
 A sequence is balanced when:
   1. The total number of '(' equals the total number of ')'.
@@ -11,10 +11,10 @@ Uses a parallel prefix sum (Hillis-Steele) to compute nesting depth at
 every position, and a parallel prefix AND to verify no intermediate
 position underflows below zero.
 
-    Input:  <bos> ( ( ) ) ?
+    Input:  <bos> ( ( ) ) \n
     Output: Y
 
-    Input:  <bos> ) ( ?
+    Input:  <bos> ) ( \n
     Output: N  (underflow at position 1)
 """
 
@@ -49,7 +49,7 @@ def create_network_parts(
     Args:
         n_stages: Prefix-sum doubling stages (handles up to 2**n_stages positions).
     """
-    vocab = list("()?YN ") + ["<bos>", "<eos>"]
+    vocab = list("()YN ") + ["\n", "<bos>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
     pos_encoding = create_pos_encoding()
     embed = embedding.get_embedding
@@ -76,7 +76,7 @@ def create_network_parts(
     is_balanced = bool_all_true([depth_is_zero, all_valid])
 
     # --- Output at trigger ---
-    is_trigger = equals_vector(embedding, embed("?"))
+    is_trigger = equals_vector(embedding, embed("\n"))
     result = select(
         is_balanced,
         create_constant(embed("Y")),

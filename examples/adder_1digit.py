@@ -1,6 +1,6 @@
 """1-digit adder: the simplest example of programming a transformer.
 
-Parses "A+B=" where A and B are single digits, and outputs their sum.
+Parses "A+B\\n" where A and B are single digits, and outputs their sum.
 All arithmetic is done via a single 100-entry lookup table that maps
 every (A, B) pair to (A+B) mod 10.
 
@@ -66,7 +66,7 @@ def create_network() -> Unembedding:
     # --- Phase 1: Vocabulary and parsing ---
     vocab = list(
         "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["<eos>", "default"]
+    ) + ["\n", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     pos_encoding = create_pos_encoding()
 
@@ -77,7 +77,7 @@ def create_network() -> Unembedding:
 
     # Detect operator positions: "+" ends the first number, "=" ends the second.
     is_first_num = equals_vector(inp=embedding, vector=embedding.get_embedding("+"))
-    is_second_num = equals_vector(inp=embedding, vector=embedding.get_embedding("="))
+    is_second_num = equals_vector(inp=embedding, vector=embedding.get_embedding("\n"))
 
     # --- Phase 2: Capture operands and compute ---
     # Look one position back to get the digit that just completed.

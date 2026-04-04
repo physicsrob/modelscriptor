@@ -1,6 +1,6 @@
 """3-digit adder using embedding-space arithmetic.
 
-Parses "A+B=" where A and B are up to 3-digit numbers, and outputs their
+Parses "A+B\\n" where A and B are up to 3-digit numbers, and outputs their
 sum autoregressively. All arithmetic is done digit-by-digit in embedding
 space: each digit pair is looked up in a table, with carry propagation
 right-to-left — exactly like pencil-and-paper addition.
@@ -37,7 +37,7 @@ def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
     """Build the 3-digit adder graph and return (output_node, pos_encoding, embedding)."""
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["<bos", "<eos>", "default"]
+    ) + ["\n", "<bos", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     pos_encoding = create_pos_encoding()
 
@@ -50,7 +50,7 @@ def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
         inp=embedding, vector=embedding.get_embedding("+")
     )
     is_end_of_second_num = equals_vector(
-        inp=embedding, vector=embedding.get_embedding("=")
+        inp=embedding, vector=embedding.get_embedding("\n")
     )
 
     first_num_digits = num_seq.get_digits_at_event(is_end_of_first_num)

@@ -39,7 +39,7 @@ from torchwright.ops.sequence_ops import (
 
 
 def create_network(max_digits: int = 3) -> Unembedding:
-    """Create a v2 adder: parses "A+B=", outputs result digits autoregressively.
+    """Create a v2 adder: parses "A+B\\n", outputs result digits autoregressively.
 
     Three phases:
       1. Parse: extract digit embeddings for A and B from the token stream
@@ -48,7 +48,7 @@ def create_network(max_digits: int = 3) -> Unembedding:
     """
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["<bos", "<eos>", "default"]
+    ) + ["\n", "<bos", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     pos_encoding = create_pos_encoding()
 
@@ -59,7 +59,7 @@ def create_network(max_digits: int = 3) -> Unembedding:
         inp=embedding, vector=embedding.get_embedding("+")
     )
     is_end_of_second_num = equals_vector(
-        inp=embedding, vector=embedding.get_embedding("=")
+        inp=embedding, vector=embedding.get_embedding("\n")
     )
 
     first_num_digits = num_seq.get_digits_at_event(is_end_of_first_num)

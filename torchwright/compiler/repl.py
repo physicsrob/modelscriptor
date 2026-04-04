@@ -40,7 +40,7 @@ def generate(
     Args:
         session: An onnxruntime.InferenceSession.
         vocab: Vocabulary for token ID conversion.
-        input_text: The input string (e.g. "12+34=").
+        input_text: The input string (e.g. "12+34").
         max_new_tokens: Maximum tokens to generate.
         bos_token: Beginning-of-sequence token.
         eos_token: End-of-sequence token.
@@ -85,11 +85,11 @@ def run_once(
 
     Args:
         onnx_path: Path to the .onnx model file.
-        prompt: The input string (e.g. "12+34=").
+        prompt: The input string (e.g. "12+34").
         max_new_tokens: Maximum tokens to generate.
     """
     session, vocab = _load(onnx_path)
-    result = generate(session, vocab, prompt, max_new_tokens)
+    result = generate(session, vocab, prompt + "\n", max_new_tokens)
     print(result)
 
 
@@ -113,5 +113,5 @@ def run_repl(
         if text.lower() == "q":
             print("Bye")
             break
-        result = generate(session, vocab, text, max_new_tokens)
+        result = generate(session, vocab, text + "\n", max_new_tokens)
         print(result)

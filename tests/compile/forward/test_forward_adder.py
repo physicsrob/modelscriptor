@@ -58,7 +58,7 @@ def _build_1digit():
 
 
 def test_1digit_adder():
-    """Compile 1-digit adder and verify arithmetic at the '=' position."""
+    """Compile 1-digit adder and verify arithmetic at the '\\n' position."""
     output_node, pos_encoding, embedding = _build_1digit()
     net = forward_compile(
         d=D,
@@ -70,12 +70,12 @@ def test_1digit_adder():
 
 
     test_cases = [
-        ("1+1=", "2"),
-        ("2+3=", "5"),
-        ("0+0=", "0"),
-        ("4+5=", "9"),
-        ("7+2=", "9"),
-        ("6+3=", "9"),
+        ("1+1\n", "2"),
+        ("2+3\n", "5"),
+        ("0+0\n", "0"),
+        ("4+5\n", "9"),
+        ("7+2\n", "9"),
+        ("6+3\n", "9"),
     ]
     for input_str, expected in test_cases:
         tokens = ["<bos"] + list(input_str)
@@ -112,7 +112,7 @@ def _build_3digit():
 
 
 def test_3digit_adder():
-    """Compile 3-digit adder, verify arithmetic at the position after '='."""
+    """Compile 3-digit adder, verify arithmetic at the position after '\\n'."""
     output_node, pos_encoding, embedding = _build_3digit()
     net = forward_compile(
         d=D,
@@ -124,12 +124,12 @@ def test_3digit_adder():
 
 
     test_cases = [
-        ("1+1=", "2"),
-        ("12+34=", "46"),
-        ("123+456=", "579"),
-        ("100+200=", "300"),
-        ("0+0=", "0"),
-        ("99+1=", "100"),
+        ("1+1\n", "2"),
+        ("12+34\n", "46"),
+        ("123+456\n", "579"),
+        ("100+200\n", "300"),
+        ("0+0\n", "0"),
+        ("99+1\n", "100"),
     ]
     for input_str, expected in test_cases:
         tokens = ["<bos"] + list(input_str)
@@ -152,11 +152,11 @@ def test_3digit_autoregressive():
 
 
     test_cases = [
-        ("1+2=", "3"),
-        ("99+1=", "100"),
-        ("100+200=", "300"),
-        ("111+222=", "333"),
-        ("456+123=", "579"),
+        ("1+2\n", "3"),
+        ("99+1\n", "100"),
+        ("100+200\n", "300"),
+        ("111+222\n", "333"),
+        ("456+123\n", "579"),
     ]
     for input_str, expected in test_cases:
         tokens = ["<bos"] + list(input_str)
