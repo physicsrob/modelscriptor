@@ -62,6 +62,37 @@ def generate(
     return "".join(vocab.id_to_token(int(tid)) for tid in token_ids[len(tokens) :])
 
 
+def _load(onnx_path: str):
+    """Load an ONNX model and its vocabulary."""
+    import onnxruntime  # type: ignore[import-untyped]
+
+    base, _ = os.path.splitext(onnx_path)
+    vocab_path = base + ".vocab.json"
+
+    with open(vocab_path) as f:
+        vocab_data = json.load(f)
+    vocab = _Vocab(vocab_data["vocab"])
+    session = onnxruntime.InferenceSession(onnx_path)
+    return session, vocab
+
+
+def run_once(
+    onnx_path: str,
+    prompt: str,
+    max_new_tokens: int = 20,
+) -> None:
+    """Run a single prompt and print the result.
+
+    Args:
+        onnx_path: Path to the .onnx model file.
+        prompt: The input string (e.g. "12+34=").
+        max_new_tokens: Maximum tokens to generate.
+    """
+    session, vocab = _load(onnx_path)
+    result = generate(session, vocab, prompt, max_new_tokens)
+    print(result)
+
+
 def run_repl(
     onnx_path: str,
     max_new_tokens: int = 20,
@@ -74,16 +105,7 @@ def run_repl(
         onnx_path: Path to the .onnx model file.
         max_new_tokens: Maximum tokens to generate per query.
     """
-    import onnxruntime  # type: ignore[import-untyped]
-
-    base, _ = os.path.splitext(onnx_path)
-    vocab_path = base + ".vocab.json"
-
-    with open(vocab_path) as f:
-        vocab_data = json.load(f)
-    vocab = _Vocab(vocab_data["vocab"])
-
-    session = onnxruntime.InferenceSession(onnx_path)
+    session, vocab = _load(onnx_path)
 
     print(f"Loaded {onnx_path} ({len(vocab.vocab)} tokens). Type 'q' to quit.")
     while True:
