@@ -1,11 +1,13 @@
+# Auto-discover compilable examples (those defining create_network_parts)
+COMPILABLE := $(shell grep -rl 'def create_network_parts' examples/*.py \
+    | sed 's|examples/||; s|\.py||')
+ONNX_FILES := $(addsuffix .onnx, $(COMPILABLE))
+
 .PHONY: compile
-compile: adder.onnx calculator.onnx
+compile: $(ONNX_FILES)
 
-adder.onnx: compile_adder.py examples/adder.py torchwright/compiler/*.py torchwright/graph/*.py
-	uv run python compile_adder.py
-
-calculator.onnx: compile_calculator.py examples/calculator.py examples/adder.py torchwright/compiler/*.py torchwright/graph/*.py
-	uv run python compile_calculator.py
+%.onnx: examples/%.py examples/compile.py torchwright/compiler/*.py torchwright/graph/*.py
+	uv run python -m examples.compile $*
 
 .PHONY: lint
 lint:
