@@ -28,7 +28,7 @@ def compiled_calc():
 def test_prefill_matches_forward(compiled_calc):
     """forward_cached with no past KV should match forward exactly."""
     net, output_node, embedding = compiled_calc
-    tokens = ["<bos"] + list("3+5=")
+    tokens = ["<bos"] + list("3+5\n")
     res_stream = net.get_input_res_stream(len(tokens), {"embedding_input": tokens})
     inp = res_stream.to(net.device)
 
@@ -44,7 +44,7 @@ def test_prefill_matches_forward(compiled_calc):
 def test_token_by_token_matches_full(compiled_calc):
     """Token-by-token cached generation should match single-pass forward."""
     net, output_node, embedding = compiled_calc
-    tokens = ["<bos"] + list("7+8=")
+    tokens = ["<bos"] + list("7+8\n")
     n_pos = len(tokens)
 
     # Full forward pass on entire sequence
@@ -67,7 +67,7 @@ def test_token_by_token_matches_full(compiled_calc):
 def test_generate_matches_autoregressive(compiled_calc):
     """generate() with KV cache should produce same tokens as compute() loop."""
     net, output_node, embedding = compiled_calc
-    tokens = ["<bos"] + list("4+5=")
+    tokens = ["<bos"] + list("4+5\n")
 
     # Old way: full recomputation each step
     old_tokens = list(tokens)

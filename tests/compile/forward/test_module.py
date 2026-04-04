@@ -64,9 +64,9 @@ def test_module_forward_matches_compiled():
     device = next(module.parameters()).device
 
     test_inputs = [
-        ["<bos", "1", "+", "2", "="],
-        ["<bos", "3", "+", "4", "="],
-        ["<bos", "0", "+", "0", "="],
+        ["<bos", "1", "+", "2", "\n"],
+        ["<bos", "3", "+", "4", "\n"],
+        ["<bos", "0", "+", "0", "\n"],
     ]
 
     for tokens in test_inputs:
@@ -184,7 +184,7 @@ def test_input_scatter_matches_get_input_res_stream():
     module.eval()
     device = next(module.parameters()).device
 
-    tokens = ["<bos", "1", "+", "2", "="]
+    tokens = ["<bos", "1", "+", "2", "\n"]
 
     # HeadlessTransformer path
     expected = net.get_input_res_stream(
@@ -224,7 +224,7 @@ def test_output_gather_matches_decode():
     module.eval()
     device = next(module.parameters()).device
 
-    tokens = ["<bos", "1", "+", "2", "="]
+    tokens = ["<bos", "1", "+", "2", "\n"]
 
     # HeadlessTransformer path: get output embedding, decode each position
     result = net.compute(
@@ -282,11 +282,11 @@ def test_module_autoregressive_1digit():
     module.eval()
 
     test_cases = [
-        ("1+1=", "2"),
-        ("2+3=", "5"),
-        ("0+0=", "0"),
-        ("4+5=", "9"),
-        ("7+2=", "9"),
+        ("1+1\n", "2"),
+        ("2+3\n", "5"),
+        ("0+0\n", "0"),
+        ("4+5\n", "9"),
+        ("7+2\n", "9"),
     ]
     for input_str, expected in test_cases:
         result = _module_generate(module, embedding.tokenizer, input_str)
@@ -314,11 +314,11 @@ def test_module_autoregressive_3digit():
     module.eval()
 
     test_cases = [
-        ("1+2=", "3"),
-        ("12+34=", "46"),
-        ("99+1=", "100"),
-        ("100+200=", "300"),
-        ("456+123=", "579"),
+        ("1+2\n", "3"),
+        ("12+34\n", "46"),
+        ("99+1\n", "100"),
+        ("100+200\n", "300"),
+        ("456+123\n", "579"),
     ]
     for input_str, expected in test_cases:
         result = _module_generate(module, embedding.tokenizer, input_str)
@@ -339,7 +339,7 @@ def test_module_state_dict_roundtrip():
     module1.eval()
     device = next(module1.parameters()).device
 
-    tokens = ["<bos", "3", "+", "6", "="]
+    tokens = ["<bos", "3", "+", "6", "\n"]
     token_ids = torch.tensor(
         [embedding.tokenizer.get_token_id(t) for t in tokens],
         dtype=torch.long,
@@ -469,7 +469,7 @@ def test_onnx_export_and_inference():
         module.eval()
         device = next(module.parameters()).device
 
-        tokens = ["<bos", "1", "+", "2", "="]
+        tokens = ["<bos", "1", "+", "2", "\n"]
         token_ids = torch.tensor(
             [embedding.tokenizer.get_token_id(t) for t in tokens],
             dtype=torch.long,
@@ -519,9 +519,9 @@ def test_onnx_repl_generate():
         session = onnxruntime.InferenceSession(onnx_path)
 
         test_cases = [
-            ("1+1=", "2"),
-            ("2+3=", "5"),
-            ("4+5=", "9"),
+            ("1+1\n", "2"),
+            ("2+3\n", "5"),
+            ("4+5\n", "9"),
         ]
         for input_str, expected in test_cases:
             result = generate(session, vocab, input_str)

@@ -79,7 +79,7 @@ def test_balanced_parens():
         ("())()(", "N"),
     ]
     for input_str, expected in test_cases:
-        tokens = ["<bos>"] + list(input_str) + ["?"]
+        tokens = ["<bos>"] + list(input_str) + ["\n"]
         result = run_autoregressive(net, output_node, embedding, tokens)
         assert (
             result == expected

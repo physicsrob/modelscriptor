@@ -47,7 +47,7 @@ def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
     """Build the calculator graph and return (output_node, pos_encoding, embedding)."""
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["<bos", "<eos>", "default"]
+    ) + ["\n", "<bos", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     pos_encoding = create_pos_encoding()
 
@@ -58,7 +58,7 @@ def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
     is_minus = equals_vector(embedding, embedding.get_embedding("-"))
     is_times = equals_vector(embedding, embedding.get_embedding("*"))
     is_operator = bool_any_true([is_plus, is_minus, is_times])
-    is_equals = equals_vector(embedding, embedding.get_embedding("="))
+    is_equals = equals_vector(embedding, embedding.get_embedding("\n"))
 
     # Guard: only detect operators before "=" — output tokens like "-" must
     # not re-trigger operator signals during autoregressive decoding.
