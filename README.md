@@ -133,43 +133,52 @@ one layer at a time. At each layer, a scheduler decides what to compute using
 the attention sublayer and FFN sublayer, then a weight writer sets the
 corresponding weight matrices.
 
-### The three primitives
+### The skip connection
 
-The transformer skip connection `out = in + f(in)` enables three operations:
+Every sublayer in a transformer computes `out = in + f(in)`. The sublayer
+output gets *added* to whatever is already in the residual stream. This single
+fact determines how values enter, persist, and leave:
 
-| Operation | Mechanism | Cost |
-|-----------|-----------|------|
-| **Write** to free columns | `0 + f(in) = f(in)` | 1 attention head or FFN slots |
-| **Add** into existing columns | `dead + live = Add(dead, live)` via skip | 1 attention head |
-| **Cancel** a dead node | `v + (-v) = 0` | 1 attention head |
+- **Values persist automatically.** They are the `in` that passes through
+  unchanged. A value written at layer 3 is still there at layer 30 unless
+  something explicitly removes it.
+
+- **A sublayer can only add.** It cannot overwrite or rearrange columns. What
+  happens depends on what is already in the target columns:
+  - If the columns are **empty** (zeroed out), the new value appears:
+    `0 + new = new`. This is how new computations enter the residual stream.
+  - If the columns hold a **dead value** (nothing downstream needs it anymore),
+    write its negation: `v + (-v) = 0`. This frees those columns for reuse.
+  - If the columns hold a value you want to **add to**, write the other addend
+    and the skip connection produces the sum. This is how the compiler
+    implements Add nodes without using any extra columns.
 
 ### What each sublayer computes
 
-**Attention sublayer** (budget: d/d_head heads per layer):
-- Attention nodes (cross-position lookups)
-- Zero-bias Linear nodes (current-position attention applies the weight matrix)
-- Add-into operations (reuses a dead addend's columns)
-- Cancellations (frees columns for reuse)
+**Attention.** Each attention head applies a weight matrix and writes to
+d_head columns -- so anything that is a matrix multiply or a targeted write
+to specific columns maps here. This includes:
+- Attention nodes (cross-position lookups -- the thing only attention can do)
+- Linear nodes without bias (a head applies the weight matrix at the
+  current position)
+- Column management: cancellations and additions into existing columns are
+  just targeted writes with the right values
 
-**FFN sublayer** (budget: d internal slots):
+**FFN.** The FFN sublayer's internal structure is Linear → ReLU → Linear,
+so it directly handles graph operations with the same shape:
 - Linear → ReLU → Linear chains
 - Standalone ReLU nodes
-- Constants (via output bias, no slot cost)
-- Bias terms for Linear nodes computed in the attention sublayer
+- Constants (via the output bias)
+- Bias terms for Linear nodes that were computed in the attention sublayer
 
-### Column allocation
+### Scheduling
 
-The compiler uses a simple greedy allocator -- no constraint solver needed.
-Nodes are assigned to whatever columns are free at the time they're computed.
-When a node is dead (all downstream consumers have been computed), its columns
-are either cancelled (freeing them) or reused in-place by an Add operation.
-
-### Pressure-aware scheduling
-
-When free columns drop below 25% of the residual stream width, the scheduler
-switches from critical-path priority to a pressure mode that prioritizes
-operations which free columns (cancellations and add-into) over new
-computations.
+The compiler picks what to compute at each layer based on what is ready (all
+inputs alive in the residual stream) and what is most urgent (longest
+dependency chain to an output). When free columns run low, the scheduler
+shifts to prioritizing operations that free space -- cancellations and
+additions into existing columns -- over new computations. Column assignment
+is greedy: nodes get whatever columns are free when they are computed.
 
 
 ## The Ops Layer
