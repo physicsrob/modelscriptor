@@ -30,6 +30,7 @@ from torchwright.ops.sequence_ops import (
 )
 
 max_digits = 3
+D_MODEL = 1024
 
 
 def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:

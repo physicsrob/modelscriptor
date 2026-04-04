@@ -55,6 +55,9 @@ from torchwright.ops.sequence_ops import (
 )
 
 
+D_MODEL = 1024
+
+
 def create_network_parts(
     max_digits: int = 3,
 ) -> Tuple[Node, PosEncoding, Embedding]:
