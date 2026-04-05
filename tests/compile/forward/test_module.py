@@ -524,7 +524,7 @@ def test_onnx_repl_generate():
             ("4+5\n", "9"),
         ]
         for input_str, expected in test_cases:
-            result = generate(session, vocab, input_str)
+            result = "".join(generate(session, vocab, input_str))
             assert (
                 result == expected
             ), f"For {input_str}: expected '{expected}' but got '{result}'"
