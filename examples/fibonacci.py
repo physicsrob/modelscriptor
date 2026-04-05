@@ -43,7 +43,7 @@ from torchwright.ops.scalar_encoding import (
 from torchwright.ops.sequence_ops import output_sequence
 
 
-D_MODEL = 1024
+D_MODEL = 512
 
 # Fixed digit width per Fibonacci number. W=2 handles values up to 99.
 DIGIT_WIDTH = 2

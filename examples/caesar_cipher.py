@@ -37,7 +37,7 @@ from torchwright.ops.sequence_ops import output_sequence
 # Letters in the alphabet
 LETTERS = "abcdefghijklmnopqrstuvwxyz"
 
-D_MODEL = 1024
+D_MODEL = 512
 MAX_LETTERS = 5
 
 
