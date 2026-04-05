@@ -5,7 +5,7 @@ from torchwright.ops.arithmetic_ops import (
     negate,
     subtract,
     multiply_scalar,
-    thermometer_square,
+    square,
     multiply_integers,
 )
 from torchwright.ops.inout_nodes import create_input
@@ -74,9 +74,9 @@ def test_compare():
                 assert output.item() == true_level if delta > 0 else false_level
 
 
-def test_thermometer_square():
+def test_square():
     x = create_input("x", 1)
-    sq = thermometer_square(x, max_value=9)
+    sq = square(x, max_value=9)
     for val in range(10):
         result = sq.compute(n_pos=1, input_values={"x": torch.tensor([[float(val)]])})
         expected = val * val
@@ -85,10 +85,10 @@ def test_thermometer_square():
         )
 
 
-def test_thermometer_square_large():
+def test_square_large():
     """Test with max_value=18 (needed for digit a+b range in multiply_integers)."""
     x = create_input("x", 1)
-    sq = thermometer_square(x, max_value=18)
+    sq = square(x, max_value=18)
     for val in [0, 1, 9, 10, 17, 18]:
         result = sq.compute(n_pos=1, input_values={"x": torch.tensor([[float(val)]])})
         expected = val * val
