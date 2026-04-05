@@ -13,7 +13,7 @@ thermometer coding (ReLU-based threshold detectors) for the conversions.
 
 See also:
     arithmetic_ops.thermometer_floor_div — the core integer division primitive
-    arithmetic_ops.thermometer_square — integer squaring via thermometer coding
+    arithmetic_ops.square — squaring via ReLU ramps
     embedding_arithmetic — the alternative: stay in embedding space throughout
 """
 

@@ -70,7 +70,7 @@ def calc_1digit():
 
 @pytest.fixture(scope="module")
 def calc_3digit():
-    # thermometer_square now splits across layers, so d=1024 suffices
+    # square splits across layers when needed, so d=1024 suffices
     net, output_node, embedding = _compile(3, d=1024)
     return net, output_node, embedding
 

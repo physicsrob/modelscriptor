@@ -305,79 +305,69 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     )
 
 
-def _thermometer_square_chunk(
-    inp: Node, k_start: int, k_end: int, name: str
-) -> Node:
-    """Compute partial sum of odd-number detectors for k in [k_start, k_end)."""
-    n_detectors = k_end - k_start
-    d_int = 2 * n_detectors
-    input_proj = torch.zeros(d_int, 1)
-    input_bias = torch.zeros(d_int)
-    output_proj = torch.zeros(d_int, 1)
+def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) -> Node:
+    """Compute x² using a sum of ReLU ramps.
 
-    for i, k in enumerate(range(k_start, k_end)):
-        threshold = k - 0.5
-        row = 2 * i
+    Uses the identity: for x aligned to the step grid,
 
-        input_proj[row, 0] = step_sharpness
-        input_proj[row + 1, 0] = step_sharpness
-        input_bias[row] = -step_sharpness * threshold
-        input_bias[row + 1] = -step_sharpness * threshold - 1.0
+        x² = step · Σ 2·ReLU(x - k)
 
-        weight = 2.0 * k - 1.0
-        output_proj[row, 0] = weight
-        output_proj[row + 1, 0] = -weight
+    where k ranges over step/2, 3·step/2, 5·step/2, ... up to max_value.
+    Each ReLU contributes a linear ramp whose heights sum to x²/2.
 
-    return linear_relu_linear(
-        input_node=inp,
-        input_proj=input_proj,
-        input_bias=input_bias,
-        output_proj=output_proj,
-        output_bias=torch.zeros(1),
-        name=name,
-    )
+    Exact when x is a multiple of ``step``. Between grid points the result
+    is a piecewise-linear interpolation (always an underestimate of x²).
 
+    Uses unpaired ReLUs with uniform output weights, so there is no
+    catastrophic cancellation in the dot product. Each detector uses
+    1 ReLU unit (vs 2 for paired-step methods), allowing twice as many
+    detectors per FFN layer.
 
-def thermometer_square(inp: Node, max_value: int, d_max: int = 1024) -> Node:
-    """Compute x² for a non-negative integer x in [0, max_value].
-
-    Uses the odd-number identity: x² = 1 + 3 + 5 + ... + (2x-1).
-    Place a detector at each integer k = 1..max_value. Each detector
-    contributes (2k-1) when x >= k, so the sum is x².
-
-        x=0 → no detectors fire                → 0
-        x=3 → detectors 1,2,3 fire: 1+3+5      → 9
-        x=5 → detectors 1..5 fire: 1+3+5+7+9   → 25
-
-    Same paired-ReLU step as thermometer_floor_div in adder_v2, but
-    the output weight is (2k-1) instead of 1.0.
-
-    Only exact for non-negative integers. For non-integers, the step
-    functions fire based on floor(x), giving floor(x)² instead of x².
-
-    When max_value requires more than d_max ReLU units (2 per detector),
-    the computation is split into multiple FFN layers whose partial
-    sums are added together.
+    When the number of detectors (max_value / step) exceeds d_max, the
+    computation is split across multiple FFN layers whose partial sums
+    are added together.
 
     Args:
-        inp: 1D scalar node with integer value in [0, max_value].
-        max_value: Upper bound on input (determines number of detectors).
-        d_max: Maximum ReLU units per FFN layer. Detectors are split
-            into chunks of d_max // 2 to stay within this budget.
+        inp: 1D scalar node with value in [0, max_value].
+        max_value: Upper bound on input.
+        step: Grid spacing. Exact for multiples of step. Smaller values
+            give better accuracy for non-grid inputs at the cost of more
+            detectors (max_value / step detectors total).
+        d_max: Maximum ReLU units per FFN layer. When more detectors are
+            needed, they are split into chunks of this size.
 
     Returns:
-        1D scalar node containing x².
+        1D scalar node containing x² (exact at grid points).
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
-    assert max_value >= 1, "max_value must be at least 1"
+    assert max_value > 0, "max_value must be positive"
 
-    chunk_size = d_max // 2  # detectors per chunk (2 ReLUs each)
+    # Build list of thresholds: step/2, 3·step/2, 5·step/2, ...
+    thresholds = []
+    k = step / 2.0
+    while k < max_value + step / 2.0:
+        thresholds.append(k)
+        k += step
+
+    output_weight = 2.0 * step
+
     chunks = []
-    for start in range(1, max_value + 1, chunk_size):
-        end = min(start + chunk_size, max_value + 1)
+    for chunk_start in range(0, len(thresholds), d_max):
+        chunk_thresholds = thresholds[chunk_start : chunk_start + d_max]
+        n = len(chunk_thresholds)
+
+        input_proj = torch.ones(n, 1)
+        input_bias = torch.tensor([-t for t in chunk_thresholds])
+        output_proj = torch.full((n, 1), output_weight)
+
         chunks.append(
-            _thermometer_square_chunk(
-                inp, start, end, name=f"thermometer_square_{start}_{end}"
+            linear_relu_linear(
+                input_node=inp,
+                input_proj=input_proj,
+                input_bias=input_bias,
+                output_proj=output_proj,
+                output_bias=torch.zeros(1),
+                name=f"square_{chunk_start}_{chunk_start + n}",
             )
         )
 
@@ -392,18 +382,18 @@ def multiply_integers(inp1: Node, inp2: Node, max_value: int) -> Node:
     a * b = ((a+b)² - (a-b)²) / 4
 
     Both inputs must be 1D scalar nodes with integer values in [0, max_value].
-    This identity is exact for all reals, but thermometer_square is only exact
-    for non-negative integers, so the inputs must be integers.
+    The polarization identity is exact for all reals, but ``square`` is only
+    exact at grid points (integers by default), so the inputs must be integers.
 
     Implementation:
         s = a + b                          range [0, 2*max_value], Linear (free)
         d = a - b                          range [-max_value, max_value], Linear (free)
         |d| = ReLU(d) + ReLU(-d)           1 FFN layer (relu_add)
-        s² = thermometer_square(s)         1 FFN layer
-        |d|² = thermometer_square(|d|)     1 FFN layer
+        s² = square(s)                     1+ FFN layers
+        |d|² = square(|d|)                 1+ FFN layers
         result = (s² - |d|²) / 4          Linear (free)
 
-    Total cost: 3 FFN layers.
+    Total cost: 3+ FFN layers.
 
     Args:
         inp1: 1D scalar node, integer value in [0, max_value].
@@ -420,8 +410,8 @@ def multiply_integers(inp1: Node, inp2: Node, max_value: int) -> Node:
     d = subtract(inp1, inp2)  # a-b (may be negative)
     abs_d = relu_add(d, negate(d))  # |a-b| = ReLU(d) + ReLU(-d)
 
-    sq_sum = thermometer_square(s, 2 * max_value)  # (a+b)²
-    sq_diff = thermometer_square(abs_d, max_value)  # (a-b)²
+    sq_sum = square(s, 2 * max_value)  # (a+b)²
+    sq_diff = square(abs_d, max_value)  # (a-b)²
 
     # a*b = ((a+b)² - (a-b)²) / 4
     return add_scaled_nodes(0.25, sq_sum, -0.25, sq_diff)
