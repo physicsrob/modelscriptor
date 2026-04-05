@@ -6,7 +6,8 @@ Requires: onnxruntime, numpy.
 
 import json
 import os
-from typing import List
+import sys
+from typing import Iterator, List
 
 import numpy as np
 
@@ -34,7 +35,7 @@ def generate(
     max_new_tokens: int = 10,
     bos_token: str = "<bos",
     eos_token: str = "<eos>",
-) -> str:
+) -> Iterator[str]:
     """Run autoregressive generation on an ONNX model.
 
     Args:
@@ -45,8 +46,8 @@ def generate(
         bos_token: Beginning-of-sequence token.
         eos_token: End-of-sequence token.
 
-    Returns:
-        The generated output string (excluding input and special tokens).
+    Yields:
+        Each generated token string as it is produced.
     """
     tokens = [bos_token] + list(input_text)
     token_ids = np.array([vocab.token_to_id(t) for t in tokens], dtype=np.int64)
@@ -58,8 +59,7 @@ def generate(
         if next_token == eos_token:
             break
         token_ids = np.append(token_ids, next_id)
-
-    return "".join(vocab.id_to_token(int(tid)) for tid in token_ids[len(tokens) :])
+        yield next_token
 
 
 def _load(onnx_path: str):
@@ -89,8 +89,11 @@ def run_once(
         max_new_tokens: Maximum tokens to generate.
     """
     session, vocab = _load(onnx_path)
-    result = generate(session, vocab, prompt + "\n", max_new_tokens)
-    print(result)
+    for token in generate(session, vocab, prompt + "\n", max_new_tokens):
+        sys.stdout.write(token)
+        sys.stdout.flush()
+    sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 def run_repl(
@@ -113,5 +116,8 @@ def run_repl(
         if text.lower() == "q":
             print("Bye")
             break
-        result = generate(session, vocab, text + "\n", max_new_tokens)
-        print(result)
+        for token in generate(session, vocab, text + "\n", max_new_tokens):
+            sys.stdout.write(token)
+            sys.stdout.flush()
+        sys.stdout.write("\n")
+        sys.stdout.flush()
