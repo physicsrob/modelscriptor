@@ -35,7 +35,7 @@ from torchwright.ops.map_select import map_to_table, select
 from torchwright.ops.sequence_ops import output_sequence, remove_leading_0s
 
 
-D_MODEL = 1024
+D_MODEL = 256
 
 
 def create_network_parts(

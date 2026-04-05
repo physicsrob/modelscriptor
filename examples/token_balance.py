@@ -34,7 +34,7 @@ from torchwright.ops.prefix_ops import prefix_sum
 from torchwright.ops.sequence_ops import output_sequence
 
 
-D_MODEL = 1024
+D_MODEL = 256
 
 
 def create_network_parts(
