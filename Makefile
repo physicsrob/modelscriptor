@@ -16,6 +16,8 @@ lint:
 
 LOCKFILE := /tmp/torchwright-test.lock
 LOGFILE := /tmp/torchwright-test.log
+WORKERS := 4
+THREADS := $(shell echo $$(( $(shell nproc) / $(WORKERS) )))
 
 .PHONY: test
 test:
@@ -24,9 +26,11 @@ test:
 	@flock $(LOCKFILE) bash -c ' \
 		echo "=== Lock acquired, running tests ===" | tee -a $(LOGFILE) && \
 		start=$$(date +%s) && \
+		OMP_NUM_THREADS=$(THREADS) MKL_NUM_THREADS=$(THREADS) \
 		uv run pytest $(if $(FILE),$(FILE),tests) \
 			-v --tb=short --no-header \
 			--durations=0 \
+			-n $(WORKERS) \
 			$(ARGS) 2>&1 | tee -a $(LOGFILE) ; \
 		rc=$${PIPESTATUS[0]} ; \
 		end=$$(date +%s) && \
