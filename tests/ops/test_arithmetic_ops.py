@@ -5,6 +5,7 @@ from torchwright.ops.arithmetic_ops import (
     negate,
     subtract,
     multiply_const,
+    piecewise_linear,
     square,
     multiply_integers,
 )
@@ -131,3 +132,75 @@ def test_multiply_integers_zero():
             },
         )
         assert abs(result.item()) < 0.1, f"0*{val} should be 0, got {result.item()}"
+
+
+def _eval_pw(node, val):
+    """Helper: evaluate a 1D piecewise_linear node at a scalar value."""
+    return node.compute(n_pos=1, input_values={"x": torch.tensor([[val]])}).item()
+
+
+def test_piecewise_linear_identity():
+    """f(x) = x on [0, 10], clamped outside."""
+    x = create_input("x", 1)
+    f = piecewise_linear(x, [0.0, 10.0], [0.0, 10.0])
+    assert abs(_eval_pw(f, 0.0) - 0.0) < 0.01
+    assert abs(_eval_pw(f, 5.0) - 5.0) < 0.01
+    assert abs(_eval_pw(f, 10.0) - 10.0) < 0.01
+    # Clamped outside range
+    assert abs(_eval_pw(f, -3.0) - 0.0) < 0.01
+    assert abs(_eval_pw(f, 15.0) - 10.0) < 0.01
+
+
+def test_piecewise_linear_vshape():
+    """Absolute value: f(x) = |x| on [-5, 5]."""
+    x = create_input("x", 1)
+    f = piecewise_linear(x, [-5.0, 0.0, 5.0], [5.0, 0.0, 5.0])
+    assert abs(_eval_pw(f, -5.0) - 5.0) < 0.01
+    assert abs(_eval_pw(f, -2.5) - 2.5) < 0.01
+    assert abs(_eval_pw(f, 0.0) - 0.0) < 0.01
+    assert abs(_eval_pw(f, 3.0) - 3.0) < 0.01
+    assert abs(_eval_pw(f, 5.0) - 5.0) < 0.01
+
+
+def test_piecewise_linear_square():
+    """Approximate x^2 via breakpoints at integers 0-9."""
+    x = create_input("x", 1)
+    bp = [float(i) for i in range(10)]
+    vals = [float(i * i) for i in range(10)]
+    f = piecewise_linear(x, bp, vals)
+    for i in range(10):
+        result = _eval_pw(f, float(i))
+        assert abs(result - i * i) < 0.01, f"f({i}) = {result}, expected {i*i}"
+
+
+def test_piecewise_linear_constant_segment():
+    """Flat section between x=5 and x=10."""
+    x = create_input("x", 1)
+    f = piecewise_linear(x, [0.0, 5.0, 10.0, 15.0], [0.0, 10.0, 10.0, 20.0])
+    assert abs(_eval_pw(f, 2.5) - 5.0) < 0.01
+    assert abs(_eval_pw(f, 5.0) - 10.0) < 0.01
+    assert abs(_eval_pw(f, 7.5) - 10.0) < 0.01
+    assert abs(_eval_pw(f, 10.0) - 10.0) < 0.01
+    assert abs(_eval_pw(f, 12.5) - 15.0) < 0.01
+
+
+def test_piecewise_linear_extrapolate():
+    """clamp=False: linear extrapolation beyond breakpoint range."""
+    x = create_input("x", 1)
+    f = piecewise_linear(x, [0.0, 10.0], [0.0, 100.0], clamp=False)
+    # Interior
+    assert abs(_eval_pw(f, 5.0) - 50.0) < 0.01
+    # Extrapolation (slope = 10)
+    assert abs(_eval_pw(f, -5.0) - (-50.0)) < 0.01
+    assert abs(_eval_pw(f, 15.0) - 150.0) < 0.01
+
+
+def test_piecewise_linear_chunking():
+    """d_max=4 forces multiple FFN layers with 10 breakpoints."""
+    x = create_input("x", 1)
+    bp = [float(i) for i in range(10)]
+    vals = [float(i * i) for i in range(10)]
+    f = piecewise_linear(x, bp, vals, d_max=4)
+    for i in range(10):
+        result = _eval_pw(f, float(i))
+        assert abs(result - i * i) < 0.01, f"f({i}) = {result}, expected {i*i}"
