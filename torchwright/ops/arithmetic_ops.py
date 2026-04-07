@@ -305,6 +305,110 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     )
 
 
+def piecewise_linear(
+    inp: Node,
+    breakpoints: List[float],
+    values: List[float],
+    clamp: bool = True,
+    d_max: int = 1024,
+    name: str = "piecewise_linear",
+) -> Node:
+    """Evaluate a piecewise-linear function defined by (x, y) breakpoints.
+
+    Linearly interpolates between consecutive breakpoints.  By default the
+    output is clamped to ``values[0]`` / ``values[-1]`` outside the
+    breakpoint range.  Set ``clamp=False`` to extrapolate using the first
+    and last segment slopes instead.
+
+    Implemented as a sum of ReLU slope-changes::
+
+        f(x) = y_0 + Σ delta_m_i · ReLU(x - x_i)
+
+    where ``delta_m_i`` is the change in slope at breakpoint ``x_i``.
+    Uses one ReLU unit per slope change, so segments with equal slopes
+    are free.
+
+    Args:
+        inp: 1D scalar node.
+        breakpoints: Strictly ascending x-coordinates (length n >= 2).
+        values: Corresponding y-values (same length as breakpoints).
+        clamp: If True (default), hold constant outside the range.
+            If False, extrapolate linearly.
+        d_max: Maximum ReLU units per FFN layer (chunks beyond this).
+        name: Debug label prefix.
+
+    Returns:
+        1D scalar node containing f(inp).
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    n = len(breakpoints)
+    assert n == len(values) and n >= 2, "Need >= 2 breakpoints with matching values"
+    assert all(
+        breakpoints[i] < breakpoints[i + 1] for i in range(n - 1)
+    ), "Breakpoints must be strictly ascending"
+
+    slopes = [
+        (values[i + 1] - values[i]) / (breakpoints[i + 1] - breakpoints[i])
+        for i in range(n - 1)
+    ]
+
+    # Build (input_weight, threshold, output_weight) triples for each ReLU.
+    relus: list = []
+
+    # Always start with the clamped representation: slope starts at 0
+    # before x_0, changes at each breakpoint, cancelled to 0 after x_{n-1}.
+    prev_slope = 0.0
+    for i in range(n - 1):
+        delta = slopes[i] - prev_slope
+        if abs(delta) > 1e-12:
+            relus.append((1.0, breakpoints[i], delta))
+        prev_slope = slopes[i]
+    if abs(prev_slope) > 1e-12:
+        relus.append((1.0, breakpoints[-1], -prev_slope))
+
+    if not clamp:
+        # Add tail ReLUs to restore linear extrapolation beyond the range.
+        # Left: ReLU(-(x - x_0)) active when x < x_0, adds slope m_0.
+        if abs(slopes[0]) > 1e-12:
+            relus.append((-1.0, breakpoints[0], -slopes[0]))
+        # Right: ReLU(x - x_{n-1}) active when x > x_{n-1}, adds slope m_{n-2}.
+        if abs(slopes[-1]) > 1e-12:
+            relus.append((1.0, breakpoints[-1], slopes[-1]))
+
+    if len(relus) == 0:
+        # Constant function
+        from torchwright.ops.inout_nodes import create_literal_value
+
+        return create_literal_value(torch.tensor([values[0]]))
+
+    chunks = []
+    for chunk_start in range(0, len(relus), d_max):
+        chunk = relus[chunk_start : chunk_start + d_max]
+        d = len(chunk)
+
+        input_proj = torch.tensor([[r[0]] for r in chunk])  # (d, 1)
+        input_bias = torch.tensor([-r[0] * r[1] for r in chunk])  # (d,)
+        output_proj = torch.tensor([[r[2]] for r in chunk])  # (d, 1)
+
+        # Only the first chunk carries the output bias (y_0).
+        ob = torch.tensor([values[0]]) if chunk_start == 0 else torch.zeros(1)
+
+        chunks.append(
+            linear_relu_linear(
+                input_node=inp,
+                input_proj=input_proj,
+                input_bias=input_bias,
+                output_proj=output_proj,
+                output_bias=ob,
+                name=f"{name}_{chunk_start}_{chunk_start + d}",
+            )
+        )
+
+    if len(chunks) == 1:
+        return chunks[0]
+    return sum_nodes(chunks)
+
+
 def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) -> Node:
     """Compute x² using a sum of ReLU ramps.
 
