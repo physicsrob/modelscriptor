@@ -80,7 +80,7 @@ def calc_1digit():
 
 @pytest.fixture(scope="module")
 def calc_3digit():
-    net, output_node, embedding = _compile(3, d=2048)
+    net, output_node, embedding = _compile(3)
     return net, output_node, embedding
 
 
