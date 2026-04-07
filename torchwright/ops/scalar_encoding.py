@@ -95,7 +95,7 @@ def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> List[
 
 
 def scalar_to_embedding(inp: Node, embedding: Embedding) -> Node:
-    """Convert a scalar digit (0.0-9.0) back to its 8D embedding vector.
+    """Convert a scalar digit (0.0-9.0) back to its embedding vector.
 
     Same paired-ReLU thermometer as thermometer_floor_div, but instead of
     each threshold contributing 1.0, it contributes an embedding delta.
@@ -108,6 +108,14 @@ def scalar_to_embedding(inp: Node, embedding: Embedding) -> Node:
         input=d → embed(d)
 
     9 thresholds at 0.5, 1.5, ..., 8.5 cover digits 0-9.
+
+    Args:
+        inp: 1D scalar node with value in [0.0, 9.0].
+        embedding: Embedding table (must contain "0"-"9").
+
+    Returns:
+        Node of width ``embedding.d_embed`` containing the reconstructed
+        embedding vector.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     d_embed = embedding.d_embed

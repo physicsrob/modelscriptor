@@ -1,3 +1,5 @@
+import torch
+from torchwright import ops
 from torchwright.ops.arithmetic_ops import (
     add_const,
     relu_add,
@@ -8,9 +10,6 @@ from torchwright.ops.arithmetic_ops import (
     piecewise_linear,
     square,
     multiply_integers,
-    abs_value,
-    elem_min,
-    elem_max,
     reciprocal,
     floor_int,
     ceil_int,
@@ -19,7 +18,6 @@ from torchwright.ops.arithmetic_ops import (
     reduce_max,
 )
 from torchwright.ops.inout_nodes import create_input
-import torch
 
 
 def test_add_const():
@@ -215,28 +213,28 @@ def test_piecewise_linear_chunking():
         assert abs(result - i * i) < 0.01, f"f({i}) = {result}, expected {i*i}"
 
 
-def test_abs_value():
-    """abs_value on a 3-wide node with positive, negative, and zero."""
+def test_abs():
+    """ops.abs on a 3-wide node with positive, negative, and zero."""
     x = create_input("x", 3)
-    out = abs_value(x)
+    out = ops.abs(x)
     vals = torch.tensor([[5.0, -3.0, 0.0]])
     result = out.compute(n_pos=1, input_values={"x": vals})
     assert torch.allclose(result, torch.tensor([[5.0, 3.0, 0.0]]))
 
 
-def test_abs_value_scalar():
-    """abs_value on scalar inputs."""
+def test_abs_scalar():
+    """ops.abs on scalar inputs."""
     x = create_input("x", 1)
-    out = abs_value(x)
+    out = ops.abs(x)
     for v in [-7.0, 0.0, 4.5]:
         result = out.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
         assert abs(result.item() - abs(v)) < 0.01
 
 
-def test_elem_min():
+def test_min():
     a = create_input("a", 3)
     b = create_input("b", 3)
-    out = elem_min(a, b)
+    out = ops.min(a, b)
     va = torch.tensor([[5.0, -2.0, 7.0]])
     vb = torch.tensor([[3.0, 1.0, 7.0]])
     result = out.compute(n_pos=1, input_values={"a": va, "b": vb})
@@ -244,10 +242,10 @@ def test_elem_min():
     assert torch.allclose(result, expected, atol=0.01)
 
 
-def test_elem_max():
+def test_max():
     a = create_input("a", 3)
     b = create_input("b", 3)
-    out = elem_max(a, b)
+    out = ops.max(a, b)
     va = torch.tensor([[5.0, -2.0, 7.0]])
     vb = torch.tensor([[3.0, 1.0, 7.0]])
     result = out.compute(n_pos=1, input_values={"a": va, "b": vb})
