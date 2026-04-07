@@ -16,7 +16,7 @@ from torchwright.graph import Node, Embedding
 from torchwright.graph.embedding import Unembedding
 from torchwright.ops.arithmetic_ops import concat
 from torchwright.ops.inout_nodes import (
-    create_constant,
+    create_literal_value,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
@@ -71,7 +71,7 @@ def create_network() -> Unembedding:
     pos_encoding = create_pos_encoding()
 
     # Determine the current digit (default to "0" for non-digit tokens).
-    zero_constant = create_constant(embedding.get_embedding("0"))
+    zero_constant = create_literal_value(embedding.get_embedding("0"))
     is_num = check_is_num(embedding_value=embedding, embedding=embedding)
     current_num = select(cond=is_num, true_node=embedding, false_node=zero_constant)
 

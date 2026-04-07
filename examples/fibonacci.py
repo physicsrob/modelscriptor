@@ -29,7 +29,7 @@ from torchwright.graph.embedding import Unembedding
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import add
 from torchwright.ops.inout_nodes import (
-    create_constant,
+    create_literal_value,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
@@ -112,13 +112,13 @@ def create_network_parts(
         for i in range(W):
             place = 10 ** (W - 1 - i)
             digit = (f // place) % 10
-            seed_tokens.append(create_constant(embed(str(digit))))
+            seed_tokens.append(create_literal_value(embed(str(digit))))
 
     recurrence_tokens = []
     for _ in range(n_terms - 2):
         recurrence_tokens.extend(recurrence_digits)
 
-    all_tokens = seed_tokens + recurrence_tokens + [create_constant(embed("<eos>"))]
+    all_tokens = seed_tokens + recurrence_tokens + [create_literal_value(embed("<eos>"))]
 
     output_node = output_sequence(
         pos_encoding,

@@ -20,7 +20,7 @@ explanation.
 from torchwright.graph.embedding import Unembedding
 from torchwright.ops.arithmetic_ops import add
 from torchwright.ops.inout_nodes import (
-    create_constant,
+    create_literal_value,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
@@ -78,7 +78,7 @@ def create_network(max_digits: int = 3) -> Unembedding:
     result_digits = [scalar_to_embedding(d, embedding) for d in digit_scalars]
 
     # --- Phase 3: Format and output ---
-    result_digits = result_digits + [create_constant(embedding.get_embedding("<eos>"))]
+    result_digits = result_digits + [create_literal_value(embedding.get_embedding("<eos>"))]
     result_digits = remove_leading_0s(embedding, result_digits, max_removals=max_digits)
 
     return create_unembedding(

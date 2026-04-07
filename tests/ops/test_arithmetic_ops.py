@@ -1,10 +1,10 @@
 from torchwright.ops.arithmetic_ops import (
-    add_scalar,
+    add_const,
     relu_add,
     compare,
     negate,
     subtract,
-    multiply_scalar,
+    multiply_const,
     square,
     multiply_integers,
 )
@@ -12,10 +12,10 @@ from torchwright.ops.inout_nodes import create_input
 import torch
 
 
-def test_add_scalar():
+def test_add_const():
     offset = 100.0
     value_input = create_input("value", 1)
-    n = add_scalar(value_input, offset)
+    n = add_const(value_input, offset)
     output = n.compute(n_pos=1, input_values={"value": torch.tensor([[1.0]])})
     assert output.tolist() == [[101.0]]
 
@@ -52,9 +52,9 @@ def test_subtract():
     assert torch.allclose(result, va - vb)
 
 
-def test_multiply_scalar():
+def test_multiply_const():
     x = create_input("x", 2)
-    out = multiply_scalar(x, 3.0)
+    out = multiply_const(x, 3.0)
     vals = torch.tensor([[2.0, -4.0]])
     result = out.compute(n_pos=1, input_values={"x": vals})
     assert torch.allclose(result, 3.0 * vals)

@@ -1,6 +1,6 @@
 from typing import List
 
-from torchwright.graph import Node, InputNode, Constant, Embedding, PosEncoding
+from torchwright.graph import Node, InputNode, LiteralValue, Embedding, PosEncoding
 import torch
 
 from torchwright.graph.embedding import Unembedding
@@ -20,17 +20,17 @@ def create_input(name: str, d: int) -> Node:
     return InputNode(name, d)
 
 
-def create_constant(vector: torch.Tensor, name: str = "") -> Node:
+def create_literal_value(vector: torch.Tensor, name: str = "") -> Node:
     """
-    Create a node with a constant value.
+    Create a node with a literal value.
 
     Args:
-    - vector (torch.Tensor): Tensor representing the constant value.
+    - vector (torch.Tensor): Tensor representing the literal value.
 
     Returns:
-    - Node: Node with the specified constant value.
+    - Node: Node with the specified literal value.
     """
-    return Constant(vector, name)
+    return LiteralValue(vector, name)
 
 
 def create_embedding(vocab: List[str]) -> Embedding:

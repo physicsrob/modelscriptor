@@ -16,7 +16,7 @@ import torch
 
 from torchwright.graph import Node, Embedding, PosEncoding
 from torchwright.ops.inout_nodes import (
-    create_constant,
+    create_literal_value,
     create_embedding,
     create_pos_encoding,
 )
@@ -76,9 +76,9 @@ def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
     first_num_digits = num_seq.get_digits_at_event(is_operator_input)
     second_num_digits = num_seq.get_digits_at_event(is_equals)
 
-    zero_embed = create_constant(embedding.get_embedding("0"))
-    eos_embed = create_constant(embedding.get_embedding("<eos>"))
-    minus_embed = create_constant(embedding.get_embedding("-"))
+    zero_embed = create_literal_value(embedding.get_embedding("0"))
+    eos_embed = create_literal_value(embedding.get_embedding("<eos>"))
+    minus_embed = create_literal_value(embedding.get_embedding("-"))
 
     # Multiplication produces up to 2*max_digits digits, so seq_len must
     # accommodate that. Addition and subtraction produce shorter results

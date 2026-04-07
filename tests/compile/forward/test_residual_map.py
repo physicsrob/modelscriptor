@@ -4,7 +4,7 @@ import torch
 from torchwright.compiler.feature_assignment import ResidualStreamState
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.graph import Node, Concatenate
-from torchwright.graph.misc import InputNode, Constant
+from torchwright.graph.misc import InputNode, LiteralValue
 
 
 def test_allocate_and_free():
@@ -77,7 +77,7 @@ def test_build_feature_assignment():
     """Build a FeatureAssignment and verify get_node_indices works."""
     rmap = ResidualStreamMap(64)
     inp = InputNode("x", 8)
-    const = Constant(torch.ones(4))
+    const = LiteralValue(torch.ones(4))
     out = InputNode("out", 3)
 
     idx_inp = rmap.allocate(inp)

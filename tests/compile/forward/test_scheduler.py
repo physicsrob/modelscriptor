@@ -18,7 +18,7 @@ from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.scheduler import LayerScheduler
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, FFNOp
 from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
-from torchwright.graph.misc import InputNode, Constant
+from torchwright.graph.misc import InputNode, LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding
 
 D = 64
@@ -102,13 +102,13 @@ def test_schedule_relu_chain():
 
 
 def test_schedule_constant():
-    """Constant node produces FFNOp('compute_constant') with no FFN slots.
+    """LiteralValue node produces FFNOp('compute_literal_value') with no FFN slots.
 
     Note: in the compile loop, Constants are typically pre-populated as input nodes.
     This tests the scheduler's capability to handle Constants that aren't pre-populated.
     """
     pos = _make_pos_encoding()
-    const = Constant(torch.tensor([1.0, -2.0, 3.5]))
+    const = LiteralValue(torch.tensor([1.0, -2.0, 3.5]))
 
     graph = GraphAnalyzer(const)
     rmap = ResidualStreamMap(D)
@@ -118,7 +118,7 @@ def test_schedule_constant():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, ffn_ops = scheduler.schedule_layer(rmap, computed)
 
-    const_ops = [op for op in ffn_ops if op.op_type == "compute_constant"]
+    const_ops = [op for op in ffn_ops if op.op_type == "compute_literal_value"]
     assert len(const_ops) == 1
     assert const_ops[0].node is const
     assert const_ops[0].ffn_slots == []
@@ -688,20 +688,20 @@ def test_no_progress_raises_error():
 def test_add_into_shared_addend_not_reassigned():
     """Shared node used as live addend must not be reassigned as dead later.
 
-    Bug pattern: A shared Constant is an input to multiple Add nodes. All Adds
+    Bug pattern: A shared LiteralValue is an input to multiple Add nodes. All Adds
     become free_adds in the same layer. The step 2a loop processes them
     sequentially, adding each Add to computed_nodes. On the last Add, the shared
-    Constant's other consumers (the earlier Adds) are now computed, making the
-    Constant dead-for-add. The scheduler reassigns the Constant's columns to the
-    last Add — but the earlier Adds' ops still reference the Constant as their
+    LiteralValue's other consumers (the earlier Adds) are now computed, making the
+    LiteralValue dead-for-add. The scheduler reassigns the LiteralValue's columns to the
+    last Add — but the earlier Adds' ops still reference the LiteralValue as their
     live addend, and the weight writer needs its columns.
 
     This is the exact bug from the calculator's switch() pattern.
     """
     pos = _make_pos_encoding()
-    shared = Constant(torch.randn(4))
+    shared = LiteralValue(torch.randn(4))
 
-    # 3 Add nodes sharing the same Constant, each with a unique dead addend
+    # 3 Add nodes sharing the same LiteralValue, each with a unique dead addend
     dead_nodes = [InputNode(f"dead{i}", 4) for i in range(3)]
     adds = [Add(shared, dn) for dn in dead_nodes]
     # Wire into output so graph includes everything

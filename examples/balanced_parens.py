@@ -27,7 +27,7 @@ from torchwright.graph.embedding import Unembedding
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import add_scaled_nodes, compare, negate
 from torchwright.ops.inout_nodes import (
-    create_constant,
+    create_literal_value,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
@@ -79,13 +79,13 @@ def create_network_parts(
     is_trigger = equals_vector(embedding, embed("\n"))
     result = select(
         is_balanced,
-        create_constant(embed("Y")),
-        create_constant(embed("N")),
+        create_literal_value(embed("Y")),
+        create_literal_value(embed("N")),
     )
     output_node = output_sequence(
         pos_encoding,
         is_trigger,
-        [result, create_constant(embed("<eos>"))],
+        [result, create_literal_value(embed("<eos>"))],
         embed(" "),
     )
     return output_node, pos_encoding, embedding

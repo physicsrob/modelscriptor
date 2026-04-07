@@ -16,7 +16,7 @@ import torch
 from torchwright.graph import Node, Embedding, PosEncoding
 from torchwright.graph.embedding import Unembedding
 from torchwright.ops.inout_nodes import (
-    create_constant,
+    create_literal_value,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
@@ -58,7 +58,7 @@ def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
 
     # --- Phase 2: Add digit-by-digit with carry propagation ---
     sum_digits = sum_digit_seqs(embedding, first_num_digits, second_num_digits) + [
-        create_constant(embedding.get_embedding("<eos>"))
+        create_literal_value(embedding.get_embedding("<eos>"))
     ]
     sum_digits = remove_leading_0s(embedding, sum_digits, max_removals=max_digits - 1)
 

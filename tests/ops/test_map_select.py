@@ -1,7 +1,7 @@
-from torchwright.ops.arithmetic_ops import add_scalar
+from torchwright.ops.arithmetic_ops import add_const
 from torchwright.ops.inout_nodes import (
     create_input,
-    create_constant,
+    create_literal_value,
     create_embedding,
 )
 from torchwright.ops.map_select import select, map_to_table, switch
@@ -13,8 +13,8 @@ def test_select():
     start = 100.0
     offset = 123.0
     cond_input = create_input("cond", 1)
-    x = create_constant(torch.tensor([start]))
-    x = select(cond=cond_input, true_node=add_scalar(x, offset), false_node=x)
+    x = create_literal_value(torch.tensor([start]))
+    x = select(cond=cond_input, true_node=add_const(x, offset), false_node=x)
     for cond in [1.0, -1.0]:
         print("\n\n")
         output = x.compute(n_pos=1, input_values={"cond": torch.tensor([[cond]])})
@@ -27,9 +27,9 @@ def test_switch():
     c1 = create_input("c1", 1)
     c2 = create_input("c2", 1)
     c3 = create_input("c3", 1)
-    v1 = create_constant(torch.tensor([10.0, 20.0]))
-    v2 = create_constant(torch.tensor([30.0, 40.0]))
-    v3 = create_constant(torch.tensor([50.0, 60.0]))
+    v1 = create_literal_value(torch.tensor([10.0, 20.0]))
+    v2 = create_literal_value(torch.tensor([30.0, 40.0]))
+    v3 = create_literal_value(torch.tensor([50.0, 60.0]))
     out = switch([c1, c2, c3], [v1, v2, v3])
 
     # Condition 1 true

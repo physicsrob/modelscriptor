@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
-from torchwright.graph.misc import Constant
+from torchwright.graph.misc import LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding, attention_hardness
 from torchwright.graph.relu import ReLU
 
@@ -27,7 +27,7 @@ class AttnHeadOp:
 
 @dataclass
 class FFNOp:
-    op_type: Literal["compute_relu", "compute_standalone_relu", "compute_constant", "compute_bias"]
+    op_type: Literal["compute_relu", "compute_standalone_relu", "compute_literal_value", "compute_bias"]
     node: Node
     target_cols: List[int]
     ffn_slots: List[int] = field(default_factory=list)
@@ -66,8 +66,8 @@ def write_ffn_sublayer(
     for op in ops:
         if op.op_type == "compute_relu":
             _write_compute_relu(layer.ffn, op, residual_map)
-        elif op.op_type == "compute_constant":
-            _write_compute_constant(layer.ffn, op)
+        elif op.op_type == "compute_literal_value":
+            _write_compute_literal_value(layer.ffn, op)
         elif op.op_type == "compute_bias":
             _write_compute_bias(layer.ffn, op)
         elif op.op_type == "compute_standalone_relu":
@@ -381,10 +381,10 @@ def _write_compute_relu(ffn, op: FFNOp, rmap: ResidualStreamMap):
         ffn.linear2.output_bias[out_col] = l2_node.output_bias[j]
 
 
-def _write_compute_constant(ffn, op: FFNOp):
+def _write_compute_literal_value(ffn, op: FFNOp):
     """Write a constant value via FFN output bias."""
     node = op.node
-    assert isinstance(node, Constant)
+    assert isinstance(node, LiteralValue)
     for i, col in enumerate(op.target_cols):
         ffn.linear2.output_bias[col] = node.value[i]
 

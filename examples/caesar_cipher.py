@@ -25,7 +25,7 @@ from torchwright.graph.embedding import Unembedding
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import concat
 from torchwright.ops.inout_nodes import (
-    create_constant,
+    create_literal_value,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
@@ -93,7 +93,7 @@ def create_network_parts(
         latched = pos_encoding.get_prev_value(raw, is_trigger)
         output_letters.append(latched)
 
-    output_letters.append(create_constant(embed("<eos>")))
+    output_letters.append(create_literal_value(embed("<eos>")))
 
     output_node = output_sequence(
         pos_encoding,

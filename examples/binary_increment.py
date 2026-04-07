@@ -25,7 +25,7 @@ from torchwright.graph import Node, Embedding
 from torchwright.graph.embedding import Unembedding
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.inout_nodes import (
-    create_constant,
+    create_literal_value,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
@@ -54,9 +54,9 @@ def create_network_parts(
 
     is_trigger = equals_vector(embedding, embed("\n"))
 
-    zero_embed = create_constant(embed("0"))
-    one_embed = create_constant(embed("1"))
-    eos_embed = create_constant(embed("<eos>"))
+    zero_embed = create_literal_value(embed("0"))
+    one_embed = create_literal_value(embed("1"))
+    eos_embed = create_literal_value(embed("<eos>"))
 
     # --- Read all bit positions at trigger (LSB first) ---
     # bits[0] = LSB (rightmost), bits[max_bits-1] = MSB (leftmost)
@@ -76,7 +76,7 @@ def create_network_parts(
 
     # --- Sequential carry chain (LSB to MSB) ---
     # carry[0] = True: we're adding 1
-    carry = [create_constant(torch.tensor([1.0]))]
+    carry = [create_literal_value(torch.tensor([1.0]))]
     for i in range(max_bits):
         # Carry propagates only through "1" bits
         carry.append(bool_all_true([is_one[i], carry[i]]))

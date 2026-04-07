@@ -59,7 +59,7 @@ class Add(Node):
             raise ValueError("Invalid node choice")
 
 
-class Constant(Node):
+class LiteralValue(Node):
     def __init__(self, value: torch.Tensor, name: str = ""):
         assert len(value.shape) == 1
         self.value = value
@@ -77,7 +77,7 @@ class Constant(Node):
         if self.is_zero():
             return "Zero"
         else:
-            return "Constant"
+            return "LiteralValue"
 
 
 class Placeholder(Node):

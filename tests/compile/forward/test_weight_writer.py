@@ -25,7 +25,7 @@ from torchwright.compiler.forward.weight_writer import (
 )
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
-from torchwright.graph.misc import InputNode, Constant
+from torchwright.graph.misc import InputNode, LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding, attention_hardness
 
 D = 64
@@ -716,21 +716,21 @@ def test_ffn_standalone_relu_preserves_input():
 
 
 # ---------------------------------------------------------------------------
-# FFN — compute_constant
+# FFN — compute_literal_value
 # ---------------------------------------------------------------------------
 
 
 def test_ffn_constant():
-    """Constant value written via FFN output bias."""
+    """LiteralValue written via FFN output bias."""
     const_value = torch.tensor([1.0, -2.0, 3.5])
-    const = Constant(const_value)
+    const = LiteralValue(const_value)
 
     rmap = ResidualStreamMap(D)
     out_cols = rmap.allocate(const)
 
     layer = TransformerLayer(D, D_HEAD)
     op = FFNOp(
-        op_type="compute_constant", node=const, target_cols=out_cols, ffn_slots=[]
+        op_type="compute_literal_value", node=const, target_cols=out_cols, ffn_slots=[]
     )
     write_ffn_sublayer(layer, [op], rmap)
     device = device_mod.get_device(verbose=False)
@@ -849,7 +849,7 @@ def test_mixed_layer():
 
     # FFN: constant
     const_value = torch.tensor([7.0, -3.0])
-    const = Constant(const_value)
+    const = LiteralValue(const_value)
 
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
@@ -867,7 +867,7 @@ def test_mixed_layer():
 
     # Write FFN ops
     ffn_op = FFNOp(
-        op_type="compute_constant", node=const, target_cols=const_cols, ffn_slots=[]
+        op_type="compute_literal_value", node=const, target_cols=const_cols, ffn_slots=[]
     )
     write_ffn_sublayer(layer, [ffn_op], rmap)
     layer.to(device_mod.get_device(verbose=False))

@@ -2,7 +2,7 @@ import torch
 
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.graph import Linear, ReLU, Add, Concatenate
-from torchwright.graph.misc import InputNode, Constant
+from torchwright.graph.misc import InputNode, LiteralValue
 from examples.adder import create_network_parts
 
 

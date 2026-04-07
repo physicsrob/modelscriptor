@@ -15,7 +15,7 @@ import torch
 from torchwright.graph import Node
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import add, compare
-from torchwright.ops.inout_nodes import create_constant
+from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.logic_ops import bool_all_true, cond_gate
 from torchwright.ops.map_select import select
 
@@ -60,7 +60,7 @@ def prefix_and(pos_encoding: PosEncoding, flag: Node, n_stages: int) -> Node:
         is_in_bounds = compare(position, 2**k - 0.5)
         # OOB → True (1.0) so AND is unchanged
         safe_flag = select(
-            is_in_bounds, offset_flag, create_constant(torch.tensor([1.0]))
+            is_in_bounds, offset_flag, create_literal_value(torch.tensor([1.0]))
         )
         result = bool_all_true([result, safe_flag])
     return result

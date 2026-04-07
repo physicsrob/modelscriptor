@@ -6,7 +6,7 @@ from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import (
     Node,
     Concatenate,
-    Constant,
+    LiteralValue,
     InputNode,
     PosEncoding,
     Embedding,
@@ -77,7 +77,7 @@ class GraphAnalyzer:
         return self._all_nodes
 
     def is_input_node(self, node: Node) -> bool:
-        return isinstance(node, (Embedding, PosEncoding, InputNode, Constant))
+        return isinstance(node, (Embedding, PosEncoding, InputNode, LiteralValue))
 
     def is_ready(self, node: Node, available: Set[Node]) -> bool:
         """Check if all of a node's inputs are available.
