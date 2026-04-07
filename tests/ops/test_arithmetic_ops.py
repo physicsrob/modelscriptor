@@ -8,6 +8,15 @@ from torchwright.ops.arithmetic_ops import (
     piecewise_linear,
     square,
     multiply_integers,
+    abs_value,
+    elem_min,
+    elem_max,
+    reciprocal,
+    floor_int,
+    ceil_int,
+    signed_multiply,
+    reduce_min,
+    reduce_max,
 )
 from torchwright.ops.inout_nodes import create_input
 import torch
@@ -204,3 +213,229 @@ def test_piecewise_linear_chunking():
     for i in range(10):
         result = _eval_pw(f, float(i))
         assert abs(result - i * i) < 0.01, f"f({i}) = {result}, expected {i*i}"
+
+
+def test_abs_value():
+    """abs_value on a 3-wide node with positive, negative, and zero."""
+    x = create_input("x", 3)
+    out = abs_value(x)
+    vals = torch.tensor([[5.0, -3.0, 0.0]])
+    result = out.compute(n_pos=1, input_values={"x": vals})
+    assert torch.allclose(result, torch.tensor([[5.0, 3.0, 0.0]]))
+
+
+def test_abs_value_scalar():
+    """abs_value on scalar inputs."""
+    x = create_input("x", 1)
+    out = abs_value(x)
+    for v in [-7.0, 0.0, 4.5]:
+        result = out.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        assert abs(result.item() - abs(v)) < 0.01
+
+
+def test_elem_min():
+    a = create_input("a", 3)
+    b = create_input("b", 3)
+    out = elem_min(a, b)
+    va = torch.tensor([[5.0, -2.0, 7.0]])
+    vb = torch.tensor([[3.0, 1.0, 7.0]])
+    result = out.compute(n_pos=1, input_values={"a": va, "b": vb})
+    expected = torch.min(va, vb)
+    assert torch.allclose(result, expected, atol=0.01)
+
+
+def test_elem_max():
+    a = create_input("a", 3)
+    b = create_input("b", 3)
+    out = elem_max(a, b)
+    va = torch.tensor([[5.0, -2.0, 7.0]])
+    vb = torch.tensor([[3.0, 1.0, 7.0]])
+    result = out.compute(n_pos=1, input_values={"a": va, "b": vb})
+    expected = torch.max(va, vb)
+    assert torch.allclose(result, expected, atol=0.01)
+
+
+def test_reciprocal():
+    """Exact at integer multiples of step in [1, 10]."""
+    x = create_input("x", 1)
+    r = reciprocal(x, min_value=1.0, max_value=10.0, step=1.0)
+    for v in range(1, 11):
+        result = r.compute(n_pos=1, input_values={"x": torch.tensor([[float(v)]])})
+        expected = 1.0 / v
+        assert abs(result.item() - expected) < 0.01, (
+            f"1/{v} = {expected}, got {result.item()}"
+        )
+
+
+def test_reciprocal_interpolation():
+    """Between grid points the result should be close to 1/x."""
+    x = create_input("x", 1)
+    r = reciprocal(x, min_value=1.0, max_value=10.0, step=1.0)
+    # Halfway between grid points — linear interpolation error is bounded
+    for v in [1.5, 2.5, 5.5]:
+        result = r.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        exact = 1.0 / v
+        assert abs(result.item() - exact) < 0.1, (
+            f"1/{v} = {exact:.4f}, got {result.item():.4f}"
+        )
+
+
+def test_floor_int():
+    x = create_input("x", 1)
+    f = floor_int(x, min_value=0, max_value=5)
+    # Exact at integers
+    for v in range(6):
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[float(v)]])})
+        assert abs(result.item() - v) < 0.01, f"floor({v}) = {v}, got {result.item()}"
+    # Between integers
+    for v, expected in [(2.3, 2.0), (2.7, 2.0), (4.9, 4.0)]:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        assert abs(result.item() - expected) < 0.01, (
+            f"floor({v}) = {expected}, got {result.item()}"
+        )
+
+
+def test_floor_int_negative():
+    x = create_input("x", 1)
+    f = floor_int(x, min_value=-3, max_value=3)
+    for v, expected in [(-2.5, -3.0), (-1.0, -1.0), (0.0, 0.0), (1.5, 1.0)]:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        assert abs(result.item() - expected) < 0.01, (
+            f"floor({v}) = {expected}, got {result.item()}"
+        )
+
+
+def test_ceil_int():
+    x = create_input("x", 1)
+    c = ceil_int(x, min_value=0, max_value=5)
+    # Exact at integers
+    for v in range(6):
+        result = c.compute(n_pos=1, input_values={"x": torch.tensor([[float(v)]])})
+        assert abs(result.item() - v) < 0.01, f"ceil({v}) = {v}, got {result.item()}"
+    # Between integers
+    for v, expected in [(2.3, 3.0), (2.7, 3.0), (0.1, 1.0)]:
+        result = c.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        assert abs(result.item() - expected) < 0.01, (
+            f"ceil({v}) = {expected}, got {result.item()}"
+        )
+
+
+def test_signed_multiply():
+    """Test all sign combinations."""
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    prod = signed_multiply(a, b, max_abs1=10.0, max_abs2=10.0, step=1.0)
+    cases = [
+        (3.0, 4.0, 12.0),
+        (-3.0, 4.0, -12.0),
+        (3.0, -4.0, -12.0),
+        (-3.0, -4.0, 12.0),
+        (0.0, 5.0, 0.0),
+        (5.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+    ]
+    for va, vb, expected in cases:
+        result = prod.compute(
+            n_pos=1,
+            input_values={
+                "a": torch.tensor([[va]]),
+                "b": torch.tensor([[vb]]),
+            },
+        )
+        assert abs(result.item() - expected) < 0.5, (
+            f"{va}*{vb} = {expected}, got {result.item()}"
+        )
+
+
+def test_signed_multiply_with_clamp():
+    """max_abs_output clamps the result."""
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    prod = signed_multiply(a, b, max_abs1=10.0, max_abs2=10.0, step=1.0, max_abs_output=20.0)
+    result = prod.compute(
+        n_pos=1,
+        input_values={"a": torch.tensor([[5.0]]), "b": torch.tensor([[5.0]])},
+    )
+    assert abs(result.item() - 20.0) < 0.5  # 5*5=25, clamped to 20
+
+
+def test_reduce_min():
+    """Find minimum key and its associated value."""
+    keys = [create_input(f"k{i}", 1) for i in range(4)]
+    vals = [create_input(f"v{i}", 2) for i in range(4)]
+    win_k, win_v = reduce_min(keys, vals)
+
+    input_values = {
+        "k0": torch.tensor([[10.0]]),
+        "k1": torch.tensor([[3.0]]),
+        "k2": torch.tensor([[7.0]]),
+        "k3": torch.tensor([[5.0]]),
+        "v0": torch.tensor([[100.0, 200.0]]),
+        "v1": torch.tensor([[300.0, 400.0]]),
+        "v2": torch.tensor([[500.0, 600.0]]),
+        "v3": torch.tensor([[700.0, 800.0]]),
+    }
+
+    result_k = win_k.compute(n_pos=1, input_values=input_values)
+    result_v = win_v.compute(n_pos=1, input_values=input_values)
+    assert abs(result_k.item() - 3.0) < 0.5
+    assert torch.allclose(result_v, torch.tensor([[300.0, 400.0]]), atol=1.0)
+
+
+def test_reduce_max():
+    """Find maximum key and its associated value."""
+    keys = [create_input(f"k{i}", 1) for i in range(4)]
+    vals = [create_input(f"v{i}", 2) for i in range(4)]
+    win_k, win_v = reduce_max(keys, vals)
+
+    input_values = {
+        "k0": torch.tensor([[10.0]]),
+        "k1": torch.tensor([[3.0]]),
+        "k2": torch.tensor([[7.0]]),
+        "k3": torch.tensor([[5.0]]),
+        "v0": torch.tensor([[100.0, 200.0]]),
+        "v1": torch.tensor([[300.0, 400.0]]),
+        "v2": torch.tensor([[500.0, 600.0]]),
+        "v3": torch.tensor([[700.0, 800.0]]),
+    }
+
+    result_k = win_k.compute(n_pos=1, input_values=input_values)
+    result_v = win_v.compute(n_pos=1, input_values=input_values)
+    assert abs(result_k.item() - 10.0) < 0.5
+    assert torch.allclose(result_v, torch.tensor([[100.0, 200.0]]), atol=1.0)
+
+
+def test_reduce_min_single():
+    """N=1: pass-through."""
+    k = create_input("k", 1)
+    v = create_input("v", 3)
+    win_k, win_v = reduce_min([k], [v])
+    input_values = {
+        "k": torch.tensor([[42.0]]),
+        "v": torch.tensor([[1.0, 2.0, 3.0]]),
+    }
+    assert abs(win_k.compute(n_pos=1, input_values=input_values).item() - 42.0) < 0.01
+    assert torch.allclose(
+        win_v.compute(n_pos=1, input_values=input_values),
+        torch.tensor([[1.0, 2.0, 3.0]]),
+    )
+
+
+def test_reduce_min_odd():
+    """N=3: odd element passes through."""
+    keys = [create_input(f"k{i}", 1) for i in range(3)]
+    vals = [create_input(f"v{i}", 1) for i in range(3)]
+    win_k, win_v = reduce_min(keys, vals)
+
+    input_values = {
+        "k0": torch.tensor([[5.0]]),
+        "k1": torch.tensor([[2.0]]),
+        "k2": torch.tensor([[8.0]]),
+        "v0": torch.tensor([[50.0]]),
+        "v1": torch.tensor([[20.0]]),
+        "v2": torch.tensor([[80.0]]),
+    }
+    result_k = win_k.compute(n_pos=1, input_values=input_values)
+    result_v = win_v.compute(n_pos=1, input_values=input_values)
+    assert abs(result_k.item() - 2.0) < 0.5
+    assert abs(result_v.item() - 20.0) < 1.0
