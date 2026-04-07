@@ -8,7 +8,7 @@ from torchwright.compiler.groups.ffn_sublayer import FFNSubLayer
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import (
     Node,
-    Constant,
+    LiteralValue,
     InputNode,
     PosEncoding,
     Concatenate,
@@ -71,7 +71,7 @@ class HeadlessTransformer:
 
         for node in self.feature_assignment.get_nodes(in_state):
             indices = self.feature_assignment.get_node_indices(in_state, node)
-            if isinstance(node, Constant):
+            if isinstance(node, LiteralValue):
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = node.value[i]
             elif isinstance(node, InputNode):

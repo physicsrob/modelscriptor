@@ -21,7 +21,7 @@ import torch
 
 from torchwright.graph import Node, Embedding
 from torchwright.ops.arithmetic_ops import concat, compare, sum_nodes
-from torchwright.ops.inout_nodes import create_constant
+from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.map_select import map_to_table, select
 
 
@@ -85,7 +85,7 @@ def sum_digit_seqs(
     Sequences are MSB-first: seq[0] is the most significant digit,
     seq[-1] is the least significant.
     """
-    carry = create_constant(torch.tensor([-1.0]))
+    carry = create_literal_value(torch.tensor([-1.0]))
     out = []
     for digit1, digit2 in reversed(list(zip(seq1, seq2))):
         sum, carry = sum_digits(embedding, digit1, digit2, carry)
@@ -137,7 +137,7 @@ def subtract_digit_seqs(
 
     Assumes seq1 >= seq2 (no sign handling). Processes right-to-left.
     """
-    borrow = create_constant(torch.tensor([-1.0]))
+    borrow = create_literal_value(torch.tensor([-1.0]))
     out = []
     for d1, d2 in reversed(list(zip(seq1, seq2))):
         result, borrow = subtract_digits(embedding, d1, d2, borrow)
@@ -244,7 +244,7 @@ def multiply_digit_seqs(
     multiplication.
     """
     n = len(seq1)
-    zero = create_constant(embedding.get_embedding("0"))
+    zero = create_literal_value(embedding.get_embedding("0"))
 
     # Step 1: Compute all digit*digit products (parallel in the graph)
     products = {}
@@ -256,7 +256,7 @@ def multiply_digit_seqs(
     # Row j = seq1 * seq2[j], shifted left by (n-1-j) positions.
     rows = []
     for j in range(n):
-        carry = create_constant(torch.tensor([-1.0]))
+        carry = create_literal_value(torch.tensor([-1.0]))
         row_digits = []
         for i in reversed(range(n)):
             tens, ones = products[i, j]

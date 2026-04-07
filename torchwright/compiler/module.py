@@ -12,7 +12,7 @@ import torch.nn as nn
 
 from torchwright.compiler.device import get_device
 from torchwright.compiler.transformer import HeadlessTransformer
-from torchwright.graph import Node, Constant, PosEncoding, Embedding, Concatenate
+from torchwright.graph import Node, LiteralValue, PosEncoding, Embedding, Concatenate
 from torchwright.graph.embedding import Tokenizer
 
 
@@ -200,7 +200,7 @@ def to_module(
             embedding_indices = indices
         elif isinstance(node, PosEncoding):
             pos_indices = indices
-        elif isinstance(node, Constant):
+        elif isinstance(node, LiteralValue):
             for i, idx in enumerate(indices):
                 constant_values[idx] = node.value[i]
         elif isinstance(node, Concatenate):

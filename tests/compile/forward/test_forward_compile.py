@@ -8,16 +8,16 @@ import torch
 
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph import Linear, ReLU, Add, Concatenate
-from torchwright.graph.misc import InputNode, Constant
+from torchwright.graph.misc import InputNode, LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.inout_nodes import (
     create_input,
-    create_constant,
+    create_literal_value,
     create_pos_encoding,
 )
 from torchwright.ops.arithmetic_ops import (
     add,
-    add_scalar,
+    add_const,
     add_scaled_nodes,
     relu,
     relu_add,
@@ -59,8 +59,8 @@ def _verify(output_node, n_pos, input_values, pos_encoding=None, max_layers=100)
 
 
 def test_compile_constant():
-    """Single Constant node — simplest possible graph."""
-    const = create_constant(torch.tensor([1.0, -2.0, 3.5]))
+    """Single LiteralValue node — simplest possible graph."""
+    const = create_literal_value(torch.tensor([1.0, -2.0, 3.5]))
     _verify(const, n_pos=2, input_values={})
 
 
@@ -244,10 +244,10 @@ def test_compile_get_prev_value():
 
 def test_compile_repeated_adds():
     """Chain of adds on constants — exercises Add scheduling."""
-    c1 = create_constant(torch.tensor([1.0]))
-    c2 = create_constant(torch.tensor([1.0]))
-    c3 = create_constant(torch.tensor([1.0]))
-    c4 = create_constant(torch.tensor([1.0]))
+    c1 = create_literal_value(torch.tensor([1.0]))
+    c2 = create_literal_value(torch.tensor([1.0]))
+    c3 = create_literal_value(torch.tensor([1.0]))
+    c4 = create_literal_value(torch.tensor([1.0]))
     a1 = add(c1, c2)
     a2 = add(c3, c4)
     out = add(a1, a2)
@@ -272,17 +272,17 @@ def test_compile_add_relu():
     )
 
 
-def test_compile_add_scalar():
-    """add_scalar — FFN bias-only addition via Add."""
+def test_compile_add_const():
+    """add_const — FFN bias-only addition via Add."""
     v = create_input("v", 1)
-    out = add_scalar(v, 100.0)
+    out = add_const(v, 100.0)
     _verify(out, n_pos=1, input_values={"v": torch.tensor([[1.0]])})
 
 
 def test_compile_cond_add_vector():
     """cond_add_vector — FFN multiplexer + Add."""
     cond = create_input("cond", 1)
-    x = create_constant(torch.tensor([15.0, 25.0]))
+    x = create_literal_value(torch.tensor([15.0, 25.0]))
     out = cond_add_vector(
         cond,
         x,
@@ -317,11 +317,11 @@ def test_compile_relu_add():
 
 def test_compile_multiple_concats():
     """Shared constants across multiple concat -> add paths."""
-    c1 = create_constant(torch.tensor([1.0]))
-    c2 = create_constant(torch.tensor([1.0]))
-    c3 = create_constant(torch.tensor([1.0]))
-    add1 = add(concat([c1, c2]), create_constant(torch.tensor([2.0, 2.0])))
-    add2 = add(concat([c1, c3]), create_constant(torch.tensor([2.0, 2.0])))
+    c1 = create_literal_value(torch.tensor([1.0]))
+    c2 = create_literal_value(torch.tensor([1.0]))
+    c3 = create_literal_value(torch.tensor([1.0]))
+    add1 = add(concat([c1, c2]), create_literal_value(torch.tensor([2.0, 2.0])))
+    add2 = add(concat([c1, c3]), create_literal_value(torch.tensor([2.0, 2.0])))
     out = add(add1, add2)
     _verify(out, n_pos=1, input_values={})
 
@@ -338,9 +338,9 @@ def test_compile_switch():
     cond1 = create_input("c1", 1)
     cond2 = create_input("c2", 1)
     cond3 = create_input("c3", 1)
-    v1 = create_constant(torch.tensor([10.0, 20.0]))
-    v2 = create_constant(torch.tensor([30.0, 40.0]))
-    v3 = create_constant(torch.tensor([50.0, 60.0]))
+    v1 = create_literal_value(torch.tensor([10.0, 20.0]))
+    v2 = create_literal_value(torch.tensor([30.0, 40.0]))
+    v3 = create_literal_value(torch.tensor([50.0, 60.0]))
     out = switch([cond1, cond2, cond3], [v1, v2, v3])
 
     # Condition 1 true
@@ -386,8 +386,8 @@ def test_compile_multi_switch_shared_constants():
     c3 = pos.get_prev_value(flag, flag)
 
     # Real values for c1, placeholder zeros for c2/c3
-    zero = create_constant(torch.zeros(4))
-    real_values = [create_constant(torch.randn(4)) for _ in range(3)]
+    zero = create_literal_value(torch.zeros(4))
+    real_values = [create_literal_value(torch.randn(4)) for _ in range(3)]
 
     # Multiple switches sharing the same zero placeholder — like the calculator
     results = []
@@ -420,9 +420,9 @@ def test_compile_switch_with_attention_conditions():
 
     pos = create_pos_encoding()
     embedding_dim = 8
-    v1 = create_constant(torch.randn(embedding_dim))
-    v2 = create_constant(torch.randn(embedding_dim))
-    v3 = create_constant(torch.randn(embedding_dim))
+    v1 = create_literal_value(torch.randn(embedding_dim))
+    v2 = create_literal_value(torch.randn(embedding_dim))
+    v3 = create_literal_value(torch.randn(embedding_dim))
 
     # Conditions via attention — like equals_vector + get_prev_value
     flag = create_input("flag", 1)

@@ -1,5 +1,5 @@
 from torchwright.graph.spherical_codes import index_to_vector
-from torchwright.ops.inout_nodes import create_constant, create_input
+from torchwright.ops.inout_nodes import create_literal_value, create_input
 from torchwright.ops.logic_ops import (
     equals_vector,
     cond_add_vector,
@@ -15,7 +15,7 @@ import torch
 def test_equals_vector():
     for i in range(10):
         for j in range(10):
-            x = create_constant(index_to_vector(i))
+            x = create_literal_value(index_to_vector(i))
             c = index_to_vector(j)
             y = equals_vector(x, c)
             output = y.compute(n_pos=1, input_values={})
@@ -29,7 +29,7 @@ def test_cond_add_vector():
     false_offset = torch.tensor([0.0, 100.0])
 
     cond_input = create_input("cond", 1)
-    x = create_constant(base_value)
+    x = create_literal_value(base_value)
     x = cond_add_vector(cond_input, x, true_offset, false_offset)
     for cond_value in [-1.0, 1.0]:
         output = x.compute(n_pos=1, input_values={"cond": torch.tensor([[cond_value]])})

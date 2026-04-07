@@ -186,7 +186,7 @@ is greedy: nodes get whatever columns are free when they are computed.
 The `torchwright/ops/` package provides high-level operations built
 on top of the raw graph nodes. These are what examples typically use:
 
-- **Arithmetic**: `add_scalar`, `negate`, `subtract`, `multiply_scalar`
+- **Arithmetic**: `add_const`, `negate`, `subtract`, `multiply_const`
 - **Logic**: `equals_vector`, `bool_not`, `bool_all_true`, `bool_any_true`
 - **Table lookups**: `map_to_table` -- maps an embedding-valued input to an
   embedding-valued output via an FFN lookup table

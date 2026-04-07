@@ -31,7 +31,7 @@ from torchwright.ops.arithmetic_ops import (
     multiply_integers,
 )
 from torchwright.ops.inout_nodes import (
-    create_constant,
+    create_literal_value,
     create_embedding,
     create_pos_encoding,
     create_unembedding,
@@ -107,8 +107,8 @@ def create_network_parts(
     number_a = digits_to_number(embedding, first_num_digits)
     number_b = digits_to_number(embedding, second_num_digits)
 
-    eos_embed = create_constant(embedding.get_embedding("<eos>"))
-    minus_embed = create_constant(embedding.get_embedding("-"))
+    eos_embed = create_literal_value(embedding.get_embedding("<eos>"))
+    minus_embed = create_literal_value(embedding.get_embedding("-"))
 
     # Multiplication produces up to 2*max_digits digits; all sequences
     # are padded to this length so switch() can select element-by-element.

@@ -53,7 +53,7 @@ def _count_layer_params(
     for op in ffn_ops:
         if op.ffn_slots:
             slots_used += len(op.ffn_slots)
-        if op.op_type in ("compute_constant", "compute_bias"):
+        if op.op_type in ("compute_literal_value", "compute_bias"):
             bias_entries += len(op.target_cols)
 
     params_per_slot = 2 * d + 2  # linear1 column + bias + linear2 row + bias

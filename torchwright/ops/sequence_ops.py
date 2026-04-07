@@ -21,7 +21,7 @@ import torch
 
 from torchwright.graph import Node, Embedding, PosEncoding
 from torchwright.ops.arithmetic_ops import sum_nodes
-from torchwright.ops.inout_nodes import create_constant
+from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.logic_ops import (
     equals_vector,
     cond_gate,
@@ -65,7 +65,7 @@ class NumericSequence:
 
     def __init__(self, pos_encoding: PosEncoding, embedding: Embedding, digits: int):
         self.pos_encoding = pos_encoding
-        zero_constant = create_constant(embedding.get_embedding("0"))
+        zero_constant = create_literal_value(embedding.get_embedding("0"))
         is_digit = check_is_digit(embedding)
 
         # Detect the start of a new number: current token is a digit,
@@ -139,7 +139,7 @@ def output_sequence(
     return select(
         cond=has_triggered,
         true_node=sum_nodes(out_values),
-        false_node=create_constant(default_output),
+        false_node=create_literal_value(default_output),
     )
 
 

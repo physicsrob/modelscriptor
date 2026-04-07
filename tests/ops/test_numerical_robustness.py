@@ -14,7 +14,7 @@ import torch
 
 from torchwright.graph import Embedding
 from torchwright.ops.arithmetic_ops import concat
-from torchwright.ops.inout_nodes import create_constant, create_embedding
+from torchwright.ops.inout_nodes import create_literal_value, create_embedding
 from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.map_select import map_to_table, select
 
@@ -44,7 +44,7 @@ def test_map_to_table_output_fidelity():
     table = _digit_identity_table(embedding)
 
     for digit in range(10):
-        inp = create_constant(embedding.get_embedding(str(digit)))
+        inp = create_literal_value(embedding.get_embedding(str(digit)))
         looked_up = map_to_table(inp, table, default=embedding.get_embedding("0"))
         result = looked_up.compute(n_pos=1, input_values={}).squeeze()
         true_emb = embedding.get_embedding(str(digit))
@@ -60,7 +60,7 @@ def test_chained_map_to_table_output_fidelity():
     table = _digit_identity_table(embedding)
 
     for digit in range(10):
-        inp = create_constant(embedding.get_embedding(str(digit)))
+        inp = create_literal_value(embedding.get_embedding(str(digit)))
         first = map_to_table(inp, table, default=embedding.get_embedding("0"))
         second = map_to_table(first, table, default=embedding.get_embedding("0"))
         result = second.compute(n_pos=1, input_values={}).squeeze()
@@ -80,7 +80,7 @@ def test_equals_vector_after_map_to_table():
     table = _digit_identity_table(embedding)
 
     for digit in range(10):
-        inp = create_constant(embedding.get_embedding(str(digit)))
+        inp = create_literal_value(embedding.get_embedding(str(digit)))
         looked_up = map_to_table(inp, table, default=embedding.get_embedding("0"))
         result = equals_vector(looked_up, embedding.get_embedding(str(digit)))
         output = result.compute(n_pos=1, input_values={}).item()
@@ -94,7 +94,7 @@ def test_equals_vector_after_map_to_table_rejects_wrong_digit():
     embedding = _make_digit_embedding()
     table = _digit_identity_table(embedding)
 
-    inp = create_constant(embedding.get_embedding("5"))
+    inp = create_literal_value(embedding.get_embedding("5"))
     looked_up = map_to_table(inp, table, default=embedding.get_embedding("0"))
 
     for wrong_digit in [0, 1, 2, 3, 4, 6, 7, 8, 9]:
@@ -111,7 +111,7 @@ def test_equals_vector_after_double_map_to_table():
     table = _digit_identity_table(embedding)
 
     for digit in range(10):
-        inp = create_constant(embedding.get_embedding(str(digit)))
+        inp = create_literal_value(embedding.get_embedding(str(digit)))
         first = map_to_table(inp, table, default=embedding.get_embedding("0"))
         second = map_to_table(first, table, default=embedding.get_embedding("0"))
         result = equals_vector(second, embedding.get_embedding(str(digit)))
@@ -132,7 +132,7 @@ def test_equals_vector_output_bounds_exact_input():
 
     for i in range(10):
         for j in range(10):
-            inp = create_constant(embedding.get_embedding(str(i)))
+            inp = create_literal_value(embedding.get_embedding(str(i)))
             result = equals_vector(inp, embedding.get_embedding(str(j)))
             output = result.compute(n_pos=1, input_values={}).item()
             assert (
@@ -157,11 +157,11 @@ def test_equals_vector_after_select():
     e3 = embedding.get_embedding("3")
     e7 = embedding.get_embedding("7")
 
-    true_node = create_constant(e3)
-    false_node = create_constant(e7)
+    true_node = create_literal_value(e3)
+    false_node = create_literal_value(e7)
 
     # Condition = true → should select e3
-    cond_true = create_constant(torch.tensor([1.0]))
+    cond_true = create_literal_value(torch.tensor([1.0]))
     selected = select(cond=cond_true, true_node=true_node, false_node=false_node)
     result = equals_vector(selected, e3)
     output = result.compute(n_pos=1, input_values={}).item()
@@ -177,7 +177,7 @@ def test_equals_vector_after_select():
     ), f"equals_vector(select(true→3), 7) = {output_wrong:.4f}, expected ~-1.0"
 
     # Condition = false → should select e7
-    cond_false = create_constant(torch.tensor([-1.0]))
+    cond_false = create_literal_value(torch.tensor([-1.0]))
     selected_f = select(cond=cond_false, true_node=true_node, false_node=false_node)
     result_f = equals_vector(selected_f, e7)
     output_f = result_f.compute(n_pos=1, input_values={}).item()
@@ -196,16 +196,16 @@ def test_equals_vector_after_nested_select():
 
     # Level 1: select between 0 and 5 (choose 5)
     level1 = select(
-        cond=create_constant(torch.tensor([1.0])),
-        true_node=create_constant(e5),
-        false_node=create_constant(e0),
+        cond=create_literal_value(torch.tensor([1.0])),
+        true_node=create_literal_value(e5),
+        false_node=create_literal_value(e0),
     )
 
     # Level 2: select between level1 output and 9 (choose level1 = 5)
     level2 = select(
-        cond=create_constant(torch.tensor([1.0])),
+        cond=create_literal_value(torch.tensor([1.0])),
         true_node=level1,
-        false_node=create_constant(e9),
+        false_node=create_literal_value(e9),
     )
 
     result = equals_vector(level2, e5)
@@ -230,7 +230,7 @@ def test_map_to_table_chain_produces_correct_lookup():
     table = _digit_identity_table(embedding)
 
     for digit in range(10):
-        inp = create_constant(embedding.get_embedding(str(digit)))
+        inp = create_literal_value(embedding.get_embedding(str(digit)))
         first = map_to_table(inp, table, default=embedding.get_embedding("0"))
         second = map_to_table(first, table, default=embedding.get_embedding("0"))
         result = second.compute(n_pos=1, input_values={}).squeeze()
@@ -277,14 +277,14 @@ def test_sum_digits_on_map_to_table_output():
 
     inp = concat(
         [
-            create_constant(embedding.get_embedding("3")),
-            create_constant(embedding.get_embedding("4")),
+            create_literal_value(embedding.get_embedding("3")),
+            create_literal_value(embedding.get_embedding("4")),
         ]
     )
     ones = map_to_table(inp, prod_table_ones, default=embedding.get_embedding("0"))
 
-    zero = create_constant(embedding.get_embedding("0"))
-    no_carry = create_constant(torch.tensor([-1.0]))
+    zero = create_literal_value(embedding.get_embedding("0"))
+    no_carry = create_literal_value(torch.tensor([-1.0]))
     digit_sum, carry_out = sum_digits(embedding, ones, zero, no_carry)
 
     result = digit_sum.compute(n_pos=1, input_values={}).squeeze()
@@ -319,7 +319,7 @@ def test_remove_leading_0s_single_level():
     e0 = embedding.get_embedding("0")
     e5 = embedding.get_embedding("5")
 
-    seq = [create_constant(e0), create_constant(e5)]
+    seq = [create_literal_value(e0), create_literal_value(e5)]
     result = remove_leading_0s(embedding, seq, max_removals=1)
 
     # After removing one leading zero: [5, 5]
@@ -340,7 +340,7 @@ def test_remove_leading_0s_two_levels():
     e0 = embedding.get_embedding("0")
     e3 = embedding.get_embedding("3")
 
-    seq = [create_constant(e0), create_constant(e0), create_constant(e3)]
+    seq = [create_literal_value(e0), create_literal_value(e0), create_literal_value(e3)]
     result = remove_leading_0s(embedding, seq, max_removals=2)
 
     # After removing two leading zeros: [3, 3, 3]
@@ -358,10 +358,10 @@ def test_remove_leading_0s_three_levels():
     e7 = embedding.get_embedding("7")
 
     seq = [
-        create_constant(e0),
-        create_constant(e0),
-        create_constant(e0),
-        create_constant(e7),
+        create_literal_value(e0),
+        create_literal_value(e0),
+        create_literal_value(e0),
+        create_literal_value(e7),
     ]
     result = remove_leading_0s(embedding, seq, max_removals=3)
 
@@ -378,7 +378,7 @@ def test_remove_leading_0s_no_removal_needed():
     e4 = embedding.get_embedding("4")
     e2 = embedding.get_embedding("2")
 
-    seq = [create_constant(e4), create_constant(e2)]
+    seq = [create_literal_value(e4), create_literal_value(e2)]
     result = remove_leading_0s(embedding, seq, max_removals=2)
 
     out0 = result[0].compute(n_pos=1, input_values={}).squeeze()

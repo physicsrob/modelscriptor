@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from torchwright.ops.arithmetic_ops import add_scalar, compare
-from torchwright.ops.inout_nodes import create_input, create_constant
+from torchwright.ops.arithmetic_ops import add_const, compare
+from torchwright.ops.inout_nodes import create_input, create_literal_value
 from torchwright.ops.loop_ops import unrolled_loop
 
 
@@ -11,7 +11,7 @@ def test_count_to_target():
     counter_input = create_input("counter", 1)
 
     def step_fn(state):
-        return {"counter": add_scalar(state["counter"], 1.0)}
+        return {"counter": add_const(state["counter"], 1.0)}
 
     def done_fn(state):
         return compare(state["counter"], 2.5)  # true when counter >= 3
@@ -39,7 +39,7 @@ def test_already_done():
     x_input = create_input("x", 1)
 
     def step_fn(state):
-        return {"x": add_scalar(state["x"], 100.0)}
+        return {"x": add_const(state["x"], 100.0)}
 
     def done_fn(state):
         return compare(state["x"], 0.5)  # x starts at 50, already done
@@ -67,7 +67,7 @@ def test_zero_iterations():
     x_input = create_input("x", 1)
 
     def step_fn(state):
-        return {"x": add_scalar(state["x"], 1.0)}
+        return {"x": add_const(state["x"], 1.0)}
 
     def done_fn(state):
         return compare(state["x"], 999.0)  # never done
@@ -95,7 +95,7 @@ def test_never_done():
     counter_input = create_input("counter", 1)
 
     def step_fn(state):
-        return {"counter": add_scalar(state["counter"], 1.0)}
+        return {"counter": add_const(state["counter"], 1.0)}
 
     def done_fn(state):
         return compare(state["counter"], 999.0)  # never triggers
@@ -125,8 +125,8 @@ def test_multi_variable_freeze():
 
     def step_fn(state):
         return {
-            "x": add_scalar(state["x"], 1.0),
-            "y": add_scalar(state["y"], 10.0),
+            "x": add_const(state["x"], 1.0),
+            "y": add_const(state["y"], 10.0),
         }
 
     def done_fn(state):
@@ -156,7 +156,7 @@ def test_mismatched_keys():
     x_input = create_input("x", 1)
 
     def step_fn(state):
-        return {"wrong_key": add_scalar(state["x"], 1.0)}
+        return {"wrong_key": add_const(state["x"], 1.0)}
 
     def done_fn(state):
         return compare(state["x"], 999.0)

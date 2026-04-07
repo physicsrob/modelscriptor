@@ -9,7 +9,7 @@ from torchwright.ops.linear_relu_linear import linear_relu_linear
 from torchwright.ops.const import step_sharpness, big_offset
 
 
-def add_scalar(inp: Node, scalar: float) -> Node:
+def add_const(inp: Node, scalar: float) -> Node:
     """
     Adds a scalar value to each entry of the input node.
 
@@ -28,9 +28,9 @@ def add_scalar(inp: Node, scalar: float) -> Node:
             input_bias=torch.zeros(1),
             output_proj=torch.tensor([0.0] * len(inp)),
             output_bias=torch.tensor([scalar] * len(inp)),
-            name="add_scalar_ffn",
+            name="add_const_ffn",
         ),
-        name="add_scalar_add",
+        name="add_const_add",
     )
 
 
@@ -220,7 +220,7 @@ def subtract(inp1: Node, inp2: Node) -> Node:
     return add(inp1, negate(inp2))
 
 
-def multiply_scalar(inp: Node, scalar: float) -> Node:
+def multiply_const(inp: Node, scalar: float) -> Node:
     """
     Multiplies each entry of the input node by a scalar.
 
@@ -232,7 +232,7 @@ def multiply_scalar(inp: Node, scalar: float) -> Node:
         Node: Node with scaled values.
     """
     d = len(inp)
-    return Linear(inp, scalar * torch.eye(d), name="multiply_scalar")
+    return Linear(inp, scalar * torch.eye(d), name="multiply_const")
 
 
 def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
@@ -273,9 +273,9 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = max_value // divisor
     if n == 0:
-        from torchwright.ops.inout_nodes import create_constant
+        from torchwright.ops.inout_nodes import create_literal_value
 
-        return create_constant(torch.tensor([0.0]))
+        return create_literal_value(torch.tensor([0.0]))
 
     d_int = 2 * n  # Two ReLU units per threshold detector
     input_proj = torch.zeros(d_int, 1)

@@ -14,7 +14,7 @@ from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, FFNOp
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
-from torchwright.graph.misc import Constant
+from torchwright.graph.misc import LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 
@@ -77,7 +77,7 @@ class LayerScheduler:
                     free_adds.append(node)
                 else:
                     deferred_adds.append(node)
-            elif isinstance(node, (Attn, Linear, ReLU, Constant)):
+            elif isinstance(node, (Attn, Linear, ReLU, LiteralValue)):
                 ready.add(node)
             # else: skip unschedulable source nodes (InputNode, Embedding, etc.)
 
@@ -112,7 +112,7 @@ class LayerScheduler:
                 d1 = self._is_dead_for_add(a1, node, computed_nodes)
                 if not (d0 or d1):
                     continue  # deferred add, skip
-            if isinstance(node, (Linear, ReLU, Constant)):
+            if isinstance(node, (Linear, ReLU, LiteralValue)):
                 ready.add(node)
 
         new_chains = self._detect_chains(ready)
@@ -331,16 +331,16 @@ class LayerScheduler:
             )
             computed_nodes.add(node)
 
-        # 3c. Constants (no slot cost)
+        # 3c. LiteralValues (no slot cost)
         constants = sorted(
-            [n for n in ready if isinstance(n, Constant)],
+            [n for n in ready if isinstance(n, LiteralValue)],
             key=self._critical_path_key,
         )
         for node in constants:
             target_cols = self._try_allocate(node, residual_map)
             if target_cols is None:
                 continue
-            ffn_ops.append(FFNOp("compute_constant", node, target_cols, []))
+            ffn_ops.append(FFNOp("compute_literal_value", node, target_cols, []))
             computed_nodes.add(node)
 
         # 3d. Bias writes for biased Linears scheduled in attention sublayer
