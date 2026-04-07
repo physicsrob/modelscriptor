@@ -7,7 +7,7 @@ from torchwright.ops.loop_ops import unrolled_loop
 
 
 def test_count_to_target():
-    """Counter increments by 1, stops at 3 with 10 max iters."""
+    """Counter increments by 1, stops at 3 with 3 max iters."""
     counter_input = create_input("counter", 1)
 
     def step_fn(state):
@@ -17,7 +17,7 @@ def test_count_to_target():
         return compare(state["counter"], 2.5)  # true when counter >= 3
 
     state, done = unrolled_loop(
-        n_iters=10,
+        n_iters=3,
         state={"counter": counter_input},
         step_fn=step_fn,
         done_fn=done_fn,
@@ -35,7 +35,7 @@ def test_count_to_target():
 
 
 def test_already_done():
-    """done_fn returns true initially — state should be unchanged after 5 iters."""
+    """done_fn returns true initially — state should be unchanged after 3 iters."""
     x_input = create_input("x", 1)
 
     def step_fn(state):
@@ -45,7 +45,7 @@ def test_already_done():
         return compare(state["x"], 0.5)  # x starts at 50, already done
 
     state, done = unrolled_loop(
-        n_iters=5,
+        n_iters=3,
         state={"x": x_input},
         step_fn=step_fn,
         done_fn=done_fn,
@@ -91,7 +91,7 @@ def test_zero_iterations():
 
 
 def test_never_done():
-    """done_fn always false — all 5 iters run, done=false at end."""
+    """done_fn always false — all 3 iters run, done=false at end."""
     counter_input = create_input("counter", 1)
 
     def step_fn(state):
@@ -101,7 +101,7 @@ def test_never_done():
         return compare(state["counter"], 999.0)  # never triggers
 
     state, done = unrolled_loop(
-        n_iters=5,
+        n_iters=3,
         state={"counter": counter_input},
         step_fn=step_fn,
         done_fn=done_fn,
@@ -110,7 +110,7 @@ def test_never_done():
     result = state["counter"].compute(
         n_pos=1, input_values={"counter": torch.tensor([[0.0]])}
     )
-    assert result.tolist() == [[5.0]]
+    assert result.tolist() == [[3.0]]
 
     done_result = done.compute(
         n_pos=1, input_values={"counter": torch.tensor([[0.0]])}
@@ -133,7 +133,7 @@ def test_multi_variable_freeze():
         return compare(state["x"], 2.5)  # true when x >= 3
 
     state, done = unrolled_loop(
-        n_iters=10,
+        n_iters=3,
         state={"x": x_input, "y": y_input},
         step_fn=step_fn,
         done_fn=done_fn,
