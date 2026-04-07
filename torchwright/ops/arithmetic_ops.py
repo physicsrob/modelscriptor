@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Tuple
 
 from torchwright.graph import Node, Add, Concatenate, Linear
 import torch
@@ -204,6 +204,20 @@ def negate(inp: Node) -> Node:
     """
     d = len(inp)
     return Linear(inp, -torch.eye(d), name="negate")
+
+
+def abs_value(inp: Node) -> Node:
+    """Element-wise absolute value.
+
+    Equivalent to ``ReLU(x) + ReLU(-x)``.
+
+    Args:
+        inp: Node of any width.
+
+    Returns:
+        Node of the same width containing ``|x|`` element-wise.
+    """
+    return relu_add(inp, negate(inp))
 
 
 def subtract(inp1: Node, inp2: Node) -> Node:
@@ -463,10 +477,285 @@ def multiply_integers(inp1: Node, inp2: Node, max_value: int) -> Node:
 
     s = add(inp1, inp2)  # a+b
     d = subtract(inp1, inp2)  # a-b (may be negative)
-    abs_d = relu_add(d, negate(d))  # |a-b| = ReLU(d) + ReLU(-d)
+    abs_d = abs_value(d)  # |a-b|
 
     sq_sum = square(s, 2 * max_value)  # (a+b)²
     sq_diff = square(abs_d, max_value)  # (a-b)²
 
     # a*b = ((a+b)² - (a-b)²) / 4
     return add_scaled_nodes(0.25, sq_sum, -0.25, sq_diff)
+
+
+def elem_min(inp1: Node, inp2: Node) -> Node:
+    """Element-wise minimum of two nodes.
+
+    Computed as ``(a + b - |a - b|) / 2``.
+
+    Args:
+        inp1: First node.
+        inp2: Second node (same width as *inp1*).
+
+    Returns:
+        Node of the same width containing ``min(inp1, inp2)`` element-wise.
+    """
+    assert len(inp1) == len(inp2)
+    diff = subtract(inp1, inp2)
+    abs_diff = abs_value(diff)
+    sum_ab = add(inp1, inp2)
+    return add_scaled_nodes(0.5, sum_ab, -0.5, abs_diff)
+
+
+def elem_max(inp1: Node, inp2: Node) -> Node:
+    """Element-wise maximum of two nodes.
+
+    Computed as ``(a + b + |a - b|) / 2``.
+
+    Args:
+        inp1: First node.
+        inp2: Second node (same width as *inp1*).
+
+    Returns:
+        Node of the same width containing ``max(inp1, inp2)`` element-wise.
+    """
+    assert len(inp1) == len(inp2)
+    diff = subtract(inp1, inp2)
+    abs_diff = abs_value(diff)
+    sum_ab = add(inp1, inp2)
+    return add_scaled_nodes(0.5, sum_ab, 0.5, abs_diff)
+
+
+def reciprocal(
+    inp: Node,
+    min_value: float,
+    max_value: float,
+    step: float = 1.0,
+    d_max: int = 1024,
+) -> Node:
+    """Compute 1/x via piecewise-linear interpolation.
+
+    Exact when x is a multiple of ``step``.  Between grid points the
+    result is linearly interpolated.
+
+    Args:
+        inp: 1D scalar node with value in [min_value, max_value].
+        min_value: Lower bound on input (must be > 0).
+        max_value: Upper bound on input.
+        step: Grid spacing.
+        d_max: Maximum ReLU units per FFN layer.
+
+    Returns:
+        1D scalar node containing 1/x.
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    assert min_value > 0, "min_value must be positive"
+    assert max_value > min_value, "max_value must exceed min_value"
+
+    breakpoints = []
+    vals = []
+    x = min_value
+    while x <= max_value + step / 2.0:
+        breakpoints.append(x)
+        vals.append(1.0 / x)
+        x += step
+
+    return piecewise_linear(inp, breakpoints, vals, d_max=d_max, name="reciprocal")
+
+
+def floor_int(inp: Node, min_value: int, max_value: int) -> Node:
+    """Compute floor(x) using a piecewise-linear staircase.
+
+    Places a steep ramp at each integer boundary using half-integer
+    thresholds (like :func:`thermometer_floor_div`).
+
+    Args:
+        inp: 1D scalar node with value in [min_value, max_value].
+        min_value: Lower bound (integer).
+        max_value: Upper bound (integer).
+
+    Returns:
+        1D scalar node containing floor(x).
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    assert max_value >= min_value
+
+    if max_value == min_value:
+        from torchwright.ops.inout_nodes import create_literal_value
+
+        return create_literal_value(torch.tensor([float(min_value)]))
+
+    # Build staircase: each step is a steep ramp of width eps ending at
+    # the integer boundary.  This ensures floor(k) = k exactly for all
+    # integers, and floor(k - delta) = k-1 for delta > eps.
+    eps = 1.0 / step_sharpness
+    breakpoints = [float(min_value) - eps]
+    values = [float(min_value)]
+
+    for k in range(min_value + 1, max_value + 1):
+        breakpoints.extend([float(k) - eps, float(k)])
+        values.extend([float(k - 1), float(k)])
+
+    breakpoints.append(float(max_value) + eps)
+    values.append(float(max_value))
+
+    return piecewise_linear(
+        inp, breakpoints, values, input_scale=step_sharpness, name="floor_int",
+    )
+
+
+def ceil_int(inp: Node, min_value: int, max_value: int) -> Node:
+    """Compute ceil(x) using the identity ``ceil(x) = -floor(-x)``.
+
+    Args:
+        inp: 1D scalar node with value in [min_value, max_value].
+        min_value: Lower bound (integer).
+        max_value: Upper bound (integer).
+
+    Returns:
+        1D scalar node containing ceil(x).
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    return negate(floor_int(negate(inp), -max_value, -min_value))
+
+
+def signed_multiply(
+    inp1: Node,
+    inp2: Node,
+    max_abs1: float,
+    max_abs2: float,
+    step: float = 1.0,
+    max_abs_output: float = None,
+    d_max: int = 1024,
+) -> Node:
+    """Multiply two signed scalars using the polarization identity.
+
+    ``a * b = (|a+b|² - |a-b|²) / 4``
+
+    Exact when both inputs are multiples of ``step``.  Piecewise-linear
+    between grid points.
+
+    Args:
+        inp1: 1D scalar node with value in [-max_abs1, max_abs1].
+        inp2: 1D scalar node with value in [-max_abs2, max_abs2].
+        max_abs1: Maximum absolute value of *inp1*.
+        max_abs2: Maximum absolute value of *inp2*.
+        step: Grid spacing for accuracy.
+        max_abs_output: Optional tighter bound on the result magnitude.
+            When provided, the output is clamped to [-max_abs_output,
+            max_abs_output].
+        d_max: Maximum ReLU units per FFN layer.
+
+    Returns:
+        1D scalar node containing inp1 * inp2.
+    """
+    assert len(inp1) == 1, "Input must be a 1D scalar node"
+    assert len(inp2) == 1, "Input must be a 1D scalar node"
+
+    s = add(inp1, inp2)                # a+b
+    d = subtract(inp1, inp2)           # a-b
+    abs_s = abs_value(s)               # |a+b|
+    abs_d = abs_value(d)               # |a-b|
+
+    max_sum = max_abs1 + max_abs2
+    sq_sum = square(abs_s, max_value=max_sum, step=step, d_max=d_max)
+    sq_diff = square(abs_d, max_value=max_sum, step=step, d_max=d_max)
+
+    result = add_scaled_nodes(0.25, sq_sum, -0.25, sq_diff)
+
+    if max_abs_output is not None:
+        result = piecewise_linear(
+            result,
+            [-max_abs_output, max_abs_output],
+            [-max_abs_output, max_abs_output],
+            clamp=True,
+            name="signed_multiply_clamp",
+        )
+
+    return result
+
+
+def reduce_min(
+    keys: List[Node], values: List[Node]
+) -> Tuple[Node, Node]:
+    """Find the (key, value) pair with the minimum key.
+
+    Uses a binary tree reduction with ``ceil(log2(N))`` stages.
+
+    Args:
+        keys: N scalar nodes (each ``d_output=1``).
+        values: N nodes (all same width).
+
+    Returns:
+        ``(winning_key, winning_value)`` tuple.
+    """
+    from torchwright.ops.map_select import select
+
+    assert len(keys) == len(values) and len(keys) >= 1
+    assert all(len(k) == 1 for k in keys)
+    if len(values) > 1:
+        d_val = len(values[0])
+        assert all(len(v) == d_val for v in values)
+
+    cur_keys = list(keys)
+    cur_vals = list(values)
+
+    while len(cur_keys) > 1:
+        nxt_keys: List[Node] = []
+        nxt_vals: List[Node] = []
+        for i in range(0, len(cur_keys), 2):
+            if i + 1 >= len(cur_keys):
+                nxt_keys.append(cur_keys[i])
+                nxt_vals.append(cur_vals[i])
+            else:
+                diff = subtract(cur_keys[i], cur_keys[i + 1])
+                # cond = 1.0 when diff > 0 (k1 > k2) → pick k2
+                cond = compare(diff, 0.0)
+                nxt_keys.append(select(cond, cur_keys[i + 1], cur_keys[i]))
+                nxt_vals.append(select(cond, cur_vals[i + 1], cur_vals[i]))
+        cur_keys = nxt_keys
+        cur_vals = nxt_vals
+
+    return cur_keys[0], cur_vals[0]
+
+
+def reduce_max(
+    keys: List[Node], values: List[Node]
+) -> Tuple[Node, Node]:
+    """Find the (key, value) pair with the maximum key.
+
+    Uses a binary tree reduction with ``ceil(log2(N))`` stages.
+
+    Args:
+        keys: N scalar nodes (each ``d_output=1``).
+        values: N nodes (all same width).
+
+    Returns:
+        ``(winning_key, winning_value)`` tuple.
+    """
+    from torchwright.ops.map_select import select
+
+    assert len(keys) == len(values) and len(keys) >= 1
+    assert all(len(k) == 1 for k in keys)
+    if len(values) > 1:
+        d_val = len(values[0])
+        assert all(len(v) == d_val for v in values)
+
+    cur_keys = list(keys)
+    cur_vals = list(values)
+
+    while len(cur_keys) > 1:
+        nxt_keys: List[Node] = []
+        nxt_vals: List[Node] = []
+        for i in range(0, len(cur_keys), 2):
+            if i + 1 >= len(cur_keys):
+                nxt_keys.append(cur_keys[i])
+                nxt_vals.append(cur_vals[i])
+            else:
+                diff = subtract(cur_keys[i], cur_keys[i + 1])
+                # cond = 1.0 when diff > 0 (k1 > k2) → pick k1
+                cond = compare(diff, 0.0)
+                nxt_keys.append(select(cond, cur_keys[i], cur_keys[i + 1]))
+                nxt_vals.append(select(cond, cur_vals[i], cur_vals[i + 1]))
+        cur_keys = nxt_keys
+        cur_vals = nxt_vals
+
+    return cur_keys[0], cur_vals[0]
