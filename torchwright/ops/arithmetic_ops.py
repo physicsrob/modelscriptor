@@ -6,7 +6,56 @@ import torch
 from torchwright.graph.relu import ReLU
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
-from torchwright.ops.const import step_sharpness, big_offset
+from torchwright.ops.const import step_sharpness
+
+_builtin_abs = abs  # save before module-level def abs() shadows the builtin
+
+
+# ---------------------------------------------------------------------------
+# Linear ops (no FFN layers — compiled into residual-stream wiring)
+# ---------------------------------------------------------------------------
+
+
+def add(inp1: Node, inp2: Node) -> Node:
+    """
+    Performs element-wise addition of two input nodes.
+
+    Args:
+        inp1 (Node): First node for addition.
+        inp2 (Node): Second node for addition.
+
+    Returns:
+        Node: Node resulting from element-wise addition.
+    """
+    return Add(inp1, inp2)
+
+
+def subtract(inp1: Node, inp2: Node) -> Node:
+    """
+    Subtracts inp2 from inp1 element-wise.
+
+    Args:
+        inp1 (Node): Node to subtract from.
+        inp2 (Node): Node to subtract.
+
+    Returns:
+        Node: Node resulting from inp1 - inp2.
+    """
+    return add(inp1, negate(inp2))
+
+
+def negate(inp: Node) -> Node:
+    """
+    Negates the input node (multiplies by -1).
+
+    Args:
+        inp (Node): Node to negate.
+
+    Returns:
+        Node: Node with negated values.
+    """
+    d = len(inp)
+    return Linear(inp, -torch.eye(d), name="negate")
 
 
 def add_const(inp: Node, scalar: float) -> Node:
@@ -34,69 +83,19 @@ def add_const(inp: Node, scalar: float) -> Node:
     )
 
 
-def add(inp1: Node, inp2: Node) -> Node:
+def multiply_const(inp: Node, scalar: float) -> Node:
     """
-    Performs element-wise addition of two input nodes.
+    Multiplies each entry of the input node by a scalar.
 
     Args:
-        inp1 (Node): First node for addition.
-        inp2 (Node): Second node for addition.
+        inp (Node): Node to scale.
+        scalar (float): Scalar multiplier.
 
     Returns:
-        Node: Node resulting from element-wise addition.
+        Node: Node with scaled values.
     """
-    return Add(inp1, inp2)
-
-
-def compare(
-    inp: Node, thresh: float, true_level: float = 1.0, false_level: float = -1.0
-) -> Node:
-    """
-    Compare input with threshold and return boolean valued node (1.0 for true, -1.0 for false)
-
-    Args:
-        inp: Node to compare. Must be length 1.
-        thresh: Threshold to use.
-        true_level: Value to return if inp is greater than thresh.
-        false_level: Value to return if inp is less than thresh.
-
-
-    Returns:
-        Node: Node with a value of true_level if inp is greater than thresh, false_level otherwise.
-    """
-
-    # We need 2 FFN entries, we'll use the equation:
-    # y= (true_level-false_level) * [
-    #   max(step_sharpness*x - step_sharpness*thresh, 0) - max(step_sharpness*x - step_sharpness*thresh - 1, 0)
-    # ] + false_level
-
-    d_input = len(inp)
-
-    input_proj = torch.tensor([[step_sharpness], [step_sharpness]])
-    input_bias = torch.tensor([-step_sharpness * thresh, -step_sharpness * thresh - 1.0])
-    output_proj = torch.tensor([[true_level - false_level], [false_level - true_level]])
-    output_bias = false_level * torch.ones(1)
-
-    return linear_relu_linear(
-        input_node=inp,
-        input_proj=input_proj,
-        input_bias=input_bias,
-        output_proj=output_proj,
-        output_bias=output_bias,
-    )
-
-
-def concat(inp_list: List[Node]) -> Node:
-    """
-    Concatenates all the Nodes in inp_list.
-
-    Args:
-        inp_list (List[Node]): List of nodes to concatenate
-
-    Returns:
-        Node: Node resulting from concatenation
-    """
-    return Concatenate(inp_list)
+    d = len(inp)
+    return Linear(inp, scalar * torch.eye(d), name="multiply_const")
 
 
 def add_scaled_nodes(scale1: float, inp1: Node, scale2: float, inp2: Node) -> Node:
@@ -143,6 +142,24 @@ def sum_nodes(inp_list: List[Node]) -> Node:
         output_matrix[i, i % d] = 1.0
 
     return Linear(input_node=x, output_matrix=output_matrix)
+
+
+def concat(inp_list: List[Node]) -> Node:
+    """
+    Concatenates all the Nodes in inp_list.
+
+    Args:
+        inp_list (List[Node]): List of nodes to concatenate
+
+    Returns:
+        Node: Node resulting from concatenation
+    """
+    return Concatenate(inp_list)
+
+
+# ---------------------------------------------------------------------------
+# ReLU-based ops (1 FFN layer each)
+# ---------------------------------------------------------------------------
 
 
 def relu(inp: Node) -> Node:
@@ -192,21 +209,7 @@ def relu_add(inp1: Node, inp2: Node) -> Node:
     )
 
 
-def negate(inp: Node) -> Node:
-    """
-    Negates the input node (multiplies by -1).
-
-    Args:
-        inp (Node): Node to negate.
-
-    Returns:
-        Node: Node with negated values.
-    """
-    d = len(inp)
-    return Linear(inp, -torch.eye(d), name="negate")
-
-
-def abs_value(inp: Node) -> Node:
+def abs(inp: Node) -> Node:
     """Element-wise absolute value.
 
     Equivalent to ``ReLU(x) + ReLU(-x)``.
@@ -220,78 +223,95 @@ def abs_value(inp: Node) -> Node:
     return relu_add(inp, negate(inp))
 
 
-def subtract(inp1: Node, inp2: Node) -> Node:
+# ---------------------------------------------------------------------------
+# Comparison
+# ---------------------------------------------------------------------------
+
+
+def compare(
+    inp: Node, thresh: float, true_level: float = 1.0, false_level: float = -1.0
+) -> Node:
     """
-    Subtracts inp2 from inp1 element-wise.
+    Compare input with threshold and return boolean valued node (1.0 for true, -1.0 for false)
 
     Args:
-        inp1 (Node): Node to subtract from.
-        inp2 (Node): Node to subtract.
+        inp: Node to compare. Must be length 1.
+        thresh: Threshold to use.
+        true_level: Value to return if inp is greater than thresh.
+        false_level: Value to return if inp is less than thresh.
+
 
     Returns:
-        Node: Node resulting from inp1 - inp2.
+        Node: Node with a value of true_level if inp is greater than thresh, false_level otherwise.
     """
-    return add(inp1, negate(inp2))
 
-
-def multiply_const(inp: Node, scalar: float) -> Node:
-    """
-    Multiplies each entry of the input node by a scalar.
-
-    Args:
-        inp (Node): Node to scale.
-        scalar (float): Scalar multiplier.
-
-    Returns:
-        Node: Node with scaled values.
-    """
-    d = len(inp)
-    return Linear(inp, scalar * torch.eye(d), name="multiply_const")
-
-
-def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
-    """Compute floor(inp / divisor) using a piecewise-linear staircase.
-
-    Places a steep ramp at each multiple of the divisor.  Half-integer
-    thresholds (9.5 not 10.0) ensure clean separation for integer inputs.
-
-        x = 35, divisor = 10  →  output = 3 = floor(35/10)
-
-    Implemented via :func:`piecewise_linear` with a staircase whose
-    transition width is ``1 / step_sharpness``.
-
-    Args:
-        inp: 1D scalar node with integer value in [0, max_value].
-        divisor: The divisor for floor division.
-        max_value: Upper bound on input (determines number of steps).
-
-    Returns:
-        1D scalar node containing floor(inp / divisor).
-    """
     assert len(inp) == 1, "Input must be a 1D scalar node"
-    n = max_value // divisor
-    if n == 0:
-        from torchwright.ops.inout_nodes import create_literal_value
 
-        return create_literal_value(torch.tensor([0.0]))
+    # We need 2 FFN entries, we'll use the equation:
+    # y= (true_level-false_level) * [
+    #   max(step_sharpness*x - step_sharpness*thresh, 0) - max(step_sharpness*x - step_sharpness*thresh - 1, 0)
+    # ] + false_level
 
-    # Build staircase breakpoints: each step is a steep ramp of width
-    # 1/step_sharpness centred on the half-integer threshold.
-    eps = 1.0 / step_sharpness
-    breakpoints = [0.0 - eps]  # clamp region before first step
-    values = [0.0]
-    for k in range(1, n + 1):
-        threshold = k * divisor - 0.5  # Half-integer: 9.5, 19.5, ...
-        breakpoints.extend([threshold - eps / 2, threshold + eps / 2])
-        values.extend([float(k - 1), float(k)])
-    # Final clamp point beyond last step
-    breakpoints.append(max_value + eps)
-    values.append(float(n))
+    input_proj = torch.tensor([[step_sharpness], [step_sharpness]])
+    input_bias = torch.tensor([-step_sharpness * thresh, -step_sharpness * thresh - 1.0])
+    output_proj = torch.tensor([[true_level - false_level], [false_level - true_level]])
+    output_bias = false_level * torch.ones(1)
 
-    return piecewise_linear(
-        inp, breakpoints, values, input_scale=step_sharpness,
-        name="thermometer_floor_div",
+    return linear_relu_linear(
+        input_node=inp,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=output_bias,
     )
+
+
+# ---------------------------------------------------------------------------
+# Element-wise min / max
+# ---------------------------------------------------------------------------
+
+
+def min(inp1: Node, inp2: Node) -> Node:
+    """Element-wise minimum of two nodes.
+
+    Computed as ``(a + b - |a - b|) / 2``.
+
+    Args:
+        inp1: First node.
+        inp2: Second node (same width as *inp1*).
+
+    Returns:
+        Node of the same width containing ``min(inp1, inp2)`` element-wise.
+    """
+    assert len(inp1) == len(inp2)
+    diff = subtract(inp1, inp2)
+    abs_diff = abs(diff)
+    sum_ab = add(inp1, inp2)
+    return add_scaled_nodes(0.5, sum_ab, -0.5, abs_diff)
+
+
+def max(inp1: Node, inp2: Node) -> Node:
+    """Element-wise maximum of two nodes.
+
+    Computed as ``(a + b + |a - b|) / 2``.
+
+    Args:
+        inp1: First node.
+        inp2: Second node (same width as *inp1*).
+
+    Returns:
+        Node of the same width containing ``max(inp1, inp2)`` element-wise.
+    """
+    assert len(inp1) == len(inp2)
+    diff = subtract(inp1, inp2)
+    abs_diff = abs(diff)
+    sum_ab = add(inp1, inp2)
+    return add_scaled_nodes(0.5, sum_ab, 0.5, abs_diff)
+
+
+# ---------------------------------------------------------------------------
+# Piecewise-linear foundation
+# ---------------------------------------------------------------------------
 
 
 def piecewise_linear(
@@ -359,19 +379,19 @@ def piecewise_linear(
     prev_slope = 0.0
     for i in range(n - 1):
         delta = slopes[i] - prev_slope
-        if abs(delta) > 1e-12:
+        if _builtin_abs(delta) > 1e-12:
             relus.append((1.0, breakpoints[i], delta))
         prev_slope = slopes[i]
-    if abs(prev_slope) > 1e-12:
+    if _builtin_abs(prev_slope) > 1e-12:
         relus.append((1.0, breakpoints[-1], -prev_slope))
 
     if not clamp:
         # Add tail ReLUs to restore linear extrapolation beyond the range.
         # Left: ReLU(-(x - x_0)) active when x < x_0, adds slope m_0.
-        if abs(slopes[0]) > 1e-12:
+        if _builtin_abs(slopes[0]) > 1e-12:
             relus.append((-1.0, breakpoints[0], -slopes[0]))
         # Right: ReLU(x - x_{n-1}) active when x > x_{n-1}, adds slope m_{n-2}.
-        if abs(slopes[-1]) > 1e-12:
+        if _builtin_abs(slopes[-1]) > 1e-12:
             relus.append((1.0, breakpoints[-1], slopes[-1]))
 
     if len(relus) == 0:
@@ -407,6 +427,11 @@ def piecewise_linear(
     if len(chunks) == 1:
         return chunks[0]
     return sum_nodes(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Piecewise-linear derived ops
+# ---------------------------------------------------------------------------
 
 
 def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) -> Node:
@@ -445,83 +470,49 @@ def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) ->
     return piecewise_linear(inp, breakpoints, vals, d_max=d_max, name="square")
 
 
-def multiply_integers(inp1: Node, inp2: Node, max_value: int) -> Node:
-    """Multiply two non-negative integer scalars using the polarization identity.
+def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
+    """Compute floor(inp / divisor) using a piecewise-linear staircase.
 
-    a * b = ((a+b)² - (a-b)²) / 4
+    Places a steep ramp at each multiple of the divisor.  Half-integer
+    thresholds (9.5 not 10.0) ensure clean separation for integer inputs.
 
-    Both inputs must be 1D scalar nodes with integer values in [0, max_value].
-    The polarization identity is exact for all reals, but ``square`` is only
-    exact at grid points (integers by default), so the inputs must be integers.
+        x = 35, divisor = 10  →  output = 3 = floor(35/10)
 
-    Implementation:
-        s = a + b                          range [0, 2*max_value], Linear (free)
-        d = a - b                          range [-max_value, max_value], Linear (free)
-        |d| = ReLU(d) + ReLU(-d)           1 FFN layer (relu_add)
-        s² = square(s)                     1+ FFN layers
-        |d|² = square(|d|)                 1+ FFN layers
-        result = (s² - |d|²) / 4          Linear (free)
-
-    Total cost: 3+ FFN layers.
+    Implemented via :func:`piecewise_linear` with a staircase whose
+    transition width is ``1 / step_sharpness``.
 
     Args:
-        inp1: 1D scalar node, integer value in [0, max_value].
-        inp2: 1D scalar node, integer value in [0, max_value].
-        max_value: Upper bound on each input.
+        inp: 1D scalar node with integer value in [0, max_value].
+        divisor: The divisor for floor division.
+        max_value: Upper bound on input (determines number of steps).
 
     Returns:
-        1D scalar node containing inp1 * inp2.
+        1D scalar node containing floor(inp / divisor).
     """
-    assert len(inp1) == 1, "Input must be a 1D scalar node"
-    assert len(inp2) == 1, "Input must be a 1D scalar node"
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    n = max_value // divisor
+    if n == 0:
+        from torchwright.ops.inout_nodes import create_literal_value
 
-    s = add(inp1, inp2)  # a+b
-    d = subtract(inp1, inp2)  # a-b (may be negative)
-    abs_d = abs_value(d)  # |a-b|
+        return create_literal_value(torch.tensor([0.0]))
 
-    sq_sum = square(s, 2 * max_value)  # (a+b)²
-    sq_diff = square(abs_d, max_value)  # (a-b)²
+    # Build staircase breakpoints: each step is a steep ramp of width
+    # 1/step_sharpness centred on the half-integer threshold.
+    eps = 1.0 / step_sharpness
+    breakpoints = [0.0 - eps]  # clamp region before first step
+    values = [0.0]
+    for k in range(1, n + 1):
+        threshold = k * divisor - 0.5  # Half-integer: 9.5, 19.5, ...
+        breakpoints.extend([threshold - eps / 2, threshold + eps / 2])
+        values.extend([float(k - 1), float(k)])
+    # Final clamp point beyond last step
+    breakpoints.append(max_value + eps)
+    values.append(float(n))
 
-    # a*b = ((a+b)² - (a-b)²) / 4
-    return add_scaled_nodes(0.25, sq_sum, -0.25, sq_diff)
-
-
-def elem_min(inp1: Node, inp2: Node) -> Node:
-    """Element-wise minimum of two nodes.
-
-    Computed as ``(a + b - |a - b|) / 2``.
-
-    Args:
-        inp1: First node.
-        inp2: Second node (same width as *inp1*).
-
-    Returns:
-        Node of the same width containing ``min(inp1, inp2)`` element-wise.
-    """
-    assert len(inp1) == len(inp2)
-    diff = subtract(inp1, inp2)
-    abs_diff = abs_value(diff)
-    sum_ab = add(inp1, inp2)
-    return add_scaled_nodes(0.5, sum_ab, -0.5, abs_diff)
-
-
-def elem_max(inp1: Node, inp2: Node) -> Node:
-    """Element-wise maximum of two nodes.
-
-    Computed as ``(a + b + |a - b|) / 2``.
-
-    Args:
-        inp1: First node.
-        inp2: Second node (same width as *inp1*).
-
-    Returns:
-        Node of the same width containing ``max(inp1, inp2)`` element-wise.
-    """
-    assert len(inp1) == len(inp2)
-    diff = subtract(inp1, inp2)
-    abs_diff = abs_value(diff)
-    sum_ab = add(inp1, inp2)
-    return add_scaled_nodes(0.5, sum_ab, 0.5, abs_diff)
+    return piecewise_linear(
+        inp, breakpoints, values, input_scale=step_sharpness,
+        name="thermometer_floor_div",
+    )
 
 
 def reciprocal(
@@ -617,6 +608,52 @@ def ceil_int(inp: Node, min_value: int, max_value: int) -> Node:
     return negate(floor_int(negate(inp), -max_value, -min_value))
 
 
+# ---------------------------------------------------------------------------
+# Multiplication
+# ---------------------------------------------------------------------------
+
+
+def multiply_integers(inp1: Node, inp2: Node, max_value: int) -> Node:
+    """Multiply two non-negative integer scalars using the polarization identity.
+
+    a * b = ((a+b)² - (a-b)²) / 4
+
+    Both inputs must be 1D scalar nodes with integer values in [0, max_value].
+    The polarization identity is exact for all reals, but ``square`` is only
+    exact at grid points (integers by default), so the inputs must be integers.
+
+    Implementation:
+        s = a + b                          range [0, 2*max_value], Linear (free)
+        d = a - b                          range [-max_value, max_value], Linear (free)
+        |d| = ReLU(d) + ReLU(-d)           1 FFN layer (relu_add)
+        s² = square(s)                     1+ FFN layers
+        |d|² = square(|d|)                 1+ FFN layers
+        result = (s² - |d|²) / 4          Linear (free)
+
+    Total cost: 3+ FFN layers.
+
+    Args:
+        inp1: 1D scalar node, integer value in [0, max_value].
+        inp2: 1D scalar node, integer value in [0, max_value].
+        max_value: Upper bound on each input.
+
+    Returns:
+        1D scalar node containing inp1 * inp2.
+    """
+    assert len(inp1) == 1, "Input must be a 1D scalar node"
+    assert len(inp2) == 1, "Input must be a 1D scalar node"
+
+    s = add(inp1, inp2)  # a+b
+    d = subtract(inp1, inp2)  # a-b (may be negative)
+    abs_d = abs(d)  # |a-b|
+
+    sq_sum = square(s, 2 * max_value)  # (a+b)²
+    sq_diff = square(abs_d, max_value)  # (a-b)²
+
+    # a*b = ((a+b)² - (a-b)²) / 4
+    return add_scaled_nodes(0.25, sq_sum, -0.25, sq_diff)
+
+
 def signed_multiply(
     inp1: Node,
     inp2: Node,
@@ -652,8 +689,8 @@ def signed_multiply(
 
     s = add(inp1, inp2)                # a+b
     d = subtract(inp1, inp2)           # a-b
-    abs_s = abs_value(s)               # |a+b|
-    abs_d = abs_value(d)               # |a-b|
+    abs_s = abs(s)               # |a+b|
+    abs_d = abs(d)               # |a-b|
 
     max_sum = max_abs1 + max_abs2
     sq_sum = square(abs_s, max_value=max_sum, step=step, d_max=d_max)
@@ -671,6 +708,11 @@ def signed_multiply(
         )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Reductions
+# ---------------------------------------------------------------------------
 
 
 def reduce_min(

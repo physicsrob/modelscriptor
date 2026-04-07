@@ -34,7 +34,11 @@ from torchwright.ops.map_select import map_to_table, select
 def check_is_digit(embedding: Embedding) -> Node:
     """Check if the current embedding value is a digit (0-9).
 
-    Returns a boolean node: 1.0 if the token is a digit, -1.0 otherwise.
+    Args:
+        embedding: Embedding input node to test.
+
+    Returns:
+        Boolean node: 1.0 if the token is a digit, -1.0 otherwise.
     """
     return map_to_table(
         inp=embedding,
@@ -96,9 +100,14 @@ class NumericSequence:
     def get_digits_at_event(self, termination_event: Node) -> List[Node]:
         """Capture the digit window at the position where termination_event fires.
 
-        Returns digits MSB-first (most significant digit at index 0).
-        The captured values persist forward via attention — once latched,
+        The captured values persist forward via attention -- once latched,
         they're available at all subsequent positions.
+
+        Args:
+            termination_event: Boolean node indicating the capture position.
+
+        Returns:
+            List of embedding-valued digit nodes, MSB-first.
         """
         return [
             self.pos_encoding.get_prev_value(digit, termination_event)

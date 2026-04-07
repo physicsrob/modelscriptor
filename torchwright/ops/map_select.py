@@ -1,5 +1,5 @@
 from torchwright.graph import Node, Concatenate
-from typing import List, Tuple, Dict
+from typing import List, Dict
 import torch
 
 from torchwright.ops.const import (

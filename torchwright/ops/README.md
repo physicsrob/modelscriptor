@@ -1,4 +1,20 @@
-# Operation Naming Convention
+# Ops Module
+
+## Recommended import style
+
+Use namespace-qualified access, like PyTorch (`torch.min`, `torch.abs`):
+
+```python
+from torchwright import ops
+
+result = ops.min(a, ops.max(b, c))
+d = ops.abs(ops.subtract(x, y))
+```
+
+This avoids shadowing Python builtins (`abs`, `min`, `max`) and keeps
+call sites concise.
+
+## Operation Naming Convention
 
 Operation Naming Convention:
 - Operation names start with a verb where possible. Most operations are performing actions on nodes, and verbs make it easier to interpret what the operation will do.

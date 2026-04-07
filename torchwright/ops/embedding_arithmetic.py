@@ -84,6 +84,15 @@ def sum_digit_seqs(
 
     Sequences are MSB-first: seq[0] is the most significant digit,
     seq[-1] is the least significant.
+
+    Args:
+        embedding: The embedding table (must contain "0"-"9").
+        seq1: List of embedding-valued digit nodes (MSB-first).
+        seq2: List of embedding-valued digit nodes (same length as *seq1*).
+
+    Returns:
+        List of embedding-valued digit nodes for the sum (MSB-first),
+        same length as the inputs (overflow digit not included).
     """
     carry = create_literal_value(torch.tensor([-1.0]))
     out = []
@@ -102,9 +111,17 @@ def sum_digit_seqs(
 def subtract_digits(
     embedding: Embedding, num1: Node, num2: Node, borrow_in: Node
 ) -> Tuple[Node, Node]:
-    """Subtract num2 + borrow from num1. Returns (result_digit, borrow_out).
+    """Subtract num2 + borrow from num1.
 
-    borrow_in: 1.0 = borrow, -1.0 = no borrow (same convention as carry).
+    Args:
+        embedding: The embedding table (must contain "0"-"9").
+        num1: Embedding-valued node for the minuend digit.
+        num2: Embedding-valued node for the subtrahend digit.
+        borrow_in: Boolean node (1.0 = borrow, -1.0 = no borrow).
+
+    Returns:
+        (result_digit, borrow_out): result_digit is an embedding-valued node,
+        borrow_out is a boolean node.
     """
     result_table = {}
     borrow_table = {}
@@ -136,6 +153,14 @@ def subtract_digit_seqs(
     """Subtract seq2 from seq1 digit by digit with borrow propagation.
 
     Assumes seq1 >= seq2 (no sign handling). Processes right-to-left.
+
+    Args:
+        embedding: The embedding table (must contain "0"-"9").
+        seq1: List of embedding-valued digit nodes (MSB-first, minuend).
+        seq2: List of embedding-valued digit nodes (same length, subtrahend).
+
+    Returns:
+        List of embedding-valued digit nodes for the difference (MSB-first).
     """
     borrow = create_literal_value(torch.tensor([-1.0]))
     out = []
@@ -153,7 +178,13 @@ def subtract_digit_seqs(
 def compare_digit_pair(embedding: Embedding, a: Node, b: Node) -> Node:
     """Compare two single-digit embeddings.
 
-    Returns 1.0 if a > b, -1.0 if a < b, 0.0 if equal.
+    Args:
+        embedding: The embedding table (must contain "0"-"9").
+        a: Embedding-valued node for the first digit.
+        b: Embedding-valued node for the second digit.
+
+    Returns:
+        Scalar node: 1.0 if a > b, -1.0 if a < b, 0.0 if equal.
     """
     table = {}
     for i in range(10):
@@ -178,9 +209,15 @@ def compare_digit_seqs(
 ) -> Node:
     """Lexicographic comparison of two digit sequences.
 
-    Returns 1.0 if seq1 >= seq2, -1.0 if seq1 < seq2.
-
     Folds from MSB to LSB: the first non-equal digit determines the result.
+
+    Args:
+        embedding: The embedding table (must contain "0"-"9").
+        seq1: List of embedding-valued digit nodes (MSB-first).
+        seq2: List of embedding-valued digit nodes (same length).
+
+    Returns:
+        Boolean node: 1.0 if seq1 >= seq2, -1.0 if seq1 < seq2.
     """
     # result_so_far: 1.0 (a>b), -1.0 (a<b), 0.0 (equal so far)
     # combine(prev, current): if prev != 0 keep prev, else take current
@@ -212,7 +249,13 @@ def compare_digit_seqs(
 def multiply_digit_pair(embedding: Embedding, a: Node, b: Node) -> Tuple[Node, Node]:
     """Multiply two single-digit embeddings.
 
-    Returns (tens_digit, ones_digit) as embedding-valued nodes.
+    Args:
+        embedding: The embedding table (must contain "0"-"9").
+        a: Embedding-valued node for the first digit.
+        b: Embedding-valued node for the second digit.
+
+    Returns:
+        (tens_digit, ones_digit) as embedding-valued nodes.
     """
     tens_table = {}
     ones_table = {}
@@ -239,9 +282,16 @@ def multiply_digit_seqs(
 ) -> List[Node]:
     """Long multiplication in embedding space: seq1 * seq2.
 
-    Returns up to 2*n digit embeddings (MSB-first). Uses partial product rows
-    added pairwise with sum_digit_seqs, mirroring pencil-and-paper long
-    multiplication.
+    Uses partial product rows added pairwise with sum_digit_seqs, mirroring
+    pencil-and-paper long multiplication.
+
+    Args:
+        embedding: The embedding table (must contain "0"-"9").
+        seq1: List of embedding-valued digit nodes (MSB-first).
+        seq2: List of embedding-valued digit nodes (same length).
+
+    Returns:
+        List of 2*n embedding-valued digit nodes (MSB-first).
     """
     n = len(seq1)
     zero = create_literal_value(embedding.get_embedding("0"))
