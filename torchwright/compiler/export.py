@@ -6,7 +6,12 @@ import os
 import torch
 
 from torchwright.compiler.forward.compile import forward_compile
-from torchwright.compiler.module import CompiledTransformerModule, to_module
+from torchwright.compiler.module import (
+    CompiledTransformerModule,
+    HeadlessTransformerModule,
+    to_module,
+    to_headless_module,
+)
 from torchwright.graph import Node
 from torchwright.graph.embedding import Embedding
 from torchwright.graph.pos_encoding import PosEncoding
@@ -97,3 +102,49 @@ def compile_to_onnx(
         model_size = os.path.getsize(output_path)
         print(f"Wrote {output_path} ({model_size:,} bytes)")
         print(f"Wrote {vocab_path}")
+
+
+def compile_headless(
+    output_node: Node,
+    pos_encoding: PosEncoding,
+    d: int = 1024,
+    d_head: int = 16,
+    max_seq_len: int = 512,
+    verbose: bool = True,
+    device: str = "auto",
+) -> HeadlessTransformerModule:
+    """Compile a graph with raw float I/O to a headless nn.Module.
+
+    Unlike ``compile_to_onnx``, this does not require an Embedding and
+    returns a ``HeadlessTransformerModule`` directly (no ONNX export).
+
+    Args:
+        output_node: The graph node whose value is the model output.
+        pos_encoding: Positional encoding node.
+        d: Residual stream dimension.
+        d_head: Attention head dimension.
+        max_seq_len: Maximum sequence length.
+        verbose: Print progress.
+        device: Target device.
+
+    Returns:
+        A HeadlessTransformerModule ready for inference.
+    """
+    if verbose:
+        print("Compiling graph...")
+    net = forward_compile(
+        d=d,
+        d_head=d_head,
+        output_node=output_node,
+        pos_encoding=pos_encoding,
+        verbose=verbose,
+        device=None,
+    )
+
+    if verbose:
+        n_layers = len(net.layers)
+        print(f"Converting to headless module ({n_layers} layers)...")
+
+    return to_headless_module(
+        net, output_node, max_seq_len=max_seq_len, device=device
+    )
