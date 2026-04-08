@@ -14,6 +14,7 @@ from torchwright.compiler.device import get_device
 from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.graph import Node, LiteralValue, PosEncoding, Embedding, Concatenate
 from torchwright.graph.embedding import Tokenizer
+from torchwright.graph.misc import InputNode
 
 
 class _AttentionLayer(nn.Module):
@@ -151,6 +152,53 @@ class CompiledTransformerModule(nn.Module):
         return logits
 
 
+class HeadlessTransformerModule(nn.Module):
+    """A compiled torchwright transformer with float I/O (no embedding heads).
+
+    Input: ``inputs`` — (seq_len, d_input) FloatTensor of raw scalar values.
+    Output: (seq_len, d_output) FloatTensor of raw scalar values.
+
+    The input columns correspond to the graph's ``InputNode`` nodes,
+    ordered alphabetically by node name.  The ``input_names`` attribute
+    records this ordering.
+    """
+
+    def __init__(
+        self,
+        layers: nn.ModuleList,
+        input_proj: torch.Tensor,
+        pos_proj: torch.Tensor,
+        constant_values: torch.Tensor,
+        pos_encoding: torch.Tensor,
+        output_gather_indices: torch.Tensor,
+        input_names: List[str],
+    ):
+        super().__init__()
+        self.layers = layers
+        self.input_names = input_names
+        self.register_buffer("input_proj", input_proj)
+        self.register_buffer("pos_proj", pos_proj)
+        self.register_buffer("constant_values", constant_values)
+        self.register_buffer("pos_encoding", pos_encoding)
+        self.register_buffer("output_gather_indices", output_gather_indices)
+
+    def forward(self, inputs: torch.FloatTensor) -> torch.Tensor:
+        seq_len = inputs.shape[0]
+
+        pos = self.pos_encoding[:seq_len]
+
+        res = (
+            inputs @ self.input_proj + pos @ self.pos_proj + self.constant_values
+        )
+
+        for layer_pair in self.layers:
+            assert isinstance(layer_pair, nn.ModuleList)
+            res = layer_pair[0](res)
+            res = layer_pair[1](res)
+
+        return res[:, self.output_gather_indices]
+
+
 def _compute_pos_encoding(d_pos: int, max_seq_len: int) -> torch.Tensor:
     """Precompute sinusoidal positional encoding buffer."""
     pe = torch.zeros(max_seq_len, d_pos)
@@ -159,6 +207,41 @@ def _compute_pos_encoding(d_pos: int, max_seq_len: int) -> torch.Tensor:
         pe[pos, 0::2] = torch.sin(pos * div_term)
         pe[pos, 1::2] = torch.cos(pos * div_term)
     return pe
+
+
+def _convert_layers(
+    compiled: HeadlessTransformer,
+    max_seq_len: int,
+) -> nn.ModuleList:
+    """Convert HeadlessTransformer layers to nn.ModuleList of (attn, ffn) pairs."""
+    d = compiled.d
+    d_head = compiled.d_head
+    n_heads = d // d_head
+    causal_mask = torch.triu(
+        torch.ones(max_seq_len, max_seq_len, dtype=torch.bool), diagonal=1
+    )
+
+    layer_modules = nn.ModuleList()
+    for layer in compiled.layers:
+        attn_comp = layer.attn.attn
+
+        W_Q = attn_comp.query_matrix.permute(1, 0, 2).reshape(d, d)
+        W_K = attn_comp.key_matrix.permute(1, 0, 2).reshape(d, d)
+        W_V = attn_comp.value_matrix.permute(1, 0, 2).reshape(d, d)
+        W_O = attn_comp.output_matrix.clone()
+
+        attn_mod = _AttentionLayer(W_Q, W_K, W_V, W_O, n_heads, d_head, causal_mask)
+
+        ffn_comp = layer.ffn
+        W1 = ffn_comp.linear1.output_matrix.clone()
+        b1 = ffn_comp.linear1.output_bias.clone()
+        W2 = ffn_comp.linear2.output_matrix.clone()
+        b2 = ffn_comp.linear2.output_bias.clone()
+
+        ffn_mod = _FFNLayer(W1, b1, W2, b2)
+        layer_modules.append(nn.ModuleList([attn_mod, ffn_mod]))
+
+    return layer_modules
 
 
 def to_module(
@@ -231,33 +314,9 @@ def to_module(
 
     # --- Precompute buffers ---
     pos_encoding_buf = _compute_pos_encoding(d_pos, max_seq_len)
-    causal_mask = torch.triu(
-        torch.ones(max_seq_len, max_seq_len, dtype=torch.bool), diagonal=1
-    )
 
     # --- Convert layers ---
-    layer_modules = nn.ModuleList()
-    for layer in compiled.layers:
-        attn_comp = layer.attn.attn  # AttnLayerComponent
-
-        # Fuse Q, K, V: (n_heads, d, d_head) -> (d, n_heads * d_head) = (d, d)
-        W_Q = attn_comp.query_matrix.permute(1, 0, 2).reshape(d, d)
-        W_K = attn_comp.key_matrix.permute(1, 0, 2).reshape(d, d)
-        W_V = attn_comp.value_matrix.permute(1, 0, 2).reshape(d, d)
-        # O stays as (n_heads, d_head, d) for bmm
-        W_O = attn_comp.output_matrix.clone()
-
-        attn_mod = _AttentionLayer(W_Q, W_K, W_V, W_O, n_heads, d_head, causal_mask)
-
-        ffn_comp = layer.ffn
-        W1 = ffn_comp.linear1.output_matrix.clone()
-        b1 = ffn_comp.linear1.output_bias.clone()
-        W2 = ffn_comp.linear2.output_matrix.clone()
-        b2 = ffn_comp.linear2.output_bias.clone()
-
-        ffn_mod = _FFNLayer(W1, b1, W2, b2)
-
-        layer_modules.append(nn.ModuleList([attn_mod, ffn_mod]))
+    layer_modules = _convert_layers(compiled, max_seq_len)
 
     # --- Embedding ---
     token_emb = nn.Embedding(
@@ -276,6 +335,104 @@ def to_module(
         output_gather_indices=output_gather_indices,
         unembed_table=embedding.table.clone(),
         tokenizer=embedding.tokenizer,
+    )
+
+    if device == "auto":
+        module.to(get_device(verbose=False))
+    elif device is not None:
+        module.to(torch.device(device))
+
+    return module
+
+
+def to_headless_module(
+    compiled: HeadlessTransformer,
+    output_node: Node,
+    max_seq_len: int = 512,
+    device: Optional[str] = "auto",
+) -> HeadlessTransformerModule:
+    """Convert a compiled HeadlessTransformer to a headless nn.Module.
+
+    The resulting module accepts raw float inputs and returns raw float
+    outputs — no embedding or unembedding.
+
+    Args:
+        compiled: The compiled transformer from forward_compile().
+        output_node: The graph node whose value is the model output.
+        max_seq_len: Maximum sequence length (for precomputed pos encoding
+            and causal mask).
+        device: Target device — "auto" (default) uses GPU if available,
+                "cpu"/"cuda" to force, or None to skip moving.
+
+    Returns:
+        A HeadlessTransformerModule.  Its ``input_names`` attribute lists
+        the InputNode names in the order they appear in the input tensor.
+    """
+    assert compiled.feature_assignment is not None
+    d = compiled.d
+
+    in_state = compiled.layers[0].attn.in_state
+    out_state = compiled.layers[-1].ffn.out_state
+
+    # --- Collect InputNode and PosEncoding indices ---
+    input_nodes: List[tuple] = []  # (name, indices)
+    pos_indices = None
+    constant_values = torch.zeros(d)
+
+    for node in compiled.feature_assignment.get_nodes(in_state):
+        indices = compiled.feature_assignment.get_node_indices(in_state, node)
+        if isinstance(node, InputNode):
+            input_nodes.append((node.name, indices))
+        elif isinstance(node, PosEncoding):
+            pos_indices = indices
+        elif isinstance(node, LiteralValue):
+            for i, idx in enumerate(indices):
+                constant_values[idx] = node.value[i]
+        elif isinstance(node, (Concatenate, Embedding)):
+            pass
+
+    assert len(input_nodes) > 0, "No InputNode found in feature assignment"
+    assert pos_indices is not None, "No PosEncoding node found in feature assignment"
+
+    # Sort by name for deterministic input ordering
+    input_nodes.sort(key=lambda x: x[0])
+    input_names = [name for name, _ in input_nodes]
+
+    # Build input scatter matrix: (d_input, d)
+    all_input_indices = []
+    for _, indices in input_nodes:
+        all_input_indices.extend(indices)
+    d_input = len(all_input_indices)
+
+    input_proj = torch.zeros(d_input, d)
+    for i, idx in enumerate(all_input_indices):
+        input_proj[i, idx] = 1.0
+
+    d_pos = len(pos_indices)
+    pos_proj = torch.zeros(d_pos, d)
+    for i, idx in enumerate(pos_indices):
+        pos_proj[i, idx] = 1.0
+
+    # --- Extract output gather indices ---
+    output_indices = compiled.feature_assignment.get_node_indices(
+        out_state, output_node
+    )
+    output_gather_indices = torch.tensor(output_indices, dtype=torch.long)
+
+    # --- Precompute buffers ---
+    pos_encoding_buf = _compute_pos_encoding(d_pos, max_seq_len)
+
+    # --- Convert layers ---
+    layer_modules = _convert_layers(compiled, max_seq_len)
+
+    module = HeadlessTransformerModule(
+        layers=layer_modules,
+        input_proj=input_proj,
+        pos_proj=pos_proj,
+        constant_values=constant_values,
+        pos_encoding=pos_encoding_buf,
+        output_gather_indices=output_gather_indices,
+        input_names=input_names,
     )
 
     if device == "auto":
