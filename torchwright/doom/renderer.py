@@ -13,6 +13,7 @@ from torchwright.graph import Concatenate, Linear, Node
 from torchwright.graph.misc import LiteralValue
 from torchwright.ops.arithmetic_ops import (
     abs,
+    clamp,
     compare,
     multiply_const,
     negate,
@@ -21,6 +22,7 @@ from torchwright.ops.arithmetic_ops import (
     signed_multiply,
     subtract,
 )
+from torchwright.ops.logic_ops import bool_all_true
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 from torchwright.ops.map_select import broadcast_select, in_range, select
 from torchwright.reference_renderer.trig import generate_trig_table
@@ -55,43 +57,40 @@ def trig_lookup(ray_angle: Node) -> Tuple[Node, Node]:
 # ---------------------------------------------------------------------------
 
 def _segment_intersection(
-    px: Node,
-    py: Node,
-    ray_cos: Node,
-    ray_sin: Node,
-    px_sin: Node,
-    py_cos: Node,
+    cos_sin: Node,
+    px_py: Node,
+    trig_and_products: Node,
     seg: Segment,
 ) -> Tuple[Node, Node, Node]:
     """Compute (den, num_t, num_u) for one segment.
 
     All outputs are scalar Linear nodes — zero FFN layers.
 
-    den   = cos * ey - sin * ex
-    num_t = (ax*ey - ay*ex) + ex*py - ey*px
-    num_u = (ax*sin - ay*cos) + (py_cos - px_sin)
+    Args:
+        cos_sin: Concatenate([ray_cos, ray_sin]), shared across segments.
+        px_py: Concatenate([px, py]), shared across segments.
+        trig_and_products: Concatenate([ray_cos, ray_sin, px_sin, py_cos]),
+            shared across segments.
+        seg: Wall segment with constant endpoints.
+
+    Returns:
+        (den, num_t, num_u) scalar nodes.
     """
     ex = seg.bx - seg.ax
     ey = seg.by - seg.ay
 
     # den = cos * ey - sin * ex  (linear in cos, sin)
-    cos_sin = Concatenate([ray_cos, ray_sin])
-    den_matrix = torch.tensor([[ey], [-ex]])
-    den = Linear(cos_sin, den_matrix, name="den")
+    den = Linear(cos_sin, torch.tensor([[ey], [-ex]]), name="den")
 
     # num_t = (ax*ey - ay*ex) + ex*py - ey*px  (linear in px, py)
     const_t = seg.ax * ey - seg.ay * ex
-    px_py = Concatenate([px, py])
-    num_t_matrix = torch.tensor([[-ey], [ex]])
-    num_t_bias = torch.tensor([const_t])
-    num_t = Linear(px_py, num_t_matrix, num_t_bias, name="num_t")
+    num_t = Linear(px_py, torch.tensor([[-ey], [ex]]),
+                   torch.tensor([const_t]), name="num_t")
 
     # num_u = (ax*sin - ay*cos) + (py_cos - px_sin)
-    # = ax*sin - ay*cos + py*cos - px*sin
-    # Linear in (ray_cos, ray_sin, px_sin, py_cos)
-    inputs_u = Concatenate([ray_cos, ray_sin, px_sin, py_cos])
-    num_u_matrix = torch.tensor([[-seg.ay], [seg.ax], [-1.0], [1.0]])
-    num_u = Linear(inputs_u, num_u_matrix, name="num_u")
+    num_u = Linear(trig_and_products,
+                   torch.tensor([[-seg.ay], [seg.ax], [-1.0], [1.0]]),
+                   name="num_u")
 
     return den, num_t, num_u
 
@@ -151,11 +150,11 @@ def _segment_distance(
     )
 
     # Step 4: Mask invalid intersections to BIG_DISTANCE
+    # Combine all validity checks into one boolean to avoid 4 sequential
+    # selects (saves ~6 ReLU depth on the critical path).
+    is_valid = bool_all_true([is_den_nonzero, is_t_pos, is_u_ge_0, is_u_le_den])
     big = LiteralValue(torch.tensor([BIG_DISTANCE]), name="big_dist")
-    dist = select(is_den_nonzero, dist, big)
-    dist = select(is_t_pos, dist, big)
-    dist = select(is_u_ge_0, dist, big)
-    dist = select(is_u_le_den, dist, big)
+    dist = select(is_valid, dist, big)
 
     return dist
 
@@ -236,19 +235,24 @@ def build_renderer_graph(
     # Stage 2: Shared products (needed for num_u across all segments)
     px_sin = signed_multiply(
         player_x, ray_sin,
-        max_abs1=max_coord, max_abs2=1.0, step=0.1,
+        max_abs1=max_coord, max_abs2=1.0, step=0.25,
     )
     py_cos = signed_multiply(
         player_y, ray_cos,
-        max_abs1=max_coord, max_abs2=1.0, step=0.1,
+        max_abs1=max_coord, max_abs2=1.0, step=0.25,
     )
+
+    # Shared Concatenates — created once, reused by all segments
+    cos_sin = Concatenate([ray_cos, ray_sin])
+    px_py = Concatenate([player_x, player_y])
+    trig_and_products = Concatenate([ray_cos, ray_sin, px_sin, py_cos])
 
     # Stages 3-4: Per-segment intersection + validity + distance
     distances = []
     colors = []
     for seg in segments:
         den, num_t, num_u = _segment_intersection(
-            player_x, player_y, ray_cos, ray_sin, px_sin, py_cos, seg,
+            cos_sin, px_py, trig_and_products, seg,
         )
         dist = _segment_distance(den, num_t, num_u, max_coord)
         distances.append(dist)
@@ -273,24 +277,15 @@ def build_renderer_graph(
     # Clamp closest_dist into [0.5, max_dist] before the fish-eye multiply,
     # so the signed_multiply inputs stay within their declared ranges.
     # Distances >= max_dist produce walls of ~0 pixels anyway.
-    min_dist_node = LiteralValue(torch.tensor([0.5]), name="min_dist")
-    max_dist_node = LiteralValue(torch.tensor([max_dist]), name="max_dist")
-    is_above_min = compare(closest_dist, 0.5)
-    clamped_dist = select(is_above_min, closest_dist, min_dist_node)
-    is_below_max = compare(clamped_dist, max_dist - 0.5)
-    # is_below_max is true when clamped_dist > max_dist-0.5, meaning TOO BIG
-    # We want to keep clamped_dist when it's <= max_dist
-    # Invert: compare returns 1.0 when input > thresh
-    clamped_dist = select(is_below_max, max_dist_node, clamped_dist)
+    # Uses piecewise_linear clamp (1 FFN layer vs 6 for compare+select pairs).
+    clamped_dist = clamp(closest_dist, 0.5, max_dist)
 
     perp_dist = signed_multiply(
         clamped_dist, perp_cos,
         max_abs1=max_dist, max_abs2=1.0, step=1.0,
     )
-    # Clamp perp_dist away from zero
-    eps_node = LiteralValue(torch.tensor([0.5]), name="min_perp")
-    is_too_small = compare(perp_dist, 0.5)
-    safe_perp_dist = select(is_too_small, perp_dist, eps_node)
+    # Clamp perp_dist away from zero (1 FFN layer vs 3 for compare+select)
+    safe_perp_dist = clamp(perp_dist, 0.5, max_dist)
 
     inv_perp = reciprocal(safe_perp_dist, min_value=0.5, max_value=max_dist, step=1.0)
     wall_height = multiply_const(inv_perp, float(config.screen_height))

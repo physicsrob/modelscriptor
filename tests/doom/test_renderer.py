@@ -63,6 +63,8 @@ def test_trig_lookup(trig_table):
 
 def test_intersection_values():
     """den, num_t, num_u match manual computation for a known case."""
+    from torchwright.graph import Concatenate
+
     px = create_input("player_x", 1)
     py = create_input("player_y", 1)
     rc = create_input("ray_cos", 1)
@@ -70,8 +72,12 @@ def test_intersection_values():
     pxs = create_input("px_sin", 1)
     pyc = create_input("py_cos", 1)
 
+    cos_sin = Concatenate([rc, rs])
+    px_py = Concatenate([px, py])
+    trig_and_products = Concatenate([rc, rs, pxs, pyc])
+
     seg = Segment(ax=5.0, ay=-10.0, bx=5.0, by=10.0, color=(1.0, 0.0, 0.0))
-    den, num_t, num_u = _segment_intersection(px, py, rc, rs, pxs, pyc, seg)
+    den, num_t, num_u = _segment_intersection(cos_sin, px_py, trig_and_products, seg)
 
     # Player at origin, facing east (cos=1, sin=0)
     vals = {
@@ -102,6 +108,8 @@ def test_intersection_values():
 
 def _compute_distance(px_val, py_val, cos_val, sin_val, seg, max_coord=20.0):
     """Helper: build intersection + distance graph and compute for one case."""
+    from torchwright.graph import Concatenate
+
     px = create_input("player_x", 1)
     py = create_input("player_y", 1)
     rc = create_input("ray_cos", 1)
@@ -109,7 +117,11 @@ def _compute_distance(px_val, py_val, cos_val, sin_val, seg, max_coord=20.0):
     pxs = create_input("px_sin", 1)
     pyc = create_input("py_cos", 1)
 
-    den, num_t, num_u = _segment_intersection(px, py, rc, rs, pxs, pyc, seg)
+    cos_sin = Concatenate([rc, rs])
+    px_py = Concatenate([px, py])
+    trig_and_products = Concatenate([rc, rs, pxs, pyc])
+
+    den, num_t, num_u = _segment_intersection(cos_sin, px_py, trig_and_products, seg)
     dist = _segment_distance(den, num_t, num_u, max_coord)
 
     vals = {

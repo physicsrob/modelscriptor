@@ -534,6 +534,36 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     return subtract(inp, multiply_const(q, float(divisor)))
 
 
+def clamp(inp: Node, lo: float, hi: float) -> Node:
+    """Clamp a scalar to [lo, hi] in a single FFN layer.
+
+    Uses :func:`piecewise_linear` with 4 breakpoints to implement an
+    identity passthrough in [lo, hi] with sharp clamping at the edges.
+    Much cheaper than a compare+select pair (1 ReLU layer vs 6).
+
+    Args:
+        inp: 1D scalar node.
+        lo: Lower bound.
+        hi: Upper bound (must be > lo).
+
+    Returns:
+        1D scalar node clamped to [lo, hi].
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    assert hi > lo, "hi must exceed lo"
+
+    from torchwright.ops.const import step_sharpness
+
+    eps = 1.0 / step_sharpness
+    return piecewise_linear(
+        inp,
+        [lo, lo + eps, hi - eps, hi],
+        [lo, lo + eps, hi - eps, hi],
+        input_scale=step_sharpness,
+        name="clamp",
+    )
+
+
 def reciprocal(
     inp: Node,
     min_value: float,

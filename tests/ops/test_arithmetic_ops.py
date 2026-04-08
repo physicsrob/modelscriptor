@@ -2,6 +2,7 @@ import torch
 from torchwright import ops
 from torchwright.ops.arithmetic_ops import (
     add_const,
+    clamp,
     relu_add,
     compare,
     negate,
@@ -457,3 +458,26 @@ def test_reduce_min_odd():
     result_v = win_v.compute(n_pos=1, input_values=input_values)
     assert abs(result_k.item() - 2.0) < 0.5
     assert abs(result_v.item() - 20.0) < 1.0
+
+
+def test_clamp():
+    """clamp(x, lo, hi) clamps to [lo, hi] and passes through in between."""
+    x = create_input("x", 1)
+    out = clamp(x, 2.0, 8.0)
+
+    cases = [
+        (-5.0, 2.0),   # below lo → lo
+        (0.0, 2.0),    # below lo → lo
+        (2.0, 2.0),    # at lo → lo
+        (5.0, 5.0),    # in range → identity
+        (8.0, 8.0),    # at hi → hi
+        (15.0, 8.0),   # above hi → hi
+        (100.0, 8.0),  # far above → hi
+    ]
+    for x_val, expected in cases:
+        result = out.compute(
+            n_pos=1, input_values={"x": torch.tensor([[x_val]])}
+        ).item()
+        assert abs(result - expected) < 0.15, (
+            f"clamp({x_val}, 2, 8): expected {expected}, got {result:.4f}"
+        )
