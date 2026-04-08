@@ -10,6 +10,7 @@ from torchwright.ops.arithmetic_ops import (
     max,
     min,
     floor_int,
+    mod_const,
     multiply_const,
     multiply_integers,
     negate,

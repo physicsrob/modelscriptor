@@ -7,6 +7,7 @@ from torchwright.ops.arithmetic_ops import (
     negate,
     subtract,
     multiply_const,
+    mod_const,
     piecewise_linear,
     square,
     multiply_integers,
@@ -139,6 +140,25 @@ def test_multiply_integers_zero():
             },
         )
         assert abs(result.item()) < 0.1, f"0*{val} should be 0, got {result.item()}"
+
+
+def test_mod_const():
+    x = create_input("x", 1)
+    cases = [
+        # (value, divisor, max_value, expected)
+        (7, 3, 10, 1),
+        (10, 5, 10, 0),
+        (13, 4, 15, 1),
+        (9, 3, 10, 0),
+        (2, 5, 10, 2),
+        (0, 3, 10, 0),
+    ]
+    for val, divisor, max_val, expected in cases:
+        m = mod_const(x, divisor, max_val)
+        result = m.compute(n_pos=1, input_values={"x": torch.tensor([[float(val)]])})
+        assert abs(result.item() - expected) < 0.5, (
+            f"{val} % {divisor} = {expected}, got {result.item()}"
+        )
 
 
 def _eval_pw(node, val):

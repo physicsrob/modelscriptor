@@ -515,6 +515,25 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     )
 
 
+def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
+    """Compute inp % divisor for non-negative integer inputs.
+
+    Uses the identity ``x % d = x - d * floor(x / d)``.
+
+    Args:
+        inp: 1D scalar node with integer value in [0, max_value].
+        divisor: The constant divisor (positive integer).
+        max_value: Upper bound on input.
+
+    Returns:
+        1D scalar node containing inp % divisor.
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    assert divisor > 0, "divisor must be positive"
+    q = thermometer_floor_div(inp, divisor, max_value)
+    return subtract(inp, multiply_const(q, float(divisor)))
+
+
 def reciprocal(
     inp: Node,
     min_value: float,
