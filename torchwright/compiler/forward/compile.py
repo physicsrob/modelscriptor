@@ -130,9 +130,9 @@ def forward_compile(
         occupied_before = d - residual_map.get_free_count()
 
         layer = net.add_layer(append=True)
-        attn_ops, ffn_ops = scheduler.schedule_layer(residual_map, computed)
+        attn_ops, ffn_ops, biased_linears = scheduler.schedule_layer(residual_map, computed)
         write_attn_sublayer(layer, attn_ops, residual_map, pos_encoding)
-        write_ffn_sublayer(layer, ffn_ops, residual_map)
+        write_ffn_sublayer(layer, ffn_ops, residual_map, set(biased_linears))
 
         layer_params = _count_layer_params(attn_ops, ffn_ops, d, d_head)
         total_params += layer_params

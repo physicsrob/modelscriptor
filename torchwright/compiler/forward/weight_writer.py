@@ -5,11 +5,12 @@ ResidualStreamMap. No strategies, no FeatureAssignment — just scatter writes.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Set
 
 import torch
 import torch.nn.functional as F
 
+from torchwright.compiler.feature_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
@@ -61,17 +62,20 @@ def write_ffn_sublayer(
     layer: TransformerLayer,
     ops: List[FFNOp],
     residual_map: ResidualStreamMap,
+    biased_linears: Optional[Set[Node]] = None,
 ):
     """Write FFN operations into a layer's FFNSubLayer components."""
+    if biased_linears is None:
+        biased_linears = set()
     for op in ops:
         if op.op_type == "compute_relu":
-            _write_compute_relu(layer.ffn, op, residual_map)
+            _write_compute_relu(layer.ffn, op, residual_map, biased_linears)
         elif op.op_type == "compute_literal_value":
             _write_compute_literal_value(layer.ffn, op)
         elif op.op_type == "compute_bias":
             _write_compute_bias(layer.ffn, op)
         elif op.op_type == "compute_standalone_relu":
-            _write_compute_standalone_relu(layer.ffn, op, residual_map)
+            _write_compute_standalone_relu(layer.ffn, op, residual_map, biased_linears)
         else:
             raise ValueError(f"Unknown ffn op_type: {op.op_type}")
 
@@ -345,7 +349,7 @@ def _write_add_into(
 # ---------------------------------------------------------------------------
 
 
-def _write_compute_relu(ffn, op: FFNOp, rmap: ResidualStreamMap):
+def _write_compute_relu(ffn, op: FFNOp, rmap: ResidualStreamMap, biased_linears: Set[Node] = frozenset()):
     """Compile a Linear1 -> ReLU -> Linear2 chain through the FFN.
 
     linear1: maps input columns to ffn_slots (applying L1's weight + bias)
@@ -372,6 +376,23 @@ def _write_compute_relu(ffn, op: FFNOp, rmap: ResidualStreamMap):
     for j, slot in enumerate(ffn_slots):
         ffn.linear1.output_bias[slot] = l1_node.output_bias[j]
 
+    # Fold deferred biased-Linear inputs into l1's intermediate bias.
+    # Biased Linears compiled in attention have their matrix applied but bias
+    # deferred to compute_bias (written to linear2 output_bias). The chain
+    # reads those columns in linear1, before output_bias is applied. Fold the
+    # bias into l1's FFN bias so the chain sees correct values.
+    if biased_linears:
+        leaves = flatten_concat_nodes([input_node]) if isinstance(input_node, Concatenate) else [input_node]
+        offset = 0
+        for leaf in leaves:
+            if leaf in biased_linears:
+                for j, slot in enumerate(ffn_slots):
+                    bias_contrib = 0.0
+                    for i in range(len(leaf)):
+                        bias_contrib += l1_node.output_matrix[offset + i, j].item() * leaf.output_bias[i].item()
+                    ffn.linear1.output_bias[slot] += bias_contrib
+            offset += len(leaf)
+
     # linear2: ffn slots -> output columns
     # L2 weight: (d_intermediate, d_output), bias: (d_output,)
     for i, slot in enumerate(ffn_slots):
@@ -397,7 +418,7 @@ def _write_compute_bias(ffn, op: FFNOp):
         ffn.linear2.output_bias[col] += node.output_bias[i]
 
 
-def _write_compute_standalone_relu(ffn, op: FFNOp, rmap: ResidualStreamMap):
+def _write_compute_standalone_relu(ffn, op: FFNOp, rmap: ResidualStreamMap, biased_linears: Set[Node] = frozenset()):
     """Compile a standalone ReLU through the FFN.
 
     linear1: identity mapping from input columns to FFN slots (bias=0)
@@ -418,6 +439,17 @@ def _write_compute_standalone_relu(ffn, op: FFNOp, rmap: ResidualStreamMap):
     # linear1: input columns → FFN slots (identity, zero bias)
     for in_col, slot in zip(in_idx, ffn_slots):
         ffn.linear1.output_matrix[in_col, slot] = 1.0
+
+    # Fold deferred biased-Linear inputs into FFN slot biases.
+    # Identity mapping means slot[k] = input[k], so the bias folds directly.
+    if biased_linears:
+        leaves = flatten_concat_nodes([input_node]) if isinstance(input_node, Concatenate) else [input_node]
+        offset = 0
+        for leaf in leaves:
+            if leaf in biased_linears:
+                for i in range(len(leaf)):
+                    ffn.linear1.output_bias[ffn_slots[offset + i]] += leaf.output_bias[i].item()
+            offset += len(leaf)
 
     # linear2: FFN slots → output columns (identity, zero bias)
     for slot, out_col in zip(ffn_slots, out_idx):

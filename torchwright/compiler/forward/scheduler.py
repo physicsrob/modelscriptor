@@ -46,7 +46,7 @@ class LayerScheduler:
 
     def schedule_layer(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
-    ) -> Tuple[List[AttnHeadOp], List[FFNOp]]:
+    ) -> Tuple[List[AttnHeadOp], List[FFNOp], List[Node]]:
         """Schedule one transformer layer's worth of operations.
 
         Phases:
@@ -60,7 +60,7 @@ class LayerScheduler:
         ``computed_nodes`` (add newly computed nodes).
 
         Returns:
-            ``(attn_ops, ffn_ops)`` lists for the weight writer.
+            ``(attn_ops, ffn_ops, biased_linears)`` lists for the weight writer.
         """
         # --- 1. Classify ready nodes ---
         all_ready = self.graph.get_ready_nodes(computed_nodes)
@@ -141,7 +141,7 @@ class LayerScheduler:
                     f"{residual_map.get_free_count()} free columns"
                 )
 
-        return attn_ops, ffn_ops
+        return attn_ops, ffn_ops, biased_linears
 
     # ------------------------------------------------------------------
     # Attention sublayer
