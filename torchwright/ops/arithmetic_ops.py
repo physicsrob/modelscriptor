@@ -429,6 +429,110 @@ def piecewise_linear(
     return sum_nodes(chunks)
 
 
+def piecewise_linear_nd(
+    inp: Node,
+    breakpoints: List[float],
+    values: List[List[float]],
+    clamp: bool = True,
+    d_max: int = 1024,
+    input_scale: float = 1.0,
+    name: str = "piecewise_linear_nd",
+) -> Node:
+    """Evaluate a vector-valued piecewise-linear function of a scalar input.
+
+    Like :func:`piecewise_linear` but each breakpoint maps to a vector
+    of D values instead of a scalar.  All D output channels share the
+    same breakpoints and ReLU units — only the output projection differs.
+    Cost: 1 FFN layer (same as scalar version), output width D.
+
+    Useful for looking up multiple precomputed values from a single
+    discrete key (e.g., per-segment properties indexed by ray angle).
+
+    Args:
+        inp: 1D scalar node.
+        breakpoints: Strictly ascending x-coordinates (length N >= 2).
+        values: List of N vectors, each of length D.
+        clamp: If True (default), hold constant outside the range.
+        d_max: Maximum ReLU units per FFN layer.
+        input_scale: Multiplier for first-layer weights (see
+            :func:`piecewise_linear`).
+        name: Debug label prefix.
+
+    Returns:
+        Node of width D containing the interpolated vector.
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    n = len(breakpoints)
+    assert n == len(values) and n >= 2
+    d_out = len(values[0])
+    assert all(len(v) == d_out for v in values)
+    assert all(
+        breakpoints[i] < breakpoints[i + 1] for i in range(n - 1)
+    ), "Breakpoints must be strictly ascending"
+
+    # Compute per-segment slopes for each output dimension.
+    # slopes[i][j] = slope of dimension j in segment i.
+    slopes = []
+    for i in range(n - 1):
+        dx = breakpoints[i + 1] - breakpoints[i]
+        slopes.append([(values[i + 1][j] - values[i][j]) / dx for j in range(d_out)])
+
+    # Build ReLU list: (input_weight, threshold, [output_weights_per_dim])
+    relus: list = []
+    prev_slopes = [0.0] * d_out
+
+    for i in range(n - 1):
+        deltas = [slopes[i][j] - prev_slopes[j] for j in range(d_out)]
+        if any(_builtin_abs(d) > 1e-12 for d in deltas):
+            relus.append((1.0, breakpoints[i], deltas))
+        prev_slopes = list(slopes[i])
+
+    # Cancel final slope (clamp)
+    if any(_builtin_abs(s) > 1e-12 for s in prev_slopes):
+        relus.append((1.0, breakpoints[-1], [-s for s in prev_slopes]))
+
+    if not clamp:
+        if any(_builtin_abs(s) > 1e-12 for s in slopes[0]):
+            relus.append((-1.0, breakpoints[0], [-s for s in slopes[0]]))
+        if any(_builtin_abs(s) > 1e-12 for s in slopes[-1]):
+            relus.append((1.0, breakpoints[-1], list(slopes[-1])))
+
+    if len(relus) == 0:
+        from torchwright.ops.inout_nodes import create_literal_value
+        return create_literal_value(torch.tensor(values[0]))
+
+    y0 = torch.tensor(values[0])
+
+    chunks = []
+    for chunk_start in range(0, len(relus), d_max):
+        chunk = relus[chunk_start : chunk_start + d_max]
+        d = len(chunk)
+        s = input_scale
+
+        input_proj = torch.tensor([[r[0] * s] for r in chunk])  # (d, 1)
+        input_bias = torch.tensor([-r[0] * s * r[1] for r in chunk])  # (d,)
+        output_proj = torch.tensor(
+            [[r[2][j] / s for j in range(d_out)] for r in chunk]
+        )  # (d, d_out)
+
+        ob = y0 if chunk_start == 0 else torch.zeros(d_out)
+
+        chunks.append(
+            linear_relu_linear(
+                input_node=inp,
+                input_proj=input_proj,
+                input_bias=input_bias,
+                output_proj=output_proj,
+                output_bias=ob,
+                name=f"{name}_{chunk_start}_{chunk_start + d}",
+            )
+        )
+
+    if len(chunks) == 1:
+        return chunks[0]
+    return sum_nodes(chunks)
+
+
 # ---------------------------------------------------------------------------
 # Piecewise-linear derived ops
 # ---------------------------------------------------------------------------
@@ -468,6 +572,38 @@ def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) ->
         x += step
 
     return piecewise_linear(inp, breakpoints, vals, d_max=d_max, name="square")
+
+
+def square_signed(
+    inp: Node, max_abs: float, step: float = 1.0, d_max: int = 1024,
+) -> Node:
+    """Compute x² for signed inputs via piecewise-linear interpolation.
+
+    Unlike :func:`square` (which only handles non-negative inputs),
+    this handles x in [-max_abs, max_abs] directly — no ``abs`` needed.
+    This saves one ReLU layer when used inside :func:`signed_multiply`.
+
+    Args:
+        inp: 1D scalar node with value in [-max_abs, max_abs].
+        max_abs: Maximum absolute value of input.
+        step: Grid spacing.
+        d_max: Maximum ReLU units per FFN layer.
+
+    Returns:
+        1D scalar node containing x².
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    assert max_abs > 0, "max_abs must be positive"
+
+    breakpoints = []
+    vals = []
+    x = -max_abs
+    while x <= max_abs + step / 2.0:
+        breakpoints.append(x)
+        vals.append(x * x)
+        x += step
+
+    return piecewise_linear(inp, breakpoints, vals, d_max=d_max, name="square_signed")
 
 
 def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:

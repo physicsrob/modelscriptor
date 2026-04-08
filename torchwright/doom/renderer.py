@@ -7,6 +7,8 @@ the weights as constants.
 
 from typing import List, Tuple
 
+import builtins
+
 import torch
 
 from torchwright.graph import Concatenate, Linear, Node
@@ -17,6 +19,7 @@ from torchwright.ops.arithmetic_ops import (
     compare,
     multiply_const,
     negate,
+    piecewise_linear_nd,
     reciprocal,
     reduce_min,
     signed_multiply,
@@ -103,60 +106,138 @@ BIG_DISTANCE = 1000.0
 
 
 def _segment_distance(
-    den: Node,
     num_t: Node,
     num_u: Node,
+    signed_inv_den: Node,
+    abs_den: Node,
+    sign_den: Node,
     max_coord: float,
 ) -> Node:
     """Compute masked distance for one segment intersection.
 
-    Returns BIG_DISTANCE if the intersection is invalid.
+    Uses precomputed per-angle values (signed_inv_den, abs_den, sign_den)
+    from a lookup table, eliminating runtime reciprocal and sign checks.
 
-    Uses sign normalization: if den < 0, negate both num_t and den so we
-    can treat den as positive for all subsequent checks.
+    Args:
+        num_t: Intersection numerator (linear in px, py).
+        num_u: Segment parameter numerator (linear in trig + shared products).
+        signed_inv_den: Precomputed 1/den preserving sign (from angle lookup).
+        abs_den: Precomputed |den| (from angle lookup).
+        sign_den: Precomputed sign(den) as ±1 (from angle lookup).
+        max_coord: Upper bound on coordinate magnitudes.
+
+    Returns:
+        Scalar distance node (BIG_DISTANCE if invalid).
     """
-    # Bounds — keep tight to avoid precision issues from overly large
-    # piecewise_linear tables.
-    # den is bounded by segment_span (≤ 2*max_coord) * trig (≤ 1)
-    max_den = 2.0 * max_coord
-    # num_t is bounded by max_coord * segment_span ≤ 2*max_coord^2
     max_num_t = 2.0 * max_coord * max_coord
-    # Max distance we care about
-    max_dist = BIG_DISTANCE
+    max_inv_den = 100.0  # 1/epsilon where epsilon=0.01 in the lookup
     epsilon = 0.05
 
-    # Step 1: Check den sign and normalize
-    is_den_pos = compare(den, 0.0)
+    # Sign-normalize num_t and num_u using precomputed sign_den.
+    # select(sign_den, x, -x) makes both behave as if den > 0.
+    adj_num_t = select(sign_den, num_t, negate(num_t))
+    adj_num_u = select(sign_den, num_u, negate(num_u))
 
-    # Normalize: make den effectively positive
-    abs_den = abs(den)
-    adj_num_t = select(is_den_pos, num_t, negate(num_t))
-    adj_num_u = select(is_den_pos, num_u, negate(num_u))
-
-    # Step 2: Validity checks (all assume den > 0 after normalization)
+    # Validity checks
     is_den_nonzero = compare(abs_den, epsilon)
     is_t_pos = compare(adj_num_t, epsilon)
     is_u_ge_0 = compare(adj_num_u, -epsilon)
     u_minus_den = subtract(abs_den, adj_num_u)
     is_u_le_den = compare(u_minus_den, -epsilon)
 
-    # Step 3: Compute distance t = num_t / den
-    inv_den = reciprocal(abs_den, min_value=epsilon, max_value=max_den, step=0.5)
+    # Distance: t = num_t * signed_inv_den (= num_t / den)
+    # Use adj_num_t * abs(signed_inv_den) = adj_num_t * (1/abs_den)
+    # signed_inv_den has the right sign built in, but we already
+    # sign-normalized num_t, so use the absolute reciprocal.
+    abs_inv_den = select(sign_den, signed_inv_den, negate(signed_inv_den))
     dist = signed_multiply(
-        adj_num_t, inv_den,
-        max_abs1=max_num_t, max_abs2=1.0 / epsilon,
+        adj_num_t, abs_inv_den,
+        max_abs1=max_num_t, max_abs2=max_inv_den,
         step=1.0,
-        max_abs_output=max_dist,
+        max_abs_output=BIG_DISTANCE,
     )
 
-    # Step 4: Mask invalid intersections to BIG_DISTANCE
-    # Combine all validity checks into one boolean to avoid 4 sequential
-    # selects (saves ~6 ReLU depth on the critical path).
+    # Mask invalid intersections
     is_valid = bool_all_true([is_den_nonzero, is_t_pos, is_u_ge_0, is_u_le_den])
     big = LiteralValue(torch.tensor([BIG_DISTANCE]), name="big_dist")
     dist = select(is_valid, dist, big)
 
     return dist
+
+
+def _build_angle_lookup(
+    ray_angle: Node,
+    segments: List[Segment],
+) -> List[Tuple[Node, Node, Node]]:
+    """Precompute per-segment den-related values as a function of ray angle.
+
+    For each segment, den = cos(angle)*ey - sin(angle)*ex is fully determined
+    by the ray angle and constant segment endpoints. Precomputing 1/den, |den|,
+    and sign(den) for all 256 angles eliminates runtime reciprocal and sign
+    normalization (saves ~5 ReLU layers on the per-segment critical path).
+
+    Returns a list of (signed_inv_den, abs_den, sign_den) node tuples,
+    one per segment.  All segments share a single piecewise_linear_nd lookup
+    (1 FFN layer total, regardless of segment count).
+    """
+    trig_table = generate_trig_table()
+    n_segs = len(segments)
+    epsilon = 0.01  # threshold for "den is zero"
+
+    # Precompute the 3 values per segment per angle
+    # Output layout: [signed_inv_den_0, abs_den_0, sign_den_0,
+    #                 signed_inv_den_1, abs_den_1, sign_den_1, ...]
+    d_out = 3 * n_segs
+    breakpoints = list(range(256))
+    values = []
+    for angle_idx in range(256):
+        cos_a = float(trig_table[angle_idx, 0])
+        sin_a = float(trig_table[angle_idx, 1])
+        row = []
+        for seg in segments:
+            ex = seg.bx - seg.ax
+            ey = seg.by - seg.ay
+            den = cos_a * ey - sin_a * ex
+            if builtins.abs(den) < epsilon:
+                row.extend([0.0, 0.0, 1.0])  # invalid: inv=0, abs=0, sign=+1
+            else:
+                row.extend([1.0 / den, builtins.abs(den), 1.0 if den > 0 else -1.0])
+        values.append(row)
+
+    # Single lookup: 1 FFN layer, outputs 3*N values
+    all_data = piecewise_linear_nd(
+        ray_angle, breakpoints, values, name="angle_lookup",
+    )
+
+    # Split into per-segment (signed_inv_den, abs_den, sign_den) triples
+    result = []
+    for i in range(n_segs):
+        offset = i * 3
+        signed_inv_den = Linear(
+            all_data,
+            _extract_matrix(d_out, offset),
+            name=f"signed_inv_den_{i}",
+        )
+        abs_den_node = Linear(
+            all_data,
+            _extract_matrix(d_out, offset + 1),
+            name=f"abs_den_{i}",
+        )
+        sign_den = Linear(
+            all_data,
+            _extract_matrix(d_out, offset + 2),
+            name=f"sign_den_{i}",
+        )
+        result.append((signed_inv_den, abs_den_node, sign_den))
+
+    return result
+
+
+def _extract_matrix(d_in: int, idx: int) -> torch.Tensor:
+    """Create a (d_in, 1) matrix that extracts column idx."""
+    m = torch.zeros(d_in, 1)
+    m[idx, 0] = 1.0
+    return m
 
 
 # ---------------------------------------------------------------------------
@@ -247,14 +328,23 @@ def build_renderer_graph(
     px_py = Concatenate([player_x, player_y])
     trig_and_products = Concatenate([ray_cos, ray_sin, px_sin, py_cos])
 
+    # Per-angle lookup: precompute signed_inv_den, abs_den, sign_den for
+    # all segments in a single piecewise_linear_nd (1 FFN layer).
+    # Eliminates runtime reciprocal + sign normalization per segment.
+    if len(segments) > 0:
+        angle_data = _build_angle_lookup(ray_angle, segments)
+
     # Stages 3-4: Per-segment intersection + validity + distance
     distances = []
     colors = []
-    for seg in segments:
-        den, num_t, num_u = _segment_intersection(
+    for i, seg in enumerate(segments):
+        _den, num_t, num_u = _segment_intersection(
             cos_sin, px_py, trig_and_products, seg,
         )
-        dist = _segment_distance(den, num_t, num_u, max_coord)
+        signed_inv_den, abs_den_node, sign_den = angle_data[i]
+        dist = _segment_distance(
+            num_t, num_u, signed_inv_den, abs_den_node, sign_den, max_coord,
+        )
         distances.append(dist)
         colors.append(LiteralValue(torch.tensor(list(seg.color)), name="seg_color"))
 

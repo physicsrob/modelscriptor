@@ -78,7 +78,7 @@ def test_compiled_single_wall_full_frame(small_config):
     """Full-frame pixel match for a single wall at 3 angles."""
     segments = [Segment(ax=5.0, ay=-10.0, bx=5.0, by=10.0, color=(1.0, 0.0, 0.0))]
     module = compile_renderer(
-        segments, small_config, max_coord=15.0, d=512, d_head=16, verbose=False,
+        segments, small_config, max_coord=15.0, d=1024, d_head=16, verbose=False,
     )
 
     for angle in [0, 32, 224]:
@@ -97,7 +97,7 @@ def test_compiled_two_walls_full_frame(small_config):
         Segment(ax=8.0, ay=-10.0, bx=8.0, by=10.0, color=(0.0, 1.0, 0.0)),
     ]
     module = compile_renderer(
-        segments, small_config, max_coord=15.0, d=512, d_head=16, verbose=False,
+        segments, small_config, max_coord=15.0, d=1024, d_head=16, verbose=False,
     )
     compiled = render_frame_compiled(module, 0.0, 0.0, 0, small_config)
     ref = render_frame(0.0, 0.0, 0, segments, small_config)
@@ -111,7 +111,7 @@ def test_compiled_box_room_full_frame(small_config):
     """Box room from center, full-frame match in all 4 directions."""
     segments = box_room()
     module = compile_renderer(
-        segments, small_config, max_coord=10.0, d=512, d_head=16, verbose=False,
+        segments, small_config, max_coord=10.0, d=1024, d_head=16, verbose=False,
     )
 
     for angle in [0, 64, 128, 192]:
@@ -127,7 +127,7 @@ def test_compiled_box_room_off_center(small_config):
     """Box room from off-center positions — tests perspective correctness."""
     segments = box_room()
     module = compile_renderer(
-        segments, small_config, max_coord=10.0, d=512, d_head=16, verbose=False,
+        segments, small_config, max_coord=10.0, d=1024, d_head=16, verbose=False,
     )
 
     positions = [
@@ -149,7 +149,7 @@ def test_compiled_multi_room(small_config):
     """Multi-room scene (22 segments including diagonals) — full frame."""
     segments = multi_room()
     module = compile_renderer(
-        segments, small_config, max_coord=15.0, d=512, d_head=16, verbose=False,
+        segments, small_config, max_coord=15.0, d=1024, d_head=16, verbose=False,
     )
 
     viewpoints = [
@@ -172,7 +172,7 @@ def test_compiled_target_resolution(target_config):
     """Phase 2 target: 32×40 box room, full-frame match."""
     segments = box_room()
     module = compile_renderer(
-        segments, target_config, max_coord=10.0, d=512, d_head=16, verbose=False,
+        segments, target_config, max_coord=10.0, d=1024, d_head=16, verbose=False,
     )
 
     for angle in [0, 64, 128, 192]:

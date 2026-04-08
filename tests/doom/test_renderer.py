@@ -107,11 +107,18 @@ def test_intersection_values():
 
 
 def _compute_distance(px_val, py_val, cos_val, sin_val, seg, max_coord=20.0):
-    """Helper: build intersection + distance graph and compute for one case."""
+    """Helper: build intersection + distance graph and compute for one case.
+
+    Uses the full pipeline including per-angle lookup, matching what
+    build_renderer_graph does.
+    """
+    from torchwright.doom.renderer import _build_angle_lookup
     from torchwright.graph import Concatenate
+    from torchwright.ops.arithmetic_ops import signed_multiply
 
     px = create_input("player_x", 1)
     py = create_input("player_y", 1)
+    ray_angle = create_input("ray_angle", 1)
     rc = create_input("ray_cos", 1)
     rs = create_input("ray_sin", 1)
     pxs = create_input("px_sin", 1)
@@ -121,12 +128,23 @@ def _compute_distance(px_val, py_val, cos_val, sin_val, seg, max_coord=20.0):
     px_py = Concatenate([px, py])
     trig_and_products = Concatenate([rc, rs, pxs, pyc])
 
-    den, num_t, num_u = _segment_intersection(cos_sin, px_py, trig_and_products, seg)
-    dist = _segment_distance(den, num_t, num_u, max_coord)
+    # Build angle lookup for this single segment
+    angle_data = _build_angle_lookup(ray_angle, [seg])
+    signed_inv_den, abs_den_node, sign_den = angle_data[0]
+
+    _den, num_t, num_u = _segment_intersection(cos_sin, px_py, trig_and_products, seg)
+    dist = _segment_distance(
+        num_t, num_u, signed_inv_den, abs_den_node, sign_den, max_coord,
+    )
+
+    # Find the ray_angle that produces cos_val, sin_val
+    import numpy as np
+    angle = int(round(np.arctan2(sin_val, cos_val) * 256 / (2 * np.pi))) % 256
 
     vals = {
         "player_x": torch.tensor([[px_val]]),
         "player_y": torch.tensor([[py_val]]),
+        "ray_angle": torch.tensor([[float(angle)]]),
         "ray_cos": torch.tensor([[cos_val]]),
         "ray_sin": torch.tensor([[sin_val]]),
         "px_sin": torch.tensor([[px_val * sin_val]]),

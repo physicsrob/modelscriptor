@@ -10,6 +10,7 @@ from torchwright.ops.arithmetic_ops import (
     multiply_const,
     mod_const,
     piecewise_linear,
+    piecewise_linear_nd,
     square,
     multiply_integers,
     reciprocal,
@@ -481,3 +482,36 @@ def test_clamp():
         assert abs(result - expected) < 0.15, (
             f"clamp({x_val}, 2, 8): expected {expected}, got {result:.4f}"
         )
+
+
+def test_piecewise_linear_nd():
+    """piecewise_linear_nd looks up vector values from a scalar key."""
+    x = create_input("x", 1)
+
+    # 4 breakpoints, 3-dimensional output (like cos, sin, extra)
+    breakpoints = [0.0, 1.0, 2.0, 3.0]
+    values = [
+        [1.0, 0.0, 10.0],   # x=0
+        [0.0, 1.0, 20.0],   # x=1
+        [-1.0, 0.0, 30.0],  # x=2
+        [0.0, -1.0, 40.0],  # x=3
+    ]
+    out = piecewise_linear_nd(x, breakpoints, values)
+    assert len(out) == 3
+
+    cases = [
+        (0.0, [1.0, 0.0, 10.0]),
+        (1.0, [0.0, 1.0, 20.0]),
+        (2.0, [-1.0, 0.0, 30.0]),
+        (3.0, [0.0, -1.0, 40.0]),
+        (0.5, [0.5, 0.5, 15.0]),   # interpolated
+        (1.5, [-0.5, 0.5, 25.0]),  # interpolated
+    ]
+    for x_val, expected in cases:
+        result = out.compute(
+            n_pos=1, input_values={"x": torch.tensor([[x_val]])}
+        ).squeeze(0).tolist()
+        for j, (r, e) in enumerate(zip(result, expected)):
+            assert abs(r - e) < 0.01, (
+                f"piecewise_linear_nd({x_val})[{j}]: expected {e}, got {r:.4f}"
+            )
