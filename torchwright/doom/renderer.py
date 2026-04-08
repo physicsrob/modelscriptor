@@ -14,7 +14,6 @@ from torchwright.graph.misc import LiteralValue
 from torchwright.ops.arithmetic_ops import (
     abs,
     compare,
-    floor_int,
     multiply_const,
     negate,
     reciprocal,
@@ -296,26 +295,25 @@ def build_renderer_graph(
     inv_perp = reciprocal(safe_perp_dist, min_value=0.5, max_value=max_dist, step=1.0)
     wall_height = multiply_const(inv_perp, float(config.screen_height))
 
-    # Wall bounds: center ± half wall height, then floor to integer to
-    # match reference renderer's int() truncation convention.
-    # in_range tests lower <= i+0.5, so floored bounds give pixel-exact match.
+    # Wall bounds: center ± half wall height.
+    # Pass continuous bounds directly to in_range, which uses a +0.5 offset
+    # to classify each row. This may differ from the reference renderer's
+    # int() truncation by at most 1 pixel at wall boundaries.
     H = config.screen_height
     center = float(H) / 2.0
     half_height = multiply_const(wall_height, 0.5)
-    wall_top_cont = Linear(
+    wall_top = Linear(
         half_height,
         torch.tensor([[-1.0]]),
         torch.tensor([center]),
-        name="wall_top_cont",
+        name="wall_top",
     )
-    wall_bottom_cont = Linear(
+    wall_bottom = Linear(
         half_height,
         torch.tensor([[1.0]]),
         torch.tensor([center]),
-        name="wall_bottom_cont",
+        name="wall_bottom",
     )
-    wall_top = floor_int(wall_top_cont, min_value=0, max_value=H)
-    wall_bottom = floor_int(wall_bottom_cont, min_value=0, max_value=H)
 
     # Handle "no hit" case: if closest_dist >= BIG, show only ceiling/floor
     # wall_top will be near center and wall_bottom near center (height ≈ 0)
