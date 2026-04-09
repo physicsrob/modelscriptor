@@ -69,17 +69,12 @@ def add_const(inp: Node, scalar: float) -> Node:
     Returns:
         Node: Output node with scalar added to each entry.
     """
-    return Add(
+    d = len(inp)
+    return Linear(
         inp,
-        linear_relu_linear(
-            input_node=inp,
-            input_proj=torch.tensor([0.0] * len(inp)),
-            input_bias=torch.zeros(1),
-            output_proj=torch.tensor([0.0] * len(inp)),
-            output_bias=torch.tensor([scalar] * len(inp)),
-            name="add_const_ffn",
-        ),
-        name="add_const_add",
+        torch.eye(d),
+        torch.tensor([scalar] * d),
+        name="add_const",
     )
 
 
