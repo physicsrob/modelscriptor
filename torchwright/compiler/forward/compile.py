@@ -21,7 +21,8 @@ from torchwright.compiler.forward.weight_writer import (
     write_ffn_sublayer,
 )
 from torchwright.compiler.transformer import HeadlessTransformer
-from torchwright.graph import Node, Linear
+from torchwright.compiler.feature_assignment import flatten_concat_nodes
+from torchwright.graph import Node, Linear, Concatenate
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 
@@ -134,6 +135,12 @@ def forward_compile(
         write_attn_sublayer(layer, attn_ops, residual_map, pos_encoding)
         write_ffn_sublayer(layer, ffn_ops, residual_map, set(biased_linears))
 
+        # Mark Concatenate nodes as computed when all leaf inputs are done
+        for node in graph.get_all_nodes():
+            if isinstance(node, Concatenate) and node not in computed:
+                if all(leaf in computed for leaf in flatten_concat_nodes([node])):
+                    computed.add(node)
+
         layer_params = _count_layer_params(attn_ops, ffn_ops, d, d_head)
         total_params += layer_params
         occupied_after = d - residual_map.get_free_count()
@@ -175,7 +182,11 @@ def forward_compile(
     fa = FeatureAssignment({in_state, out_state})
     for node, indices in input_indices.items():
         fa.assign(in_state, node, indices)
-    fa.assign(out_state, output_node, residual_map.get_indices(output_node))
+    if isinstance(output_node, Concatenate):
+        for leaf in flatten_concat_nodes([output_node]):
+            fa.assign(out_state, leaf, residual_map.get_indices(leaf))
+    else:
+        fa.assign(out_state, output_node, residual_map.get_indices(output_node))
     net.feature_assignment = fa
 
     if device == "auto":
