@@ -125,9 +125,9 @@ def main():
         help="transformer: game logic + rendering in compiled transformer (default). "
              "reference: pure Python implementation.",
     )
-    parser.add_argument("--width", type=int, default=32)
-    parser.add_argument("--height", type=int, default=40)
-    parser.add_argument("--fov", type=int, default=16)
+    parser.add_argument("--width", type=int, default=64)
+    parser.add_argument("--height", type=int, default=80)
+    parser.add_argument("--fov", type=int, default=32)
     parser.add_argument("--scale", type=int, default=8)
     args = parser.parse_args()
 
