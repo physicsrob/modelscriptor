@@ -13,7 +13,7 @@ import numpy as np
 from torchwright.doom.game import GameState, update_state
 from torchwright.doom.input import PlayerInput
 from torchwright.reference_renderer.render import render_frame
-from torchwright.reference_renderer.scenes import box_room, multi_room
+from torchwright.reference_renderer.scenes import box_room, box_room_textured, multi_room
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
@@ -27,6 +27,7 @@ def play(
     max_coord: float = 20.0,
     scale: int = 8,
     mode: str = "transformer",
+    textures=None,
 ) -> None:
     """Run an interactive game loop with pygame display.
 
@@ -39,6 +40,7 @@ def play(
         scale: Pixel scaling factor for display window.
         mode: "transformer" compiles game logic + rendering into a
             transformer. "reference" uses the Python implementation.
+        textures: Optional texture atlas for wall textures.
     """
     try:
         import pygame
@@ -51,7 +53,9 @@ def play(
 
         print("Compiling game graph...")
         module = compile_game(
-            segments, config, max_coord, d=1024, d_head=16,
+            segments, config, max_coord,
+            textures=textures,
+            d=2048 if textures else 1024, d_head=16,
         )
 
         def frame_fn(state, inputs):
@@ -64,6 +68,7 @@ def play(
             new_state = update_state(state, inputs, segments, trig_table)
             frame = render_frame(
                 new_state.x, new_state.y, new_state.angle, segments, config,
+                textures=textures,
             )
             return frame, new_state
 
@@ -136,8 +141,9 @@ def main():
         floor_color=(0.4, 0.4, 0.4),
     )
 
+    textures = None
     if args.scene == "box":
-        segments = box_room()
+        segments, textures = box_room_textured()
         start_x, start_y, start_angle = 0.0, 0.0, 0
         max_coord = 10.0
     else:
@@ -146,7 +152,8 @@ def main():
         max_coord = 15.0
 
     play(segments, config, start_x, start_y, start_angle,
-         max_coord=max_coord, scale=args.scale, mode=args.mode)
+         max_coord=max_coord, scale=args.scale, mode=args.mode,
+         textures=textures)
 
 
 if __name__ == "__main__":
