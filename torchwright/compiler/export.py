@@ -110,6 +110,7 @@ def compile_headless(
     d: int = 1024,
     d_head: int = 16,
     max_seq_len: int = 512,
+    max_layers: int = 100,
     verbose: bool = True,
     device: str = "auto",
 ) -> HeadlessTransformerModule:
@@ -124,6 +125,7 @@ def compile_headless(
         d: Residual stream dimension.
         d_head: Attention head dimension.
         max_seq_len: Maximum sequence length.
+        max_layers: Safety limit on number of compiled layers.
         verbose: Print progress.
         device: Target device.
 
@@ -138,6 +140,7 @@ def compile_headless(
         output_node=output_node,
         pos_encoding=pos_encoding,
         verbose=verbose,
+        max_layers=max_layers,
         device=None,
     )
 

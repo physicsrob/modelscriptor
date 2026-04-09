@@ -279,37 +279,32 @@ def _column_fill(
 # Full graph
 # ---------------------------------------------------------------------------
 
-def build_renderer_graph(
+def build_rendering_pipeline(
+    player_x: Node,
+    player_y: Node,
+    ray_angle: Node,
+    perp_cos: Node,
     segments: List[Segment],
     config: RenderConfig,
     max_coord: float = 20.0,
-) -> Tuple[Node, "PosEncoding"]:
-    """Build the complete per-column rendering graph.
+) -> Node:
+    """Build the rendering pipeline from graph nodes.
 
-    Inputs (per position, alphabetical order for headless module):
-        perp_cos:  cos(ray_angle - player_angle) for fish-eye correction
-        player_x:  world x coordinate
-        player_y:  world y coordinate
-        ray_angle: integer 0-255, index into trig table
-
-    Output: H*3 floats — RGB for each row of this screen column.
+    This is the core rendering graph.  It can be called with InputNodes
+    (Phase 2 standalone renderer) or with computed nodes (Phase 3+ game
+    graph where position and angle are derived from game logic).
 
     Args:
+        player_x, player_y: World-coordinate nodes (scalar).
+        ray_angle: Integer 0-255 angle node (scalar).
+        perp_cos: Fish-eye correction cos(ray_angle - player_angle) (scalar).
         segments: Wall segments with constant geometry baked into weights.
         config: Render configuration (screen size, colors).
         max_coord: Upper bound on coordinate magnitudes.
 
     Returns:
-        (output_node, pos_encoding) tuple for compilation.
+        Output node: H*3 floats (RGB for each row of this screen column).
     """
-    pos_encoding = create_pos_encoding()
-
-    # Inputs (names chosen so alphabetical order = perp_cos, player_x, player_y, ray_angle)
-    perp_cos = create_input("perp_cos", 1)
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    ray_angle = create_input("ray_angle", 1)
-
     # Stage 1: Trig lookup
     ray_cos, ray_sin = trig_lookup(ray_angle)
 
@@ -359,31 +354,19 @@ def build_renderer_graph(
         closest_dist, wall_color = reduce_min(distances, colors)
 
     # Stage 6: Wall height via fish-eye corrected distance.
-    # max_dist bounds the longest distance we need precision for — beyond
-    # this, walls are so far away they render as 0-1 pixels. Using tight
-    # bounds avoids enormous piecewise_linear tables that choke the scheduler.
     max_dist = 2.0 * max_coord
-
-    # Clamp closest_dist into [0.5, max_dist] before the fish-eye multiply,
-    # so the signed_multiply inputs stay within their declared ranges.
-    # Distances >= max_dist produce walls of ~0 pixels anyway.
-    # Uses piecewise_linear clamp (1 FFN layer vs 6 for compare+select pairs).
     clamped_dist = clamp(closest_dist, 0.5, max_dist)
 
     perp_dist = signed_multiply(
         clamped_dist, perp_cos,
         max_abs1=max_dist, max_abs2=1.0, step=1.0,
     )
-    # Clamp perp_dist away from zero (1 FFN layer vs 3 for compare+select)
     safe_perp_dist = clamp(perp_dist, 0.5, max_dist)
 
     inv_perp = reciprocal(safe_perp_dist, min_value=0.5, max_value=max_dist, step=1.0)
     wall_height = multiply_const(inv_perp, float(config.screen_height))
 
     # Wall bounds: center ± half wall height.
-    # Pass continuous bounds directly to in_range, which uses a +0.5 offset
-    # to classify each row. This may differ from the reference renderer's
-    # int() truncation by at most 1 pixel at wall boundaries.
     H = config.screen_height
     center = float(H) / 2.0
     half_height = multiply_const(wall_height, 0.5)
@@ -400,11 +383,41 @@ def build_renderer_graph(
         name="wall_bottom",
     )
 
-    # Handle "no hit" case: if closest_dist >= BIG, show only ceiling/floor
-    # wall_top will be near center and wall_bottom near center (height ≈ 0)
-    # This happens naturally since 1/BIG ≈ 0 → wall_height ≈ 0
-
     # Stage 7: Column fill
-    output = _column_fill(wall_top, wall_bottom, wall_color, config)
+    return _column_fill(wall_top, wall_bottom, wall_color, config)
+
+
+def build_renderer_graph(
+    segments: List[Segment],
+    config: RenderConfig,
+    max_coord: float = 20.0,
+) -> Tuple[Node, "PosEncoding"]:
+    """Build the complete per-column rendering graph (Phase 2 standalone).
+
+    Creates InputNodes and calls build_rendering_pipeline.  For Phase 3+,
+    use build_rendering_pipeline directly with computed nodes.
+
+    Inputs (per position, alphabetical order for headless module):
+        perp_cos:  cos(ray_angle - player_angle) for fish-eye correction
+        player_x:  world x coordinate
+        player_y:  world y coordinate
+        ray_angle: integer 0-255, index into trig table
+
+    Output: H*3 floats — RGB for each row of this screen column.
+
+    Returns:
+        (output_node, pos_encoding) tuple for compilation.
+    """
+    pos_encoding = create_pos_encoding()
+
+    perp_cos = create_input("perp_cos", 1)
+    player_x = create_input("player_x", 1)
+    player_y = create_input("player_y", 1)
+    ray_angle = create_input("ray_angle", 1)
+
+    output = build_rendering_pipeline(
+        player_x, player_y, ray_angle, perp_cos,
+        segments, config, max_coord,
+    )
 
     return output, pos_encoding
