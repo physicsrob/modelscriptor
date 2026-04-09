@@ -446,11 +446,21 @@ class LayerScheduler:
         return cost
 
     def _get_effective_consumers(self, node: Node) -> Set[Node]:
-        """Get consumers, resolving through Concatenate nodes."""
+        """Get consumers, resolving through Concatenate nodes.
+
+        Terminal Concatenates (no consumers, i.e. output nodes) are kept
+        as effective consumers so their children aren't freed prematurely.
+        """
         result = set()
         for consumer in self.graph.get_consumers(node):
             if isinstance(consumer, Concatenate):
-                result |= self._get_effective_consumers(consumer)
+                resolved = self._get_effective_consumers(consumer)
+                if resolved:
+                    result |= resolved
+                else:
+                    # Terminal Concatenate (output node) — its children's
+                    # columns must stay allocated until compilation ends.
+                    result.add(consumer)
             else:
                 result.add(consumer)
         return result
