@@ -98,21 +98,41 @@ def multi_room() -> List[Segment]:
     ]
 
 
-def box_room_textured(size: float = 10.0) -> Tuple[List[Segment], List[np.ndarray]]:
+def box_room_textured(
+    size: float = 10.0,
+    wad_path: str = None,
+    tex_size: int = 8,
+) -> Tuple[List[Segment], List[np.ndarray]]:
     """Box room with textured walls.
 
-    Returns (segments, textures) where each wall uses a different
-    texture from the default atlas: east=brick, west=stone,
-    north=stripe, south=checker.
-    """
-    from torchwright.reference_renderer.textures import default_texture_atlas
+    When *wad_path* is provided, loads real DOOM textures from the WAD
+    and downscales them to *tex_size* x *tex_size*.  Otherwise falls
+    back to the built-in procedural textures.
 
+    Returns ``(segments, textures)`` where each wall uses a different
+    texture: east=STARTAN3/brick, west=STARG3/stone, north=BROWN1/stripe,
+    south=BROWNGRN/checker.
+    """
     h = size / 2.0
-    textures = default_texture_atlas()
+
+    if wad_path is not None:
+        from torchwright.doom.wad import WADReader
+        from torchwright.reference_renderer.textures import downscale_texture
+
+        wad = WADReader(wad_path)
+        names = ["STARTAN3", "STARG3", "BROWN1", "BROWNGRN"]
+        textures = [
+            downscale_texture(wad.get_texture(n), tex_size, tex_size)
+            for n in names
+        ]
+    else:
+        from torchwright.reference_renderer.textures import default_texture_atlas
+        textures = default_texture_atlas()
+
     segments = [
-        Segment(ax=h, ay=-h, bx=h, by=h, color=(1, 0, 0), texture_id=0),     # east: brick
-        Segment(ax=-h, ay=h, bx=-h, by=-h, color=(0, 1, 0), texture_id=1),   # west: stone
-        Segment(ax=-h, ay=h, bx=h, by=h, color=(0, 0, 1), texture_id=2),     # north: stripe
-        Segment(ax=h, ay=-h, bx=-h, by=-h, color=(1, 1, 0), texture_id=3),   # south: checker
+        Segment(ax=h, ay=-h, bx=h, by=h, color=(1, 0, 0), texture_id=0),
+        Segment(ax=-h, ay=h, bx=-h, by=-h, color=(0, 1, 0), texture_id=1),
+        Segment(ax=-h, ay=h, bx=h, by=h, color=(0, 0, 1), texture_id=2),
+        Segment(ax=h, ay=-h, bx=-h, by=-h, color=(1, 1, 0), texture_id=3),
     ]
     return segments, textures

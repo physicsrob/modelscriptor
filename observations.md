@@ -45,3 +45,12 @@ coordinate), but each row of vertical resolution costs ~2 FFN layers
 divided by the group packing factor.  DOOM's 64-tall textures are
 feasible (~16-22 layers with grouping) but 128-tall textures would eat
 half the layer budget.
+
+**Debugging footnote:** we initially suspected that chaining
+`broadcast_select` calls (each using the previous output as
+false_value) caused the internal `big_offset` constant to accumulate.
+It doesn't — `broadcast_select` composes correctly.  The actual bug
+was passing inputs to the `HeadlessTransformerModule` in the wrong
+order (it expects alphabetical by input name, not declaration order).
+Scrambled wall coordinates produced garbage that happened to look like
+offset leakage.  Lesson: always check input ordering first.

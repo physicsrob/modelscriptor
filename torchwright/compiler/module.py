@@ -130,6 +130,8 @@ class CompiledTransformerModule(nn.Module):
         self.tokenizer = tokenizer
 
     def forward(self, token_ids: torch.LongTensor) -> torch.Tensor:
+        orig_device = token_ids.device
+        token_ids = token_ids.to(self.embedding_proj.device)
         seq_len = token_ids.shape[0]
 
         # Build initial residual stream
@@ -149,7 +151,7 @@ class CompiledTransformerModule(nn.Module):
         # Extract output embedding and compute logits
         output_emb = res[:, self.output_gather_indices]  # (seq_len, d_embed)
         logits = output_emb @ self.unembed_table.T  # (seq_len, vocab_size)
-        return logits
+        return logits.to(orig_device)
 
 
 class HeadlessTransformerModule(nn.Module):
@@ -183,6 +185,8 @@ class HeadlessTransformerModule(nn.Module):
         self.register_buffer("output_gather_indices", output_gather_indices)
 
     def forward(self, inputs: torch.FloatTensor) -> torch.Tensor:
+        orig_device = inputs.device
+        inputs = inputs.to(self.input_proj.device)
         seq_len = inputs.shape[0]
 
         pos = self.pos_encoding[:seq_len]
@@ -196,7 +200,7 @@ class HeadlessTransformerModule(nn.Module):
             res = layer_pair[0](res)
             res = layer_pair[1](res)
 
-        return res[:, self.output_gather_indices]
+        return res[:, self.output_gather_indices].to(orig_device)
 
 
 def _compute_pos_encoding(d_pos: int, max_seq_len: int) -> torch.Tensor:

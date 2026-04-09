@@ -125,6 +125,10 @@ def main():
         help="transformer: game logic + rendering in compiled transformer (default). "
              "reference: pure Python implementation.",
     )
+    parser.add_argument("--wad", type=str, default=None,
+                        help="Path to doom1.wad for real DOOM textures")
+    parser.add_argument("--tex-size", type=int, default=8,
+                        help="Texture resolution (downscaled from WAD)")
     parser.add_argument("--width", type=int, default=64)
     parser.add_argument("--height", type=int, default=80)
     parser.add_argument("--fov", type=int, default=32)
@@ -143,7 +147,9 @@ def main():
 
     textures = None
     if args.scene == "box":
-        segments, textures = box_room_textured()
+        segments, textures = box_room_textured(
+            wad_path=args.wad, tex_size=args.tex_size,
+        )
         start_x, start_y, start_angle = 0.0, 0.0, 0
         max_coord = 10.0
     else:

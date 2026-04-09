@@ -53,7 +53,7 @@ def test_headless_forward_matches_compiled():
 
     # HeadlessTransformer path
     result = net.compute(n_pos, {"a": a_vals, "b": b_vals})
-    expected = result[out]
+    expected = result[out].cpu()
 
     # Module path — inputs ordered alphabetically: a then b
     inputs = torch.cat([a_vals, b_vals], dim=1)  # (3, 2)
