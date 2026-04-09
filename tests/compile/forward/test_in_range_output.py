@@ -43,8 +43,10 @@ def test_textured_column_fill_16_bands():
     )
 
     # Wall from row 2 to row 10 (height=8)
+    # HeadlessTransformerModule expects inputs in alphabetical name order:
+    # wb=10, wh=8, wt=2
     with torch.no_grad():
-        result = module(torch.tensor([[2.0, 10.0, 8.0]])).numpy().reshape(12, 3)
+        result = module(torch.tensor([[10.0, 8.0, 2.0]])).numpy().reshape(12, 3)
 
     # Wall rows should show the texture color, not big_offset garbage
     for row in range(2, 10):
