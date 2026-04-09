@@ -103,3 +103,27 @@ def solid_color_texture(color: Tuple[float, float, float]) -> np.ndarray:
     tex = np.empty((1, 1, 3), dtype=np.float64)
     tex[0, 0] = color
     return tex
+
+
+def downscale_texture(
+    tex: np.ndarray, target_w: int, target_h: int,
+) -> np.ndarray:
+    """Downscale a texture by averaging blocks of source pixels.
+
+    Args:
+        tex: Source texture, shape ``(src_w, src_h, 3)``.
+        target_w, target_h: Target dimensions.
+
+    Returns:
+        ``(target_w, target_h, 3)`` float64 array.
+    """
+    sw, sh = tex.shape[0], tex.shape[1]
+    result = np.zeros((target_w, target_h, 3), dtype=np.float64)
+    for col in range(target_w):
+        for row in range(target_h):
+            c0 = col * sw // target_w
+            c1 = (col + 1) * sw // target_w
+            r0 = row * sh // target_h
+            r1 = (row + 1) * sh // target_h
+            result[col, row] = tex[c0:c1, r0:r1].mean(axis=(0, 1))
+    return result
