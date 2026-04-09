@@ -55,7 +55,7 @@ def play(
         module = compile_game(
             segments, config, max_coord,
             textures=textures,
-            d=2048 if textures else 1024, d_head=16,
+            d=3072 if textures else 1024, d_head=16,
         )
 
         def frame_fn(state, inputs):
