@@ -104,6 +104,7 @@ def compile_game(
     max_coord: float = 20.0,
     move_speed: float = 0.3,
     turn_speed: int = 4,
+    textures=None,
     d: int = 1024,
     d_head: int = 16,
     device: str = "cpu",
@@ -117,6 +118,9 @@ def compile_game(
         max_coord: Upper bound on coordinate magnitudes.
         move_speed: Player movement speed per frame.
         turn_speed: Angle units per turn input per frame.
+        textures: Optional list of (W, H, 3) texture arrays for wall
+            textures.  When provided, segments must have ``texture_id``
+            set to index into this list.
         d: Residual stream width (d_model).
         d_head: Attention head dimension.
         device: Target device.
@@ -129,6 +133,7 @@ def compile_game(
 
     output_node, pos_encoding = build_game_graph(
         segments, config, max_coord, move_speed, turn_speed,
+        textures=textures,
     )
     module = compile_headless(
         output_node, pos_encoding,

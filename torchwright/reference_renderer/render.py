@@ -12,13 +12,12 @@ def intersect_ray_segment(
     ray_cos: float,
     ray_sin: float,
     seg: Segment,
-) -> Optional[float]:
-    """Compute ray-segment intersection distance.
+) -> Optional[Tuple[float, float]]:
+    """Compute ray-segment intersection distance and u parameter.
 
-    Returns the ray parameter t (distance along ray) if the ray hits
-    the segment, or None if it misses.  Validity is checked via sign
-    tests on the numerators and denominator — no division until we
-    know the hit is valid.
+    Returns ``(t, u)`` where *t* is the distance along the ray and *u*
+    is the fractional position along the segment (0 at A, 1 at B).
+    Returns ``None`` if the ray misses.
 
     Args:
         px, py: Player (ray origin) position.
@@ -26,7 +25,7 @@ def intersect_ray_segment(
         seg: Wall segment to test.
 
     Returns:
-        t > 0 if the ray hits the segment, else None.
+        ``(t, u)`` if the ray hits the segment, else ``None``.
     """
     dx = ray_cos
     dy = ray_sin
@@ -53,7 +52,7 @@ def intersect_ray_segment(
         if num_u > 0.0 or num_u < den:
             return None
 
-    return num_t / den
+    return num_t / den, num_u / den
 
 
 def render_column(
@@ -63,10 +62,21 @@ def render_column(
     player_angle: int,
     segments: List[Segment],
     config: RenderConfig,
+    textures: Optional[List[np.ndarray]] = None,
 ) -> np.ndarray:
     """Render a single screen column.
 
-    Returns an array of shape (screen_height, 3) with RGB values.
+    Args:
+        col: Screen column index.
+        player_x, player_y: Player world coordinates.
+        player_angle: Player facing direction (0-255).
+        segments: Wall segments.
+        config: Render configuration.
+        textures: Optional texture atlas — list of (W, H, 3) arrays
+            indexed by ``Segment.texture_id``.
+
+    Returns:
+        Array of shape (screen_height, 3) with RGB values.
     """
     h = config.screen_height
     column = np.empty((h, 3), dtype=np.float64)
@@ -84,13 +94,17 @@ def render_column(
 
     # Find nearest intersection
     best_t: Optional[float] = None
+    best_u: float = 0.0
     best_seg: Optional[Segment] = None
 
     for seg in segments:
-        t = intersect_ray_segment(player_x, player_y, ray_cos, ray_sin, seg)
-        if t is not None and (best_t is None or t < best_t):
-            best_t = t
-            best_seg = seg
+        hit = intersect_ray_segment(player_x, player_y, ray_cos, ray_sin, seg)
+        if hit is not None:
+            t, u = hit
+            if best_t is None or t < best_t:
+                best_t = t
+                best_u = u
+                best_seg = seg
 
     if best_t is None or best_seg is None:
         return column
@@ -112,8 +126,18 @@ def render_column(
 
     if wall_top < wall_bottom:
         column[:wall_top] = config.ceiling_color
-        column[wall_top:wall_bottom] = best_seg.color
         column[wall_bottom:] = config.floor_color
+
+        if textures is not None and best_seg.texture_id >= 0:
+            tex = textures[best_seg.texture_id]
+            tw, th = tex.shape[0], tex.shape[1]
+            tex_col = min(int(best_u * tw), tw - 1)
+            for row in range(wall_top, wall_bottom):
+                v = (row - wall_top) / (wall_bottom - wall_top)
+                tex_row = min(int(v * th), th - 1)
+                column[row] = tex[tex_col, tex_row]
+        else:
+            column[wall_top:wall_bottom] = best_seg.color
 
     return column
 
@@ -137,17 +161,27 @@ def render_frame(
     player_angle: int,
     segments: List[Segment],
     config: RenderConfig,
+    textures: Optional[List[np.ndarray]] = None,
 ) -> np.ndarray:
     """Render a complete frame.
 
-    Returns an RGB image as a numpy array of shape
-    (config.screen_height, config.screen_width, 3).
+    Args:
+        player_x, player_y: Player world coordinates.
+        player_angle: Player facing direction (0-255).
+        segments: Wall segments.
+        config: Render configuration.
+        textures: Optional texture atlas for wall textures.
+
+    Returns:
+        An RGB image as a numpy array of shape
+        (config.screen_height, config.screen_width, 3).
     """
     frame = np.empty((config.screen_height, config.screen_width, 3), dtype=np.float64)
 
     for col in range(config.screen_width):
         frame[:, col, :] = render_column(
-            col, player_x, player_y, player_angle, segments, config
+            col, player_x, player_y, player_angle, segments, config,
+            textures=textures,
         )
 
     return frame

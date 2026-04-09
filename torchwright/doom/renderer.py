@@ -1,33 +1,37 @@
-"""Build a torchwright graph that renders a flat-shaded first-person view.
+"""Build torchwright graphs that render flat-shaded or textured first-person views.
 
-The graph takes (perp_cos, player_x, player_y, ray_angle) per position and
-outputs H*3 RGB values (one screen column).  Segment geometry is baked into
-the weights as constants.
+The graph takes per-position inputs and outputs H*3 RGB values (one screen
+column).  Segment geometry is baked into the weights as constants.
 """
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import builtins
 
+import numpy as np
 import torch
 
 from torchwright.graph import Concatenate, Linear, Node
 from torchwright.graph.misc import LiteralValue
 from torchwright.ops.arithmetic_ops import (
     abs,
+    add,
     clamp,
     compare,
     multiply_const,
     negate,
+    piecewise_linear,
     piecewise_linear_nd,
     reciprocal,
     reduce_min,
     signed_multiply,
     subtract,
+    sum_nodes,
+    thermometer_floor_div,
 )
 from torchwright.ops.logic_ops import bool_all_true
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
-from torchwright.ops.map_select import broadcast_select, in_range, select
+from torchwright.ops.map_select import broadcast_select, in_range, map_to_table, select
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
@@ -165,6 +169,57 @@ def _segment_distance(
     return dist
 
 
+def _segment_distance_and_texinfo(
+    num_t: Node,
+    num_u: Node,
+    signed_inv_den: Node,
+    abs_den: Node,
+    sign_den: Node,
+    max_coord: float,
+    texture_id: int,
+) -> Tuple[Node, Node]:
+    """Like _segment_distance but also returns texture metadata.
+
+    Returns ``(dist, tex_meta)`` where tex_meta is a width-3 node
+    containing ``[texture_id, adj_num_u, abs_den]`` (masked to defaults
+    when the intersection is invalid).
+    """
+    max_num_t = 2.0 * max_coord * max_coord
+    max_inv_den = 100.0
+    epsilon = 0.05
+
+    adj_num_t = select(sign_den, num_t, negate(num_t))
+    adj_num_u = select(sign_den, num_u, negate(num_u))
+
+    is_den_nonzero = compare(abs_den, epsilon)
+    is_t_pos = compare(adj_num_t, epsilon)
+    is_u_ge_0 = compare(adj_num_u, -epsilon)
+    u_minus_den = subtract(abs_den, adj_num_u)
+    is_u_le_den = compare(u_minus_den, -epsilon)
+
+    abs_inv_den = select(sign_den, signed_inv_den, negate(signed_inv_den))
+    dist = signed_multiply(
+        adj_num_t, abs_inv_den,
+        max_abs1=max_num_t, max_abs2=max_inv_den,
+        step=1.0,
+        max_abs_output=BIG_DISTANCE,
+    )
+
+    is_valid = bool_all_true([is_den_nonzero, is_t_pos, is_u_ge_0, is_u_le_den])
+    big = LiteralValue(torch.tensor([BIG_DISTANCE]), name="big_dist")
+    dist = select(is_valid, dist, big)
+
+    # Texture metadata: carry through reduce_min
+    tex_id_node = LiteralValue(
+        torch.tensor([float(texture_id)]), name=f"tex_id_{texture_id}",
+    )
+    valid_meta = Concatenate([tex_id_node, adj_num_u, abs_den])
+    invalid_meta = LiteralValue(torch.tensor([0.0, 0.0, 1.0]), name="invalid_meta")
+    tex_meta = select(is_valid, valid_meta, invalid_meta)
+
+    return dist, tex_meta
+
+
 def _build_angle_lookup(
     ray_angle: Node,
     segments: List[Segment],
@@ -273,6 +328,242 @@ def _column_fill(
     # Step 2: Overlay wall color in [wall_top, wall_bottom)
     wall_masks = in_range(wall_top, wall_bottom, H)
     return broadcast_select(wall_masks, wall_color, base, H, 3)
+
+
+# ---------------------------------------------------------------------------
+# Textured column fill
+# ---------------------------------------------------------------------------
+
+
+def _textured_column_fill(
+    wall_top: Node,
+    wall_bottom: Node,
+    wall_height: Node,
+    tex_column_colors: Node,
+    tex_height: int,
+    config: RenderConfig,
+) -> Node:
+    """Fill a screen column with textured wall and solid floor/ceiling.
+
+    Divides the wall into *tex_height* horizontal bands.  Each band
+    gets the corresponding texture row color.  Band boundaries are
+    computed from wall_top and wall_height (both runtime).
+
+    The band ``in_range`` calls and ``broadcast_select`` calls are all
+    independent and can pack into a small number of FFN layers.
+
+    Args:
+        wall_top: Scalar node — top of wall in screen rows.
+        wall_bottom: Scalar node — bottom of wall in screen rows.
+        wall_height: Scalar node — wall_bottom - wall_top.
+        tex_column_colors: Node of width ``tex_height * 3`` — RGB for
+            each texture row in this column.
+        tex_height: Number of texture rows.
+        config: Render configuration.
+
+    Returns:
+        Node of width H*3 (one RGB per screen row).
+    """
+    H = config.screen_height
+    ceil_node = LiteralValue(torch.tensor(list(config.ceiling_color)), name="ceiling")
+    floor_node = LiteralValue(torch.tensor(list(config.floor_color)), name="floor")
+    h_node = LiteralValue(torch.tensor([float(H)]), name="h_bound")
+
+    # Base column: floor below wall_bottom, ceiling above
+    floor_masks = in_range(wall_bottom, h_node, H)
+    base = broadcast_select(floor_masks, floor_node, ceil_node, H, 3)
+
+    # Compute band boundaries: boundary_k = wall_top + k * wall_height / tex_height
+    # Each is a Linear function of (wall_top, wall_height) — free.
+    wt_wh = Concatenate([wall_top, wall_height])
+    zeros_H3 = LiteralValue(torch.zeros(H * 3), name="zeros_tex")
+
+    # Accumulate textured wall: for each band, broadcast_select its color
+    # into the rows where that band is active, then sum all bands.
+    band_layers = []
+    for k in range(tex_height):
+        lo_k = float(k) / tex_height
+        hi_k = float(k + 1) / tex_height
+        boundary_lo = Linear(wt_wh, torch.tensor([[1.0], [lo_k]]), name=f"band_lo_{k}")
+        boundary_hi = Linear(wt_wh, torch.tensor([[1.0], [hi_k]]), name=f"band_hi_{k}")
+
+        band_mask = in_range(boundary_lo, boundary_hi, H)
+
+        # Extract this texture row's color (width 3) from tex_column_colors
+        extract = torch.zeros(tex_height * 3, 3)
+        for c in range(3):
+            extract[k * 3 + c, c] = 1.0
+        row_color = Linear(tex_column_colors, extract, name=f"tex_row_{k}")
+
+        band_fill = broadcast_select(band_mask, row_color, zeros_H3, H, 3)
+        band_layers.append(band_fill)
+
+    textured_wall = sum_nodes(band_layers)
+
+    # Composite: wall region gets textured_wall, rest keeps base
+    wall_masks = in_range(wall_top, wall_bottom, H)
+    return broadcast_select(wall_masks, textured_wall, base, H, 3)
+
+
+# ---------------------------------------------------------------------------
+# Textured rendering pipeline
+# ---------------------------------------------------------------------------
+
+
+def build_textured_rendering_pipeline(
+    player_x: Node,
+    player_y: Node,
+    ray_angle: Node,
+    perp_cos: Node,
+    segments: List[Segment],
+    config: RenderConfig,
+    textures: List[np.ndarray],
+    max_coord: float = 20.0,
+) -> Node:
+    """Build a textured rendering pipeline.
+
+    Same structure as :func:`build_rendering_pipeline` but carries
+    texture metadata (texture_id, adj_num_u, abs_den) through the
+    min-reduction instead of a solid color.  After finding the nearest
+    segment, normalises the u coordinate, looks up the texture column,
+    and fills the wall with per-row texture colors.
+
+    All textures must have the same dimensions (tex_width x tex_height).
+
+    Args:
+        player_x, player_y: World-coordinate nodes (scalar).
+        ray_angle: Integer 0-255 angle node (scalar).
+        perp_cos: Fish-eye correction node (scalar).
+        segments: Wall segments with ``texture_id`` set.
+        config: Render configuration.
+        textures: List of (tex_width, tex_height, 3) arrays — the atlas.
+        max_coord: Upper bound on coordinate magnitudes.
+
+    Returns:
+        Output node: H*3 floats (RGB for each row of this screen column).
+    """
+    tex_w = textures[0].shape[0]
+    tex_h = textures[0].shape[1]
+
+    # --- Stages 1-3: identical to solid-color pipeline ---
+
+    ray_cos, ray_sin = trig_lookup(ray_angle)
+
+    px_sin = signed_multiply(
+        player_x, ray_sin,
+        max_abs1=max_coord, max_abs2=1.0, step=0.25,
+    )
+    py_cos = signed_multiply(
+        player_y, ray_cos,
+        max_abs1=max_coord, max_abs2=1.0, step=0.25,
+    )
+
+    cos_sin = Concatenate([ray_cos, ray_sin])
+    px_py = Concatenate([player_x, player_y])
+    trig_and_products = Concatenate([ray_cos, ray_sin, px_sin, py_cos])
+
+    if len(segments) > 0:
+        angle_data = _build_angle_lookup(ray_angle, segments)
+
+    # --- Stage 4: Per-segment intersection + texture metadata ---
+    distances = []
+    tex_metas = []
+    for i, seg in enumerate(segments):
+        _den, num_t, num_u = _segment_intersection(
+            cos_sin, px_py, trig_and_products, seg,
+        )
+        signed_inv_den, abs_den_node, sign_den = angle_data[i]
+        tid = seg.texture_id if seg.texture_id >= 0 else 0
+        dist, tex_meta = _segment_distance_and_texinfo(
+            num_t, num_u, signed_inv_den, abs_den_node, sign_den,
+            max_coord, tid,
+        )
+        distances.append(dist)
+        tex_metas.append(tex_meta)
+
+    # --- Stage 5: Min-reduction ---
+    if len(segments) == 0:
+        closest_dist = LiteralValue(torch.tensor([BIG_DISTANCE]), name="no_hit")
+        winning_meta = LiteralValue(torch.tensor([0.0, 0.0, 1.0]), name="no_meta")
+    elif len(segments) == 1:
+        closest_dist = distances[0]
+        winning_meta = tex_metas[0]
+    else:
+        closest_dist, winning_meta = reduce_min(distances, tex_metas)
+
+    # Extract winning metadata
+    d_meta = 3
+    winning_tex_id = Linear(
+        winning_meta, _extract_matrix(d_meta, 0), name="win_tex_id",
+    )
+    winning_adj_num_u = Linear(
+        winning_meta, _extract_matrix(d_meta, 1), name="win_adj_num_u",
+    )
+    winning_abs_den = Linear(
+        winning_meta, _extract_matrix(d_meta, 2), name="win_abs_den",
+    )
+
+    # --- Stage 6: Wall height (same as solid) ---
+    max_dist = 2.0 * max_coord
+    clamped_dist = clamp(closest_dist, 0.5, max_dist)
+
+    perp_dist = signed_multiply(
+        clamped_dist, perp_cos,
+        max_abs1=max_dist, max_abs2=1.0, step=1.0,
+    )
+    safe_perp_dist = clamp(perp_dist, 0.5, max_dist)
+
+    inv_perp = reciprocal(safe_perp_dist, min_value=0.5, max_value=max_dist, step=1.0)
+    wall_height = multiply_const(inv_perp, float(config.screen_height))
+
+    H = config.screen_height
+    center = float(H) / 2.0
+    half_height = multiply_const(wall_height, 0.5)
+    wall_top = Linear(
+        half_height, torch.tensor([[-1.0]]), torch.tensor([center]),
+        name="wall_top",
+    )
+    wall_bottom = Linear(
+        half_height, torch.tensor([[1.0]]), torch.tensor([center]),
+        name="wall_bottom",
+    )
+
+    # --- Stage 7: u normalization ---
+    # u_norm = adj_num_u / abs_den, only for the winning segment
+    max_abs_den = 2.0 * max_coord  # rough upper bound
+    safe_abs_den = clamp(winning_abs_den, 0.01, max_abs_den)
+    inv_abs_den = reciprocal(safe_abs_den, min_value=0.01, max_value=max_abs_den, step=0.1)
+    u_norm = signed_multiply(
+        winning_adj_num_u, inv_abs_den,
+        max_abs1=max_abs_den, max_abs2=1.0 / 0.01,
+        step=0.5, max_abs_output=1.0,
+    )
+    u_clamped = clamp(u_norm, 0.0, 1.0 - 1e-4)
+
+    # tex_col_idx = floor(u * tex_width)
+    tex_col_float = multiply_const(u_clamped, float(tex_w))
+    tex_col_idx = thermometer_floor_div(tex_col_float, 1, tex_w - 1)
+
+    # --- Stage 8: Texture column lookup ---
+    # Build map_to_table keyed by (texture_id, col_idx) → tex_height*3 values
+    tex_key_to_value = {}
+    for tid, tex in enumerate(textures):
+        tw = tex.shape[0]
+        for col in range(tw):
+            # key = [texture_id, column_index]
+            key = torch.tensor([float(tid), float(col)])
+            # value = all row colors for this column, flattened
+            val = torch.tensor(tex[col].flatten(), dtype=torch.float32)
+            tex_key_to_value[key] = val
+
+    default_val = torch.zeros(tex_h * 3)
+    tex_lookup_input = Concatenate([winning_tex_id, tex_col_idx])
+    tex_column_colors = map_to_table(tex_lookup_input, tex_key_to_value, default_val)
+
+    # --- Stage 9: Textured column fill ---
+    return _textured_column_fill(
+        wall_top, wall_bottom, wall_height, tex_column_colors, tex_h, config,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -216,31 +216,32 @@ def test_multiple_depths(config):
 def test_intersect_direct_hit():
     """Ray pointing +x hits a vertical segment at x=5."""
     seg = Segment(ax=5.0, ay=-1.0, bx=5.0, by=1.0, color=WALL_COLOR)
-    t = intersect_ray_segment(0.0, 0.0, 1.0, 0.0, seg)
-    assert t is not None
+    hit = intersect_ray_segment(0.0, 0.0, 1.0, 0.0, seg)
+    assert hit is not None
+    t, u = hit
     assert abs(t - 5.0) < 1e-10
 
 
 def test_intersect_miss_behind():
     """Segment behind the ray origin returns None."""
     seg = Segment(ax=-5.0, ay=-1.0, bx=-5.0, by=1.0, color=WALL_COLOR)
-    t = intersect_ray_segment(0.0, 0.0, 1.0, 0.0, seg)
-    assert t is None
+    hit = intersect_ray_segment(0.0, 0.0, 1.0, 0.0, seg)
+    assert hit is None
 
 
 def test_intersect_miss_parallel():
     """Ray parallel to segment returns None."""
     seg = Segment(ax=3.0, ay=0.0, bx=8.0, by=0.0, color=WALL_COLOR)
-    t = intersect_ray_segment(0.0, 0.0, 1.0, 0.0, seg)
-    assert t is None
+    hit = intersect_ray_segment(0.0, 0.0, 1.0, 0.0, seg)
+    assert hit is None
 
 
 def test_intersect_miss_outside_segment():
     """Ray would hit the line but misses the segment (u outside [0, 1])."""
     # Segment from (5, 2) to (5, 3) — ray along y=0 misses
     seg = Segment(ax=5.0, ay=2.0, bx=5.0, by=3.0, color=WALL_COLOR)
-    t = intersect_ray_segment(0.0, 0.0, 1.0, 0.0, seg)
-    assert t is None
+    hit = intersect_ray_segment(0.0, 0.0, 1.0, 0.0, seg)
+    assert hit is None
 
 
 # ── Box room tests ─────────────────────────────────────────────────

@@ -28,7 +28,11 @@ from torchwright.ops.logic_ops import bool_all_true, bool_any_true
 from torchwright.ops.map_select import select
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
-from torchwright.doom.renderer import build_rendering_pipeline, trig_lookup
+from torchwright.doom.renderer import (
+    build_rendering_pipeline,
+    build_textured_rendering_pipeline,
+    trig_lookup,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +276,7 @@ def build_game_graph(
     max_coord: float = 20.0,
     move_speed: float = 0.3,
     turn_speed: int = 4,
+    textures=None,
 ) -> Tuple[Node, "PosEncoding"]:
     """Build the complete game logic + rendering graph.
 
@@ -333,10 +338,16 @@ def build_game_graph(
     ray_angle = _compute_ray_angle(new_angle, angle_offset)
 
     # 5. Render using resolved position
-    pixels = build_rendering_pipeline(
-        resolved_x, resolved_y, ray_angle, perp_cos,
-        segments, config, max_coord,
-    )
+    if textures is not None:
+        pixels = build_textured_rendering_pipeline(
+            resolved_x, resolved_y, ray_angle, perp_cos,
+            segments, config, textures, max_coord,
+        )
+    else:
+        pixels = build_rendering_pipeline(
+            resolved_x, resolved_y, ray_angle, perp_cos,
+            segments, config, max_coord,
+        )
 
     # 6. Output: pixels + updated state
     output = Concatenate([pixels, resolved_x, resolved_y, new_angle])

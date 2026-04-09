@@ -98,8 +98,9 @@ def test_intersection_values():
     assert abs(num_u.compute(1, vals).item() - 10.0) < 1e-4
 
     # t = 100/20 = 5.0 — matches intersect_ray_segment
-    ref_t = intersect_ray_segment(0.0, 0.0, 1.0, 0.0, seg)
-    assert ref_t is not None
+    hit = intersect_ray_segment(0.0, 0.0, 1.0, 0.0, seg)
+    assert hit is not None
+    ref_t, ref_u = hit
     assert abs(ref_t - 5.0) < 1e-10
 
 
