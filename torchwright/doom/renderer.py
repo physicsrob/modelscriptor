@@ -342,24 +342,30 @@ def _textured_column_fill(
     tex_column_colors: Node,
     tex_height: int,
     config: RenderConfig,
+    group_size: int = 8,
 ) -> Node:
     """Fill a screen column with textured wall and solid floor/ceiling.
 
     Divides the wall into *tex_height* horizontal bands.  Each band
-    gets the corresponding texture row color.  Band boundaries are
-    computed from wall_top and wall_height (both runtime).
+    gets the corresponding texture row color.  Bands are processed in
+    groups: within each group, the ``in_range`` and ``broadcast_select``
+    calls are independent and pack into a small number of FFN layers.
+    Group results are summed (free) and the intermediates freed before
+    the next group, keeping peak residual-stream width manageable.
 
-    The band ``in_range`` calls and ``broadcast_select`` calls are all
-    independent and can pack into a small number of FFN layers.
+    Cost: ~2 FFN layers per group + 3 for base/composite.
 
     Args:
-        wall_top: Scalar node — top of wall in screen rows.
-        wall_bottom: Scalar node — bottom of wall in screen rows.
-        wall_height: Scalar node — wall_bottom - wall_top.
-        tex_column_colors: Node of width ``tex_height * 3`` — RGB for
+        wall_top: Scalar node -- top of wall in screen rows.
+        wall_bottom: Scalar node -- bottom of wall in screen rows.
+        wall_height: Scalar node -- wall_bottom - wall_top.
+        tex_column_colors: Node of width ``tex_height * 3`` -- RGB for
             each texture row in this column.
         tex_height: Number of texture rows.
         config: Render configuration.
+        group_size: Number of bands processed in parallel per group.
+            Larger groups use more residual-stream width but fewer
+            FFN layers.
 
     Returns:
         Node of width H*3 (one RGB per screen row).
@@ -373,31 +379,42 @@ def _textured_column_fill(
     floor_masks = in_range(wall_bottom, h_node, H)
     base = broadcast_select(floor_masks, floor_node, ceil_node, H, 3)
 
-    # Compute band boundaries: boundary_k = wall_top + k * wall_height / tex_height
-    # Each is a Linear function of (wall_top, wall_height) — free.
+    # Band boundaries: boundary_k = wall_top + k * wall_height / tex_height
+    # Each is a Linear function of (wall_top, wall_height) -- free.
     wt_wh = Concatenate([wall_top, wall_height])
     zeros_H3 = LiteralValue(torch.zeros(H * 3), name="zeros_tex")
 
-    # Accumulate textured wall one band at a time.  Sequential addition
-    # keeps at most one band_fill (H*3) alive at a time, avoiding a
-    # residual-stream width explosion that would require d_model > 2048.
-    textured_wall = zeros_H3
-    for k in range(tex_height):
-        lo_k = float(k) / tex_height
-        hi_k = float(k + 1) / tex_height
-        boundary_lo = Linear(wt_wh, torch.tensor([[1.0], [lo_k]]), name=f"band_lo_{k}")
-        boundary_hi = Linear(wt_wh, torch.tensor([[1.0], [hi_k]]), name=f"band_hi_{k}")
+    # Process bands in groups.  Within each group all in_range and
+    # broadcast_select calls are independent (each uses zeros_H3 as
+    # false_value) so the scheduler can pack them.  sum_nodes within
+    # the group is free (Linear).  Groups are then summed.
+    group_sums = []
+    for g_start in range(0, tex_height, group_size):
+        g_end = min(g_start + group_size, tex_height)
+        band_fills = []
+        for k in range(g_start, g_end):
+            lo_k = float(k) / tex_height
+            hi_k = float(k + 1) / tex_height
+            boundary_lo = Linear(
+                wt_wh, torch.tensor([[1.0], [lo_k]]), name=f"band_lo_{k}",
+            )
+            boundary_hi = Linear(
+                wt_wh, torch.tensor([[1.0], [hi_k]]), name=f"band_hi_{k}",
+            )
+            band_mask = in_range(boundary_lo, boundary_hi, H)
 
-        band_mask = in_range(boundary_lo, boundary_hi, H)
+            extract = torch.zeros(tex_height * 3, 3)
+            for c in range(3):
+                extract[k * 3 + c, c] = 1.0
+            row_color = Linear(tex_column_colors, extract, name=f"tex_row_{k}")
 
-        # Extract this texture row's color (width 3) from tex_column_colors
-        extract = torch.zeros(tex_height * 3, 3)
-        for c in range(3):
-            extract[k * 3 + c, c] = 1.0
-        row_color = Linear(tex_column_colors, extract, name=f"tex_row_{k}")
+            band_fills.append(
+                broadcast_select(band_mask, row_color, zeros_H3, H, 3)
+            )
 
-        band_fill = broadcast_select(band_mask, row_color, zeros_H3, H, 3)
-        textured_wall = add(textured_wall, band_fill)
+        group_sums.append(sum_nodes(band_fills))
+
+    textured_wall = sum_nodes(group_sums)
 
     # Composite: wall region gets textured_wall, rest keeps base
     wall_masks = in_range(wall_top, wall_bottom, H)
