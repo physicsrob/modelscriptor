@@ -378,9 +378,10 @@ def _textured_column_fill(
     wt_wh = Concatenate([wall_top, wall_height])
     zeros_H3 = LiteralValue(torch.zeros(H * 3), name="zeros_tex")
 
-    # Accumulate textured wall: for each band, broadcast_select its color
-    # into the rows where that band is active, then sum all bands.
-    band_layers = []
+    # Accumulate textured wall one band at a time.  Sequential addition
+    # keeps at most one band_fill (H*3) alive at a time, avoiding a
+    # residual-stream width explosion that would require d_model > 2048.
+    textured_wall = zeros_H3
     for k in range(tex_height):
         lo_k = float(k) / tex_height
         hi_k = float(k + 1) / tex_height
@@ -396,9 +397,7 @@ def _textured_column_fill(
         row_color = Linear(tex_column_colors, extract, name=f"tex_row_{k}")
 
         band_fill = broadcast_select(band_mask, row_color, zeros_H3, H, 3)
-        band_layers.append(band_fill)
-
-    textured_wall = sum_nodes(band_layers)
+        textured_wall = add(textured_wall, band_fill)
 
     # Composite: wall region gets textured_wall, rest keeps base
     wall_masks = in_range(wall_top, wall_bottom, H)
