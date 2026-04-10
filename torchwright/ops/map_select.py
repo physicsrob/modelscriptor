@@ -93,33 +93,28 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     assert len(cond) == 1  # Condition must be length 1
     assert len(true_node) == len(false_node)
 
-    # Strategy:
-    # - Concatenate(true_node; false_node)
-    # - Add [offset ... offset;  -offset ... -offset] if cond is true
-    # - Add [-offset ... -offset;  offset ... offset] if cond is false
-    # - Rectify
-    # - Merge the two halves by summing
-    # - Subtract offset
-    true_offset = torch.tensor(
-        ([big_offset] * len(true_node)) + ([-big_offset] * len(true_node))
-    )
-    false_offset = torch.tensor(
-        ([-big_offset] * len(true_node)) + ([big_offset] * len(true_node))
-    )
-    x: Node = Concatenate([true_node, false_node])
-    x = cond_add_vector(cond, x, true_offset, false_offset)
+    d = len(true_node)
+    # Fused single L→R→L reading [cond, true_node, false_node]:
+    #   unit_a[j] = ReLU(big_offset*cond + true_j)    -- alive when cond=+1
+    #   unit_b[j] = ReLU(-big_offset*cond + false_j)  -- alive when cond=-1
+    #   out_j     = unit_a[j] + unit_b[j] - big_offset
+    d_hidden = 2 * d
+    input_proj = torch.zeros(d_hidden, 1 + 2 * d)
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, d)
+    output_bias = torch.full((d,), -big_offset)
 
-    # Splits the input node into two equal-length vectors, apply ReLU to each,
-    # and sum them with offset.
-    input_proj = torch.eye(len(x))
-    input_bias = torch.zeros(len(x))
-    output_proj = torch.zeros((len(x), len(true_node)))
-    output_bias = torch.tensor([-big_offset] * len(true_node))
+    for j in range(d):
+        a = j
+        b = d + j
+        input_proj[a, 0] = big_offset
+        input_proj[a, 1 + j] = 1.0
+        input_proj[b, 0] = -big_offset
+        input_proj[b, 1 + d + j] = 1.0
+        output_proj[a, j] = 1.0
+        output_proj[b, j] = 1.0
 
-    for i in range(len(true_node)):
-        output_proj[i, i] = 1.0
-        output_proj[len(true_node) + i, i] = 1.0
-
+    x = Concatenate([cond, true_node, false_node])
     return linear_relu_linear(
         input_node=x,
         input_proj=input_proj,
