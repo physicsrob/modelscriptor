@@ -21,7 +21,6 @@ from torchwright.ops.arithmetic_ops import (
     multiply_const,
     negate,
     piecewise_linear,
-    piecewise_linear_nd,
     reciprocal,
     reduce_min,
     signed_multiply,
@@ -51,11 +50,9 @@ def trig_lookup(ray_angle: Node) -> Tuple[Node, Node]:
 
     table = generate_trig_table()  # (256, 2): col0=cos, col1=sin
     breakpoints = list(range(256))
-    cos_values = [float(table[i, 0]) for i in range(256)]
-    sin_values = [float(table[i, 1]) for i in range(256)]
 
-    ray_cos = piecewise_linear(ray_angle, breakpoints, cos_values, name="trig_cos")
-    ray_sin = piecewise_linear(ray_angle, breakpoints, sin_values, name="trig_sin")
+    ray_cos = piecewise_linear(ray_angle, breakpoints, lambda i: float(table[int(i), 0]), name="trig_cos")
+    ray_sin = piecewise_linear(ray_angle, breakpoints, lambda i: float(table[int(i), 1]), name="trig_sin")
     return ray_cos, ray_sin
 
 
@@ -232,7 +229,7 @@ def _build_angle_lookup(
     normalization (saves ~5 ReLU layers on the per-segment critical path).
 
     Returns a list of (signed_inv_den, abs_den, sign_den) node tuples,
-    one per segment.  All segments share a single piecewise_linear_nd lookup
+    one per segment.  All segments share a single piecewise_linear lookup
     (1 FFN layer total, regardless of segment count).
     """
     trig_table = generate_trig_table()
@@ -244,24 +241,24 @@ def _build_angle_lookup(
     #                 signed_inv_den_1, abs_den_1, sign_den_1, ...]
     d_out = 3 * n_segs
     breakpoints = list(range(256))
-    values = []
-    for angle_idx in range(256):
-        cos_a = float(trig_table[angle_idx, 0])
-        sin_a = float(trig_table[angle_idx, 1])
+
+    def _angle_row(angle_idx):
+        cos_a = float(trig_table[int(angle_idx), 0])
+        sin_a = float(trig_table[int(angle_idx), 1])
         row = []
         for seg in segments:
             ex = seg.bx - seg.ax
             ey = seg.by - seg.ay
             den = cos_a * ey - sin_a * ex
             if builtins.abs(den) < epsilon:
-                row.extend([0.0, 0.0, 1.0])  # invalid: inv=0, abs=0, sign=+1
+                row.extend([0.0, 0.0, 1.0])
             else:
                 row.extend([1.0 / den, builtins.abs(den), 1.0 if den > 0 else -1.0])
-        values.append(row)
+        return row
 
     # Single lookup: 1 FFN layer, outputs 3*N values
-    all_data = piecewise_linear_nd(
-        ray_angle, breakpoints, values, name="angle_lookup",
+    all_data = piecewise_linear(
+        ray_angle, breakpoints, _angle_row, name="angle_lookup",
     )
 
     # Split into per-segment (signed_inv_den, abs_den, sign_den) triples
@@ -631,7 +628,7 @@ def build_rendering_pipeline(
     trig_and_products = Concatenate([ray_cos, ray_sin, px_sin, py_cos])
 
     # Per-angle lookup: precompute signed_inv_den, abs_den, sign_den for
-    # all segments in a single piecewise_linear_nd (1 FFN layer).
+    # all segments in a single piecewise_linear (1 FFN layer).
     # Eliminates runtime reciprocal + sign normalization per segment.
     if len(segments) > 0:
         angle_data = _build_angle_lookup(ray_angle, segments)

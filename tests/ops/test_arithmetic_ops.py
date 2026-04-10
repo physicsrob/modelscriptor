@@ -10,7 +10,6 @@ from torchwright.ops.arithmetic_ops import (
     multiply_const,
     mod_const,
     piecewise_linear,
-    piecewise_linear_nd,
     square,
     multiply_integers,
     reciprocal,
@@ -171,7 +170,7 @@ def _eval_pw(node, val):
 def test_piecewise_linear_identity():
     """f(x) = x on [0, 10], clamped outside."""
     x = create_input("x", 1)
-    f = piecewise_linear(x, [0.0, 10.0], [0.0, 10.0])
+    f = piecewise_linear(x, [0.0, 10.0], lambda x: x)
     assert abs(_eval_pw(f, 0.0) - 0.0) < 0.01
     assert abs(_eval_pw(f, 5.0) - 5.0) < 0.01
     assert abs(_eval_pw(f, 10.0) - 10.0) < 0.01
@@ -183,7 +182,7 @@ def test_piecewise_linear_identity():
 def test_piecewise_linear_vshape():
     """Absolute value: f(x) = |x| on [-5, 5]."""
     x = create_input("x", 1)
-    f = piecewise_linear(x, [-5.0, 0.0, 5.0], [5.0, 0.0, 5.0])
+    f = piecewise_linear(x, [-5.0, 0.0, 5.0], abs)
     assert abs(_eval_pw(f, -5.0) - 5.0) < 0.01
     assert abs(_eval_pw(f, -2.5) - 2.5) < 0.01
     assert abs(_eval_pw(f, 0.0) - 0.0) < 0.01
@@ -195,8 +194,7 @@ def test_piecewise_linear_square():
     """Approximate x^2 via breakpoints at integers 0-9."""
     x = create_input("x", 1)
     bp = [float(i) for i in range(10)]
-    vals = [float(i * i) for i in range(10)]
-    f = piecewise_linear(x, bp, vals)
+    f = piecewise_linear(x, bp, lambda x: x * x)
     for i in range(10):
         result = _eval_pw(f, float(i))
         assert abs(result - i * i) < 0.01, f"f({i}) = {result}, expected {i*i}"
@@ -205,7 +203,8 @@ def test_piecewise_linear_square():
 def test_piecewise_linear_constant_segment():
     """Flat section between x=5 and x=10."""
     x = create_input("x", 1)
-    f = piecewise_linear(x, [0.0, 5.0, 10.0, 15.0], [0.0, 10.0, 10.0, 20.0])
+    f = piecewise_linear(x, [0.0, 5.0, 10.0, 15.0],
+                         lambda x: 2 * x if x <= 5 else (10 if x <= 10 else 2 * x - 10))
     assert abs(_eval_pw(f, 2.5) - 5.0) < 0.01
     assert abs(_eval_pw(f, 5.0) - 10.0) < 0.01
     assert abs(_eval_pw(f, 7.5) - 10.0) < 0.01
@@ -216,7 +215,7 @@ def test_piecewise_linear_constant_segment():
 def test_piecewise_linear_extrapolate():
     """clamp=False: linear extrapolation beyond breakpoint range."""
     x = create_input("x", 1)
-    f = piecewise_linear(x, [0.0, 10.0], [0.0, 100.0], clamp=False)
+    f = piecewise_linear(x, [0.0, 10.0], lambda x: 10 * x, clamp=False)
     # Interior
     assert abs(_eval_pw(f, 5.0) - 50.0) < 0.01
     # Extrapolation (slope = 10)
@@ -228,8 +227,7 @@ def test_piecewise_linear_chunking():
     """d_max=4 forces multiple FFN layers with 10 breakpoints."""
     x = create_input("x", 1)
     bp = [float(i) for i in range(10)]
-    vals = [float(i * i) for i in range(10)]
-    f = piecewise_linear(x, bp, vals, d_max=4)
+    f = piecewise_linear(x, bp, lambda x: x * x, d_max=4)
     for i in range(10):
         result = _eval_pw(f, float(i))
         assert abs(result - i * i) < 0.01, f"f({i}) = {result}, expected {i*i}"
@@ -484,19 +482,18 @@ def test_clamp():
         )
 
 
-def test_piecewise_linear_nd():
-    """piecewise_linear_nd looks up vector values from a scalar key."""
+def test_piecewise_linear_vector():
+    """piecewise_linear with vector-valued fn looks up vector values from a scalar key."""
+    import math
+
     x = create_input("x", 1)
 
-    # 4 breakpoints, 3-dimensional output (like cos, sin, extra)
+    # 4 breakpoints, 3-dimensional output (cos, sin, linear ramp)
     breakpoints = [0.0, 1.0, 2.0, 3.0]
-    values = [
-        [1.0, 0.0, 10.0],   # x=0
-        [0.0, 1.0, 20.0],   # x=1
-        [-1.0, 0.0, 30.0],  # x=2
-        [0.0, -1.0, 40.0],  # x=3
-    ]
-    out = piecewise_linear_nd(x, breakpoints, values)
+    out = piecewise_linear(
+        x, breakpoints,
+        lambda t: [math.cos(t * math.pi / 2), math.sin(t * math.pi / 2), 10.0 * (t + 1)],
+    )
     assert len(out) == 3
 
     cases = [
@@ -513,5 +510,5 @@ def test_piecewise_linear_nd():
         ).squeeze(0).tolist()
         for j, (r, e) in enumerate(zip(result, expected)):
             assert abs(r - e) < 0.01, (
-                f"piecewise_linear_nd({x_val})[{j}]: expected {e}, got {r:.4f}"
+                f"piecewise_linear({x_val})[{j}]: expected {e}, got {r:.4f}"
             )
