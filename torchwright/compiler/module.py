@@ -227,18 +227,22 @@ def _convert_layers(
     for layer in compiled.layers:
         attn_comp = layer.attn.attn
 
+        # permute().reshape() forces a copy because the result isn't
+        # contiguous; that's the only memory traffic we actually need.
+        # The W_O / MLP tensors are already contiguous and we own them,
+        # so move (no clone).
         W_Q = attn_comp.query_matrix.permute(1, 0, 2).reshape(d, d)
         W_K = attn_comp.key_matrix.permute(1, 0, 2).reshape(d, d)
         W_V = attn_comp.value_matrix.permute(1, 0, 2).reshape(d, d)
-        W_O = attn_comp.output_matrix.clone()
+        W_O = attn_comp.output_matrix
 
         attn_mod = _AttentionLayer(W_Q, W_K, W_V, W_O, n_heads, d_head, causal_mask)
 
         mlp_comp = layer.mlp
-        W1 = mlp_comp.linear1.output_matrix.clone()
-        b1 = mlp_comp.linear1.output_bias.clone()
-        W2 = mlp_comp.linear2.output_matrix.clone()
-        b2 = mlp_comp.linear2.output_bias.clone()
+        W1 = mlp_comp.linear1.output_matrix
+        b1 = mlp_comp.linear1.output_bias
+        W2 = mlp_comp.linear2.output_matrix
+        b2 = mlp_comp.linear2.output_bias
 
         mlp_mod = _MLPLayer(W1, b1, W2, b2)
         layer_modules.append(nn.ModuleList([attn_mod, mlp_mod]))

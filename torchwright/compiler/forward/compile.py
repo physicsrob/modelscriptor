@@ -5,6 +5,7 @@ Produces a HeadlessTransformer that can compute the output node's value
 given input values.
 """
 
+import time
 from typing import Optional
 
 import torch
@@ -119,23 +120,36 @@ def forward_compile(
         )
         print(
             f"  {'Layer':<8} {'Ops':>8}  {'Layer params':>28}  "
-            f"{'Stream in':>10}  {'Stream out':>11}"
+            f"{'Stream in':>10}  {'Stream out':>11}  {'Time':>10}"
         )
 
     # 3. Layer loop — seed with input node params (Embedding, etc.)
     total_params = sum(n.num_params() for n in input_nodes)
+    total_layer_time = 0.0
     for i in range(max_layers):
         if output_node in computed:
             break
 
         occupied_before = d - residual_map.get_free_count()
 
+        t_layer_start = time.perf_counter()
         layer = net.add_layer(append=True)
+        t_schedule_start = time.perf_counter()
         attn_ops, mlp_ops, biased_linears = scheduler.schedule_layer(
             residual_map, computed
         )
+        t_attn_start = time.perf_counter()
         write_attn_sublayer(layer, attn_ops, residual_map, pos_encoding)
+        t_mlp_start = time.perf_counter()
         write_mlp_sublayer(layer, mlp_ops, residual_map, set(biased_linears))
+        t_layer_end = time.perf_counter()
+
+        layer_time = t_layer_end - t_layer_start
+        alloc_time = t_schedule_start - t_layer_start
+        schedule_time = t_attn_start - t_schedule_start
+        attn_time = t_mlp_start - t_attn_start
+        mlp_time = t_layer_end - t_mlp_start
+        total_layer_time += layer_time
 
         # Mark Concatenate nodes as computed when all leaf inputs are done
         for node in graph.get_all_nodes():
@@ -157,7 +171,10 @@ def forward_compile(
                 f"  {i:<8} {n_ops:>5} ops  "
                 f"{layer_params:>9,}/{layer_capacity:,} ({pct_params:>4.1f}%)  "
                 f"{occupied_before:>6}/{d} ({pct_before:>2}%)  "
-                f"{occupied_after:>6}/{d} ({pct_after:>2}%)"
+                f"{occupied_after:>6}/{d} ({pct_after:>2}%)  "
+                f"{layer_time*1000:>7.1f}ms "
+                f"(alloc {alloc_time*1000:.0f} sch {schedule_time*1000:.0f} "
+                f"attn {attn_time*1000:.0f} mlp {mlp_time*1000:.0f})"
             )
     else:
         raise RuntimeError(
@@ -171,7 +188,8 @@ def forward_compile(
         print(
             f"\n  {len(net.layers)} layers, "
             f"{total_params:,} / {transformer_params:,} params used "
-            f"({pct_used:.1f}%)"
+            f"({pct_used:.1f}%), "
+            f"{total_layer_time:.2f}s total layer time"
         )
 
     # Ensure at least one layer exists for ResidualAssignment states
