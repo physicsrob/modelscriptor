@@ -6,6 +6,7 @@ Usage:
 
 import argparse
 import sys
+import time
 from typing import List
 
 import numpy as np
@@ -13,7 +14,9 @@ import numpy as np
 from torchwright.doom.game import GameState, update_state
 from torchwright.doom.input import PlayerInput
 from torchwright.reference_renderer.render import render_frame
-from torchwright.reference_renderer.scenes import box_room, box_room_textured, multi_room
+from torchwright.reference_renderer.scenes import (
+    box_room_textured, multi_room_textured,
+)
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
@@ -55,12 +58,11 @@ def play(
         module = compile_game(
             segments, config, max_coord,
             textures=textures,
-            d=3072 if textures else 1024, d_head=16,
+            d=4096, d_head=16,
         )
 
         def frame_fn(state, inputs):
-            frame, new_state = step_frame_compiled(module, state, inputs, config)
-            return frame, new_state
+            return step_frame_compiled(module, state, inputs, config)
     else:
         trig_table = config.trig_table
 
@@ -82,6 +84,7 @@ def play(
 
     running = True
     frame_count = 0
+    last_frame_ms = 0.0
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -99,7 +102,9 @@ def play(
             turn_right=keys[pygame.K_RIGHT],
         )
 
+        t0 = time.perf_counter()
         frame, state = frame_fn(state, inputs)
+        last_frame_ms = (time.perf_counter() - t0) * 1000.0
 
         pixels = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
         surface = pygame.surfarray.make_surface(pixels.transpose(1, 0, 2))
@@ -109,9 +114,10 @@ def play(
 
         frame_count += 1
         if frame_count % 10 == 0:
+            fps = 1000.0 / last_frame_ms if last_frame_ms > 0 else 0
             pygame.display.set_caption(
                 f"{label} | pos=({state.x:.1f}, {state.y:.1f}) "
-                f"angle={state.angle}"
+                f"angle={state.angle} | {last_frame_ms:.0f}ms ({fps:.1f} fps)"
             )
 
     pygame.quit()
@@ -125,8 +131,8 @@ def main():
         help="transformer: game logic + rendering in compiled transformer (default). "
              "reference: pure Python implementation.",
     )
-    parser.add_argument("--wad", type=str, default=None,
-                        help="Path to doom1.wad for real DOOM textures")
+    parser.add_argument("--wad", type=str, default="doom1.wad",
+                        help="Path to doom1.wad for DOOM textures")
     parser.add_argument("--tex-size", type=int, default=8,
                         help="Texture resolution (downscaled from WAD)")
     parser.add_argument("--width", type=int, default=64)
@@ -145,7 +151,6 @@ def main():
         floor_color=(0.4, 0.4, 0.4),
     )
 
-    textures = None
     if args.scene == "box":
         segments, textures = box_room_textured(
             wad_path=args.wad, tex_size=args.tex_size,
@@ -153,7 +158,9 @@ def main():
         start_x, start_y, start_angle = 0.0, 0.0, 0
         max_coord = 10.0
     else:
-        segments = multi_room()
+        segments, textures = multi_room_textured(
+            wad_path=args.wad, tex_size=args.tex_size,
+        )
         start_x, start_y, start_angle = -8.0, 0.0, 0
         max_coord = 15.0
 

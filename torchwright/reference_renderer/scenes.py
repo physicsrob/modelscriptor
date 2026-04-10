@@ -98,6 +98,83 @@ def multi_room() -> List[Segment]:
     ]
 
 
+def multi_room_textured(
+    wad_path: str = "doom1.wad",
+    tex_size: int = 8,
+) -> Tuple[List[Segment], List[np.ndarray]]:
+    """Multi-room scene with textured walls.
+
+    Same geometry as ``multi_room()`` but with WAD textures assigned:
+        0 = STARTAN3 (room A walls, interior walls)
+        1 = STARG3   (doorways)
+        2 = BROWN1   (corridor, pillars)
+        3 = BROWNGRN (room B walls)
+
+    Returns ``(segments, textures)``.
+    """
+    if wad_path is not None:
+        from torchwright.doom.wad import WADReader
+        from torchwright.reference_renderer.textures import downscale_texture
+
+        wad = WADReader(wad_path)
+        names = ["STARTAN3", "STARG3", "BROWN1", "BROWNGRN"]
+        textures = [
+            downscale_texture(wad.get_texture(n), tex_size, tex_size)
+            for n in names
+        ]
+    else:
+        from torchwright.reference_renderer.textures import default_texture_atlas
+        textures = default_texture_atlas()
+
+    T_A, T_DOOR, T_CORR, T_B = 0, 1, 2, 3
+
+    RED = (0.8, 0.2, 0.1)
+    GREEN = (0.1, 0.7, 0.2)
+    BLUE = (0.2, 0.3, 0.8)
+    YELLOW = (0.8, 0.8, 0.1)
+    CYAN = (0.1, 0.7, 0.7)
+    MAGENTA = (0.7, 0.1, 0.6)
+    ORANGE = (0.9, 0.5, 0.1)
+    GRAY = (0.5, 0.5, 0.5)
+
+    segments = [
+        # Room A walls
+        Segment(ax=-12, ay=-6, bx=-4, by=-6, color=RED, texture_id=T_A),
+        Segment(ax=-12, ay=6, bx=-12, by=-6, color=GREEN, texture_id=T_A),
+        Segment(ax=-4, ay=6, bx=-12, by=6, color=BLUE, texture_id=T_A),
+        Segment(ax=-4, ay=-6, bx=-4, by=-2, color=YELLOW, texture_id=T_DOOR),
+        Segment(ax=-4, ay=2, bx=-4, by=6, color=YELLOW, texture_id=T_DOOR),
+
+        # Corridor south wall
+        Segment(ax=-4, ay=-2, bx=-2, by=-2, color=GRAY, texture_id=T_CORR),
+        Segment(ax=-2, ay=-2, bx=2, by=-2, color=GRAY, texture_id=T_CORR),
+        Segment(ax=2, ay=-2, bx=4, by=-4, color=GRAY, texture_id=T_CORR),
+
+        # Corridor north wall
+        Segment(ax=-4, ay=2, bx=-2, by=2, color=GRAY, texture_id=T_CORR),
+        Segment(ax=-2, ay=2, bx=2, by=2, color=GRAY, texture_id=T_CORR),
+        Segment(ax=2, ay=2, bx=4, by=4, color=GRAY, texture_id=T_CORR),
+
+        # Room B walls
+        Segment(ax=4, ay=-4, bx=12, by=-4, color=CYAN, texture_id=T_B),
+        Segment(ax=12, ay=-4, bx=12, by=4, color=MAGENTA, texture_id=T_B),
+        Segment(ax=12, ay=4, bx=4, by=4, color=ORANGE, texture_id=T_B),
+        Segment(ax=4, ay=4, bx=4, by=2, color=BLUE, texture_id=T_DOOR),
+        Segment(ax=4, ay=-2, bx=4, by=-4, color=BLUE, texture_id=T_DOOR),
+
+        # Extra interior walls
+        Segment(ax=-10, ay=0, bx=-8, by=0, color=RED, texture_id=T_A),
+        Segment(ax=8, ay=-2, bx=10, by=0, color=CYAN, texture_id=T_A),
+        Segment(ax=8, ay=2, bx=10, by=0, color=ORANGE, texture_id=T_A),
+
+        # Pillars
+        Segment(ax=0, ay=-1.5, bx=0, by=-0.5, color=MAGENTA, texture_id=T_CORR),
+        Segment(ax=0, ay=0.5, bx=0, by=1.5, color=MAGENTA, texture_id=T_CORR),
+        Segment(ax=-7, ay=-3, bx=-7, by=-2, color=GREEN, texture_id=T_CORR),
+    ]
+    return segments, textures
+
+
 def box_room_textured(
     size: float = 10.0,
     wad_path: str = None,
