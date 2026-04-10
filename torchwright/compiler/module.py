@@ -274,6 +274,8 @@ class HeadlessTransformerModule(nn.Module):
         self.register_buffer("output_gather_indices", output_gather_indices)
 
     def forward(self, inputs: torch.FloatTensor) -> torch.Tensor:
+        # Do not export this directly — the .to(device) dance leaks a Cast
+        # node into the traced graph. Export via _CachedHeadlessWrapper.
         orig_device = inputs.device
         inputs = inputs.to(self.input_proj.device)
         seq_len = inputs.shape[0]

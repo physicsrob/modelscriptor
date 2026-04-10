@@ -427,9 +427,6 @@ def test_parameters_are_registered():
 # Test 11: ONNX export and inference roundtrip
 # ---------------------------------------------------------------------------
 
-onnxruntime = pytest.importorskip("onnxruntime")
-
-
 def _empty_past_feeds(n_layers: int, n_heads: int, d_head: int) -> dict:
     import numpy as np
 
@@ -453,6 +450,7 @@ def test_onnx_export_and_inference():
     Feeds the cached protocol (empty past, past_len=0) which should be
     mathematically equivalent to the non-cached full-sequence forward.
     """
+    onnxruntime = pytest.importorskip("onnxruntime")
     from torchwright.compiler.export import compile_to_onnx
 
     output_node, pos_encoding, embedding = _build_1digit()
@@ -523,6 +521,7 @@ def test_onnx_cached_decode_step_matches_full_pt():
     full sequence. This catches causal-mask boundary errors at the
     prefill→decode transition.
     """
+    onnxruntime = pytest.importorskip("onnxruntime")
     import numpy as np
 
     from torchwright.compiler.export import compile_to_onnx
@@ -597,6 +596,7 @@ def test_onnx_cached_decode_step_matches_full_pt():
 
 def test_onnx_repl_model_metadata_discovery():
     """_load() recovers n_layers, n_heads, d_head from the cached ONNX graph."""
+    pytest.importorskip("onnxruntime")
     from torchwright.compiler.export import compile_to_onnx
     from torchwright.compiler.repl import _load
 
@@ -635,6 +635,7 @@ def test_onnx_repl_model_metadata_discovery():
 
 def test_onnx_repl_generate():
     """Test the standalone REPL generate function against an ONNX model."""
+    pytest.importorskip("onnxruntime")
     from torchwright.compiler.export import compile_to_onnx
     from torchwright.compiler.repl import _load, generate
 
