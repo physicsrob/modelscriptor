@@ -21,6 +21,7 @@ from torchwright.ops.arithmetic_ops import (
     multiply_const,
     negate,
     piecewise_linear,
+    piecewise_linear_2d,
     reciprocal,
     reduce_min,
     signed_multiply,
@@ -54,6 +55,72 @@ def trig_lookup(ray_angle: Node) -> Tuple[Node, Node]:
     ray_cos = piecewise_linear(ray_angle, breakpoints, lambda i: float(table[int(i), 0]), name="trig_cos")
     ray_sin = piecewise_linear(ray_angle, breakpoints, lambda i: float(table[int(i), 1]), name="trig_sin")
     return ray_cos, ray_sin
+
+
+# ---------------------------------------------------------------------------
+# Wall height from distance (2D lookup)
+# ---------------------------------------------------------------------------
+
+# Distance breakpoints: dense near 0 where 1/x is steep, sparse far away.
+_DIST_BREAKPOINTS = [
+    0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0,
+    6.0, 8.0, 10.0, 13.0, 16.0, 20.0, 25.0, 30.0, 35.0, 40.0,
+]
+
+# perp_cos breakpoints: covers typical FOV range.
+_COS_BREAKPOINTS = [0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
+
+
+def _wall_height_lookup(
+    closest_dist: Node,
+    perp_cos: Node,
+    config: RenderConfig,
+    max_coord: float,
+) -> Tuple[Node, Node, Node]:
+    """Compute wall_top, wall_bottom, wall_height via a single 2D lookup.
+
+    Replaces the 6-FFN chain (clamp → signed_multiply → clamp →
+    reciprocal → multiply_const → Linear) with 1 FFN layer.
+
+    Args:
+        closest_dist: Scalar distance to nearest wall.
+        perp_cos: Fish-eye correction cosine (scalar).
+        config: Render configuration.
+        max_coord: Upper bound on coordinate magnitudes.
+
+    Returns:
+        (wall_top, wall_bottom, wall_height) scalar nodes.
+    """
+    H = config.screen_height
+    max_dist = 2.0 * max_coord
+
+    # Clamp distance before the 2D lookup so BIG_DISTANCE (no-hit)
+    # maps to a tiny wall height instead of extrapolating wildly.
+    clamped_dist = clamp(closest_dist, 0.5, max_dist)
+
+    def _wall_h(d, c):
+        d_safe = builtins.max(0.5, builtins.min(max_dist, d))
+        perp = builtins.max(0.5, builtins.min(max_dist, d_safe * c))
+        return float(H) / perp
+
+    wall_height = piecewise_linear_2d(
+        clamped_dist, perp_cos,
+        _DIST_BREAKPOINTS, _COS_BREAKPOINTS,
+        _wall_h,
+        name="wall_height_2d",
+    )
+
+    center = float(H) / 2.0
+    half_height = multiply_const(wall_height, 0.5)
+    wall_top = Linear(
+        half_height, torch.tensor([[-1.0]]), torch.tensor([center]),
+        name="wall_top",
+    )
+    wall_bottom = Linear(
+        half_height, torch.tensor([[1.0]]), torch.tensor([center]),
+        name="wall_bottom",
+    )
+    return wall_top, wall_bottom, wall_height
 
 
 # ---------------------------------------------------------------------------
@@ -516,29 +583,9 @@ def build_textured_rendering_pipeline(
         winning_meta, _extract_matrix(d_meta, 2), name="win_abs_den",
     )
 
-    # --- Stage 6: Wall height (same as solid) ---
-    max_dist = 2.0 * max_coord
-    clamped_dist = clamp(closest_dist, 0.5, max_dist)
-
-    perp_dist = signed_multiply(
-        clamped_dist, perp_cos,
-        max_abs1=max_dist, max_abs2=1.0, step=1.0,
-    )
-    safe_perp_dist = clamp(perp_dist, 0.5, max_dist)
-
-    inv_perp = reciprocal(safe_perp_dist, min_value=0.5, max_value=max_dist, step=1.0)
-    wall_height = multiply_const(inv_perp, float(config.screen_height))
-
-    H = config.screen_height
-    center = float(H) / 2.0
-    half_height = multiply_const(wall_height, 0.5)
-    wall_top = Linear(
-        half_height, torch.tensor([[-1.0]]), torch.tensor([center]),
-        name="wall_top",
-    )
-    wall_bottom = Linear(
-        half_height, torch.tensor([[1.0]]), torch.tensor([center]),
-        name="wall_bottom",
+    # --- Stage 6: Wall height (2D lookup) ---
+    wall_top, wall_bottom, wall_height = _wall_height_lookup(
+        closest_dist, perp_cos, config, max_coord,
     )
 
     # --- Stage 7: u normalization ---
@@ -657,34 +704,9 @@ def build_rendering_pipeline(
     else:
         closest_dist, wall_color = reduce_min(distances, colors)
 
-    # Stage 6: Wall height via fish-eye corrected distance.
-    max_dist = 2.0 * max_coord
-    clamped_dist = clamp(closest_dist, 0.5, max_dist)
-
-    perp_dist = signed_multiply(
-        clamped_dist, perp_cos,
-        max_abs1=max_dist, max_abs2=1.0, step=1.0,
-    )
-    safe_perp_dist = clamp(perp_dist, 0.5, max_dist)
-
-    inv_perp = reciprocal(safe_perp_dist, min_value=0.5, max_value=max_dist, step=1.0)
-    wall_height = multiply_const(inv_perp, float(config.screen_height))
-
-    # Wall bounds: center ± half wall height.
-    H = config.screen_height
-    center = float(H) / 2.0
-    half_height = multiply_const(wall_height, 0.5)
-    wall_top = Linear(
-        half_height,
-        torch.tensor([[-1.0]]),
-        torch.tensor([center]),
-        name="wall_top",
-    )
-    wall_bottom = Linear(
-        half_height,
-        torch.tensor([[1.0]]),
-        torch.tensor([center]),
-        name="wall_bottom",
+    # Stage 6: Wall height (2D lookup)
+    wall_top, wall_bottom, wall_height = _wall_height_lookup(
+        closest_dist, perp_cos, config, max_coord,
     )
 
     # Stage 7: Column fill
