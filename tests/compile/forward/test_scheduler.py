@@ -16,7 +16,7 @@ import torch
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.scheduler import LayerScheduler
-from torchwright.compiler.forward.weight_writer import AttnHeadOp, FFNOp
+from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding
@@ -40,13 +40,13 @@ def _make_biased_linear(inp, d_out, name=""):
     return Linear(inp, torch.randn(len(inp), d_out), torch.randn(d_out), name=name)
 
 
-def _make_relu_chain(inp, d_int, d_out, name=""):
+def _make_relu_chain(inp, d_hidden, d_out, name=""):
     """L1 -> ReLU -> L2 chain. Returns (l2, relu, l1)."""
     l1 = Linear(
-        inp, torch.randn(len(inp), d_int), torch.randn(d_int), name=f"{name}_l1"
+        inp, torch.randn(len(inp), d_hidden), torch.randn(d_hidden), name=f"{name}_l1"
     )
     r = ReLU(l1, name=f"{name}_r")
-    l2 = Linear(r, torch.randn(d_int, d_out), torch.randn(d_out), name=f"{name}_l2")
+    l2 = Linear(r, torch.randn(d_hidden, d_out), torch.randn(d_out), name=f"{name}_l2")
     return l2, r, l1
 
 
@@ -68,7 +68,7 @@ def test_schedule_attn_node():
     computed = {pos, v}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     compute_attn = [op for op in attn_ops if op.op_type == "compute_attn"]
     assert len(compute_attn) == 1
@@ -77,7 +77,7 @@ def test_schedule_attn_node():
 
 
 def test_schedule_relu_chain():
-    """L->R->L chain produces FFNOp('compute_relu'); all 3 nodes marked computed."""
+    """L->R->L chain produces MLPOp('compute_relu'); all 3 nodes marked computed."""
     pos = _make_pos_encoding()
     x = InputNode("x", 4)
     l2, r, l1 = _make_relu_chain(x, 8, 3, "chain")
@@ -89,12 +89,12 @@ def test_schedule_relu_chain():
     computed = {pos, x}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
-    relu_ops = [op for op in ffn_ops if op.op_type == "compute_relu"]
+    relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]
     assert len(relu_ops) == 1
     assert relu_ops[0].node is l2
-    assert len(relu_ops[0].ffn_slots) == 8  # intermediate dim
+    assert len(relu_ops[0].mlp_slots) == 8  # intermediate dim
 
     assert l1 in computed
     assert r in computed
@@ -102,7 +102,7 @@ def test_schedule_relu_chain():
 
 
 def test_schedule_constant():
-    """LiteralValue node produces FFNOp('compute_literal_value') with no FFN slots.
+    """LiteralValue node produces MLPOp('compute_literal_value') with no MLP slots.
 
     Note: in the compile loop, Constants are typically pre-populated as input nodes.
     This tests the scheduler's capability to handle Constants that aren't pre-populated.
@@ -116,12 +116,12 @@ def test_schedule_constant():
     computed = {pos}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
-    const_ops = [op for op in ffn_ops if op.op_type == "compute_literal_value"]
+    const_ops = [op for op in mlp_ops if op.op_type == "compute_literal_value"]
     assert len(const_ops) == 1
     assert const_ops[0].node is const
-    assert const_ops[0].ffn_slots == []
+    assert const_ops[0].mlp_slots == []
     assert const in computed
 
 
@@ -138,7 +138,7 @@ def test_schedule_zero_bias_linear():
     computed = {pos, x}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     linear_ops = [op for op in attn_ops if op.op_type == "compute_linear"]
     assert len(linear_ops) == 1
@@ -169,7 +169,7 @@ def test_schedule_large_input_linear():
     computed = {pos} | set(inputs)
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     linear_ops = [op for op in attn_ops if op.op_type == "compute_linear"]
     assert any(op.node is linear for op in linear_ops)
@@ -177,7 +177,7 @@ def test_schedule_large_input_linear():
 
 
 def test_schedule_biased_linear():
-    """Biased Linear (len <= d_head) produces both AttnHeadOp and FFNOp in same layer."""
+    """Biased Linear (len <= d_head) produces both AttnHeadOp and MLPOp in same layer."""
     pos = _make_pos_encoding()
     x = InputNode("x", 4)
     linear = _make_biased_linear(x, 3, "biased")
@@ -189,14 +189,14 @@ def test_schedule_biased_linear():
     computed = {pos, x}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     # Wx via attention
     linear_ops = [op for op in attn_ops if op.op_type == "compute_linear"]
     assert any(op.node is linear for op in linear_ops)
 
-    # bias via FFN
-    bias_ops = [op for op in ffn_ops if op.op_type == "compute_bias"]
+    # bias via MLP
+    bias_ops = [op for op in mlp_ops if op.op_type == "compute_bias"]
     assert any(op.node is linear for op in bias_ops)
 
     assert linear in computed
@@ -219,7 +219,7 @@ def test_schedule_cancellation():
     computed = {pos, x, a}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     cancel_ops = [op for op in attn_ops if op.op_type == "cancel"]
     assert any(op.node is x for op in cancel_ops)
@@ -253,7 +253,7 @@ def test_schedule_free_add():
     computed = {pos, dead_node, live_node}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.op_type == "add_into"]
     assert len(add_ops) == 1
@@ -285,7 +285,7 @@ def test_schedule_deferred_add_via_compute():
     computed = {pos, a, b}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.node is add_node]
     assert len(add_ops) == 1
@@ -315,7 +315,7 @@ def test_schedule_add_into_preferred_over_compute_add():
     computed = {pos, a, b}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.node is add_node]
     assert len(add_ops) == 1
@@ -340,7 +340,7 @@ def test_schedule_add_both_addends_dead():
     computed = {pos, a, b}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.op_type == "add_into"]
     assert len(add_ops) == 1
@@ -369,7 +369,7 @@ def test_head_budget_exhaustion():
     computed = {pos, x}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     # Should not exceed head budget
     assert len(attn_ops) <= N_HEADS
@@ -378,8 +378,8 @@ def test_head_budget_exhaustion():
     assert 0 < len(scheduled) <= N_HEADS
 
 
-def test_ffn_slot_exhaustion():
-    """More L->R->L chains than FFN slots: respects slot budget."""
+def test_mlp_slot_exhaustion():
+    """More L->R->L chains than MLP slots: respects slot budget."""
     pos = _make_pos_encoding()
     x = InputNode("x", 4)
     # 4 chains × 20 slots each = 80 > D=64
@@ -397,14 +397,14 @@ def test_ffn_slot_exhaustion():
     computed = {pos, x}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     total_slots = sum(
-        len(op.ffn_slots) for op in ffn_ops if op.op_type == "compute_relu"
+        len(op.mlp_slots) for op in mlp_ops if op.op_type == "compute_relu"
     )
     assert total_slots <= D
 
-    relu_ops = [op for op in ffn_ops if op.op_type == "compute_relu"]
+    relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]
     assert 0 < len(relu_ops) < 4
 
 
@@ -436,14 +436,14 @@ def test_schedule_under_column_pressure():
     computed = {pos, filler, x, a}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     # Must cancel x (dead) to free columns
     cancel_ops = [op for op in attn_ops if op.op_type == "cancel"]
     assert any(op.node is x for op in cancel_ops)
 
     # Relu chain should still be scheduled
-    relu_ops = [op for op in ffn_ops if op.op_type == "compute_relu"]
+    relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]
     assert len(relu_ops) == 1
     assert l2 in computed
 
@@ -555,7 +555,7 @@ def test_scheduling_with_concatenate_input():
 # ---------------------------------------------------------------------------
 
 
-def test_mixed_attn_and_ffn():
+def test_mixed_attn_and_mlp():
     """Both Attn node and L->R->L chain ready: both scheduled in same layer."""
     pos = _make_pos_encoding()
     v = InputNode("v", 4)
@@ -573,10 +573,10 @@ def test_mixed_attn_and_ffn():
     computed = {pos, v, x}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     assert any(op.op_type == "compute_attn" and op.node is attn_node for op in attn_ops)
-    assert any(op.op_type == "compute_relu" and op.node is l2 for op in ffn_ops)
+    assert any(op.op_type == "compute_relu" and op.node is l2 for op in mlp_ops)
     assert attn_node in computed
     assert l2 in computed
 
@@ -587,7 +587,7 @@ def test_mixed_attn_and_ffn():
 
 
 def test_schedule_standalone_relu():
-    """Standalone ReLU (not part of L->R->L chain) produces FFNOp('compute_standalone_relu').
+    """Standalone ReLU (not part of L->R->L chain) produces MLPOp('compute_standalone_relu').
 
     This pattern occurs in cond_gate: ReLU(Add(...)) where the ReLU's consumer
     is an Add, not a Linear — so it's not part of any chain.
@@ -607,12 +607,12 @@ def test_schedule_standalone_relu():
     computed = {pos, x, other}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
-    relu_ops = [op for op in ffn_ops if op.op_type == "compute_standalone_relu"]
+    relu_ops = [op for op in mlp_ops if op.op_type == "compute_standalone_relu"]
     assert len(relu_ops) == 1
     assert relu_ops[0].node is relu_node
-    assert len(relu_ops[0].ffn_slots) == len(relu_node)  # 4 slots for 4-dim
+    assert len(relu_ops[0].mlp_slots) == len(relu_node)  # 4 slots for 4-dim
     assert relu_node in computed
 
 
@@ -717,7 +717,7 @@ def test_add_into_shared_addend_not_reassigned():
     computed = {pos, shared} | set(dead_nodes)
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_into_ops = [op for op in attn_ops if op.op_type == "add_into"]
     assert len(add_into_ops) == 3, f"Expected 3 add_into ops, got {len(add_into_ops)}"
@@ -754,4 +754,4 @@ def test_output_already_computed():
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     # Should not raise — nothing to do
-    attn_ops, ffn_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)

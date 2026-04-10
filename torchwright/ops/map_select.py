@@ -35,18 +35,18 @@ def map_to_table(
     assert len(inp) == d_key
     assert len(default) == d_value
 
-    d_int = len(key_to_value)
+    d_hidden = len(key_to_value)
     speed = embedding_step_sharpness
-    # We'll use 1 FFN entry per item in the table, and an overall output bias of the default value
+    # We'll use 1 MLP entry per item in the table, and an overall output bias of the default value
     # So roughly speaking:
-    # input_proj will be (d_int x d_key), where input_proj[i, :] = table.keys()[i]
-    # input_bias will be (d_int), where input_bias[i] = 1.0/speed - (table.keys()[i] @ table.keys()[i])
-    # output_proj will be (d_int, d_value), where output_proj[i, :] = speed * (table.values()[i] - default)
+    # input_proj will be (d_hidden x d_key), where input_proj[i, :] = table.keys()[i]
+    # input_bias will be (d_hidden), where input_bias[i] = 1.0/speed - (table.keys()[i] @ table.keys()[i])
+    # output_proj will be (d_hidden, d_value), where output_proj[i, :] = speed * (table.values()[i] - default)
     # output_bias will be (d_value), equal to default
 
-    input_proj = torch.zeros(d_int, d_key)
-    input_bias = torch.zeros(d_int)
-    output_proj = torch.zeros(d_int, d_value)
+    input_proj = torch.zeros(d_hidden, d_key)
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, d_value)
 
     for i, (key, value) in enumerate(key_to_value.items()):
         input_proj[i, :] = key
@@ -93,33 +93,28 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     assert len(cond) == 1  # Condition must be length 1
     assert len(true_node) == len(false_node)
 
-    # Strategy:
-    # - Concatenate(true_node; false_node)
-    # - Add [offset ... offset;  -offset ... -offset] if cond is true
-    # - Add [-offset ... -offset;  offset ... offset] if cond is false
-    # - Rectify
-    # - Merge the two halves by summing
-    # - Subtract offset
-    true_offset = torch.tensor(
-        ([big_offset] * len(true_node)) + ([-big_offset] * len(true_node))
-    )
-    false_offset = torch.tensor(
-        ([-big_offset] * len(true_node)) + ([big_offset] * len(true_node))
-    )
-    x: Node = Concatenate([true_node, false_node])
-    x = cond_add_vector(cond, x, true_offset, false_offset)
+    d = len(true_node)
+    # Fused single L→R→L reading [cond, true_node, false_node]:
+    #   unit_a[j] = ReLU(big_offset*cond + true_j)    -- alive when cond=+1
+    #   unit_b[j] = ReLU(-big_offset*cond + false_j)  -- alive when cond=-1
+    #   out_j     = unit_a[j] + unit_b[j] - big_offset
+    d_hidden = 2 * d
+    input_proj = torch.zeros(d_hidden, 1 + 2 * d)
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, d)
+    output_bias = torch.full((d,), -big_offset)
 
-    # Splits the input node into two equal-length vectors, apply ReLU to each,
-    # and sum them with offset.
-    input_proj = torch.eye(len(x))
-    input_bias = torch.zeros(len(x))
-    output_proj = torch.zeros((len(x), len(true_node)))
-    output_bias = torch.tensor([-big_offset] * len(true_node))
+    for j in range(d):
+        a = j
+        b = d + j
+        input_proj[a, 0] = big_offset
+        input_proj[a, 1 + j] = 1.0
+        input_proj[b, 0] = -big_offset
+        input_proj[b, 1 + d + j] = 1.0
+        output_proj[a, j] = 1.0
+        output_proj[b, j] = 1.0
 
-    for i in range(len(true_node)):
-        output_proj[i, i] = 1.0
-        output_proj[len(true_node) + i, i] = 1.0
-
+    x = Concatenate([cond, true_node, false_node])
     return linear_relu_linear(
         input_node=x,
         input_proj=input_proj,
@@ -151,29 +146,29 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     assert len(upper) == 1
 
     S = step_sharpness
-    d_int = 4 * n_slots  # 4 ReLU units per position
+    d_hidden = 4 * n_slots  # 4 neurons per position
 
     # Input is [lower, upper], d_input=2
     inp = Concatenate([lower, upper])
 
-    input_proj = torch.zeros(d_int, 2)
-    input_bias = torch.zeros(d_int)
-    output_proj = torch.zeros(d_int, n_slots)
+    input_proj = torch.zeros(d_hidden, 2)
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, n_slots)
     output_bias = torch.full((n_slots,), -1.0)
 
     for i in range(n_slots):
         center = i + 0.5
         base = 4 * i
 
-        # step_past_lower: step(center - lower) using 2 ReLU units
+        # step_past_lower: step(center - lower) using 2 neurons
         # Unit 0: ReLU(S*center - S*lower) = ReLU(-S*lower + S*center)
-        input_proj[base, 0] = -S      # reads lower
+        input_proj[base, 0] = -S  # reads lower
         input_bias[base] = S * center
         # Unit 1: ReLU(S*center - S*lower - 1) = ReLU(-S*lower + S*center - 1)
         input_proj[base + 1, 0] = -S
         input_bias[base + 1] = S * center - 1.0
 
-        # step_past_upper: step(center - upper) using 2 ReLU units
+        # step_past_upper: step(center - upper) using 2 neurons
         # Unit 2: ReLU(S*center - S*upper)
         input_proj[base + 2, 1] = -S  # reads upper
         input_bias[base + 2] = S * center
@@ -232,7 +227,7 @@ def broadcast_select(
     assert false_is_broadcast or len(false_value) == n_slots * d_fill
 
     half_big = big_offset / 2.0
-    d_int = 2 * n_slots * d_fill
+    d_hidden = 2 * n_slots * d_fill
     inp = Concatenate([masks, true_value, false_value])
     d_input = len(inp)
 
@@ -241,15 +236,15 @@ def broadcast_select(
     true_offset = n_slots
     false_offset = n_slots + len(true_value)
 
-    input_proj = torch.zeros(d_int, d_input)
-    input_bias = torch.zeros(d_int)
-    output_proj = torch.zeros(d_int, n_slots * d_fill)
+    input_proj = torch.zeros(d_hidden, d_input)
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, n_slots * d_fill)
     output_bias = torch.full((n_slots * d_fill,), -half_big)
 
     for i in range(n_slots):
         for j in range(d_fill):
             out_idx = i * d_fill + j
-            unit_a = 2 * out_idx      # routes true_value
+            unit_a = 2 * out_idx  # routes true_value
             unit_b = 2 * out_idx + 1  # routes false_value
 
             # Unit A: ReLU(half_big * mask_i + true_ij)

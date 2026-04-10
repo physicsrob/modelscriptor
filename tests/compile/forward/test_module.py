@@ -1,7 +1,7 @@
 """Tests for CompiledTransformerModule (nn.Module conversion).
 
 Verifies numerical equivalence between the original HeadlessTransformer
-and the converted nn.Module at every level: attention, FFN, input scatter,
+and the converted nn.Module at every level: attention, MLP, input scatter,
 output gather, and full model.
 """
 
@@ -16,7 +16,7 @@ from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.module import (
     CompiledTransformerModule,
     _AttentionLayer,
-    _FFNLayer,
+    _MLPLayer,
     to_module,
 )
 from torchwright.graph import Embedding
@@ -141,35 +141,35 @@ def test_attention_layer_matches_component():
 
 
 # ---------------------------------------------------------------------------
-# Test 3: FFN layer matches FFNSubLayer
+# Test 3: MLP layer matches MLPSubLayer
 # ---------------------------------------------------------------------------
 
 
-def test_ffn_layer_matches_component():
-    """_FFNLayer produces same output as FFNSubLayer.forward()."""
+def test_mlp_layer_matches_component():
+    """_MLPLayer produces same output as MLPSubLayer.forward()."""
     net, output_node, pos_encoding, embedding = _compile_1digit()
     device = net.device
 
     layer = net.layers[0]
-    ffn_comp = layer.ffn
+    mlp_comp = layer.mlp
 
-    W1 = ffn_comp.linear1.output_matrix.clone()
-    b1 = ffn_comp.linear1.output_bias.clone()
-    W2 = ffn_comp.linear2.output_matrix.clone()
-    b2 = ffn_comp.linear2.output_bias.clone()
+    W1 = mlp_comp.linear1.output_matrix.clone()
+    b1 = mlp_comp.linear1.output_bias.clone()
+    W2 = mlp_comp.linear2.output_matrix.clone()
+    b2 = mlp_comp.linear2.output_bias.clone()
 
-    ffn_mod = _FFNLayer(W1, b1, W2, b2)
-    ffn_mod.to(device)
-    ffn_mod.eval()
+    mlp_mod = _MLPLayer(W1, b1, W2, b2)
+    mlp_mod.to(device)
+    mlp_mod.eval()
 
     inp = torch.randn(8, D, device=device)
 
-    expected = ffn_comp.forward(inp)
-    actual = ffn_mod(inp)
+    expected = mlp_comp.forward(inp)
+    actual = mlp_mod(inp)
 
     assert torch.allclose(
         actual.cpu(), expected.cpu(), atol=1e-5
-    ), f"FFN max diff: {(actual.cpu() - expected.cpu()).abs().max().item():.6f}"
+    ), f"MLP max diff: {(actual.cpu() - expected.cpu()).abs().max().item():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -394,14 +394,14 @@ def test_parameters_are_registered():
 
     n_layers = len(net.layers)
 
-    # Count parameters: per layer = 4 attn (Q,K,V,O) + 4 ffn (W1,b1,W2,b2) = 8
+    # Count parameters: per layer = 4 attn (Q,K,V,O) + 4 mlp (W1,b1,W2,b2) = 8
     # Plus 1 for token_embedding.weight
     param_names = [name for name, _ in module.named_parameters()]
 
     # Check embedding
     assert "token_embedding.weight" in param_names
 
-    # Check each layer has attn and ffn params
+    # Check each layer has attn and mlp params
     for i in range(n_layers):
         prefix = f"layers.{i}"
         assert f"{prefix}.0.W_Q" in param_names, f"Missing W_Q in layer {i}"

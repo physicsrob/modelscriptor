@@ -2,9 +2,9 @@ from typing import Any, List, Dict, Optional, Tuple, Union
 
 import torch
 
-from torchwright.compiler.feature_assignment import FeatureAssignment
+from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.groups.attn_sublayer import AttnSubLayer
-from torchwright.compiler.groups.ffn_sublayer import FFNSubLayer
+from torchwright.compiler.groups.mlp_sublayer import MLPSubLayer
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import (
     Node,
@@ -27,7 +27,7 @@ class HeadlessTransformer:
     d: int
     d_head: int
     pos_encoding: Optional[PosEncoding]
-    feature_assignment: Optional[FeatureAssignment]
+    residual_assignment: Optional[ResidualAssignment]
 
     def __init__(
         self,
@@ -39,7 +39,7 @@ class HeadlessTransformer:
         self.d_head = d_head
         self.pos_encoding = pos_encoding
         self.layers = []
-        self.feature_assignment = None
+        self.residual_assignment = None
 
     @property
     def device(self) -> torch.device:
@@ -65,12 +65,12 @@ class HeadlessTransformer:
         n_pos: int,
         input_values: Dict[str, Any],
     ):
-        assert self.feature_assignment
+        assert self.residual_assignment
         in_state = self.layers[0].attn.in_state
         res_stream = torch.zeros((n_pos, self.d))
 
-        for node in self.feature_assignment.get_nodes(in_state):
-            indices = self.feature_assignment.get_node_indices(in_state, node)
+        for node in self.residual_assignment.get_nodes(in_state):
+            indices = self.residual_assignment.get_node_indices(in_state, node)
             if isinstance(node, LiteralValue):
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = node.value[i]
@@ -98,9 +98,9 @@ class HeadlessTransformer:
         res = inp
         all_states = {}
         for i, layer in enumerate(self.layers):
-            sublayer_pairs: List[tuple[Union[AttnSubLayer, FFNSubLayer], str]] = [
+            sublayer_pairs: List[tuple[Union[AttnSubLayer, MLPSubLayer], str]] = [
                 (layer.attn, "attn"),
-                (layer.ffn, "ffn"),
+                (layer.mlp, "mlp"),
             ]
             for sublayer, sublayer_name in sublayer_pairs:
                 if return_states:
@@ -135,7 +135,7 @@ class HeadlessTransformer:
         for i, layer in enumerate(self.layers):
             res, kv = layer.attn.forward_cached(res, past_kvs[i])
             new_kvs.append(kv)
-            res = layer.ffn.forward(res)
+            res = layer.mlp.forward(res)
 
         return res, new_kvs
 
@@ -147,14 +147,16 @@ class HeadlessTransformer:
         Returns a dict mapping each output Node to its value tensor
         of shape ``(n_pos, node.d_output)``.
         """
-        assert self.feature_assignment
+        assert self.residual_assignment
 
-        res = self.forward(self.get_input_res_stream(n_pos, input_values).to(self.device))
+        res = self.forward(
+            self.get_input_res_stream(n_pos, input_values).to(self.device)
+        )
         result = {}
-        out_state = self.layers[-1].ffn.out_state
+        out_state = self.layers[-1].mlp.out_state
 
-        for node in self.feature_assignment.get_nodes(out_state):
-            indices = self.feature_assignment.get_node_indices(out_state, node)
+        for node in self.residual_assignment.get_nodes(out_state):
+            indices = self.residual_assignment.get_node_indices(out_state, node)
             result[node] = res[:, indices]
         return result
 
@@ -169,15 +171,17 @@ class HeadlessTransformer:
 
         Returns the generated tokens (not including input_tokens).
         """
-        assert self.feature_assignment
-        out_state = self.layers[-1].ffn.out_state
-        indices = self.feature_assignment.get_node_indices(out_state, output_node)
+        assert self.residual_assignment
+        out_state = self.layers[-1].mlp.out_state
+        indices = self.residual_assignment.get_node_indices(out_state, output_node)
 
         tokens = list(input_tokens)
         input_values: Dict[str, Any] = {"embedding_input": tokens}
 
         # Prefill: process all input tokens at once
-        res_stream = self.get_input_res_stream(len(tokens), input_values).to(self.device)
+        res_stream = self.get_input_res_stream(len(tokens), input_values).to(
+            self.device
+        )
         res, kvs = self.forward_cached(res_stream)
 
         generated: List[str] = []

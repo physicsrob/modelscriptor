@@ -7,7 +7,7 @@ import torch
 class Linear(Node):
     """Affine transform: ``y = x @ output_matrix + output_bias``.
 
-    The compiler may realise this as either an FFN slice or an attention
+    The compiler may realise this as either an MLP slice or an attention
     head attending to the current position, depending on context.
 
     Attributes:

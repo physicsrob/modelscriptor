@@ -74,8 +74,8 @@ class _AttentionLayer(nn.Module):
         return out.sum(dim=0) + inp
 
 
-class _FFNLayer(nn.Module):
-    """Feed-forward sublayer: linear1 -> ReLU -> linear2 + skip connection."""
+class _MLPLayer(nn.Module):
+    """MLP sublayer: linear1 -> ReLU -> linear2 + skip connection."""
 
     def __init__(
         self, W1: torch.Tensor, b1: torch.Tensor, W2: torch.Tensor, b2: torch.Tensor
@@ -191,9 +191,7 @@ class HeadlessTransformerModule(nn.Module):
 
         pos = self.pos_encoding[:seq_len]
 
-        res = (
-            inputs @ self.input_proj + pos @ self.pos_proj + self.constant_values
-        )
+        res = inputs @ self.input_proj + pos @ self.pos_proj + self.constant_values
 
         for layer_pair in self.layers:
             assert isinstance(layer_pair, nn.ModuleList)
@@ -217,7 +215,7 @@ def _convert_layers(
     compiled: HeadlessTransformer,
     max_seq_len: int,
 ) -> nn.ModuleList:
-    """Convert HeadlessTransformer layers to nn.ModuleList of (attn, ffn) pairs."""
+    """Convert HeadlessTransformer layers to nn.ModuleList of (attn, mlp) pairs."""
     d = compiled.d
     d_head = compiled.d_head
     n_heads = d // d_head
@@ -229,21 +227,25 @@ def _convert_layers(
     for layer in compiled.layers:
         attn_comp = layer.attn.attn
 
+        # permute().reshape() forces a copy because the result isn't
+        # contiguous; that's the only memory traffic we actually need.
+        # The W_O / MLP tensors are already contiguous and we own them,
+        # so move (no clone).
         W_Q = attn_comp.query_matrix.permute(1, 0, 2).reshape(d, d)
         W_K = attn_comp.key_matrix.permute(1, 0, 2).reshape(d, d)
         W_V = attn_comp.value_matrix.permute(1, 0, 2).reshape(d, d)
-        W_O = attn_comp.output_matrix.clone()
+        W_O = attn_comp.output_matrix
 
         attn_mod = _AttentionLayer(W_Q, W_K, W_V, W_O, n_heads, d_head, causal_mask)
 
-        ffn_comp = layer.ffn
-        W1 = ffn_comp.linear1.output_matrix.clone()
-        b1 = ffn_comp.linear1.output_bias.clone()
-        W2 = ffn_comp.linear2.output_matrix.clone()
-        b2 = ffn_comp.linear2.output_bias.clone()
+        mlp_comp = layer.mlp
+        W1 = mlp_comp.linear1.output_matrix
+        b1 = mlp_comp.linear1.output_bias
+        W2 = mlp_comp.linear2.output_matrix
+        b2 = mlp_comp.linear2.output_bias
 
-        ffn_mod = _FFNLayer(W1, b1, W2, b2)
-        layer_modules.append(nn.ModuleList([attn_mod, ffn_mod]))
+        mlp_mod = _MLPLayer(W1, b1, W2, b2)
+        layer_modules.append(nn.ModuleList([attn_mod, mlp_mod]))
 
     return layer_modules
 
@@ -268,21 +270,21 @@ def to_module(
     Returns:
         A CompiledTransformerModule that accepts token_ids and returns logits.
     """
-    assert compiled.feature_assignment is not None
+    assert compiled.residual_assignment is not None
     d = compiled.d
     d_head = compiled.d_head
     n_heads = d // d_head
 
     in_state = compiled.layers[0].attn.in_state
-    out_state = compiled.layers[-1].ffn.out_state
+    out_state = compiled.layers[-1].mlp.out_state
 
     # --- Extract input scatter indices ---
     embedding_indices = None
     pos_indices = None
     constant_values = torch.zeros(d)
 
-    for node in compiled.feature_assignment.get_nodes(in_state):
-        indices = compiled.feature_assignment.get_node_indices(in_state, node)
+    for node in compiled.residual_assignment.get_nodes(in_state):
+        indices = compiled.residual_assignment.get_node_indices(in_state, node)
         if isinstance(node, Embedding):
             embedding_indices = indices
         elif isinstance(node, PosEncoding):
@@ -295,8 +297,8 @@ def to_module(
 
     assert (
         embedding_indices is not None
-    ), "No Embedding node found in feature assignment"
-    assert pos_indices is not None, "No PosEncoding node found in feature assignment"
+    ), "No Embedding node found in residual assignment"
+    assert pos_indices is not None, "No PosEncoding node found in residual assignment"
 
     d_embed = len(embedding_indices)
     d_pos = len(pos_indices)
@@ -311,7 +313,7 @@ def to_module(
         pos_proj[i, idx] = 1.0
 
     # --- Extract output gather indices ---
-    output_indices = compiled.feature_assignment.get_node_indices(
+    output_indices = compiled.residual_assignment.get_node_indices(
         out_state, output_node
     )
     output_gather_indices = torch.tensor(output_indices, dtype=torch.long)
@@ -372,19 +374,19 @@ def to_headless_module(
         A HeadlessTransformerModule.  Its ``input_names`` attribute lists
         the InputNode names in the order they appear in the input tensor.
     """
-    assert compiled.feature_assignment is not None
+    assert compiled.residual_assignment is not None
     d = compiled.d
 
     in_state = compiled.layers[0].attn.in_state
-    out_state = compiled.layers[-1].ffn.out_state
+    out_state = compiled.layers[-1].mlp.out_state
 
     # --- Collect InputNode and PosEncoding indices ---
     input_nodes: List[tuple] = []  # (name, indices)
     pos_indices = None
     constant_values = torch.zeros(d)
 
-    for node in compiled.feature_assignment.get_nodes(in_state):
-        indices = compiled.feature_assignment.get_node_indices(in_state, node)
+    for node in compiled.residual_assignment.get_nodes(in_state):
+        indices = compiled.residual_assignment.get_node_indices(in_state, node)
         if isinstance(node, InputNode):
             input_nodes.append((node.name, indices))
         elif isinstance(node, PosEncoding):
@@ -395,8 +397,8 @@ def to_headless_module(
         elif isinstance(node, (Concatenate, Embedding)):
             pass
 
-    assert len(input_nodes) > 0, "No InputNode found in feature assignment"
-    assert pos_indices is not None, "No PosEncoding node found in feature assignment"
+    assert len(input_nodes) > 0, "No InputNode found in residual assignment"
+    assert pos_indices is not None, "No PosEncoding node found in residual assignment"
 
     # Sort by name for deterministic input ordering
     input_nodes.sort(key=lambda x: x[0])
@@ -418,7 +420,7 @@ def to_headless_module(
         pos_proj[i, idx] = 1.0
 
     # --- Extract output gather indices ---
-    output_indices = compiled.feature_assignment.get_node_indices(
+    output_indices = compiled.residual_assignment.get_node_indices(
         out_state, output_node
     )
     output_gather_indices = torch.tensor(output_indices, dtype=torch.long)

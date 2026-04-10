@@ -1,7 +1,7 @@
 """Layer scheduler for the forward compiler.
 
 Given the current residual stream state and graph metadata, decides what
-to compute/cancel in one transformer layer. Returns AttnHeadOp and FFNOp
+to compute/cancel in one transformer layer. Returns AttnHeadOp and MLPOp
 lists for the weight writer.
 
 Mutates residual_map (allocate, free, reassign) and computed_nodes (add).
@@ -9,10 +9,10 @@ Mutates residual_map (allocate, free, reassign) and computed_nodes (add).
 
 from typing import List, Optional, Set, Tuple
 
-from torchwright.compiler.feature_assignment import flatten_concat_nodes
+from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
-from torchwright.compiler.forward.weight_writer import AttnHeadOp, FFNOp
+from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding
@@ -23,7 +23,7 @@ class LayerScheduler:
     """Decides what operations to schedule in one transformer layer.
 
     Given the current residual-stream allocation and which nodes have
-    been computed, picks attention and FFN operations for the next layer.
+    been computed, picks attention and MLP operations for the next layer.
 
     Key concepts:
         - **dead node**: all downstream consumers are already computed,
@@ -46,21 +46,21 @@ class LayerScheduler:
 
     def schedule_layer(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
-    ) -> Tuple[List[AttnHeadOp], List[FFNOp], List[Node]]:
+    ) -> Tuple[List[AttnHeadOp], List[MLPOp], List[Node]]:
         """Schedule one transformer layer's worth of operations.
 
         Phases:
             1. Classify ready nodes (free adds, deferred adds, compute-ready).
             2. Attention sublayer: free adds, compute ops (Attn/Linear/Add),
                cancellations of dead nodes.
-            3. FFN sublayer: Linear->ReLU->Linear chains, standalone ReLUs,
+            3. MLP sublayer: Linear->ReLU->Linear chains, standalone ReLUs,
                constants, bias writes for biased Linears.
 
         Mutates ``residual_map`` (allocate/free/reassign) and
         ``computed_nodes`` (add newly computed nodes).
 
         Returns:
-            ``(attn_ops, ffn_ops, biased_linears)`` lists for the weight writer.
+            ``(attn_ops, mlp_ops, biased_linears)`` lists for the weight writer.
         """
         # --- 1. Classify ready nodes ---
         all_ready = self.graph.get_ready_nodes(computed_nodes)
@@ -86,7 +86,7 @@ class LayerScheduler:
 
         # Remove chain-internal nodes from ready so they're not double-scheduled.
         # L1 with fanout stays in ready for standalone attention scheduling.
-        for l1, relu, l2, d_int, exclusive in chains:
+        for l1, relu, l2, d_hidden, exclusive in chains:
             ready.discard(l2)
             ready.discard(relu)
             if exclusive:
@@ -102,8 +102,8 @@ class LayerScheduler:
         )
 
         # --- 2.5. Re-check readiness after attention ---
-        # Nodes computed by attention may unlock FFN-eligible nodes in the same
-        # layer (the FFN sublayer reads x + attn(x), so it sees attention results).
+        # Nodes computed by attention may unlock MLP-eligible nodes in the same
+        # layer (the MLP sublayer reads x + attn(x), so it sees attention results).
         newly_ready = self.graph.get_ready_nodes(computed_nodes) - all_ready
         for node in newly_ready:
             if isinstance(node, Add):
@@ -116,15 +116,15 @@ class LayerScheduler:
                 ready.add(node)
 
         new_chains = self._detect_chains(ready)
-        for l1, relu, l2, d_int, exclusive in new_chains:
+        for l1, relu, l2, d_hidden, exclusive in new_chains:
             ready.discard(l2)
             ready.discard(relu)
             if exclusive:
                 ready.discard(l1)
         chains.extend(new_chains)
 
-        # --- 3. FFN sublayer ---
-        ffn_ops = self._schedule_ffn_sublayer(
+        # --- 3. MLP sublayer ---
+        mlp_ops = self._schedule_mlp_sublayer(
             ready, chains, biased_linears, residual_map, computed_nodes
         )
 
@@ -132,7 +132,7 @@ class LayerScheduler:
         # Only raise if there were ready/schedulable nodes but nothing got scheduled
         # (actual deadlock). If nothing was ready, the caller just needs to provide
         # more inputs or call again after state changes.
-        if not attn_ops and not ffn_ops and had_schedulable:
+        if not attn_ops and not mlp_ops and had_schedulable:
             remaining = self.graph.get_all_nodes() - computed_nodes
             remaining = {n for n in remaining if not isinstance(n, Concatenate)}
             if remaining:
@@ -141,7 +141,7 @@ class LayerScheduler:
                     f"{residual_map.get_free_count()} free columns"
                 )
 
-        return attn_ops, ffn_ops, biased_linears
+        return attn_ops, mlp_ops, biased_linears
 
     # ------------------------------------------------------------------
     # Attention sublayer
@@ -268,13 +268,13 @@ class LayerScheduler:
         return attn_ops, biased_linears
 
     # ------------------------------------------------------------------
-    # FFN sublayer
+    # MLP sublayer
     # ------------------------------------------------------------------
 
-    def _schedule_ffn_sublayer(
+    def _schedule_mlp_sublayer(
         self, ready, chains, biased_linears, residual_map, computed_nodes
     ):
-        ffn_ops = []
+        mlp_ops = []
         next_slot = 0
 
         # 3a. L->R->L chains
@@ -288,15 +288,15 @@ class LayerScheduler:
             )
         else:
             chains.sort(key=lambda c: -self.graph.get_critical_path_length(c[2]))
-        for l1, relu, l2, d_int, exclusive in chains:
-            if next_slot + d_int > self.d:
+        for l1, relu, l2, d_hidden, exclusive in chains:
+            if next_slot + d_hidden > self.d:
                 continue
             target_cols = self._try_allocate(l2, residual_map)
             if target_cols is None:
                 continue
-            ffn_slots = list(range(next_slot, next_slot + d_int))
-            next_slot += d_int
-            ffn_ops.append(FFNOp("compute_relu", l2, target_cols, ffn_slots))
+            mlp_slots = list(range(next_slot, next_slot + d_hidden))
+            next_slot += d_hidden
+            mlp_ops.append(MLPOp("compute_relu", l2, target_cols, mlp_slots))
             computed_nodes.update({l1, relu, l2})
 
             # L1 with fanout: also allocate L1 in residual stream
@@ -324,10 +324,10 @@ class LayerScheduler:
             target_cols = self._try_allocate(node, residual_map)
             if target_cols is None:
                 continue
-            ffn_slots = list(range(next_slot, next_slot + d_relu))
+            mlp_slots = list(range(next_slot, next_slot + d_relu))
             next_slot += d_relu
-            ffn_ops.append(
-                FFNOp("compute_standalone_relu", node, target_cols, ffn_slots)
+            mlp_ops.append(
+                MLPOp("compute_standalone_relu", node, target_cols, mlp_slots)
             )
             computed_nodes.add(node)
 
@@ -340,15 +340,15 @@ class LayerScheduler:
             target_cols = self._try_allocate(node, residual_map)
             if target_cols is None:
                 continue
-            ffn_ops.append(FFNOp("compute_literal_value", node, target_cols, []))
+            mlp_ops.append(MLPOp("compute_literal_value", node, target_cols, []))
             computed_nodes.add(node)
 
         # 3d. Bias writes for biased Linears scheduled in attention sublayer
         for node in biased_linears:
             target_cols = residual_map.get_indices(node)
-            ffn_ops.append(FFNOp("compute_bias", node, target_cols, []))
+            mlp_ops.append(MLPOp("compute_bias", node, target_cols, []))
 
-        return ffn_ops
+        return mlp_ops
 
     # ------------------------------------------------------------------
     # Chain detection
@@ -357,7 +357,7 @@ class LayerScheduler:
     def _detect_chains(self, ready):
         """Detect L1->ReLU->L2 chains by walking forward from ready Linears.
 
-        Returns list of (l1, relu, l2, d_intermediate, exclusive).
+        Returns list of (l1, relu, l2, d_hidden, exclusive).
         exclusive means L1 has no effective consumers other than the ReLU.
         """
         chains = []
@@ -403,7 +403,9 @@ class LayerScheduler:
         """
         cost = len(node)
         for inp in node.inputs:
-            leaves = flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
+            leaves = (
+                flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
+            )
             for leaf in leaves:
                 if leaf is self.pos_encoding:
                     continue
@@ -424,17 +426,19 @@ class LayerScheduler:
     ) -> int:
         """Net column cost of an L1->ReLU->L2 chain.
 
-        Only L2 is allocated in the residual stream (L1/ReLU use FFN slots).
+        Only L2 is allocated in the residual stream (L1/ReLU use MLP slots).
         Non-exclusive L1 is also allocated separately.
         """
-        l1, relu, l2, d_int, exclusive = chain
+        l1, relu, l2, d_hidden, exclusive = chain
         cost = len(l2)
         if not exclusive and not residual_map.is_allocated(l1):
             cost += len(l1)
 
         hypothetical = computed_nodes | {l1, relu, l2}
         for inp in l1.inputs:
-            leaves = flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
+            leaves = (
+                flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
+            )
             for leaf in leaves:
                 if leaf is self.pos_encoding:
                     continue

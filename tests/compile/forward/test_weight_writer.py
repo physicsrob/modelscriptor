@@ -19,9 +19,9 @@ import torchwright.compiler.device as device_mod
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.weight_writer import (
     AttnHeadOp,
-    FFNOp,
+    MLPOp,
     write_attn_sublayer,
-    write_ffn_sublayer,
+    write_mlp_sublayer,
 )
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
@@ -63,7 +63,7 @@ def test_identity_layer():
     layer.to(device)
     inp = torch.randn(N_POS, D, device=device)
     out = layer.attn.forward(inp)
-    out = layer.ffn.forward(out)
+    out = layer.mlp.forward(out)
     assert torch.allclose(inp, out, atol=1e-6)
 
 
@@ -544,12 +544,12 @@ def test_compute_add_wide():
 
 
 # ---------------------------------------------------------------------------
-# FFN — compute_relu
+# MLP — compute_relu
 # ---------------------------------------------------------------------------
 
 
-def test_ffn_relu_chain():
-    """Linear -> ReLU -> Linear chain compiled via FFN."""
+def test_mlp_relu_chain():
+    """Linear -> ReLU -> Linear chain compiled via MLP."""
     x = InputNode("x", 4)
     W1 = torch.randn(4, 8)
     b1 = torch.randn(8)
@@ -563,28 +563,28 @@ def test_ffn_relu_chain():
     x_cols = rmap.allocate(x)
     out_cols = rmap.allocate(l2)
 
-    ffn_slots = list(range(0, 8))  # 8 internal FFN slots for the 8-dim intermediate
+    mlp_slots = list(range(0, 8))  # 8 internal MLP slots for the 8-dim intermediate
 
     layer = TransformerLayer(D, D_HEAD)
-    op = FFNOp(
-        op_type="compute_relu", node=l2, target_cols=out_cols, ffn_slots=ffn_slots
+    op = MLPOp(
+        op_type="compute_relu", node=l2, target_cols=out_cols, mlp_slots=mlp_slots
     )
-    write_ffn_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
     res = _build_residual_stream(rmap, {x: x_values})
 
-    # Run FFN sublayer only
-    out = layer.ffn.forward(res)
+    # Run MLP sublayer only
+    out = layer.mlp.forward(res)
     result = out[:, out_cols]
 
     expected = l2.compute(N_POS, {"x": x_values})
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
-def test_ffn_relu_chain_multiple():
-    """Two L->R->L chains in same FFN, using different slot ranges."""
+def test_mlp_relu_chain_multiple():
+    """Two L->R->L chains in same MLP, using different slot ranges."""
     x = InputNode("x", 4)
     y = InputNode("y", 3)
 
@@ -606,27 +606,27 @@ def test_ffn_relu_chain_multiple():
 
     layer = TransformerLayer(D, D_HEAD)
     ops = [
-        FFNOp(
+        MLPOp(
             op_type="compute_relu",
             node=l1b,
             target_cols=out1_cols,
-            ffn_slots=list(range(0, 6)),
+            mlp_slots=list(range(0, 6)),
         ),
-        FFNOp(
+        MLPOp(
             op_type="compute_relu",
             node=l2b,
             target_cols=out2_cols,
-            ffn_slots=list(range(6, 11)),
+            mlp_slots=list(range(6, 11)),
         ),
     ]
-    write_ffn_sublayer(layer, ops, rmap)
+    write_mlp_sublayer(layer, ops, rmap)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
     y_values = torch.randn(N_POS, 3)
     res = _build_residual_stream(rmap, {x: x_values, y: y_values})
 
-    out = layer.ffn.forward(res)
+    out = layer.mlp.forward(res)
 
     expected1 = l1b.compute(N_POS, {"x": x_values})
     expected2 = l2b.compute(N_POS, {"y": y_values})
@@ -635,12 +635,12 @@ def test_ffn_relu_chain_multiple():
 
 
 # ---------------------------------------------------------------------------
-# FFN — compute_standalone_relu
+# MLP — compute_standalone_relu
 # ---------------------------------------------------------------------------
 
 
-def test_ffn_standalone_relu():
-    """Standalone ReLU compiled via FFN with identity linear1/linear2."""
+def test_mlp_standalone_relu():
+    """Standalone ReLU compiled via MLP with identity linear1/linear2."""
     x = InputNode("x", 4)
     relu_node = ReLU(x, name="standalone_relu")
 
@@ -648,16 +648,16 @@ def test_ffn_standalone_relu():
     x_cols = rmap.allocate(x)
     out_cols = rmap.allocate(relu_node)
 
-    ffn_slots = list(range(0, 4))  # 4 slots for 4-dim ReLU
+    mlp_slots = list(range(0, 4))  # 4 slots for 4-dim ReLU
 
     layer = TransformerLayer(D, D_HEAD)
-    op = FFNOp(
+    op = MLPOp(
         op_type="compute_standalone_relu",
         node=relu_node,
         target_cols=out_cols,
-        ffn_slots=ffn_slots,
+        mlp_slots=mlp_slots,
     )
-    write_ffn_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 
     # Input with mix of positive and negative values to exercise ReLU
@@ -671,14 +671,14 @@ def test_ffn_standalone_relu():
     )
     res = _build_residual_stream(rmap, {x: x_values})
 
-    out = layer.ffn.forward(res)
+    out = layer.mlp.forward(res)
     result = out[:, out_cols]
 
     expected = relu_node.compute(N_POS, {"x": x_values})
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
-def test_ffn_standalone_relu_preserves_input():
+def test_mlp_standalone_relu_preserves_input():
     """Standalone ReLU doesn't corrupt the input node's columns."""
     x = InputNode("x", 4)
     relu_node = ReLU(x, name="standalone_relu")
@@ -687,16 +687,16 @@ def test_ffn_standalone_relu_preserves_input():
     x_cols = rmap.allocate(x)
     out_cols = rmap.allocate(relu_node)
 
-    ffn_slots = list(range(0, 4))
+    mlp_slots = list(range(0, 4))
 
     layer = TransformerLayer(D, D_HEAD)
-    op = FFNOp(
+    op = MLPOp(
         op_type="compute_standalone_relu",
         node=relu_node,
         target_cols=out_cols,
-        ffn_slots=ffn_slots,
+        mlp_slots=mlp_slots,
     )
-    write_ffn_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.tensor(
@@ -709,19 +709,19 @@ def test_ffn_standalone_relu_preserves_input():
     )
     res = _build_residual_stream(rmap, {x: x_values})
 
-    out = layer.ffn.forward(res)
+    out = layer.mlp.forward(res)
 
     # Input columns should be preserved by the skip connection
     assert torch.allclose(out[:, x_cols].cpu(), x_values, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
-# FFN — compute_literal_value
+# MLP — compute_literal_value
 # ---------------------------------------------------------------------------
 
 
-def test_ffn_constant():
-    """LiteralValue written via FFN output bias."""
+def test_mlp_constant():
+    """LiteralValue written via MLP output bias."""
     const_value = torch.tensor([1.0, -2.0, 3.5])
     const = LiteralValue(const_value)
 
@@ -729,16 +729,16 @@ def test_ffn_constant():
     out_cols = rmap.allocate(const)
 
     layer = TransformerLayer(D, D_HEAD)
-    op = FFNOp(
-        op_type="compute_literal_value", node=const, target_cols=out_cols, ffn_slots=[]
+    op = MLPOp(
+        op_type="compute_literal_value", node=const, target_cols=out_cols, mlp_slots=[]
     )
-    write_ffn_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], rmap)
     device = device_mod.get_device(verbose=False)
     layer.to(device)
 
     res = torch.zeros(N_POS, D, device=device)
 
-    out = layer.ffn.forward(res)
+    out = layer.mlp.forward(res)
     result = out[:, out_cols]
 
     expected = const.compute(N_POS, {})
@@ -746,12 +746,12 @@ def test_ffn_constant():
 
 
 # ---------------------------------------------------------------------------
-# Biased Linear split (attention Wx + FFN b)
+# Biased Linear split (attention Wx + MLP b)
 # ---------------------------------------------------------------------------
 
 
 def test_biased_linear_split():
-    """Linear with non-zero bias: attention computes Wx, FFN adds b."""
+    """Linear with non-zero bias: attention computes Wx, MLP adds b."""
     pos = _make_pos_encoding()
     x = InputNode("x", 4)
     W = torch.randn(4, 3)
@@ -771,20 +771,20 @@ def test_biased_linear_split():
     )
     write_attn_sublayer(layer, [attn_op], rmap, pos)
 
-    # FFN adds bias
-    ffn_op = FFNOp(
-        op_type="compute_bias", node=linear_node, target_cols=out_cols, ffn_slots=[]
+    # MLP adds bias
+    mlp_op = MLPOp(
+        op_type="compute_bias", node=linear_node, target_cols=out_cols, mlp_slots=[]
     )
-    write_ffn_sublayer(layer, [ffn_op], rmap)
+    write_mlp_sublayer(layer, [mlp_op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
     pe_values = pos.compute(N_POS, {})
     res = _build_residual_stream(rmap, {pos: pe_values, x: x_values})
 
-    # Run full layer: attn sublayer then ffn sublayer
+    # Run full layer: attn sublayer then mlp sublayer
     out = layer.attn.forward(res)
-    out = layer.ffn.forward(out)
+    out = layer.mlp.forward(out)
     result = out[:, out_cols]
 
     expected = linear_node.compute(N_POS, {"x": x_values})
@@ -834,12 +834,12 @@ def test_non_contiguous_columns():
 
 
 # ---------------------------------------------------------------------------
-# Mixed layer (attn + FFN together)
+# Mixed layer (attn + MLP together)
 # ---------------------------------------------------------------------------
 
 
 def test_mixed_layer():
-    """One layer with both attention ops and FFN ops, verifying composition."""
+    """One layer with both attention ops and MLP ops, verifying composition."""
     pos = _make_pos_encoding()
     x = InputNode("x", 4)
 
@@ -847,7 +847,7 @@ def test_mixed_layer():
     W_attn = torch.randn(4, 3)
     lin_attn = Linear(x, W_attn, torch.zeros(3), name="lin_attn")
 
-    # FFN: constant
+    # MLP: constant
     const_value = torch.tensor([7.0, -3.0])
     const = LiteralValue(const_value)
 
@@ -865,11 +865,14 @@ def test_mixed_layer():
     )
     write_attn_sublayer(layer, [attn_op], rmap, pos)
 
-    # Write FFN ops
-    ffn_op = FFNOp(
-        op_type="compute_literal_value", node=const, target_cols=const_cols, ffn_slots=[]
+    # Write MLP ops
+    mlp_op = MLPOp(
+        op_type="compute_literal_value",
+        node=const,
+        target_cols=const_cols,
+        mlp_slots=[],
     )
-    write_ffn_sublayer(layer, [ffn_op], rmap)
+    write_mlp_sublayer(layer, [mlp_op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -878,12 +881,12 @@ def test_mixed_layer():
 
     # Run full layer
     out = layer.attn.forward(res)
-    out = layer.ffn.forward(out)
+    out = layer.mlp.forward(out)
 
     # Check attention result
     expected_attn = lin_attn.compute(N_POS, {"x": x_values})
     assert torch.allclose(out[:, attn_out_cols].cpu(), expected_attn, atol=1e-4)
 
-    # Check FFN result
+    # Check MLP result
     expected_const = const.compute(N_POS, {})
     assert torch.allclose(out[:, const_cols].cpu(), expected_const, atol=1e-4)

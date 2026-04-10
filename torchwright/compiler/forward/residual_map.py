@@ -1,7 +1,7 @@
 from typing import Dict, List, Set
 
-from torchwright.compiler.feature_assignment import (
-    FeatureAssignment,
+from torchwright.compiler.residual_assignment import (
+    ResidualAssignment,
     ResidualStreamState,
     flatten_concat_nodes,
 )
@@ -71,14 +71,14 @@ class ResidualStreamMap:
     def get_allocated_nodes(self) -> Set[Node]:
         return set(self._node_to_indices.keys())
 
-    def build_feature_assignment(
+    def build_residual_assignment(
         self,
         in_state: ResidualStreamState,
         out_state: ResidualStreamState,
         input_nodes: List[Node],
         output_node: Node,
-    ) -> FeatureAssignment:
-        """Build a FeatureAssignment bridge for HeadlessTransformer.compute().
+    ) -> ResidualAssignment:
+        """Build a ResidualAssignment bridge for HeadlessTransformer.compute().
 
         Populates exactly two states:
         - in_state with all input_nodes at their allocated columns
@@ -86,8 +86,8 @@ class ResidualStreamMap:
         - out_state with output_node at its allocated columns
           (read by compute)
         """
-        fa = FeatureAssignment({in_state, out_state})
+        ra = ResidualAssignment({in_state, out_state})
         for node in input_nodes:
-            fa.assign(in_state, node, self.get_indices(node))
-        fa.assign(out_state, output_node, self.get_indices(output_node))
-        return fa
+            ra.assign(in_state, node, self.get_indices(node))
+        ra.assign(out_state, output_node, self.get_indices(output_node))
+        return ra

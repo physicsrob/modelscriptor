@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from torchwright.compiler.feature_assignment import ResidualStreamState
+from torchwright.compiler.residual_assignment import ResidualStreamState
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.graph import Node, Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
@@ -73,8 +73,8 @@ def test_reassign():
     assert rmap.get_free_count() == 56  # unchanged
 
 
-def test_build_feature_assignment():
-    """Build a FeatureAssignment and verify get_node_indices works."""
+def test_build_residual_assignment():
+    """Build a ResidualAssignment and verify get_node_indices works."""
     rmap = ResidualStreamMap(64)
     inp = InputNode("x", 8)
     const = LiteralValue(torch.ones(4))
@@ -87,16 +87,16 @@ def test_build_feature_assignment():
     in_state = ResidualStreamState(name="in")
     out_state = ResidualStreamState(name="out")
 
-    fa = rmap.build_feature_assignment(
+    ra = rmap.build_residual_assignment(
         in_state=in_state,
         out_state=out_state,
         input_nodes=[inp, const],
         output_node=out,
     )
 
-    assert fa.get_node_indices(in_state, inp) == idx_inp
-    assert fa.get_node_indices(in_state, const) == idx_const
-    assert fa.get_node_indices(out_state, out) == idx_out
+    assert ra.get_node_indices(in_state, inp) == idx_inp
+    assert ra.get_node_indices(in_state, const) == idx_const
+    assert ra.get_node_indices(out_state, out) == idx_out
 
 
 def test_no_fragmentation():

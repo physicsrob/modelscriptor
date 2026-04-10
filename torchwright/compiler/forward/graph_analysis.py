@@ -1,7 +1,7 @@
 from collections import defaultdict, deque
 from typing import Dict, List, Set
 
-from torchwright.compiler.feature_assignment import flatten_concat_nodes
+from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import (
     Node,

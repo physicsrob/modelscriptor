@@ -1,13 +1,13 @@
 from typing import Optional
 
 from torchwright.compiler.groups.attn_sublayer import AttnSubLayer
-from torchwright.compiler.groups.ffn_sublayer import FFNSubLayer
+from torchwright.compiler.groups.mlp_sublayer import MLPSubLayer
 from torchwright.graph import PosEncoding
 
 
 class TransformerLayer:
     attn: AttnSubLayer
-    ffn: FFNSubLayer
+    mlp: MLPSubLayer
 
     def __init__(
         self,
@@ -16,12 +16,12 @@ class TransformerLayer:
         pos_encoding: Optional[PosEncoding] = None,
     ):
         self.attn = AttnSubLayer(d, d_head, pos_encoding)
-        self.ffn = FFNSubLayer(d)
+        self.mlp = MLPSubLayer(d)
 
     def to(self, device):
         self.attn.to(device)
-        self.ffn.to(device)
+        self.mlp.to(device)
         return self
 
     def num_params(self):
-        return self.attn.num_params() + self.ffn.num_params()
+        return self.attn.num_params() + self.mlp.num_params()

@@ -5,35 +5,37 @@ Produces a HeadlessTransformer that can compute the output node's value
 given input values.
 """
 
-from typing import Optional
+import time
+from typing import Callable, Optional
 
 import torch
 
 from torchwright.compiler.device import get_device
-from torchwright.compiler.feature_assignment import FeatureAssignment
+from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.scheduler import LayerScheduler
 from torchwright.compiler.forward.weight_writer import (
     AttnHeadOp,
-    FFNOp,
+    MLPOp,
     write_attn_sublayer,
-    write_ffn_sublayer,
+    write_mlp_sublayer,
 )
+from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.compiler.transformer import HeadlessTransformer
-from torchwright.compiler.feature_assignment import flatten_concat_nodes
+from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Node, Linear, Concatenate
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 
 
 def _count_layer_params(
-    attn_ops: list[AttnHeadOp], ffn_ops: list[FFNOp], d: int, d_head: int
+    attn_ops: list[AttnHeadOp], mlp_ops: list[MLPOp], d: int, d_head: int
 ) -> int:
     """Count transformer parameters used by one layer's ops.
 
     Attention ops consume whole heads (4 * d * d_head params each).
-    FFN ops consume slots (2*d + 2 params each) or bias entries (1 each).
+    MLP ops consume slots (2*d + 2 params each) or bias entries (1 each).
     """
     params_per_head = 4 * d * d_head
 
@@ -51,9 +53,9 @@ def _count_layer_params(
 
     slots_used = 0
     bias_entries = 0
-    for op in ffn_ops:
-        if op.ffn_slots:
-            slots_used += len(op.ffn_slots)
+    for op in mlp_ops:
+        if op.mlp_slots:
+            slots_used += len(op.mlp_slots)
         if op.op_type in ("compute_literal_value", "compute_bias"):
             bias_entries += len(op.target_cols)
 
@@ -69,6 +71,7 @@ def forward_compile(
     verbose: bool = True,
     max_layers: int = 100,
     device: Optional[str] = "auto",
+    on_layer_compiled: Optional[Callable[[int, TransformerLayer], None]] = None,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -81,6 +84,14 @@ def forward_compile(
         max_layers: Safety limit on number of layers.
         device: Target device — "auto" (default) uses GPU if available,
                 "cpu"/"cuda" to force, or None to skip moving.
+        on_layer_compiled: Optional streaming hook, called with
+            ``(layer_index, layer)`` after each layer's weights are fully
+            written.  The callback may extract weight tensors and then
+            null the component weight attributes to reclaim memory
+            before the next layer is allocated.  The residual-stream
+            state objects (``layer.attn.in_state`` / ``layer.mlp.out_state``)
+            stay valid regardless and are consumed later when building
+            ``residual_assignment``.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -112,6 +123,12 @@ def forward_compile(
 
     graph_params = sum(n.num_params() for n in graph.get_all_nodes())
 
+    # Per-layer tensor capacity (Q/K/V/O attention matrices + linear1/linear2
+    # weights & biases).  Computed once instead of via `layer.num_params()` so
+    # the verbose log still works after `on_layer_compiled` nulls the layer's
+    # weight attributes.
+    layer_capacity = 6 * d * d + 2 * d
+
     if verbose:
         print(
             f"Compiling {len(graph.get_all_nodes())} graph nodes "
@@ -119,21 +136,36 @@ def forward_compile(
         )
         print(
             f"  {'Layer':<8} {'Ops':>8}  {'Layer params':>28}  "
-            f"{'Stream in':>10}  {'Stream out':>11}"
+            f"{'Stream in':>10}  {'Stream out':>11}  {'Time':>10}"
         )
 
     # 3. Layer loop — seed with input node params (Embedding, etc.)
     total_params = sum(n.num_params() for n in input_nodes)
+    total_layer_time = 0.0
     for i in range(max_layers):
         if output_node in computed:
             break
 
         occupied_before = d - residual_map.get_free_count()
 
+        t_layer_start = time.perf_counter()
         layer = net.add_layer(append=True)
-        attn_ops, ffn_ops, biased_linears = scheduler.schedule_layer(residual_map, computed)
+        t_schedule_start = time.perf_counter()
+        attn_ops, mlp_ops, biased_linears = scheduler.schedule_layer(
+            residual_map, computed
+        )
+        t_attn_start = time.perf_counter()
         write_attn_sublayer(layer, attn_ops, residual_map, pos_encoding)
-        write_ffn_sublayer(layer, ffn_ops, residual_map, set(biased_linears))
+        t_mlp_start = time.perf_counter()
+        write_mlp_sublayer(layer, mlp_ops, residual_map, set(biased_linears))
+        t_layer_end = time.perf_counter()
+
+        layer_time = t_layer_end - t_layer_start
+        alloc_time = t_schedule_start - t_layer_start
+        schedule_time = t_attn_start - t_schedule_start
+        attn_time = t_mlp_start - t_attn_start
+        mlp_time = t_layer_end - t_mlp_start
+        total_layer_time += layer_time
 
         # Mark Concatenate nodes as computed when all leaf inputs are done
         for node in graph.get_all_nodes():
@@ -141,13 +173,12 @@ def forward_compile(
                 if all(leaf in computed for leaf in flatten_concat_nodes([node])):
                     computed.add(node)
 
-        layer_params = _count_layer_params(attn_ops, ffn_ops, d, d_head)
+        layer_params = _count_layer_params(attn_ops, mlp_ops, d, d_head)
         total_params += layer_params
         occupied_after = d - residual_map.get_free_count()
 
         if verbose:
-            n_ops = len(attn_ops) + len(ffn_ops)
-            layer_capacity = layer.num_params()
+            n_ops = len(attn_ops) + len(mlp_ops)
             pct_params = 100 * layer_params / layer_capacity if layer_capacity else 0
             pct_before = 100 * occupied_before // d
             pct_after = 100 * occupied_after // d
@@ -155,39 +186,54 @@ def forward_compile(
                 f"  {i:<8} {n_ops:>5} ops  "
                 f"{layer_params:>9,}/{layer_capacity:,} ({pct_params:>4.1f}%)  "
                 f"{occupied_before:>6}/{d} ({pct_before:>2}%)  "
-                f"{occupied_after:>6}/{d} ({pct_after:>2}%)"
+                f"{occupied_after:>6}/{d} ({pct_after:>2}%)  "
+                f"{layer_time*1000:>7.1f}ms "
+                f"(alloc {alloc_time*1000:.0f} sch {schedule_time*1000:.0f} "
+                f"attn {attn_time*1000:.0f} mlp {mlp_time*1000:.0f})",
+                flush=True,
             )
+
+        if on_layer_compiled is not None:
+            on_layer_compiled(i, layer)
     else:
         raise RuntimeError(
             f"Compilation did not converge in {max_layers} layers. "
             f"{len(graph.get_all_nodes() - computed)} nodes remaining."
         )
 
-    transformer_params = sum(layer.num_params() for layer in net.layers)
+    # layer_capacity is constant per layer (6*d*d + 2*d); avoids touching
+    # layer tensors, which may have been freed by on_layer_compiled.
+    transformer_params = layer_capacity * len(net.layers)
     if verbose:
         pct_used = 100 * total_params / transformer_params if transformer_params else 0
         print(
             f"\n  {len(net.layers)} layers, "
             f"{total_params:,} / {transformer_params:,} params used "
-            f"({pct_used:.1f}%)"
+            f"({pct_used:.1f}%), "
+            f"{total_layer_time:.2f}s total layer time"
         )
 
-    # Ensure at least one layer exists for FeatureAssignment states
+    # Ensure at least one layer exists for ResidualAssignment states.
+    # If compile produced zero layers (trivial graph), run the callback on
+    # the placeholder too so every layer in net.layers is consistently in
+    # the extracted state.
     if not net.layers:
-        net.add_layer(append=True)
+        fallback_layer = net.add_layer(append=True)
+        if on_layer_compiled is not None:
+            on_layer_compiled(0, fallback_layer)
 
-    # 4. Build FeatureAssignment bridge from saved input indices
+    # 4. Build ResidualAssignment bridge from saved input indices
     in_state = net.layers[0].attn.in_state
-    out_state = net.layers[-1].ffn.out_state
-    fa = FeatureAssignment({in_state, out_state})
+    out_state = net.layers[-1].mlp.out_state
+    ra = ResidualAssignment({in_state, out_state})
     for node, indices in input_indices.items():
-        fa.assign(in_state, node, indices)
+        ra.assign(in_state, node, indices)
     if isinstance(output_node, Concatenate):
         for leaf in flatten_concat_nodes([output_node]):
-            fa.assign(out_state, leaf, residual_map.get_indices(leaf))
+            ra.assign(out_state, leaf, residual_map.get_indices(leaf))
     else:
-        fa.assign(out_state, output_node, residual_map.get_indices(output_node))
-    net.feature_assignment = fa
+        ra.assign(out_state, output_node, residual_map.get_indices(output_node))
+    net.residual_assignment = ra
 
     if device == "auto":
         net.to(get_device(verbose=verbose))

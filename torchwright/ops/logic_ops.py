@@ -36,20 +36,21 @@ def bool_all_true(inp_list: List[Node]) -> Node:
     """
     Returns a node that evaluates to True if all of the input nodes are true.
 
+    Inputs must be clean ±1.0 booleans (as produced by compare/bool_* ops).
+    Sum of N such inputs is +N only when all are +1; otherwise ≤ N-2.
+    A threshold at N-1 cleanly separates the two cases.
+
     Args:
         inp_list (List[Node]): List of nodes to be evaluated.
 
     Returns:
         Node: Output node that is True if all input nodes are true, otherwise False.
     """
-    # Strategy:
-    # Convert all the values to 1.0 if they're > 0.0 and 0.0 otherwise
-    # then sum them, and if the sum is > (len(nodes)-0.5), return 1.0, otherwise -1.0
-    sum_node = sum_nodes(
-        [compare(n, thresh=0.0, true_level=1.0, false_level=0.0) for n in inp_list]
-    )
     return compare(
-        sum_node, thresh=len(inp_list) - 0.5, true_level=1.0, false_level=-1.0
+        sum_nodes(inp_list),
+        thresh=len(inp_list) - 1.0,
+        true_level=1.0,
+        false_level=-1.0,
     )
 
 
@@ -79,9 +80,9 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     """
     # If value1 == c, result is 1
     # else result is -1
-    # We'll use a FFN:
+    # We'll use an MLP:
     # y = 2.0*speed * max(1.0/speed + c @ value - c @ c, 0) - 1.0
-    # d_int = 1
+    # d_hidden = 1
     speed = embedding_step_sharpness
     input_proj = vector.unsqueeze(0)  # We're dotting vector into value
     input_bias = 1.0 / speed - vector @ vector
@@ -117,7 +118,7 @@ def cond_add_vector(
     assert len(cond) == 1
     assert len(true_vector) == len(false_vector) == len(inp)
 
-    # We need 2 FFN entries, we'll use the equation:
+    # We need 2 MLP entries, we'll use the equation:
     # y= c * [max(step_sharpness*x, 0) - max(step_sharpness*x - 1, 0)]
     # And rely on the residual connection
 

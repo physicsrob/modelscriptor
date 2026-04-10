@@ -2,19 +2,19 @@ import torch
 
 from torchwright.compiler.components.linear import LinearLayerComponent
 from torchwright.compiler.components.relu import ReLULayerComponent
-from torchwright.compiler.feature_assignment import ResidualStreamState
+from torchwright.compiler.residual_assignment import ResidualStreamState
 
 
-class FFNSubLayer:
-    """Feed-forward sublayer: linear1 -> relu -> linear2 + residual skip.
+class MLPSubLayer:
+    """MLP sublayer: linear1 -> relu -> linear2 + residual skip.
 
     Forward: out = linear2(relu(linear1(inp))) + inp
     """
 
     def __init__(self, d: int):
         self.d = d
-        self.in_state = ResidualStreamState(name="FFNSubLayer In State")
-        self.out_state = ResidualStreamState(name="FFNSubLayer Out State")
+        self.in_state = ResidualStreamState(name="MLPSubLayer In State")
+        self.out_state = ResidualStreamState(name="MLPSubLayer Out State")
         self.linear1 = LinearLayerComponent(d, name="linear1")
         self.relu = ReLULayerComponent(d, name="relu")
         self.linear2 = LinearLayerComponent(d, name="linear2")
