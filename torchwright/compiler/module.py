@@ -73,6 +73,49 @@ class _AttentionLayer(nn.Module):
         # Sum over heads + skip connection
         return out.sum(dim=0) + inp
 
+    def forward_cached(
+        self,
+        inp: torch.Tensor,
+        past_K: torch.Tensor,
+        past_V: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cached forward.
+
+        Args:
+            inp:    (n_new, d) — residual stream for new positions only.
+            past_K: (n_heads, n_past, d_head)
+            past_V: (n_heads, n_past, d_head)
+
+        Returns:
+            (out, new_K, new_V) where out is (n_new, d) with the skip
+            connection applied, and new_K / new_V are
+            (n_heads, n_past + n_new, d_head).
+        """
+        n_new = inp.shape[0]
+
+        Q = (inp @ self.W_Q).view(n_new, self.n_heads, self.d_head).permute(1, 0, 2)
+        K_new = (inp @ self.W_K).view(n_new, self.n_heads, self.d_head).permute(1, 0, 2)
+        V_new = (inp @ self.W_V).view(n_new, self.n_heads, self.d_head).permute(1, 0, 2)
+
+        K = torch.cat([past_K, K_new], dim=1)
+        V = torch.cat([past_V, V_new], dim=1)
+        n_total = K.shape[1]
+
+        attn_logits = torch.bmm(Q, K.transpose(-2, -1))  # (n_heads, n_new, n_total)
+
+        # Row r (absolute position n_past + r) may attend to columns 0..n_past+r.
+        # Mask column c when c > n_past + r, i.e. triu diagonal = n_total - n_new + 1.
+        mask = torch.triu(
+            torch.ones(n_new, n_total, dtype=torch.bool, device=inp.device),
+            diagonal=n_total - n_new + 1,
+        ).unsqueeze(0)
+        attn_logits = attn_logits.masked_fill(mask, -1000.0)
+
+        attn_weights = torch.softmax(attn_logits, dim=-1)
+        attn_out = torch.bmm(attn_weights, V)
+        out = torch.bmm(attn_out, self.W_O)
+        return out.sum(dim=0) + inp, K, V
+
 
 class _FFNLayer(nn.Module):
     """Feed-forward sublayer: linear1 -> ReLU -> linear2 + skip connection."""
@@ -152,6 +195,52 @@ class CompiledTransformerModule(nn.Module):
         output_emb = res[:, self.output_gather_indices]  # (seq_len, d_embed)
         logits = output_emb @ self.unembed_table.T  # (seq_len, vocab_size)
         return logits.to(orig_device)
+
+
+class _CachedTransformerWrapper(nn.Module):
+    """Export-friendly cached forward for CompiledTransformerModule.
+
+    Signature matches the ONNX graph:
+        forward(token_ids, past_len, past_K_0, past_V_0, ..., past_K_{N-1}, past_V_{N-1})
+          -> (logits, new_K_0, new_V_0, ..., new_K_{N-1}, new_V_{N-1})
+
+    Prefill is expressed by passing empty past tensors
+    (shape (n_heads, 0, d_head)) and past_len=0.
+    """
+
+    def __init__(self, base: CompiledTransformerModule):
+        super().__init__()
+        self.base = base
+        self.n_layers = len(base.layers)
+
+    def forward(
+        self,
+        token_ids: torch.LongTensor,
+        past_len: torch.LongTensor,
+        *past_kvs: torch.Tensor,
+    ):
+        b = self.base
+        n_new = token_ids.shape[0]
+
+        embedded = b.token_embedding(token_ids)  # (n_new, d_embed)
+        pos = b.pos_encoding[past_len : past_len + n_new]  # (n_new, d_pos)
+        res = embedded @ b.embedding_proj + pos @ b.pos_proj + b.constant_values
+
+        new_kvs: List[torch.Tensor] = []
+        for i, layer_pair in enumerate(b.layers):
+            assert isinstance(layer_pair, nn.ModuleList)
+            attn_mod = layer_pair[0]
+            ffn_mod = layer_pair[1]
+            past_K_i = past_kvs[2 * i]
+            past_V_i = past_kvs[2 * i + 1]
+            res, new_K_i, new_V_i = attn_mod.forward_cached(res, past_K_i, past_V_i)
+            res = ffn_mod(res)
+            new_kvs.append(new_K_i)
+            new_kvs.append(new_V_i)
+
+        output_emb = res[:, b.output_gather_indices]
+        logits = output_emb @ b.unembed_table.T
+        return (logits, *new_kvs)
 
 
 class HeadlessTransformerModule(nn.Module):

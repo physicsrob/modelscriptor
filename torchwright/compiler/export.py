@@ -9,6 +9,7 @@ from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.module import (
     CompiledTransformerModule,
     HeadlessTransformerModule,
+    _CachedTransformerWrapper,
     to_module,
     to_headless_module,
 )
@@ -17,25 +18,63 @@ from torchwright.graph.embedding import Embedding
 from torchwright.graph.pos_encoding import PosEncoding
 
 
-def _export_onnx(
+def _export_onnx_cached(
     module: CompiledTransformerModule,
     output_path: str,
     opset_version: int = 14,
-    example_seq_len: int = 10,
+    example_seq_len: int = 4,
 ) -> None:
+    """Export with KV cache plumbing.
+
+    Graph I/O:
+        inputs:  token_ids, past_len, past_K_i, past_V_i  (i in 0..n_layers-1)
+        outputs: logits, new_K_i, new_V_i                  (i in 0..n_layers-1)
+
+    Prefill uses empty past tensors of shape (n_heads, 0, d_head) and
+    past_len=0. Decode uses (n_heads, past_len, d_head).
+    """
     module.eval()
-    dummy_input = torch.zeros(example_seq_len, dtype=torch.long)
+    wrapper = _CachedTransformerWrapper(module)
+    wrapper.eval()
+
+    n_layers = len(module.layers)
+    first_layer = module.layers[0]
+    assert isinstance(first_layer, torch.nn.ModuleList)
+    first_attn = first_layer[0]
+    n_heads = first_attn.n_heads
+    d_head = first_attn.d_head
+
+    dummy_tokens = torch.zeros(example_seq_len, dtype=torch.long)
+    dummy_past_len = torch.tensor(0, dtype=torch.long)
+    dummy_past_kvs = []
+    for _ in range(n_layers):
+        dummy_past_kvs.append(torch.zeros(n_heads, 0, d_head, dtype=torch.float32))
+        dummy_past_kvs.append(torch.zeros(n_heads, 0, d_head, dtype=torch.float32))
+
+    input_names = ["token_ids", "past_len"]
+    output_names = ["logits"]
+    for i in range(n_layers):
+        input_names += [f"past_K_{i}", f"past_V_{i}"]
+        output_names += [f"new_K_{i}", f"new_V_{i}"]
+
+    dynamic_axes: dict = {
+        "token_ids": {0: "n_new"},
+        "logits": {0: "n_new"},
+    }
+    for i in range(n_layers):
+        dynamic_axes[f"past_K_{i}"] = {1: "n_past"}
+        dynamic_axes[f"past_V_{i}"] = {1: "n_past"}
+        dynamic_axes[f"new_K_{i}"] = {1: "n_total"}
+        dynamic_axes[f"new_V_{i}"] = {1: "n_total"}
+
     torch.onnx.export(
-        module,
-        (dummy_input,),
+        wrapper,
+        (dummy_tokens, dummy_past_len, *dummy_past_kvs),
         output_path,
         opset_version=opset_version,
-        input_names=["token_ids"],
-        output_names=["logits"],
-        dynamic_axes={
-            "token_ids": {0: "seq_len"},
-            "logits": {0: "seq_len"},
-        },
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
         dynamo=False,
     )
 
@@ -92,7 +131,7 @@ def compile_to_onnx(
 
     if verbose:
         print(f"Exporting ONNX: {n_layers} layers, {n_params:,} parameters")
-    _export_onnx(module, output_path)
+    _export_onnx_cached(module, output_path)
 
     vocab_path = _vocab_path_for(output_path)
     with open(vocab_path, "w") as f:
