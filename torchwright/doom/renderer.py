@@ -124,6 +124,91 @@ def _wall_height_lookup(
 
 
 # ---------------------------------------------------------------------------
+# Shared products (2D lookup)
+# ---------------------------------------------------------------------------
+
+# Position breakpoints: dense near 0, sparser at extremes.
+_POS_BREAKPOINTS = [
+    -20.0, -15.0, -10.0, -7.0, -5.0, -3.0, -2.0, -1.0, -0.5,
+    0.0,
+    0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0,
+]
+
+# Trig value breakpoints: full [-1, 1] range.
+_TRIG_BREAKPOINTS = [
+    -1.0, -0.9, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 0.9, 1.0,
+]
+
+
+def _shared_products(
+    player_x: Node,
+    player_y: Node,
+    ray_cos: Node,
+    ray_sin: Node,
+) -> Tuple[Node, Node]:
+    """Compute px*sin(θ) and py*cos(θ) via 2D lookups (1 FFN each).
+
+    Replaces two ``signed_multiply`` calls (~3 FFN each) with two
+    ``piecewise_linear_2d`` lookups (1 FFN each, parallel).
+    """
+    px_sin = piecewise_linear_2d(
+        player_x, ray_sin,
+        _POS_BREAKPOINTS, _TRIG_BREAKPOINTS,
+        lambda x, s: x * s,
+        name="px_sin_2d",
+    )
+    py_cos = piecewise_linear_2d(
+        player_y, ray_cos,
+        _POS_BREAKPOINTS, _TRIG_BREAKPOINTS,
+        lambda y, c: y * c,
+        name="py_cos_2d",
+    )
+    return px_sin, py_cos
+
+
+# ---------------------------------------------------------------------------
+# u-normalization (2D lookup)
+# ---------------------------------------------------------------------------
+
+# adj_num_u breakpoints: ranges from 0 to ~max_coord (sign-normalized).
+_U_BREAKPOINTS = [
+    0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 30.0, 40.0,
+]
+
+# abs_den breakpoints: from small (glancing angles) to large.
+_DEN_BREAKPOINTS = [
+    0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 25.0, 40.0,
+]
+
+
+def _u_norm_lookup(
+    winning_adj_num_u: Node,
+    winning_abs_den: Node,
+    tex_w: int,
+    max_coord: float,
+) -> Node:
+    """Compute texture column index via a single 2D lookup.
+
+    Replaces the 7-FFN chain (clamp → reciprocal → signed_multiply →
+    clamp → multiply_const → thermometer_floor_div) with 1 FFN layer.
+
+    Returns a scalar node containing floor(clamp(u/den, 0, 1) * tex_w),
+    i.e. an integer in [0, tex_w-1].
+    """
+    def _tex_col(u, d):
+        d_safe = builtins.max(0.01, builtins.min(2.0 * max_coord, d))
+        u_norm = builtins.max(0.0, builtins.min(1.0 - 1e-4, u / d_safe))
+        return builtins.min(tex_w - 1, builtins.max(0, int(u_norm * tex_w)))
+
+    return piecewise_linear_2d(
+        winning_adj_num_u, winning_abs_den,
+        _U_BREAKPOINTS, _DEN_BREAKPOINTS,
+        lambda u, d: float(_tex_col(u, d)),
+        name="tex_col_2d",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Stage 3: Per-segment intersection (Linear nodes — zero FFN cost)
 # ---------------------------------------------------------------------------
 
@@ -528,15 +613,7 @@ def build_textured_rendering_pipeline(
     # --- Stages 1-3: identical to solid-color pipeline ---
 
     ray_cos, ray_sin = trig_lookup(ray_angle)
-
-    px_sin = signed_multiply(
-        player_x, ray_sin,
-        max_abs1=max_coord, max_abs2=1.0, step=0.25,
-    )
-    py_cos = signed_multiply(
-        player_y, ray_cos,
-        max_abs1=max_coord, max_abs2=1.0, step=0.25,
-    )
+    px_sin, py_cos = _shared_products(player_x, player_y, ray_cos, ray_sin)
 
     cos_sin = Concatenate([ray_cos, ray_sin])
     px_py = Concatenate([player_x, player_y])
@@ -588,21 +665,8 @@ def build_textured_rendering_pipeline(
         closest_dist, perp_cos, config, max_coord,
     )
 
-    # --- Stage 7: u normalization ---
-    # u_norm = adj_num_u / abs_den, only for the winning segment
-    max_abs_den = 2.0 * max_coord  # rough upper bound
-    safe_abs_den = clamp(winning_abs_den, 0.01, max_abs_den)
-    inv_abs_den = reciprocal(safe_abs_den, min_value=0.01, max_value=max_abs_den, step=0.1)
-    u_norm = signed_multiply(
-        winning_adj_num_u, inv_abs_den,
-        max_abs1=max_abs_den, max_abs2=1.0 / 0.01,
-        step=0.5, max_abs_output=1.0,
-    )
-    u_clamped = clamp(u_norm, 0.0, 1.0 - 1e-4)
-
-    # tex_col_idx = floor(u * tex_width)
-    tex_col_float = multiply_const(u_clamped, float(tex_w))
-    tex_col_idx = thermometer_floor_div(tex_col_float, 1, tex_w - 1)
+    # --- Stage 7: u normalization (2D lookup) ---
+    tex_col_idx = _u_norm_lookup(winning_adj_num_u, winning_abs_den, tex_w, max_coord)
 
     # --- Stage 8: Texture column lookup ---
     # Build map_to_table keyed by (texture_id, col_idx) → tex_height*3 values
@@ -659,15 +723,8 @@ def build_rendering_pipeline(
     # Stage 1: Trig lookup
     ray_cos, ray_sin = trig_lookup(ray_angle)
 
-    # Stage 2: Shared products (needed for num_u across all segments)
-    px_sin = signed_multiply(
-        player_x, ray_sin,
-        max_abs1=max_coord, max_abs2=1.0, step=0.25,
-    )
-    py_cos = signed_multiply(
-        player_y, ray_cos,
-        max_abs1=max_coord, max_abs2=1.0, step=0.25,
-    )
+    # Stage 2: Shared products (2D lookups — 1 FFN each, parallel)
+    px_sin, py_cos = _shared_products(player_x, player_y, ray_cos, ray_sin)
 
     # Shared Concatenates — created once, reused by all segments
     cos_sin = Concatenate([ray_cos, ray_sin])
