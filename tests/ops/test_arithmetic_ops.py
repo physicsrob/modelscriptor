@@ -377,6 +377,58 @@ def test_signed_multiply_with_clamp():
     assert abs(result.item() - 20.0) < 0.5  # 5*5=25, clamped to 20
 
 
+def test_signed_multiply_strategies():
+    """Both deep and shallow strategies produce correct results."""
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    cases = [
+        (3.0, 4.0, 12.0),
+        (-3.0, 4.0, -12.0),
+        (3.0, -4.0, -12.0),
+        (-3.0, -4.0, 12.0),
+        (5.0, -2.0, -10.0),
+        (0.0, 7.0, 0.0),
+    ]
+    for strategy in ("deep", "shallow"):
+        prod = signed_multiply(
+            a, b, max_abs1=10.0, max_abs2=10.0, step=1.0, strategy=strategy,
+        )
+        for va, vb, expected in cases:
+            result = prod.compute(
+                n_pos=1,
+                input_values={
+                    "a": torch.tensor([[va]]),
+                    "b": torch.tensor([[vb]]),
+                },
+            )
+            assert abs(result.item() - expected) < 0.5, (
+                f"strategy={strategy} {va}*{vb}: expected {expected}, "
+                f"got {result.item()}"
+            )
+
+
+def test_multiply_integers_strategies():
+    """Both strategies produce correct integer products."""
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    for strategy in ("deep", "shallow"):
+        prod = multiply_integers(a, b, max_value=9, strategy=strategy)
+        for va in range(10):
+            for vb in range(10):
+                result = prod.compute(
+                    n_pos=1,
+                    input_values={
+                        "a": torch.tensor([[float(va)]]),
+                        "b": torch.tensor([[float(vb)]]),
+                    },
+                )
+                expected = va * vb
+                assert abs(result.item() - expected) < 0.5, (
+                    f"strategy={strategy} {va}*{vb}: expected {expected}, "
+                    f"got {result.item()}"
+                )
+
+
 def test_reduce_min():
     """Find minimum key and its associated value."""
     keys = [create_input(f"k{i}", 1) for i in range(4)]

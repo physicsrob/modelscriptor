@@ -866,7 +866,9 @@ def ceil_int(inp: Node, min_value: int, max_value: int) -> Node:
 # ---------------------------------------------------------------------------
 
 
-def multiply_integers(inp1: Node, inp2: Node, max_value: int) -> Node:
+def multiply_integers(
+    inp1: Node, inp2: Node, max_value: int, strategy: str = "deep",
+) -> Node:
     """Multiply two non-negative integer scalars using the polarization identity.
 
     a * b = ((a+b)² - (a-b)²) / 4
@@ -878,30 +880,38 @@ def multiply_integers(inp1: Node, inp2: Node, max_value: int) -> Node:
     Implementation:
         s = a + b                          range [0, 2*max_value], Linear (free)
         d = a - b                          range [-max_value, max_value], Linear (free)
-        |d| = ReLU(d) + ReLU(-d)           1 FFN layer (relu_add)
         s² = square(s)                     1+ FFN layers
-        |d|² = square(|d|)                 1+ FFN layers
-        result = (s² - |d|²) / 4          Linear (free)
+        d²:
+          deep    → |d| = abs(d), |d|² = square(|d|)        2 FFN layers
+          shallow → square_signed(d)                         1 FFN layer (~2× width)
+        result = (s² - d²) / 4              Linear (free)
 
-    Total cost: 3+ FFN layers.
+    Total cost: 3 FFN layers (deep, default) or 2 FFN layers (shallow).
 
     Args:
         inp1: 1D scalar node, integer value in [0, max_value].
         inp2: 1D scalar node, integer value in [0, max_value].
         max_value: Upper bound on each input.
+        strategy: ``"deep"`` (default, abs+square, narrower) or ``"shallow"``
+            (square_signed, saves 1 FFN layer at ~2× the width on the
+            d branch).  Use ``"shallow"`` only when the target ``d`` can
+            fit ``2*max_value + 1`` ReLU units in a single FFN layer.
 
     Returns:
         1D scalar node containing inp1 * inp2.
     """
+    assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"
 
     s = add(inp1, inp2)  # a+b
     d = subtract(inp1, inp2)  # a-b (may be negative)
-    abs_d = abs(d)  # |a-b|
 
     sq_sum = square(s, 2 * max_value)  # (a+b)²
-    sq_diff = square(abs_d, max_value)  # (a-b)²
+    if strategy == "shallow":
+        sq_diff = square_signed(d, max_abs=max_value)  # (a-b)²
+    else:
+        sq_diff = square(abs(d), max_value)  # (a-b)²
 
     # a*b = ((a+b)² - (a-b)²) / 4
     return add_scaled_nodes(0.25, sq_sum, -0.25, sq_diff)
@@ -915,6 +925,7 @@ def signed_multiply(
     step: float = 1.0,
     max_abs_output: float = None,
     d_max: int = 1024,
+    strategy: str = "deep",
 ) -> Node:
     """Multiply two signed scalars using the polarization identity.
 
@@ -922,6 +933,15 @@ def signed_multiply(
 
     Exact when both inputs are multiples of ``step``.  Piecewise-linear
     between grid points.
+
+    Two implementations of the squarings are available:
+
+    - ``"deep"`` (default): ``abs(s)`` then ``square(abs_s)`` per branch.
+      Depth 2 per branch (1 abs layer + 1 square layer), narrower FFN
+      width (~``2*ceil(max_sum/step)`` ReLU units total).
+    - ``"shallow"``: ``square_signed(s)`` per branch.  Depth 1 per branch,
+      roughly 2× the FFN width (~``2*ceil(2*max_sum/step)`` ReLU units).
+      Saves 1 FFN layer.
 
     Args:
         inp1: 1D scalar node with value in [-max_abs1, max_abs1].
@@ -933,21 +953,29 @@ def signed_multiply(
             When provided, the output is clamped to [-max_abs_output,
             max_abs_output].
         d_max: Maximum ReLU units per FFN layer.
+        strategy: ``"deep"`` (default) or ``"shallow"``.  Use
+            ``"shallow"`` only when the target ``d`` can fit
+            ``2 * (2*max_sum/step + 1)`` ReLU units in a single layer.
 
     Returns:
         1D scalar node containing inp1 * inp2.
     """
+    assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"
 
     s = add(inp1, inp2)                # a+b
     d = subtract(inp1, inp2)           # a-b
-    abs_s = abs(s)               # |a+b|
-    abs_d = abs(d)               # |a-b|
-
     max_sum = max_abs1 + max_abs2
-    sq_sum = square(abs_s, max_value=max_sum, step=step, d_max=d_max)
-    sq_diff = square(abs_d, max_value=max_sum, step=step, d_max=d_max)
+
+    if strategy == "shallow":
+        sq_sum = square_signed(s, max_abs=max_sum, step=step, d_max=d_max)
+        sq_diff = square_signed(d, max_abs=max_sum, step=step, d_max=d_max)
+    else:  # "deep"
+        abs_s = abs(s)               # |a+b|
+        abs_d = abs(d)               # |a-b|
+        sq_sum = square(abs_s, max_value=max_sum, step=step, d_max=d_max)
+        sq_diff = square(abs_d, max_value=max_sum, step=step, d_max=d_max)
 
     result = add_scaled_nodes(0.25, sq_sum, -0.25, sq_diff)
 
