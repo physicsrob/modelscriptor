@@ -7,7 +7,7 @@ Usage:
 import argparse
 import sys
 import time
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
@@ -31,6 +31,7 @@ def play(
     scale: int = 8,
     mode: str = "transformer",
     textures=None,
+    from_onnx: Optional[str] = None,
 ) -> None:
     """Run an interactive game loop with pygame display.
 
@@ -44,6 +45,12 @@ def play(
         mode: "transformer" compiles game logic + rendering into a
             transformer. "reference" uses the Python implementation.
         textures: Optional texture atlas for wall textures.
+        from_onnx: Path to a pre-saved game ``.onnx`` (produced by
+            ``torchwright.doom.to_onnx``).  When set with
+            ``mode="transformer"``, skip the in-process compile and run
+            inference through ``onnxruntime`` instead.  The scene /
+            ``--width`` / ``--height`` / ``--fov`` must match the ones
+            used when the ``.onnx`` was built.
     """
     try:
         import pygame
@@ -52,14 +59,22 @@ def play(
         sys.exit(1)
 
     if mode == "transformer":
-        from torchwright.doom.compile import compile_game, step_frame_compiled
+        from torchwright.doom.compile import step_frame_compiled
 
-        print("Compiling game graph...")
-        module = compile_game(
-            segments, config, max_coord,
-            textures=textures,
-            d=4096, d_head=16,
-        )
+        if from_onnx is not None:
+            from torchwright.compiler.onnx_load import OnnxHeadlessModule
+
+            print(f"Loading {from_onnx}...")
+            module = OnnxHeadlessModule(from_onnx)
+        else:
+            from torchwright.doom.compile import compile_game
+
+            print("Compiling game graph...")
+            module = compile_game(
+                segments, config, max_coord,
+                textures=textures,
+                d=4096, d_head=16,
+            )
 
         def frame_fn(state, inputs):
             return step_frame_compiled(module, state, inputs, config)
@@ -139,6 +154,12 @@ def main():
     parser.add_argument("--height", type=int, default=80)
     parser.add_argument("--fov", type=int, default=32)
     parser.add_argument("--scale", type=int, default=8)
+    parser.add_argument(
+        "--from-onnx", type=str, default=None,
+        help="Path to a pre-saved game .onnx (from torchwright.doom.to_onnx). "
+             "Skips the in-process compile and runs via onnxruntime. "
+             "Scene/width/height/fov must match the config used at export.",
+    )
     args = parser.parse_args()
 
     trig_table = generate_trig_table()
@@ -166,7 +187,7 @@ def main():
 
     play(segments, config, start_x, start_y, start_angle,
          max_coord=max_coord, scale=args.scale, mode=args.mode,
-         textures=textures)
+         textures=textures, from_onnx=args.from_onnx)
 
 
 if __name__ == "__main__":

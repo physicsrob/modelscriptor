@@ -6,8 +6,8 @@ Usage:
 
 import argparse
 
-from torchwright.compiler.export import export_headless_to_onnx
-from torchwright.doom.compile import compile_game, compile_renderer
+from torchwright.compiler.export import compile_and_emit_onnx
+from torchwright.doom.renderer import build_renderer_graph
 from torchwright.reference_renderer.scenes import (
     box_room,
     box_room_textured,
@@ -41,7 +41,6 @@ def main():
              "Use a larger value (e.g. 4096 for game) for higher quality.",
     )
     parser.add_argument("--d-head", type=int, default=16)
-    parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument(
         "-o", "--output", type=str, default=None,
         help="Output .onnx path. Default: doom_<mode>_<scene>.onnx",
@@ -68,12 +67,14 @@ def main():
             segments = multi_room()
             max_coord = 15.0
         d = args.d if args.d is not None else 512
-        print(f"Compiling renderer graph (d={d})...")
-        module = compile_renderer(
-            segments, config, max_coord=max_coord,
-            d=d, d_head=args.d_head, device=args.device,
+        print(f"Building renderer graph (d={d})...")
+        output_node, pos_encoding = build_renderer_graph(
+            segments, config, max_coord,
         )
+        max_layers = 100
     else:
+        from torchwright.doom.game_graph import build_game_graph
+
         if args.scene == "box":
             segments, textures = box_room_textured(
                 wad_path=args.wad, tex_size=args.tex_size,
@@ -85,14 +86,24 @@ def main():
             )
             max_coord = 15.0
         d = args.d if args.d is not None else 1024
-        print(f"Compiling game graph (d={d})...")
-        module = compile_game(
-            segments, config, max_coord=max_coord,
+        print(f"Building game graph (d={d})...")
+        output_node, pos_encoding = build_game_graph(
+            segments, config, max_coord,
+            move_speed=0.3, turn_speed=4,
             textures=textures,
-            d=d, d_head=args.d_head, device=args.device,
         )
+        max_layers = 200
 
-    export_headless_to_onnx(module, output_path)
+    compile_and_emit_onnx(
+        output_node=output_node,
+        pos_encoding=pos_encoding,
+        output_path=output_path,
+        d=d,
+        d_head=args.d_head,
+        max_seq_len=config.screen_width,
+        max_layers=max_layers,
+        verbose=True,
+    )
 
 
 if __name__ == "__main__":

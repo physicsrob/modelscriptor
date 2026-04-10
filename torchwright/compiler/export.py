@@ -3,6 +3,7 @@
 import json
 import os
 import time
+from typing import List, Optional
 
 import numpy as np
 import onnx
@@ -13,11 +14,13 @@ from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.module import (
     CompiledTransformerModule,
     HeadlessTransformerModule,
-    to_module,
+    _compute_pos_encoding,
     to_headless_module,
+    to_module,
 )
-from torchwright.graph import Node
-from torchwright.graph.embedding import Embedding
+from torchwright.compiler.transformer import HeadlessTransformer
+from torchwright.graph import Concatenate, Embedding, LiteralValue, Node
+from torchwright.graph.misc import InputNode
 from torchwright.graph.pos_encoding import PosEncoding
 
 
@@ -108,77 +111,280 @@ def compile_to_onnx(
         print(f"Wrote {vocab_path}")
 
 
-def export_headless_to_onnx(
-    module: HeadlessTransformerModule,
+def emit_headless_onnx(
+    compiled: HeadlessTransformer,
+    output_node: Node,
     output_path: str,
-    example_seq_len: int = 10,
-    opset_version: int = 14,
+    max_seq_len: int = 512,
     verbose: bool = True,
+    free_layers: bool = True,
 ) -> None:
-    """Export a HeadlessTransformerModule to ONNX (no embedding required).
+    """Emit an ONNX model directly from a HeadlessTransformer.
+
+    Mirrors ``HeadlessTransformerModule.forward`` by walking
+    ``compiled.layers`` and streaming each layer's weights into
+    ``TensorProto`` initializers while emitting the corresponding ONNX
+    nodes.  This skips the ``nn.Module`` intermediate (and therefore
+    ``torch.onnx.export``) so the convert-phase memory peak is no longer
+    doubled by a second copy of every weight tensor in ``nn.Parameter``
+    form.
+
+    When ``free_layers=True`` the compiled layer's weight attributes are
+    nulled out as soon as their initializers are built, so Python can
+    reclaim each layer's torch storage before the next layer runs.
 
     Writes two files:
-        <output_path>                  -- the ONNX model
-        <output_path>.input_names.json -- ordered list of input column names
-
-    The ONNX model has a single float input tensor named ``inputs`` with
-    shape ``(seq_len, d_input)`` and a single float output tensor named
-    ``outputs`` with shape ``(seq_len, d_output)``.  The input column
-    ordering matches ``module.input_names`` (alphabetical by graph
-    InputNode name); the sidecar JSON records this so consumers know how
-    to populate each column.
+        ``<output_path>``                    — the ONNX model
+        ``<output_path>.input_names.json``   — ordered input column names
     """
-    module.eval()
-    d_input = len(module.input_names)
-    dummy_input = torch.zeros(example_seq_len, d_input, dtype=torch.float32)
+    assert compiled.residual_assignment is not None
+    d = compiled.d
+    d_head = compiled.d_head
+    n_heads = d // d_head
 
-    n_params = sum(p.numel() for p in module.parameters())
-    n_layers = len(module.layers)
-    if verbose:
-        print(f"Exporting ONNX: {n_layers} layers, {n_params:,} parameters")
+    in_state = compiled.layers[0].attn.in_state
+    out_state = compiled.layers[-1].mlp.out_state
 
-    # Trace with dynamo=True so initializers stay in memory (no multi-file
-    # disk spill).  Then sparsify mostly-zero initializers in-place and save
-    # the consolidated model.
-    seq_dim = torch.export.Dim("seq_len", min=1, max=8192)
+    # --- Extract I/O metadata (mirrors to_headless_module header) ------
     t0 = time.perf_counter()
-    prog = torch.onnx.export(
-        module,
-        (dummy_input,),
-        None,  # in-memory ONNXProgram
-        dynamo=True,
-        input_names=["inputs"],
-        output_names=["outputs"],
-        dynamic_shapes={"inputs": {0: seq_dim}},
-        verbose=False,
+
+    input_nodes_list: List[tuple] = []  # (name, indices)
+    pos_indices: Optional[List[int]] = None
+    constant_values = np.zeros(d, dtype=np.float32)
+
+    for node in compiled.residual_assignment.get_nodes(in_state):
+        indices = compiled.residual_assignment.get_node_indices(in_state, node)
+        if isinstance(node, InputNode):
+            input_nodes_list.append((node.name, indices))
+        elif isinstance(node, PosEncoding):
+            pos_indices = indices
+        elif isinstance(node, LiteralValue):
+            for i, idx in enumerate(indices):
+                constant_values[idx] = float(node.value[i])
+        elif isinstance(node, (Concatenate, Embedding)):
+            pass
+
+    assert len(input_nodes_list) > 0, "No InputNode found in residual assignment"
+    assert pos_indices is not None, "No PosEncoding node found in residual assignment"
+
+    input_nodes_list.sort(key=lambda x: x[0])
+    input_names = [name for name, _ in input_nodes_list]
+
+    all_input_indices: List[int] = []
+    for _, idx in input_nodes_list:
+        all_input_indices.extend(idx)
+    d_input = len(all_input_indices)
+
+    input_proj = np.zeros((d_input, d), dtype=np.float32)
+    for i, idx in enumerate(all_input_indices):
+        input_proj[i, idx] = 1.0
+
+    d_pos = len(pos_indices)
+    pos_proj = np.zeros((d_pos, d), dtype=np.float32)
+    for i, idx in enumerate(pos_indices):
+        pos_proj[i, idx] = 1.0
+
+    pos_encoding_buf = (
+        _compute_pos_encoding(d_pos, max_seq_len)
+        .numpy()
+        .astype(np.float32, copy=False)
     )
-    t_trace = time.perf_counter() - t0
 
-    model = prog.model_proto
+    # -1000 above the diagonal, 0 on/below — mirrors _AttentionLayer.forward
+    # where a bool mask is filled with -1000.  Using a float adder avoids the
+    # Where/bool-mask path entirely.
+    causal_mask = np.triu(
+        np.full((max_seq_len, max_seq_len), -1000.0, dtype=np.float32), k=1
+    )
 
+    output_indices = compiled.residual_assignment.get_node_indices(
+        out_state, output_node
+    )
+    output_gather_indices = np.asarray(output_indices, dtype=np.int64)
+    d_output = len(output_gather_indices)
+
+    t_extract = time.perf_counter() - t0
+
+    # --- Build ONNX nodes and initializers -----------------------------
     t0 = time.perf_counter()
-    n_sparse, n_dense_kept, bytes_saved = _sparsify_initializers(model, verbose=verbose)
+
+    initializers: List[TensorProto] = []
+    nodes: List = []
+
+    def add_init_float(name: str, arr: np.ndarray) -> None:
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        initializers.append(
+            helper.make_tensor(
+                name=name,
+                data_type=TensorProto.FLOAT,
+                dims=list(arr.shape),
+                vals=arr.tobytes(),
+                raw=True,
+            )
+        )
+
+    def add_init_int64(name: str, arr: np.ndarray) -> None:
+        arr = np.ascontiguousarray(arr, dtype=np.int64)
+        initializers.append(
+            helper.make_tensor(
+                name=name,
+                data_type=TensorProto.INT64,
+                dims=list(arr.shape),
+                vals=arr.tobytes(),
+                raw=True,
+            )
+        )
+
+    def add_node(op: str, ins: List[str], outs: List[str], **attrs) -> None:
+        nodes.append(helper.make_node(op, ins, outs, **attrs))
+
+    # Static initializers for the preamble
+    add_init_float("input_proj", input_proj)
+    add_init_float("pos_proj", pos_proj)
+    add_init_float("constant_values", constant_values)
+    add_init_float("pos_encoding_full", pos_encoding_buf)
+    add_init_float("causal_mask_full", causal_mask)
+    add_init_int64("output_gather_indices_init", output_gather_indices)
+
+    # Shape-math constants (reused across ops where shape matches).
+    add_init_int64("_zero_1d", np.array([0], dtype=np.int64))
+    add_init_int64("_zeros_2d", np.array([0, 0], dtype=np.int64))
+    add_init_int64("_axes_01", np.array([0, 1], dtype=np.int64))
+    add_init_int64(
+        "_qkv_view_shape", np.array([0, n_heads, d_head], dtype=np.int64)
+    )
+    # For the fused attention output projection: reshape
+    # (t, n_heads, d_head) → (t, d).
+    add_init_int64("_ctx_flat_shape", np.array([0, d], dtype=np.int64))
+
+    # --- Preamble -------------------------------------------------------
+    add_node("Shape", ["inputs"], ["input_shape"])
+    add_node("Gather", ["input_shape", "_zero_1d"], ["seq_len_1d"], axis=0)
+    add_node(
+        "Slice",
+        ["pos_encoding_full", "_zero_1d", "seq_len_1d", "_zero_1d"],
+        ["pos"],
+    )
+    add_node("MatMul", ["inputs", "input_proj"], ["inp_res"])
+    add_node("MatMul", ["pos", "pos_proj"], ["pos_res"])
+    add_node("Add", ["inp_res", "pos_res"], ["res_pi"])
+    add_node("Add", ["res_pi", "constant_values"], ["res_0"])
+    add_node("Concat", ["seq_len_1d", "seq_len_1d"], ["mask_ends"], axis=0)
+    add_node(
+        "Slice",
+        ["causal_mask_full", "_zeros_2d", "mask_ends", "_axes_01"],
+        ["mask_2d"],
+    )
+    add_node("Unsqueeze", ["mask_2d", "_zero_1d"], ["mask_3d"])
+
+    # --- Per-layer emit -------------------------------------------------
+    current_res = "res_0"
+    n_layers = len(compiled.layers)
+    for i, layer in enumerate(compiled.layers):
+        attn = layer.attn.attn
+        # permute().reshape() forces a contiguous copy (needed to fuse heads).
+        # .cpu() is a no-op if already on CPU; otherwise copies from device.
+        W_Q = (
+            attn.query_matrix.permute(1, 0, 2).reshape(d, d).contiguous().cpu().numpy()
+        )
+        W_K = (
+            attn.key_matrix.permute(1, 0, 2).reshape(d, d).contiguous().cpu().numpy()
+        )
+        W_V = (
+            attn.value_matrix.permute(1, 0, 2).reshape(d, d).contiguous().cpu().numpy()
+        )
+        # (n_heads, d_head, d) → (d, d).  Same bytes, different shape,
+        # so a single (t, d) @ (d, d) MatMul replaces the per-head
+        # MatMul + ReduceSum form.
+        W_O = attn.output_matrix.reshape(d, d).contiguous().cpu().numpy()
+        W1 = layer.mlp.linear1.output_matrix.cpu().numpy()
+        b1 = layer.mlp.linear1.output_bias.cpu().numpy()
+        W2 = layer.mlp.linear2.output_matrix.cpu().numpy()
+        b2 = layer.mlp.linear2.output_bias.cpu().numpy()
+
+        p = f"l{i}"
+        add_init_float(f"{p}_WQ", W_Q)
+        add_init_float(f"{p}_WK", W_K)
+        add_init_float(f"{p}_WV", W_V)
+        add_init_float(f"{p}_WO", W_O)
+        add_init_float(f"{p}_W1", W1)
+        add_init_float(f"{p}_b1", b1)
+        add_init_float(f"{p}_W2", W2)
+        add_init_float(f"{p}_b2", b2)
+
+        current_res = _emit_layer_nodes(
+            nodes, i, current_res, d, d_head, n_heads
+        )
+
+        if free_layers:
+            attn.query_matrix = None
+            attn.key_matrix = None
+            attn.value_matrix = None
+            attn.output_matrix = None
+            layer.mlp.linear1.output_matrix = None
+            layer.mlp.linear1.output_bias = None
+            layer.mlp.linear2.output_matrix = None
+            layer.mlp.linear2.output_bias = None
+        del W_Q, W_K, W_V, W_O, W1, b1, W2, b2
+
+    # --- Postamble ------------------------------------------------------
+    add_node(
+        "Gather",
+        [current_res, "output_gather_indices_init"],
+        ["outputs"],
+        axis=1,
+    )
+
+    t_emit = time.perf_counter() - t0
+
+    # --- Build graph + model -------------------------------------------
+    t0 = time.perf_counter()
+    inputs_vi = helper.make_tensor_value_info(
+        "inputs", TensorProto.FLOAT, ["seq_len", d_input]
+    )
+    outputs_vi = helper.make_tensor_value_info(
+        "outputs", TensorProto.FLOAT, ["seq_len", d_output]
+    )
+    graph = helper.make_graph(
+        nodes,
+        "headless_transformer",
+        inputs=[inputs_vi],
+        outputs=[outputs_vi],
+        initializer=initializers,
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 14)],
+        producer_name="torchwright",
+    )
+    t_build = time.perf_counter() - t0
+
+    # --- Sparsify + save -----------------------------------------------
+    t0 = time.perf_counter()
+    n_sparse, n_dense_kept, bytes_saved = _sparsify_initializers(
+        model, verbose=verbose
+    )
     t_sparsify = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     onnx.save_model(model, output_path)
     t_save = time.perf_counter() - t0
 
-    if verbose:
-        print(
-            f"Phases: trace {t_trace:.2f}s, "
-            f"sparsify {t_sparsify:.2f}s, save {t_save:.2f}s"
-        )
-        print(
-            f"Sparsified {n_sparse} initializers, kept {n_dense_kept} dense, "
-            f"saved ~{bytes_saved/1e6:.0f} MB"
-        )
-
     sidecar_path = output_path + ".input_names.json"
     with open(sidecar_path, "w") as f:
-        json.dump({"input_names": list(module.input_names)}, f)
+        json.dump({"input_names": input_names}, f)
 
     if verbose:
+        print(
+            f"Phases: extract {t_extract:.2f}s, emit {t_emit:.2f}s, "
+            f"build {t_build:.2f}s, sparsify {t_sparsify:.2f}s, "
+            f"save {t_save:.2f}s"
+        )
+        print(
+            f"{n_layers} layers, "
+            f"sparsified {n_sparse} initializers, kept {n_dense_kept} dense, "
+            f"saved ~{bytes_saved/1e6:.0f} MB"
+        )
         model_size = os.path.getsize(output_path)
         print(f"Wrote {output_path} ({model_size:,} bytes)")
         print(f"Wrote {sidecar_path}")
@@ -265,6 +471,401 @@ def _sparsify_initializers(model, verbose: bool = True):
     model.graph.sparse_initializer.extend(sparse_new)
 
     return n_sparse, n_dense_kept, bytes_saved
+
+
+# ---------------------------------------------------------------------------
+# Streaming compile-and-emit: build ONNX initializers layer-by-layer while
+# forward_compile is still running, freeing each layer's dense torch tensors
+# as we go.  Lets 320x200 tex-64 game graphs fit in ~5 GB of RAM instead of
+# accumulating 6*d^2*N bytes of dense weights.
+# ---------------------------------------------------------------------------
+
+
+_SPARSITY_THRESHOLD = 0.75
+_MIN_SPARSE_ELEMENTS = 1024  # skip tiny tensors — per-init overhead dominates
+
+
+def _tensor_to_proto(name: str, arr: np.ndarray):
+    """Convert a float32 numpy array to (dense_tp, sparse_tp).
+
+    Exactly one of the returned values is non-None.  Float tensors with
+    zero-fraction >= 75% and at least 1024 elements become
+    SparseTensorProto (COO, flat int64 indices).  Everything else is a
+    dense TensorProto with ``raw_data``.
+    """
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
+    n_elem = arr.size
+    dims = list(arr.shape)
+
+    if n_elem < _MIN_SPARSE_ELEMENTS:
+        dense_tp = helper.make_tensor(
+            name=name,
+            data_type=TensorProto.FLOAT,
+            dims=dims,
+            vals=arr.tobytes(),
+            raw=True,
+        )
+        return dense_tp, None
+
+    flat = arr.reshape(-1)
+    nnz = int(np.count_nonzero(flat))
+    zero_frac = 1.0 - nnz / n_elem
+    if zero_frac < _SPARSITY_THRESHOLD:
+        dense_tp = helper.make_tensor(
+            name=name,
+            data_type=TensorProto.FLOAT,
+            dims=dims,
+            vals=arr.tobytes(),
+            raw=True,
+        )
+        return dense_tp, None
+
+    nz_idx = np.flatnonzero(flat)
+    nz_val = flat[nz_idx]
+    values_tp = helper.make_tensor(
+        name=name,  # SparseTensorProto identified by values.name
+        data_type=TensorProto.FLOAT,
+        dims=[nnz],
+        vals=nz_val.astype(np.float32, copy=False).tobytes(),
+        raw=True,
+    )
+    indices_tp = helper.make_tensor(
+        name=name + "__indices",
+        data_type=TensorProto.INT64,
+        dims=[nnz],
+        vals=nz_idx.astype(np.int64, copy=False).tobytes(),
+        raw=True,
+    )
+    sparse_tp = helper.make_sparse_tensor(
+        values=values_tp, indices=indices_tp, dims=dims,
+    )
+    return None, sparse_tp
+
+
+def _append_proto(
+    dense_tp,
+    sparse_tp,
+    dense_inits: list,
+    sparse_inits: list,
+) -> None:
+    if dense_tp is not None:
+        dense_inits.append(dense_tp)
+    else:
+        sparse_inits.append(sparse_tp)
+
+
+def _emit_layer_nodes(
+    nodes: list,
+    layer_idx: int,
+    current_res: str,
+    d: int,
+    d_head: int,
+    n_heads: int,
+) -> str:
+    """Emit ONNX nodes for one transformer layer.  Returns the name of
+    the updated residual stream tensor to feed into the next layer.
+
+    Attention-output projection is fused: ``ctx`` of shape
+    ``(n_heads, t, d_head)`` is transposed + reshaped to ``(t, d)`` and
+    projected through a single ``(d, d)`` W_O matmul — no
+    ``(n_heads, t, d)`` intermediate.  Mathematically identical to the
+    per-head matmul + ReduceSum form, just written the way the original
+    multi-head attention paper does it.
+    """
+    p = f"l{layer_idx}"
+
+    def node(op, ins, outs, **attrs):
+        nodes.append(helper.make_node(op, ins, outs, **attrs))
+
+    # Attention sublayer
+    node("MatMul", [current_res, f"{p}_WQ"], [f"{p}_Q_flat"])
+    node("Reshape", [f"{p}_Q_flat", "_qkv_view_shape"], [f"{p}_Q_view"])
+    node("Transpose", [f"{p}_Q_view"], [f"{p}_Q"], perm=[1, 0, 2])
+
+    node("MatMul", [current_res, f"{p}_WK"], [f"{p}_K_flat"])
+    node("Reshape", [f"{p}_K_flat", "_qkv_view_shape"], [f"{p}_K_view"])
+    node("Transpose", [f"{p}_K_view"], [f"{p}_K"], perm=[1, 0, 2])
+
+    node("MatMul", [current_res, f"{p}_WV"], [f"{p}_V_flat"])
+    node("Reshape", [f"{p}_V_flat", "_qkv_view_shape"], [f"{p}_V_view"])
+    node("Transpose", [f"{p}_V_view"], [f"{p}_V"], perm=[1, 0, 2])
+
+    node("Transpose", [f"{p}_K"], [f"{p}_K_T"], perm=[0, 2, 1])
+    node("MatMul", [f"{p}_Q", f"{p}_K_T"], [f"{p}_logits"])
+    node("Add", [f"{p}_logits", "mask_3d"], [f"{p}_logits_masked"])
+    node("Softmax", [f"{p}_logits_masked"], [f"{p}_weights"], axis=-1)
+    node("MatMul", [f"{p}_weights", f"{p}_V"], [f"{p}_ctx"])
+
+    # Fuse heads into feature dim and apply the (d, d) output projection
+    # in one shot.  Equivalent to the old MatMul+ReduceSum but avoids
+    # the (n_heads, t, d) transient.
+    node("Transpose", [f"{p}_ctx"], [f"{p}_ctx_t"], perm=[1, 0, 2])
+    node("Reshape", [f"{p}_ctx_t", "_ctx_flat_shape"], [f"{p}_ctx_flat"])
+    node("MatMul", [f"{p}_ctx_flat", f"{p}_WO"], [f"{p}_attn_sum"])
+    node("Add", [current_res, f"{p}_attn_sum"], [f"{p}_res_attn"])
+
+    # MLP sublayer
+    node("MatMul", [f"{p}_res_attn", f"{p}_W1"], [f"{p}_l1_m"])
+    node("Add", [f"{p}_l1_m", f"{p}_b1"], [f"{p}_l1_b"])
+    node("Relu", [f"{p}_l1_b"], [f"{p}_l1_r"])
+    node("MatMul", [f"{p}_l1_r", f"{p}_W2"], [f"{p}_l2_m"])
+    node("Add", [f"{p}_l2_m", f"{p}_b2"], [f"{p}_l2_b"])
+    node("Add", [f"{p}_res_attn", f"{p}_l2_b"], [f"{p}_res_next"])
+
+    return f"{p}_res_next"
+
+
+def compile_and_emit_onnx(
+    output_node: Node,
+    pos_encoding: Optional[PosEncoding],
+    output_path: str,
+    d: int,
+    d_head: int,
+    max_seq_len: int = 512,
+    max_layers: int = 200,
+    verbose: bool = True,
+) -> None:
+    """Compile a graph and emit ONNX in one streaming pass.
+
+    After each layer is compiled, its dense weight tensors are extracted,
+    sparsified on the fly (so ``SparseTensorProto`` is the only copy of
+    mostly-zero matrices), and the compile layer's tensor attributes are
+    nulled out.  Peak in-memory weight footprint therefore stays around
+    one layer's dense size plus the cumulative sparse bytes — 5-10 GB for
+    a 320x200 tex-64 game graph instead of the 50-100 GB that holding all
+    layers dense would require.
+    """
+    dense_inits: list = []
+    sparse_inits: list = []
+
+    def on_layer_compiled(i: int, layer) -> None:
+        attn = layer.attn.attn
+        mlp = layer.mlp
+
+        def emit(name: str, arr: np.ndarray) -> None:
+            dense_tp, sparse_tp = _tensor_to_proto(name, arr)
+            _append_proto(dense_tp, sparse_tp, dense_inits, sparse_inits)
+
+        # Extract Q/K/V/O one at a time and free each torch tensor as soon
+        # as its bytes are inside a TensorProto/SparseTensorProto.
+        emit(
+            f"l{i}_WQ",
+            attn.query_matrix.permute(1, 0, 2).reshape(d, d).contiguous().cpu().numpy(),
+        )
+        attn.query_matrix = None
+        emit(
+            f"l{i}_WK",
+            attn.key_matrix.permute(1, 0, 2).reshape(d, d).contiguous().cpu().numpy(),
+        )
+        attn.key_matrix = None
+        emit(
+            f"l{i}_WV",
+            attn.value_matrix.permute(1, 0, 2).reshape(d, d).contiguous().cpu().numpy(),
+        )
+        attn.value_matrix = None
+        # Fuse (n_heads, d_head, d) → (d, d).  Same bytes, different
+        # shape metadata: the resulting initializer matches the canonical
+        # "Attention Is All You Need" W_O layout and feeds a single
+        # (t, d) @ (d, d) MatMul at inference time.
+        emit(
+            f"l{i}_WO",
+            attn.output_matrix.reshape(d, d).contiguous().cpu().numpy(),
+        )
+        attn.output_matrix = None
+
+        emit(f"l{i}_W1", mlp.linear1.output_matrix.cpu().numpy())
+        mlp.linear1.output_matrix = None
+        emit(f"l{i}_b1", mlp.linear1.output_bias.cpu().numpy())
+        mlp.linear1.output_bias = None
+        emit(f"l{i}_W2", mlp.linear2.output_matrix.cpu().numpy())
+        mlp.linear2.output_matrix = None
+        emit(f"l{i}_b2", mlp.linear2.output_bias.cpu().numpy())
+        mlp.linear2.output_bias = None
+
+    # --- Phase 1: streaming compile ------------------------------------
+    t0 = time.perf_counter()
+    compiled = forward_compile(
+        d=d,
+        d_head=d_head,
+        output_node=output_node,
+        pos_encoding=pos_encoding,
+        verbose=verbose,
+        max_layers=max_layers,
+        device=None,
+        on_layer_compiled=on_layer_compiled,
+    )
+    t_compile = time.perf_counter() - t0
+
+    # --- Phase 2: preamble / postamble metadata + graph assembly -------
+    assert compiled.residual_assignment is not None
+    n_heads = d // d_head
+    n_layers = len(compiled.layers)
+
+    t0 = time.perf_counter()
+    in_state = compiled.layers[0].attn.in_state
+    out_state = compiled.layers[-1].mlp.out_state
+
+    input_nodes_list: List[tuple] = []
+    pos_indices: Optional[List[int]] = None
+    constant_values = np.zeros(d, dtype=np.float32)
+
+    for node in compiled.residual_assignment.get_nodes(in_state):
+        indices = compiled.residual_assignment.get_node_indices(in_state, node)
+        if isinstance(node, InputNode):
+            input_nodes_list.append((node.name, indices))
+        elif isinstance(node, PosEncoding):
+            pos_indices = indices
+        elif isinstance(node, LiteralValue):
+            for k, idx in enumerate(indices):
+                constant_values[idx] = float(node.value[k])
+        elif isinstance(node, (Concatenate, Embedding)):
+            pass
+
+    assert len(input_nodes_list) > 0, "No InputNode found in residual assignment"
+    assert pos_indices is not None, "No PosEncoding node found in residual assignment"
+
+    input_nodes_list.sort(key=lambda x: x[0])
+    input_names = [name for name, _ in input_nodes_list]
+
+    all_input_indices: List[int] = []
+    for _, idx in input_nodes_list:
+        all_input_indices.extend(idx)
+    d_input = len(all_input_indices)
+
+    input_proj = np.zeros((d_input, d), dtype=np.float32)
+    for k, idx in enumerate(all_input_indices):
+        input_proj[k, idx] = 1.0
+
+    d_pos = len(pos_indices)
+    pos_proj = np.zeros((d_pos, d), dtype=np.float32)
+    for k, idx in enumerate(pos_indices):
+        pos_proj[k, idx] = 1.0
+
+    pos_encoding_buf = (
+        _compute_pos_encoding(d_pos, max_seq_len)
+        .numpy()
+        .astype(np.float32, copy=False)
+    )
+    causal_mask = np.triu(
+        np.full((max_seq_len, max_seq_len), -1000.0, dtype=np.float32), k=1
+    )
+
+    output_indices = compiled.residual_assignment.get_node_indices(
+        out_state, output_node
+    )
+    output_gather_indices = np.asarray(output_indices, dtype=np.int64)
+    d_output = len(output_gather_indices)
+
+    # Preamble initializers — float ones run through _tensor_to_proto so
+    # the very sparse input_proj/pos_proj/constant_values get COO-encoded
+    # at build time.
+    def add_float(name: str, arr: np.ndarray) -> None:
+        dense_tp, sparse_tp = _tensor_to_proto(name, arr)
+        _append_proto(dense_tp, sparse_tp, dense_inits, sparse_inits)
+
+    def add_int64(name: str, arr: np.ndarray) -> None:
+        arr = np.ascontiguousarray(arr, dtype=np.int64)
+        dense_inits.append(
+            helper.make_tensor(
+                name=name,
+                data_type=TensorProto.INT64,
+                dims=list(arr.shape),
+                vals=arr.tobytes(),
+                raw=True,
+            )
+        )
+
+    add_float("input_proj", input_proj)
+    add_float("pos_proj", pos_proj)
+    add_float("constant_values", constant_values)
+    add_float("pos_encoding_full", pos_encoding_buf)
+    add_float("causal_mask_full", causal_mask)
+    add_int64("output_gather_indices_init", output_gather_indices)
+    add_int64("_zero_1d", np.array([0], dtype=np.int64))
+    add_int64("_zeros_2d", np.array([0, 0], dtype=np.int64))
+    add_int64("_axes_01", np.array([0, 1], dtype=np.int64))
+    add_int64("_qkv_view_shape", np.array([0, n_heads, d_head], dtype=np.int64))
+    # Shape constant for the fused-attention output projection:
+    # Reshape (t, n_heads, d_head) → (t, d).
+    add_int64("_ctx_flat_shape", np.array([0, d], dtype=np.int64))
+
+    nodes: list = []
+
+    def add_node(op: str, ins: List[str], outs: List[str], **attrs) -> None:
+        nodes.append(helper.make_node(op, ins, outs, **attrs))
+
+    # Preamble
+    add_node("Shape", ["inputs"], ["input_shape"])
+    add_node("Gather", ["input_shape", "_zero_1d"], ["seq_len_1d"], axis=0)
+    add_node(
+        "Slice",
+        ["pos_encoding_full", "_zero_1d", "seq_len_1d", "_zero_1d"],
+        ["pos"],
+    )
+    add_node("MatMul", ["inputs", "input_proj"], ["inp_res"])
+    add_node("MatMul", ["pos", "pos_proj"], ["pos_res"])
+    add_node("Add", ["inp_res", "pos_res"], ["res_pi"])
+    add_node("Add", ["res_pi", "constant_values"], ["res_0"])
+    add_node("Concat", ["seq_len_1d", "seq_len_1d"], ["mask_ends"], axis=0)
+    add_node(
+        "Slice",
+        ["causal_mask_full", "_zeros_2d", "mask_ends", "_axes_01"],
+        ["mask_2d"],
+    )
+    add_node("Unsqueeze", ["mask_2d", "_zero_1d"], ["mask_3d"])
+
+    current_res = "res_0"
+    for i in range(n_layers):
+        current_res = _emit_layer_nodes(nodes, i, current_res, d, d_head, n_heads)
+
+    add_node(
+        "Gather",
+        [current_res, "output_gather_indices_init"],
+        ["outputs"],
+        axis=1,
+    )
+
+    inputs_vi = helper.make_tensor_value_info(
+        "inputs", TensorProto.FLOAT, ["seq_len", d_input]
+    )
+    outputs_vi = helper.make_tensor_value_info(
+        "outputs", TensorProto.FLOAT, ["seq_len", d_output]
+    )
+    graph = helper.make_graph(
+        nodes,
+        "headless_transformer",
+        inputs=[inputs_vi],
+        outputs=[outputs_vi],
+        initializer=dense_inits,
+        sparse_initializer=sparse_inits,
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 14)],
+        producer_name="torchwright",
+    )
+    t_build = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    onnx.save_model(model, output_path)
+    t_save = time.perf_counter() - t0
+
+    sidecar_path = output_path + ".input_names.json"
+    with open(sidecar_path, "w") as f:
+        json.dump({"input_names": input_names}, f)
+
+    if verbose:
+        print(
+            f"Phases: compile+emit {t_compile:.2f}s, "
+            f"build {t_build:.2f}s, save {t_save:.2f}s"
+        )
+        print(
+            f"{n_layers} layers, "
+            f"{len(sparse_inits)} sparse inits, {len(dense_inits)} dense inits"
+        )
+        model_size = os.path.getsize(output_path)
+        print(f"Wrote {output_path} ({model_size:,} bytes)")
+        print(f"Wrote {sidecar_path}")
 
 
 def compile_headless(

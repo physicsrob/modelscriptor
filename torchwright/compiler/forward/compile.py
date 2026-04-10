@@ -6,7 +6,7 @@ given input values.
 """
 
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -21,6 +21,7 @@ from torchwright.compiler.forward.weight_writer import (
     write_attn_sublayer,
     write_mlp_sublayer,
 )
+from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Node, Linear, Concatenate
@@ -70,6 +71,7 @@ def forward_compile(
     verbose: bool = True,
     max_layers: int = 100,
     device: Optional[str] = "auto",
+    on_layer_compiled: Optional[Callable[[int, TransformerLayer], None]] = None,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -82,6 +84,14 @@ def forward_compile(
         max_layers: Safety limit on number of layers.
         device: Target device — "auto" (default) uses GPU if available,
                 "cpu"/"cuda" to force, or None to skip moving.
+        on_layer_compiled: Optional streaming hook, called with
+            ``(layer_index, layer)`` after each layer's weights are fully
+            written.  The callback may extract weight tensors and then
+            null the component weight attributes to reclaim memory
+            before the next layer is allocated.  The residual-stream
+            state objects (``layer.attn.in_state`` / ``layer.mlp.out_state``)
+            stay valid regardless and are consumed later when building
+            ``residual_assignment``.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -112,6 +122,12 @@ def forward_compile(
         input_indices[node] = residual_map.get_indices(node)
 
     graph_params = sum(n.num_params() for n in graph.get_all_nodes())
+
+    # Per-layer tensor capacity (Q/K/V/O attention matrices + linear1/linear2
+    # weights & biases).  Computed once instead of via `layer.num_params()` so
+    # the verbose log still works after `on_layer_compiled` nulls the layer's
+    # weight attributes.
+    layer_capacity = 6 * d * d + 2 * d
 
     if verbose:
         print(
@@ -163,7 +179,6 @@ def forward_compile(
 
         if verbose:
             n_ops = len(attn_ops) + len(mlp_ops)
-            layer_capacity = layer.num_params()
             pct_params = 100 * layer_params / layer_capacity if layer_capacity else 0
             pct_before = 100 * occupied_before // d
             pct_after = 100 * occupied_after // d
@@ -174,15 +189,21 @@ def forward_compile(
                 f"{occupied_after:>6}/{d} ({pct_after:>2}%)  "
                 f"{layer_time*1000:>7.1f}ms "
                 f"(alloc {alloc_time*1000:.0f} sch {schedule_time*1000:.0f} "
-                f"attn {attn_time*1000:.0f} mlp {mlp_time*1000:.0f})"
+                f"attn {attn_time*1000:.0f} mlp {mlp_time*1000:.0f})",
+                flush=True,
             )
+
+        if on_layer_compiled is not None:
+            on_layer_compiled(i, layer)
     else:
         raise RuntimeError(
             f"Compilation did not converge in {max_layers} layers. "
             f"{len(graph.get_all_nodes() - computed)} nodes remaining."
         )
 
-    transformer_params = sum(layer.num_params() for layer in net.layers)
+    # layer_capacity is constant per layer (6*d*d + 2*d); avoids touching
+    # layer tensors, which may have been freed by on_layer_compiled.
+    transformer_params = layer_capacity * len(net.layers)
     if verbose:
         pct_used = 100 * total_params / transformer_params if transformer_params else 0
         print(
@@ -192,9 +213,14 @@ def forward_compile(
             f"{total_layer_time:.2f}s total layer time"
         )
 
-    # Ensure at least one layer exists for ResidualAssignment states
+    # Ensure at least one layer exists for ResidualAssignment states.
+    # If compile produced zero layers (trivial graph), run the callback on
+    # the placeholder too so every layer in net.layers is consistently in
+    # the extracted state.
     if not net.layers:
-        net.add_layer(append=True)
+        fallback_layer = net.add_layer(append=True)
+        if on_layer_compiled is not None:
+            on_layer_compiled(0, fallback_layer)
 
     # 4. Build ResidualAssignment bridge from saved input indices
     in_state = net.layers[0].attn.in_state

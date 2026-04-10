@@ -229,6 +229,12 @@ def main():
                              "(default: auto from height)")
     parser.add_argument("--wall-threshold", type=float, default=1.5,
                         help="Distance to wall that triggers a turn")
+    parser.add_argument(
+        "--from-onnx", type=str, default=None,
+        help="Path to a pre-saved game .onnx (from torchwright.doom.to_onnx). "
+             "Skips the in-process compile and runs via onnxruntime. "
+             "Scene/width/height/fov must match the config used at export.",
+    )
     args = parser.parse_args()
 
     trig_table = generate_trig_table()
@@ -255,25 +261,33 @@ def main():
         max_coord = 15.0
 
     if args.mode == "transformer":
-        from torchwright.doom.compile import compile_game, step_frame_compiled
+        from torchwright.doom.compile import step_frame_compiled
 
-        # Auto-size d to fit per-column output (H*3 pixels) plus working
-        # stream (~3500 used for H=80 with d=4096). Round up to next pow2.
-        if args.d is None:
-            needed = max(4096, args.height * 3 + 3500)
-            d = 1024
-            while d < needed:
-                d *= 2
+        if args.from_onnx is not None:
+            from torchwright.compiler.onnx_load import OnnxHeadlessModule
+
+            print(f"Loading {args.from_onnx}...")
+            module = OnnxHeadlessModule(args.from_onnx)
         else:
-            d = args.d
+            from torchwright.doom.compile import compile_game
 
-        print(f"Compiling game graph (d={d})...")
-        module = compile_game(
-            segments, config, max_coord,
-            textures=textures,
-            d=d, d_head=16,
-            device=args.device,
-        )
+            # Auto-size d to fit per-column output (H*3 pixels) plus working
+            # stream (~3500 used for H=80 with d=4096). Round up to next pow2.
+            if args.d is None:
+                needed = max(4096, args.height * 3 + 3500)
+                d = 1024
+                while d < needed:
+                    d *= 2
+            else:
+                d = args.d
+
+            print(f"Compiling game graph (d={d})...")
+            module = compile_game(
+                segments, config, max_coord,
+                textures=textures,
+                d=d, d_head=16,
+                device=args.device,
+            )
 
         def frame_fn(state, inputs):
             return step_frame_compiled(module, state, inputs, config)

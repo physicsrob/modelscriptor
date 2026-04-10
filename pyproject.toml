@@ -8,7 +8,6 @@ dependencies = [
     "onnx",
     "onnxruntime",
     "pygame>=2.6.1",
-    "onnxscript>=0.6.2",
 ]
 
 [dependency-groups]

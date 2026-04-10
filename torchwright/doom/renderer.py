@@ -588,18 +588,21 @@ def _textured_column_fill(
     tex_column_colors: Node,
     tex_height: int,
     config: RenderConfig,
-    group_size: int = 8,
+    sum_fanout: int = 4,
 ) -> Node:
     """Fill a screen column with textured wall and solid floor/ceiling.
 
-    Divides the wall into *tex_height* horizontal bands.  Each band
-    gets the corresponding texture row color.  Bands are processed in
-    groups: within each group, the ``in_range`` and ``broadcast_select``
-    calls are independent and pack into a small number of MLP sublayers.
-    Group results are summed (free) and the intermediates freed before
-    the next group, keeping peak residual-stream width manageable.
+    Divides the wall into *tex_height* horizontal bands.  Each band gets
+    the corresponding texture row color via an ``in_range`` mask +
+    ``broadcast_select``, and all bands are summed into the final
+    textured wall.
 
-    Cost: ~2 MLP sublayers per group + 3 for base/composite.
+    The per-band fill tensors are each ``H*3`` wide, so at tex_size=64 /
+    H=200 a flat sum would hold ``64 * 600 = 38,400`` residual-stream
+    columns simultaneously.  ``sum_fanout`` caps how many of those bands
+    live on the stream at once by chaining the sum through a running
+    accumulator inside :func:`sum_nodes`; this trades a few extra
+    Linears for a dramatically lower peak width.
 
     Args:
         wall_top: Scalar node -- top of wall in screen rows.
@@ -609,9 +612,10 @@ def _textured_column_fill(
             each texture row in this column.
         tex_height: Number of texture rows.
         config: Render configuration.
-        group_size: Number of bands processed in parallel per group.
-            Larger groups use more residual-stream width but fewer
-            MLP sublayers.
+        sum_fanout: Max operands live per reduction step in the final
+            band sum.  ``4`` keeps peak per-column at ~``sum_fanout *
+            H*3`` plus the running accumulator and is a sweet spot for
+            tex_size 8..64 at H in [80, 200].
 
     Returns:
         Node of width H*3 (one RGB per screen row).
@@ -630,39 +634,35 @@ def _textured_column_fill(
     wt_wh = Concatenate([wall_top, wall_height])
     zeros_H3 = LiteralValue(torch.zeros(H * 3), name="zeros_tex")
 
-    # Process bands in groups.  Within each group all in_range and
-    # broadcast_select calls are independent (each uses zeros_H3 as
-    # false_value) so the scheduler can pack them.  sum_nodes within
-    # the group is free (Linear).  Groups are then summed.
-    group_sums = []
-    for g_start in range(0, tex_height, group_size):
-        g_end = min(g_start + group_size, tex_height)
-        band_fills = []
-        for k in range(g_start, g_end):
-            lo_k = float(k) / tex_height
-            hi_k = float(k + 1) / tex_height
-            boundary_lo = Linear(
-                wt_wh,
-                torch.tensor([[1.0], [lo_k]]),
-                name=f"band_lo_{k}",
-            )
-            boundary_hi = Linear(
-                wt_wh,
-                torch.tensor([[1.0], [hi_k]]),
-                name=f"band_hi_{k}",
-            )
-            band_mask = in_range(boundary_lo, boundary_hi, H)
+    # Build all bands as independent graph nodes and hand the whole list
+    # to sum_nodes with a fanout cap.  The chained reduction inside
+    # sum_nodes + the scheduler's dead-node freeing keeps only
+    # ``sum_fanout`` bands + the running accumulator alive at any step;
+    # the rest are lazily computed as the reduction advances.
+    band_fills: List[Node] = []
+    for k in range(tex_height):
+        lo_k = float(k) / tex_height
+        hi_k = float(k + 1) / tex_height
+        boundary_lo = Linear(
+            wt_wh,
+            torch.tensor([[1.0], [lo_k]]),
+            name=f"band_lo_{k}",
+        )
+        boundary_hi = Linear(
+            wt_wh,
+            torch.tensor([[1.0], [hi_k]]),
+            name=f"band_hi_{k}",
+        )
+        band_mask = in_range(boundary_lo, boundary_hi, H)
 
-            extract = torch.zeros(tex_height * 3, 3)
-            for c in range(3):
-                extract[k * 3 + c, c] = 1.0
-            row_color = Linear(tex_column_colors, extract, name=f"tex_row_{k}")
+        extract = torch.zeros(tex_height * 3, 3)
+        for c in range(3):
+            extract[k * 3 + c, c] = 1.0
+        row_color = Linear(tex_column_colors, extract, name=f"tex_row_{k}")
 
-            band_fills.append(broadcast_select(band_mask, row_color, zeros_H3, H, 3))
+        band_fills.append(broadcast_select(band_mask, row_color, zeros_H3, H, 3))
 
-        group_sums.append(sum_nodes(band_fills))
-
-    textured_wall = sum_nodes(group_sums)
+    textured_wall = sum_nodes(band_fills, max_fanout=sum_fanout)
 
     # Composite: wall region gets textured_wall, rest keeps base
     wall_masks = in_range(wall_top, wall_bottom, H)

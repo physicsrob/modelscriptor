@@ -1,5 +1,5 @@
 import builtins
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from torchwright.graph import Node, Add, Concatenate, Linear
 import torch
@@ -119,25 +119,55 @@ def add_scaled_nodes(scale1: float, inp1: Node, scale2: float, inp2: Node) -> No
     return Linear(concat, M)
 
 
-def sum_nodes(inp_list: List[Node]) -> Node:
-    """
-    Computes the sum of all input nodes.
+def sum_nodes(
+    inp_list: List[Node], *, max_fanout: Optional[int] = None
+) -> Node:
+    """Compute the sum of all input nodes.
 
     Args:
-        inp_list (List[Node]): List of nodes to be summed.
+        inp_list: List of nodes to be summed.  All must have the same
+            output width.
+        max_fanout: Optional cap on the number of operands combined in a
+            single reduction step.  ``None`` (default) produces a single
+            flat ``Linear`` that takes all N operands at once — shallow
+            but holds all inputs on the residual stream simultaneously.
+            Setting ``max_fanout=k >= 2`` chains the reduction through a
+            running accumulator so at most ``k`` operands are alive at
+            any reduction step: wider input lists trade one Linear per
+            chunk for a correspondingly lower peak stream footprint.
+            Prefer the dial when the input list is large and each
+            operand is wide (e.g. H*3 pixel bands in the renderer).
 
     Returns:
-        Node: Node with the summed value of input nodes.
+        Node holding the elementwise sum.
     """
     d_values = {len(node) for node in inp_list}
     assert len(d_values) == 1
     d = d_values.pop()
-    x = Concatenate(inp_list)
-    output_matrix = torch.zeros(len(x), d)
-    for i in range(len(x)):
-        output_matrix[i, i % d] = 1.0
 
-    return Linear(input_node=x, output_matrix=output_matrix)
+    if max_fanout is not None and max_fanout < 2:
+        raise ValueError(f"max_fanout must be >= 2, got {max_fanout}")
+
+    def _flat(nodes: List[Node]) -> Node:
+        x = Concatenate(nodes)
+        output_matrix = torch.zeros(len(x), d)
+        for i in range(len(x)):
+            output_matrix[i, i % d] = 1.0
+        return Linear(input_node=x, output_matrix=output_matrix)
+
+    if max_fanout is None or len(inp_list) <= max_fanout:
+        return _flat(inp_list)
+
+    # Chain into a running accumulator so at most ``max_fanout`` operands
+    # are live per reduction step.  The first chunk uses the full fanout;
+    # subsequent chunks leave one slot for the running accumulator so the
+    # total alive per step stays at ``max_fanout``.
+    running = _flat(inp_list[:max_fanout])
+    chunk = max_fanout - 1
+    for start in range(max_fanout, len(inp_list), chunk):
+        group = inp_list[start : start + chunk]
+        running = _flat([running] + list(group))
+    return running
 
 
 def concat(inp_list: List[Node]) -> Node:

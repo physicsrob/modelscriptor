@@ -211,3 +211,147 @@ def test_compile_headless():
     with torch.no_grad():
         result = module(torch.tensor([[1.0]]))
     assert result.item() < -0.5, f"compare(1, 5) should be false, got {result.item()}"
+
+
+# ---------------------------------------------------------------------------
+# Direct ONNX emission (emit_headless_onnx) round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_emit_headless_onnx_matches_headless_module(tmp_path):
+    """emit_headless_onnx output matches to_headless_module output via ORT."""
+    import numpy as np
+    import pytest
+
+    ort = pytest.importorskip("onnxruntime")
+
+    from torchwright.compiler.export import emit_headless_onnx
+
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    cond = compare(a, 0.0)
+    out = select(cond, b, a)
+
+    pos_encoding = create_pos_encoding()
+    # Compile twice: once for the ONNX emit (layers are freed during emit),
+    # and once for the reference nn.Module comparison.
+    net_for_onnx = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out,
+        pos_encoding=pos_encoding, verbose=False,
+    )
+    net_for_ref = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out,
+        pos_encoding=pos_encoding, verbose=False,
+    )
+    ref_module = to_headless_module(net_for_ref, out, device="cpu")
+    ref_module.eval()
+
+    onnx_path = str(tmp_path / "model.onnx")
+    emit_headless_onnx(net_for_onnx, out, onnx_path, max_seq_len=32, verbose=False)
+
+    assert (tmp_path / "model.onnx.input_names.json").exists()
+
+    session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+
+    torch.manual_seed(0)
+    for seq_len in (1, 5, 10):
+        inputs = torch.randn(seq_len, 2)
+        with torch.no_grad():
+            ref = ref_module(inputs).numpy()
+        ort_out = session.run(None, {input_name: inputs.numpy().astype(np.float32)})[0]
+        assert ort_out.shape == ref.shape, (ort_out.shape, ref.shape)
+        max_diff = float(np.abs(ort_out - ref).max())
+        assert np.allclose(ort_out, ref, atol=1e-4), (
+            f"seq_len={seq_len} max diff {max_diff:.6f}"
+        )
+
+
+def test_onnx_headless_module_loader(tmp_path):
+    """OnnxHeadlessModule is a drop-in for HeadlessTransformerModule."""
+    import numpy as np
+    import pytest
+
+    pytest.importorskip("onnxruntime")
+
+    from torchwright.compiler.export import emit_headless_onnx
+    from torchwright.compiler.onnx_load import OnnxHeadlessModule
+
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    cond = compare(a, 0.0)
+    out = select(cond, b, a)
+
+    pos_encoding = create_pos_encoding()
+    net_for_onnx = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out,
+        pos_encoding=pos_encoding, verbose=False,
+    )
+    net_for_ref = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out,
+        pos_encoding=pos_encoding, verbose=False,
+    )
+    ref_module = to_headless_module(net_for_ref, out, device="cpu")
+    ref_module.eval()
+
+    onnx_path = str(tmp_path / "loader.onnx")
+    emit_headless_onnx(net_for_onnx, out, onnx_path, max_seq_len=16, verbose=False)
+
+    loaded = OnnxHeadlessModule(onnx_path)
+    loaded.eval()
+    assert loaded.input_names == ["a", "b"]
+
+    torch.manual_seed(1)
+    for seq_len in (1, 4, 8):
+        inputs = torch.randn(seq_len, 2)
+        with torch.no_grad():
+            ref = ref_module(inputs)
+            loaded_out = loaded(inputs)
+        assert isinstance(loaded_out, torch.Tensor)
+        assert loaded_out.shape == ref.shape
+        assert np.allclose(loaded_out.numpy(), ref.numpy(), atol=1e-4), (
+            f"seq_len={seq_len} diverges"
+        )
+
+
+def test_emit_headless_onnx_multiply(tmp_path):
+    """signed_multiply compiled to ONNX via direct emission matches reference."""
+    import numpy as np
+    import pytest
+
+    ort = pytest.importorskip("onnxruntime")
+
+    from torchwright.compiler.export import emit_headless_onnx
+
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    out = signed_multiply(a, b, max_abs1=10, max_abs2=10)
+
+    pos_encoding = create_pos_encoding()
+    net_for_onnx = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out,
+        pos_encoding=pos_encoding, verbose=False,
+    )
+    net_for_ref = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out,
+        pos_encoding=pos_encoding, verbose=False,
+    )
+    ref_module = to_headless_module(net_for_ref, out, device="cpu")
+    ref_module.eval()
+
+    onnx_path = str(tmp_path / "mul.onnx")
+    emit_headless_onnx(net_for_onnx, out, onnx_path, max_seq_len=16, verbose=False)
+
+    session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+
+    a_vals = torch.tensor([[3.0], [-2.0], [0.0], [7.0]])
+    b_vals = torch.tensor([[4.0], [5.0], [1.0], [-1.0]])
+    inputs = torch.cat([a_vals, b_vals], dim=1)
+
+    with torch.no_grad():
+        ref = ref_module(inputs).numpy()
+    ort_out = session.run(None, {input_name: inputs.numpy().astype(np.float32)})[0]
+    assert np.allclose(ort_out, ref, atol=1e-3), (
+        f"max diff {float(np.abs(ort_out - ref).max()):.6f}"
+    )
