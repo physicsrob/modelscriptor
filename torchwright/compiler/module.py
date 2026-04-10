@@ -292,6 +292,50 @@ class HeadlessTransformerModule(nn.Module):
         return res[:, self.output_gather_indices].to(orig_device)
 
 
+class _CachedHeadlessWrapper(nn.Module):
+    """Export-friendly cached forward for HeadlessTransformerModule.
+
+    Signature matches the ONNX graph:
+        forward(inputs, past_len, past_K_0, past_V_0, ..., past_K_{N-1}, past_V_{N-1})
+          -> (output, new_K_0, new_V_0, ..., new_K_{N-1}, new_V_{N-1})
+
+    Prefill is expressed by passing empty past tensors
+    (shape (n_heads, 0, d_head)) and past_len=0.
+    """
+
+    def __init__(self, base: HeadlessTransformerModule):
+        super().__init__()
+        self.base = base
+        self.n_layers = len(base.layers)
+
+    def forward(
+        self,
+        inputs: torch.FloatTensor,
+        past_len: torch.LongTensor,
+        *past_kvs: torch.Tensor,
+    ):
+        b = self.base
+        n_new = inputs.shape[0]
+
+        pos = b.pos_encoding[past_len : past_len + n_new]
+        res = inputs @ b.input_proj + pos @ b.pos_proj + b.constant_values
+
+        new_kvs: List[torch.Tensor] = []
+        for i, layer_pair in enumerate(b.layers):
+            assert isinstance(layer_pair, nn.ModuleList)
+            attn_mod = layer_pair[0]
+            ffn_mod = layer_pair[1]
+            past_K_i = past_kvs[2 * i]
+            past_V_i = past_kvs[2 * i + 1]
+            res, new_K_i, new_V_i = attn_mod.forward_cached(res, past_K_i, past_V_i)
+            res = ffn_mod(res)
+            new_kvs.append(new_K_i)
+            new_kvs.append(new_V_i)
+
+        output = res[:, b.output_gather_indices]
+        return (output, *new_kvs)
+
+
 def _compute_pos_encoding(d_pos: int, max_seq_len: int) -> torch.Tensor:
     """Precompute sinusoidal positional encoding buffer."""
     pe = torch.zeros(max_seq_len, d_pos)
