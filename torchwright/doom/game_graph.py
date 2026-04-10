@@ -22,6 +22,7 @@ from torchwright.ops.arithmetic_ops import (
     negate,
     signed_multiply,
     subtract,
+    thermometer_floor_div,
 )
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 from torchwright.ops.logic_ops import bool_all_true, bool_any_true
@@ -281,60 +282,132 @@ def build_game_graph(
     """Build the complete game logic + rendering graph.
 
     One forward pass processes player inputs, updates position with
-    collision detection, and renders the scene.
+    collision detection, and renders the scene.  The host writes seed
+    state and player inputs at position 0 only; rows 1..W-1 of the input
+    tensor are zero.  The graph broadcasts position 0's inputs across
+    all positions via ``get_prev_value`` and derives per-column
+    ``angle_offset`` and ``perp_cos`` from the position encoding.
 
-    Inputs (per position, alphabetical order):
-        angle_offset:       per-column angular offset from center
+    Inputs (per position, alphabetical order).  Only row 0 is populated
+    by the host:
+
         input_backward:     0.0 or 1.0
         input_forward:      0.0 or 1.0
         input_strafe_left:  0.0 or 1.0
         input_strafe_right: 0.0 or 1.0
         input_turn_left:    0.0 or 1.0
         input_turn_right:   0.0 or 1.0
-        old_angle:          previous frame facing direction (0-255)
-        old_x:              previous frame x position
-        old_y:              previous frame y position
-        perp_cos:           cos(angle_offset) for fish-eye correction
+        seed_angle:         seed facing direction (0-255)
+        seed_x:             seed x position
+        seed_y:             seed y position
 
-    Output per position: H*3 pixel values + 3 state values (new_x, new_y, new_angle).
+    Output per position: H*3 pixel values + 3 state values
+    (new_x, new_y, new_angle).  The state values are identical at every
+    position because the broadcast pattern feeds identical inputs into
+    the game-logic subgraph everywhere.
 
     Returns:
         (output_node, pos_encoding) tuple for compilation.
     """
     pos_encoding = create_pos_encoding()
 
-    # Create inputs (alphabetical order)
-    angle_offset = create_input("angle_offset", 1)
+    # Create inputs (alphabetical order — matches HeadlessTransformerModule)
     input_backward = create_input("input_backward", 1)
     input_forward = create_input("input_forward", 1)
     input_strafe_left = create_input("input_strafe_left", 1)
     input_strafe_right = create_input("input_strafe_right", 1)
     input_turn_left = create_input("input_turn_left", 1)
     input_turn_right = create_input("input_turn_right", 1)
-    old_angle = create_input("old_angle", 1)
-    old_x = create_input("old_x", 1)
-    old_y = create_input("old_y", 1)
-    perp_cos = create_input("perp_cos", 1)
+    seed_angle = create_input("seed_angle", 1)
+    seed_x = create_input("seed_x", 1)
+    seed_y = create_input("seed_y", 1)
 
-    # === Game Logic Phase ===
+    # === Position-0 seed broadcast ===
+    # is_pos_0 is +1 at position 0 and -1 elsewhere.  get_position_scalar
+    # returns exactly 0.0 at pos 0 (sin(0)=0) and ~k at pos k>0, so the
+    # 0.5 threshold is unambiguous at position 0 itself.
+    position_scalar = pos_encoding.get_position_scalar()
+    is_pos_0 = compare(
+        position_scalar, 0.5, true_level=-1.0, false_level=1.0,
+    )
+
+    # Broadcast pos-0 values to all positions in a single attention head:
+    # pack the 9 scalars into one width-9 node and call get_prev_value
+    # once (d_head=16 has room for 9).
+    seeds_packed = Concatenate([
+        input_backward,
+        input_forward,
+        input_strafe_left,
+        input_strafe_right,
+        input_turn_left,
+        input_turn_right,
+        seed_angle,
+        seed_x,
+        seed_y,
+    ])
+    broadcast = pos_encoding.get_prev_value(seeds_packed, is_pos_0)
+
+    def _extract(idx: int, name: str) -> Node:
+        m = torch.zeros(9, 1)
+        m[idx, 0] = 1.0
+        return Linear(broadcast, m, name=name)
+
+    eff_input_backward = _extract(0, "eff_input_backward")
+    eff_input_forward = _extract(1, "eff_input_forward")
+    eff_input_strafe_left = _extract(2, "eff_input_strafe_left")
+    eff_input_strafe_right = _extract(3, "eff_input_strafe_right")
+    eff_input_turn_left = _extract(4, "eff_input_turn_left")
+    eff_input_turn_right = _extract(5, "eff_input_turn_right")
+    eff_seed_angle = _extract(6, "eff_seed_angle")
+    eff_seed_x = _extract(7, "eff_seed_x")
+    eff_seed_y = _extract(8, "eff_seed_y")
+
+    # === Graph-derived per-column angle_offset and perp_cos ===
+    # Integer-exact: matches the host-side
+    #     angle_offset = (col - W//2) * fov_columns // W
+    # when (W//2)*fov_columns % W == 0 (satisfied by the test fixtures).
+    W = config.screen_width
+    fov = config.fov_columns
+    col_idx = thermometer_floor_div(position_scalar, 1, max_value=W)
+    col_times_fov = multiply_const(col_idx, float(fov))
+    ao_unsigned = thermometer_floor_div(
+        col_times_fov, W, max_value=fov * W,
+    )
+    angle_offset = add_const(ao_unsigned, float(-(fov // 2)))
+
+    # perp_cos = cos(angle_offset mod 256), reusing the existing trig lookup.
+    perp_shifted = add_const(angle_offset, 256.0)
+    perp_angle = mod_const(perp_shifted, 256, max_value=256 + fov)
+    perp_cos, _perp_sin = trig_lookup(perp_angle)
+
+    # === Game Logic Phase (consumes effective_* from broadcast) ===
 
     # 1. Angle update
-    new_angle = _compute_new_angle(old_angle, input_turn_left, input_turn_right, turn_speed)
+    new_angle = _compute_new_angle(
+        eff_seed_angle,
+        eff_input_turn_left,
+        eff_input_turn_right,
+        turn_speed,
+    )
 
     # 2. Velocity from inputs
     dx, dy = _compute_velocity(
-        new_angle, input_forward, input_backward,
-        input_strafe_left, input_strafe_right, move_speed,
+        new_angle,
+        eff_input_forward,
+        eff_input_backward,
+        eff_input_strafe_left,
+        eff_input_strafe_right,
+        move_speed,
     )
 
     # 3. Collision detection + position resolution
     resolved_x, resolved_y = _resolve_collision_graph(
-        old_x, old_y, dx, dy, segments, max_coord, move_speed,
+        eff_seed_x, eff_seed_y, dx, dy, segments, max_coord, move_speed,
     )
 
     # === Rendering Phase ===
 
-    # 4. Per-column ray angle
+    # 4. Per-column ray angle: (new_angle + angle_offset) mod 256
     ray_angle = _compute_ray_angle(new_angle, angle_offset)
 
     # 5. Render using resolved position

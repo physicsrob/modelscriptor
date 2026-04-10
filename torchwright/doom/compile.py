@@ -145,6 +145,19 @@ def compile_game(
     return module
 
 
+EXPECTED_INPUT_NAMES = (
+    "input_backward",
+    "input_forward",
+    "input_strafe_left",
+    "input_strafe_right",
+    "input_turn_left",
+    "input_turn_right",
+    "seed_angle",
+    "seed_x",
+    "seed_y",
+)
+
+
 def step_frame_compiled(
     module,
     state: GameState,
@@ -153,12 +166,15 @@ def step_frame_compiled(
 ) -> Tuple[np.ndarray, GameState]:
     """Run one game frame: update state + render.
 
-    Builds the input tensor (11 inputs per column), runs the compiled
-    game graph, and extracts the rendered frame and updated state.
+    Writes the seed state and player inputs into **row 0 only** of a
+    ``(W, 9)`` input tensor; rows 1..W-1 stay zero.  The compiled graph
+    broadcasts row 0 across all positions internally and derives the
+    per-column ``angle_offset`` / ``perp_cos`` from the position
+    encoding.
 
     Args:
         module: Compiled game HeadlessTransformerModule.
-        state: Current game state.
+        state: Current game state (used as the seed at row 0).
         inputs: Player input flags for this frame.
         config: Render configuration.
 
@@ -166,28 +182,25 @@ def step_frame_compiled(
         (frame, new_state) where frame is (H, W, 3) float array
         and new_state is the updated GameState.
     """
+    assert tuple(module.input_names) == EXPECTED_INPUT_NAMES, (
+        f"Compiled module has stale input names {module.input_names}; "
+        f"expected {EXPECTED_INPUT_NAMES}. Recompile after the phase-α refactor."
+    )
+
     W = config.screen_width
     H = config.screen_height
-    trig = config.trig_table
 
-    # Build input tensor: (W, 11) — alphabetical input order
-    inp = torch.zeros(W, 11)
-    for col in range(W):
-        col_offset = col - W // 2
-        angle_offset = col_offset * config.fov_columns // W
-        perp_cos_val = float(trig[angle_offset % 256, 0])
-
-        inp[col, 0] = float(angle_offset)
-        inp[col, 1] = float(inputs.backward)
-        inp[col, 2] = float(inputs.forward)
-        inp[col, 3] = float(inputs.strafe_left)
-        inp[col, 4] = float(inputs.strafe_right)
-        inp[col, 5] = float(inputs.turn_left)
-        inp[col, 6] = float(inputs.turn_right)
-        inp[col, 7] = float(state.angle)
-        inp[col, 8] = float(state.x)
-        inp[col, 9] = float(state.y)
-        inp[col, 10] = perp_cos_val
+    # (W, 9) input tensor — only row 0 is populated.
+    inp = torch.zeros(W, 9)
+    inp[0, 0] = float(inputs.backward)
+    inp[0, 1] = float(inputs.forward)
+    inp[0, 2] = float(inputs.strafe_left)
+    inp[0, 3] = float(inputs.strafe_right)
+    inp[0, 4] = float(inputs.turn_left)
+    inp[0, 5] = float(inputs.turn_right)
+    inp[0, 6] = float(state.angle)
+    inp[0, 7] = float(state.x)
+    inp[0, 8] = float(state.y)
 
     with torch.no_grad():
         output = module(inp)  # (W, H*3 + 3)
@@ -195,7 +208,7 @@ def step_frame_compiled(
     # Extract pixels: first H*3 columns
     pixels = output[:, :H * 3].cpu().numpy().reshape(W, H, 3).transpose(1, 0, 2)
 
-    # Extract state from position 0 (all positions compute the same state)
+    # Extract state from position 0 (all positions compute the same state).
     new_x = output[0, H * 3].item()
     new_y = output[0, H * 3 + 1].item()
     new_angle = round(output[0, H * 3 + 2].item()) % 256
