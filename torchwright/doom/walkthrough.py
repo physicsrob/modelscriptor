@@ -222,18 +222,13 @@ def main():
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--scale", type=int, default=4,
                         help="Nearest-neighbor upscale factor for output")
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Device for transformer mode (default: cuda)")
-    parser.add_argument("--d", type=int, default=None,
-                        help="Transformer residual stream width "
-                             "(default: auto from height)")
     parser.add_argument("--wall-threshold", type=float, default=1.5,
                         help="Distance to wall that triggers a turn")
     parser.add_argument(
-        "--from-onnx", type=str, default=None,
-        help="Path to a pre-saved game .onnx (from torchwright.doom.to_onnx). "
-             "Skips the in-process compile and runs via onnxruntime. "
-             "Scene/width/height/fov must match the config used at export.",
+        "--onnx", type=str, default=None,
+        help="Path to a game .onnx produced by torchwright.doom.to_onnx. "
+             "Required for --mode transformer. Scene/width/height/fov "
+             "must match the config used at export.",
     )
     args = parser.parse_args()
 
@@ -261,33 +256,20 @@ def main():
         max_coord = 15.0
 
     if args.mode == "transformer":
+        if args.onnx is None:
+            raise SystemExit(
+                "transformer mode requires --onnx <path>. "
+                "Compile the graph first with "
+                f"`python -m torchwright.doom.to_onnx --mode game --scene {args.scene} "
+                f"--width {args.width} --height {args.height} --fov {args.fov} "
+                f"--tex-size {args.tex_size}`."
+            )
+
+        from torchwright.compiler.onnx_load import OnnxHeadlessModule
         from torchwright.doom.compile import step_frame_compiled
 
-        if args.from_onnx is not None:
-            from torchwright.compiler.onnx_load import OnnxHeadlessModule
-
-            print(f"Loading {args.from_onnx}...")
-            module = OnnxHeadlessModule(args.from_onnx)
-        else:
-            from torchwright.doom.compile import compile_game
-
-            # Auto-size d to fit per-column output (H*3 pixels) plus working
-            # stream (~3500 used for H=80 with d=4096). Round up to next pow2.
-            if args.d is None:
-                needed = max(4096, args.height * 3 + 3500)
-                d = 1024
-                while d < needed:
-                    d *= 2
-            else:
-                d = args.d
-
-            print(f"Compiling game graph (d={d})...")
-            module = compile_game(
-                segments, config, max_coord,
-                textures=textures,
-                d=d, d_head=16,
-                device=args.device,
-            )
+        print(f"Loading {args.onnx}...")
+        module = OnnxHeadlessModule(args.onnx)
 
         def frame_fn(state, inputs):
             return step_frame_compiled(module, state, inputs, config)
