@@ -224,6 +224,9 @@ def main():
                         help="Nearest-neighbor upscale factor for output")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device for transformer mode (default: cuda)")
+    parser.add_argument("--d", type=int, default=None,
+                        help="Transformer residual stream width "
+                             "(default: auto from height)")
     parser.add_argument("--wall-threshold", type=float, default=1.5,
                         help="Distance to wall that triggers a turn")
     args = parser.parse_args()
@@ -254,11 +257,21 @@ def main():
     if args.mode == "transformer":
         from torchwright.doom.compile import compile_game, step_frame_compiled
 
-        print("Compiling game graph...")
+        # Auto-size d to fit per-column output (H*3 pixels) plus working
+        # stream (~3500 used for H=80 with d=4096). Round up to next pow2.
+        if args.d is None:
+            needed = max(4096, args.height * 3 + 3500)
+            d = 1024
+            while d < needed:
+                d *= 2
+        else:
+            d = args.d
+
+        print(f"Compiling game graph (d={d})...")
         module = compile_game(
             segments, config, max_coord,
             textures=textures,
-            d=4096, d_head=16,
+            d=d, d_head=16,
             device=args.device,
         )
 
