@@ -1,10 +1,10 @@
-"""Tests for deferred-bias correctness across FFN operation types.
+"""Tests for deferred-bias correctness across MLP operation types.
 
 When a biased Linear is compiled in the attention sublayer, its bias is
-deferred to the FFN's output bias (compute_bias). FFN operations that
+deferred to the MLP's output bias (compute_bias). MLP operations that
 read from the biased Linear's residual columns in the same layer see
-the pre-bias value via ffn.linear1. These tests verify that the compiler
-handles this interaction correctly for each FFN op type.
+the pre-bias value via mlp.linear1. These tests verify that the compiler
+handles this interaction correctly for each MLP op type.
 """
 
 import torch
@@ -20,8 +20,8 @@ from torchwright.ops.map_select import in_range
 def test_standalone_relu_after_biased_linear():
     """Standalone ReLU should see the biased Linear's full value (W@x + bias).
 
-    Bug: the standalone ReLU reads via ffn.linear1 before compute_bias
-    writes to ffn.linear2.output_bias, so it sees W@x without the bias.
+    Bug: the standalone ReLU reads via mlp.linear1 before compute_bias
+    writes to mlp.linear2.output_bias, so it sees W@x without the bias.
     """
     pos = create_pos_encoding()
     x = create_input("x", 1)
@@ -35,7 +35,11 @@ def test_standalone_relu_after_biased_linear():
     output = Add(z, offset)
 
     net = forward_compile(
-        d=64, d_head=16, output_node=output, pos_encoding=pos, verbose=False,
+        d=64,
+        d_head=16,
+        output_node=output,
+        pos_encoding=pos,
+        verbose=False,
     )
 
     # x=2 → y=3 → z=ReLU(3)=3 → output=103
@@ -55,9 +59,9 @@ def test_standalone_relu_after_biased_linear():
     graph_out = output.compute(1, vals)[0]
     compiled_out = net.compute(1, vals)[output][0]
     assert abs(graph_out[0].item() - 108.0) < 0.5
-    assert abs(compiled_out[0].item() - 108.0) < 0.5, (
-        f"Expected 108, got {compiled_out[0].item():.1f}."
-    )
+    assert (
+        abs(compiled_out[0].item() - 108.0) < 0.5
+    ), f"Expected 108, got {compiled_out[0].item():.1f}."
 
 
 def test_chain_with_two_biased_linear_inputs():
@@ -77,7 +81,11 @@ def test_chain_with_two_biased_linear_inputs():
     masks = in_range(lower, upper, H)
 
     net = forward_compile(
-        d=64, d_head=16, output_node=masks, pos_encoding=pos, verbose=False,
+        d=64,
+        d_head=16,
+        output_node=masks,
+        pos_encoding=pos,
+        verbose=False,
     )
 
     # a=-5, b=-12 → lower=5, upper=8 → positions 5,6,7 in range
@@ -89,12 +97,12 @@ def test_chain_with_two_biased_linear_inputs():
 
     expected = [-1, -1, -1, -1, -1, 1, 1, 1]
     for i in range(H):
-        assert abs(graph_out[i].item() - expected[i]) < 0.5, (
-            f"Graph mismatch at slot {i}: got {graph_out[i].item():.1f}, expected {expected[i]}"
-        )
-        assert abs(compiled_out[i].item() - expected[i]) < 0.5, (
-            f"Compiled mismatch at slot {i}: got {compiled_out[i].item():.1f}, expected {expected[i]}"
-        )
+        assert (
+            abs(graph_out[i].item() - expected[i]) < 0.5
+        ), f"Graph mismatch at slot {i}: got {graph_out[i].item():.1f}, expected {expected[i]}"
+        assert (
+            abs(compiled_out[i].item() - expected[i]) < 0.5
+        ), f"Compiled mismatch at slot {i}: got {compiled_out[i].item():.1f}, expected {expected[i]}"
 
 
 def test_biased_linear_fanout_chain_and_add():
@@ -126,7 +134,11 @@ def test_biased_linear_fanout_chain_and_add():
     output = Add(mask_sum, y)
 
     net = forward_compile(
-        d=64, d_head=16, output_node=output, pos_encoding=pos, verbose=False,
+        d=64,
+        d_head=16,
+        output_node=output,
+        pos_encoding=pos,
+        verbose=False,
     )
 
     # x=0 → y=5
@@ -136,9 +148,9 @@ def test_biased_linear_fanout_chain_and_add():
     graph_out = output.compute(1, vals)[0]
     compiled_out = net.compute(1, vals)[output][0]
 
-    assert abs(graph_out[0].item() - 3.0) < 0.5, (
-        f"Graph: expected 3, got {graph_out[0].item():.1f}"
-    )
+    assert (
+        abs(graph_out[0].item() - 3.0) < 0.5
+    ), f"Graph: expected 3, got {graph_out[0].item():.1f}"
     assert abs(compiled_out[0].item() - 3.0) < 0.5, (
         f"Compiled: expected 3, got {compiled_out[0].item():.1f}. "
         f"13 → fold missing, -2 → compute_bias missing, -7 → bias doubled"

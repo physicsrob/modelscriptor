@@ -1,7 +1,7 @@
 """Writes weight matrices into TransformerLayer components.
 
 Each operation directly sets matrix entries using column indices from the
-ResidualStreamMap. No strategies, no FeatureAssignment — just scatter writes.
+ResidualStreamMap. No strategies, no ResidualAssignment — just scatter writes.
 """
 
 from dataclasses import dataclass, field
@@ -10,7 +10,7 @@ from typing import List, Literal, Optional, Set
 import torch
 import torch.nn.functional as F
 
-from torchwright.compiler.feature_assignment import flatten_concat_nodes
+from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
@@ -21,17 +21,24 @@ from torchwright.graph.relu import ReLU
 
 @dataclass
 class AttnHeadOp:
-    op_type: Literal["compute_attn", "compute_linear", "compute_add", "cancel", "add_into"]
+    op_type: Literal[
+        "compute_attn", "compute_linear", "compute_add", "cancel", "add_into"
+    ]
     node: Node
     target_cols: List[int]
 
 
 @dataclass
-class FFNOp:
-    op_type: Literal["compute_relu", "compute_standalone_relu", "compute_literal_value", "compute_bias"]
+class MLPOp:
+    op_type: Literal[
+        "compute_relu",
+        "compute_standalone_relu",
+        "compute_literal_value",
+        "compute_bias",
+    ]
     node: Node
     target_cols: List[int]
-    ffn_slots: List[int] = field(default_factory=list)
+    mlp_slots: List[int] = field(default_factory=list)
 
 
 def write_attn_sublayer(
@@ -58,26 +65,26 @@ def write_attn_sublayer(
             raise ValueError(f"Unknown attn op_type: {op.op_type}")
 
 
-def write_ffn_sublayer(
+def write_mlp_sublayer(
     layer: TransformerLayer,
-    ops: List[FFNOp],
+    ops: List[MLPOp],
     residual_map: ResidualStreamMap,
     biased_linears: Optional[Set[Node]] = None,
 ):
-    """Write FFN operations into a layer's FFNSubLayer components."""
+    """Write MLP operations into a layer's MLPSubLayer components."""
     if biased_linears is None:
         biased_linears = set()
     for op in ops:
         if op.op_type == "compute_relu":
-            _write_compute_relu(layer.ffn, op, residual_map, biased_linears)
+            _write_compute_relu(layer.mlp, op, residual_map, biased_linears)
         elif op.op_type == "compute_literal_value":
-            _write_compute_literal_value(layer.ffn, op)
+            _write_compute_literal_value(layer.mlp, op)
         elif op.op_type == "compute_bias":
-            _write_compute_bias(layer.ffn, op)
+            _write_compute_bias(layer.mlp, op)
         elif op.op_type == "compute_standalone_relu":
-            _write_compute_standalone_relu(layer.ffn, op, residual_map, biased_linears)
+            _write_compute_standalone_relu(layer.mlp, op, residual_map, biased_linears)
         else:
-            raise ValueError(f"Unknown ffn op_type: {op.op_type}")
+            raise ValueError(f"Unknown mlp op_type: {op.op_type}")
 
 
 # ---------------------------------------------------------------------------
@@ -345,16 +352,18 @@ def _write_add_into(
 
 
 # ---------------------------------------------------------------------------
-# FFN operations
+# MLP operations
 # ---------------------------------------------------------------------------
 
 
-def _write_compute_relu(ffn, op: FFNOp, rmap: ResidualStreamMap, biased_linears: Set[Node] = frozenset()):
-    """Compile a Linear1 -> ReLU -> Linear2 chain through the FFN.
+def _write_compute_relu(
+    mlp, op: MLPOp, rmap: ResidualStreamMap, biased_linears: Set[Node] = frozenset()
+):
+    """Compile a Linear1 -> ReLU -> Linear2 chain through the MLP sublayer.
 
-    linear1: maps input columns to ffn_slots (applying L1's weight + bias)
+    linear1: maps input columns to mlp_slots (applying L1's weight + bias)
     relu: applied elementwise (no weights)
-    linear2: maps ffn_slots to target columns (applying L2's weight + bias)
+    linear2: maps mlp_slots to target columns (applying L2's weight + bias)
     """
     l2_node = op.node
     assert isinstance(l2_node, Linear)
@@ -365,65 +374,74 @@ def _write_compute_relu(ffn, op: FFNOp, rmap: ResidualStreamMap, biased_linears:
 
     input_node = l1_node.inputs[0]
     in_idx = rmap.resolve_indices(input_node)
-    ffn_slots = op.ffn_slots
+    mlp_slots = op.mlp_slots
     out_idx = op.target_cols
 
-    # linear1: input columns -> ffn slots
-    # L1 weight: (d_input, d_intermediate), bias: (d_intermediate,)
+    # linear1: input columns -> mlp slots
+    # L1 weight: (d_input, d_hidden), bias: (d_hidden,)
     for i, in_col in enumerate(in_idx):
-        for j, slot in enumerate(ffn_slots):
-            ffn.linear1.output_matrix[in_col, slot] = l1_node.output_matrix[i, j]
-    for j, slot in enumerate(ffn_slots):
-        ffn.linear1.output_bias[slot] = l1_node.output_bias[j]
+        for j, slot in enumerate(mlp_slots):
+            mlp.linear1.output_matrix[in_col, slot] = l1_node.output_matrix[i, j]
+    for j, slot in enumerate(mlp_slots):
+        mlp.linear1.output_bias[slot] = l1_node.output_bias[j]
 
-    # Fold deferred biased-Linear inputs into l1's intermediate bias.
+    # Fold deferred biased-Linear inputs into l1's hidden bias.
     # Biased Linears compiled in attention have their matrix applied but bias
     # deferred to compute_bias (written to linear2 output_bias). The chain
     # reads those columns in linear1, before output_bias is applied. Fold the
-    # bias into l1's FFN bias so the chain sees correct values.
+    # bias into l1's MLP bias so the chain sees correct values.
     if biased_linears:
-        leaves = flatten_concat_nodes([input_node]) if isinstance(input_node, Concatenate) else [input_node]
+        leaves = (
+            flatten_concat_nodes([input_node])
+            if isinstance(input_node, Concatenate)
+            else [input_node]
+        )
         offset = 0
         for leaf in leaves:
             if leaf in biased_linears:
-                for j, slot in enumerate(ffn_slots):
+                for j, slot in enumerate(mlp_slots):
                     bias_contrib = 0.0
                     for i in range(len(leaf)):
-                        bias_contrib += l1_node.output_matrix[offset + i, j].item() * leaf.output_bias[i].item()
-                    ffn.linear1.output_bias[slot] += bias_contrib
+                        bias_contrib += (
+                            l1_node.output_matrix[offset + i, j].item()
+                            * leaf.output_bias[i].item()
+                        )
+                    mlp.linear1.output_bias[slot] += bias_contrib
             offset += len(leaf)
 
-    # linear2: ffn slots -> output columns
-    # L2 weight: (d_intermediate, d_output), bias: (d_output,)
-    for i, slot in enumerate(ffn_slots):
+    # linear2: mlp slots -> output columns
+    # L2 weight: (d_hidden, d_output), bias: (d_output,)
+    for i, slot in enumerate(mlp_slots):
         for j, out_col in enumerate(out_idx):
-            ffn.linear2.output_matrix[slot, out_col] = l2_node.output_matrix[i, j]
+            mlp.linear2.output_matrix[slot, out_col] = l2_node.output_matrix[i, j]
     for j, out_col in enumerate(out_idx):
-        ffn.linear2.output_bias[out_col] = l2_node.output_bias[j]
+        mlp.linear2.output_bias[out_col] = l2_node.output_bias[j]
 
 
-def _write_compute_literal_value(ffn, op: FFNOp):
-    """Write a constant value via FFN output bias."""
+def _write_compute_literal_value(mlp, op: MLPOp):
+    """Write a constant value via MLP output bias."""
     node = op.node
     assert isinstance(node, LiteralValue)
     for i, col in enumerate(op.target_cols):
-        ffn.linear2.output_bias[col] = node.value[i]
+        mlp.linear2.output_bias[col] = node.value[i]
 
 
-def _write_compute_bias(ffn, op: FFNOp):
-    """Add bias to FFN output bias (for biased Linear split)."""
+def _write_compute_bias(mlp, op: MLPOp):
+    """Add bias to MLP output bias (for biased Linear split)."""
     node = op.node
     assert isinstance(node, Linear)
     for i, col in enumerate(op.target_cols):
-        ffn.linear2.output_bias[col] += node.output_bias[i]
+        mlp.linear2.output_bias[col] += node.output_bias[i]
 
 
-def _write_compute_standalone_relu(ffn, op: FFNOp, rmap: ResidualStreamMap, biased_linears: Set[Node] = frozenset()):
-    """Compile a standalone ReLU through the FFN.
+def _write_compute_standalone_relu(
+    mlp, op: MLPOp, rmap: ResidualStreamMap, biased_linears: Set[Node] = frozenset()
+):
+    """Compile a standalone ReLU through the MLP sublayer.
 
-    linear1: identity mapping from input columns to FFN slots (bias=0)
+    linear1: identity mapping from input columns to MLP slots (bias=0)
     relu: applied elementwise (built-in)
-    linear2: identity mapping from FFN slots to output columns (bias=0)
+    linear2: identity mapping from MLP slots to output columns (bias=0)
 
     The skip connection preserves the input. Output columns (initially zero)
     receive relu(input_value).
@@ -433,24 +451,30 @@ def _write_compute_standalone_relu(ffn, op: FFNOp, rmap: ResidualStreamMap, bias
 
     input_node = relu_node.inputs[0]
     in_idx = rmap.resolve_indices(input_node)
-    ffn_slots = op.ffn_slots
+    mlp_slots = op.mlp_slots
     out_idx = op.target_cols
 
-    # linear1: input columns → FFN slots (identity, zero bias)
-    for in_col, slot in zip(in_idx, ffn_slots):
-        ffn.linear1.output_matrix[in_col, slot] = 1.0
+    # linear1: input columns → MLP slots (identity, zero bias)
+    for in_col, slot in zip(in_idx, mlp_slots):
+        mlp.linear1.output_matrix[in_col, slot] = 1.0
 
-    # Fold deferred biased-Linear inputs into FFN slot biases.
+    # Fold deferred biased-Linear inputs into MLP slot biases.
     # Identity mapping means slot[k] = input[k], so the bias folds directly.
     if biased_linears:
-        leaves = flatten_concat_nodes([input_node]) if isinstance(input_node, Concatenate) else [input_node]
+        leaves = (
+            flatten_concat_nodes([input_node])
+            if isinstance(input_node, Concatenate)
+            else [input_node]
+        )
         offset = 0
         for leaf in leaves:
             if leaf in biased_linears:
                 for i in range(len(leaf)):
-                    ffn.linear1.output_bias[ffn_slots[offset + i]] += leaf.output_bias[i].item()
+                    mlp.linear1.output_bias[mlp_slots[offset + i]] += leaf.output_bias[
+                        i
+                    ].item()
             offset += len(leaf)
 
-    # linear2: FFN slots → output columns (identity, zero bias)
-    for slot, out_col in zip(ffn_slots, out_idx):
-        ffn.linear2.output_matrix[slot, out_col] = 1.0
+    # linear2: MLP slots → output columns (identity, zero bias)
+    for slot, out_col in zip(mlp_slots, out_idx):
+        mlp.linear2.output_matrix[slot, out_col] = 1.0

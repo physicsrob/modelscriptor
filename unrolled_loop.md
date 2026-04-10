@@ -104,12 +104,12 @@ matches the existing carry-chain pattern.
 
 Each unrolled iteration adds:
 
-- 1 `done_fn` call (typically 1 FFN layer for a `compare`)
-- 1 `step_fn` call (user-defined; for DDA this is several FFN layers)
-- N `select` calls for N state variables (1 FFN layer each)
-- 1 `select` for the sticky done flag (1 FFN layer)
+- 1 `done_fn` call (typically 1 MLP sublayer for a `compare`)
+- 1 `step_fn` call (user-defined; for DDA this is several MLP sublayers)
+- N `select` calls for N state variables (1 MLP sublayer each)
+- 1 `select` for the sticky done flag (1 MLP sublayer)
 
-**Overhead per iteration**: N + 2 FFN layers beyond the step function cost.
+**Overhead per iteration**: N + 2 MLP sublayers beyond the step function cost.
 
 For DDA with 8 state variables and ~16 max iterations (diagonal of 8x8 grid):
 ~16 x (8 + 2 + step_cost) layers. With step_cost ~5-10 for DDA, total is

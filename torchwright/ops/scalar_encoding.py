@@ -75,7 +75,7 @@ def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> List[
         digit[1] = floor(79 / 10)   = 7    remainder = 79  - 7*10  = 9
         digit[2] = remainder         = 9
 
-    max_value shrinks at each step (999→99→9) so the thermometer FFNs
+    max_value shrinks at each step (999→99→9) so the thermometer MLPs
     only need thresholds for the remaining range.
     """
     digits = []
@@ -120,11 +120,11 @@ def scalar_to_embedding(inp: Node, embedding: Embedding) -> Node:
     assert len(inp) == 1, "Input must be a 1D scalar node"
     d_embed = embedding.d_embed
     n_thresholds = 9
-    d_int = 2 * n_thresholds
+    d_hidden = 2 * n_thresholds
 
-    input_proj = torch.zeros(d_int, 1)
-    input_bias = torch.zeros(d_int)
-    output_proj = torch.zeros(d_int, d_embed)
+    input_proj = torch.zeros(d_hidden, 1)
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, d_embed)
 
     for k in range(n_thresholds):
         threshold = k + 0.5

@@ -21,8 +21,13 @@ class ResidualStreamState:
         return f"ResidualStreamState({self.state_id}, name='{self.name}')"
 
 
-class FeatureAssignment:
-    """Maps graph nodes to column indices in the residual stream, per state."""
+class ResidualAssignment:
+    """Maps graph nodes to column indices in the residual stream, per state.
+
+    (Previously named ``FeatureAssignment``; renamed to avoid colliding with
+    the circuits-literature meaning of *feature* — an interpretable direction
+    in activation space.)
+    """
 
     mapping: Dict[ResidualStreamState, Dict[Node, List[int]]]
 

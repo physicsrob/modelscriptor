@@ -13,7 +13,7 @@ _builtin_abs = abs  # save before module-level def abs() shadows the builtin
 
 
 # ---------------------------------------------------------------------------
-# Linear ops (no FFN layers — compiled into residual-stream wiring)
+# Linear ops (no MLP sublayers — compiled into residual-stream wiring)
 # ---------------------------------------------------------------------------
 
 
@@ -154,7 +154,7 @@ def concat(inp_list: List[Node]) -> Node:
 
 
 # ---------------------------------------------------------------------------
-# ReLU-based ops (1 FFN layer each)
+# ReLU-based ops (1 MLP sublayer each)
 # ---------------------------------------------------------------------------
 
 
@@ -243,13 +243,15 @@ def compare(
 
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
-    # We need 2 FFN entries, we'll use the equation:
+    # We need 2 MLP entries, we'll use the equation:
     # y= (true_level-false_level) * [
     #   max(step_sharpness*x - step_sharpness*thresh, 0) - max(step_sharpness*x - step_sharpness*thresh - 1, 0)
     # ] + false_level
 
     input_proj = torch.tensor([[step_sharpness], [step_sharpness]])
-    input_bias = torch.tensor([-step_sharpness * thresh, -step_sharpness * thresh - 1.0])
+    input_bias = torch.tensor(
+        [-step_sharpness * thresh, -step_sharpness * thresh - 1.0]
+    )
     output_proj = torch.tensor([[true_level - false_level], [false_level - true_level]])
     output_bias = false_level * torch.ones(1)
 
@@ -328,7 +330,7 @@ def piecewise_linear(
 
     *fn* may return a scalar (``float``) or a vector (``List[float]``).
     When vector-valued, all output channels share the same breakpoints
-    and ReLU units — only the output projection differs.  The output
+    and neurons — only the output projection differs.  The output
     node has width D matching the vector length.
 
     Implemented as a sum of ReLU slope-changes::
@@ -336,8 +338,8 @@ def piecewise_linear(
         f(x) = y_0 + Σ delta_m_i · ReLU(x - x_i)
 
     where ``delta_m_i`` is the change in slope at breakpoint ``x_i``.
-    Uses one ReLU unit per slope change, so segments with equal slopes
-    are free.  Cost: 1 FFN layer regardless of output width.
+    Uses one neuron per slope change, so segments with equal slopes
+    are free.  Cost: 1 MLP sublayer regardless of output width.
 
     Args:
         inp: 1D scalar node.
@@ -347,7 +349,7 @@ def piecewise_linear(
             length.
         clamp: If True (default), hold constant outside the range.
             If False, extrapolate linearly.
-        d_max: Maximum ReLU units per FFN layer (chunks beyond this).
+        d_max: Maximum neurons per MLP sublayer (chunks beyond this).
         input_scale: Multiplier for the first-layer weights.  Each ReLU
             ``delta · ReLU(x - b)`` is rewritten as
             ``(delta/s) · ReLU(s·x - s·b)`` so the intermediate
@@ -408,6 +410,7 @@ def piecewise_linear(
 
     if len(relus) == 0:
         from torchwright.ops.inout_nodes import create_literal_value
+
         return create_literal_value(torch.tensor(values[0]))
 
     y0 = torch.tensor(values[0])
@@ -461,14 +464,14 @@ def piecewise_linear_2d(
     The callable *fn(x, y)* is evaluated at every grid vertex in
     *breakpoints1* × *breakpoints2* to obtain target values.  The
     result is a piecewise-linear interpolant on a triangulated
-    rectangular grid (**1 FFN layer**).
+    rectangular grid (**1 MLP sublayer**).
 
     Outside the grid the output is clamped to the nearest edge/corner
     value (constant extrapolation).
 
-    **Cost:** 1 FFN layer.  The number of ReLU (hidden) units is
+    **Cost:** 1 MLP sublayer.  The number of neurons (hidden units) is
     approximately 2·n1·n2 for an n1 × n2 grid.  For a 30×10 grid this
-    is ~600 hidden units, well within typical ``d`` values.
+    is ~600 neurons, well within typical ``d`` values.
 
     Args:
         inp1: 1D scalar node (first input variable).
@@ -476,7 +479,7 @@ def piecewise_linear_2d(
         breakpoints1: Strictly ascending x-coordinates (length n1 ≥ 2).
         breakpoints2: Strictly ascending y-coordinates (length n2 ≥ 2).
         fn: ``fn(x, y) -> float`` evaluated at each grid vertex.
-        d_max: Maximum ReLU units per FFN layer.
+        d_max: Maximum neurons per MLP sublayer.
         name: Debug label prefix.
 
     Returns:
@@ -487,7 +490,9 @@ def piecewise_linear_2d(
     n1 = len(breakpoints1)
     n2 = len(breakpoints2)
     assert n1 >= 2 and n2 >= 2, "Need >= 2 breakpoints per axis"
-    values = [[fn(breakpoints1[i], breakpoints2[j]) for j in range(n2)] for i in range(n1)]
+    values = [
+        [fn(breakpoints1[i], breakpoints2[j]) for j in range(n2)] for i in range(n1)
+    ]
     assert all(
         breakpoints1[i] < breakpoints1[i + 1] for i in range(n1 - 1)
     ), "breakpoints1 must be strictly ascending"
@@ -557,9 +562,9 @@ def piecewise_linear_2d(
             idx = i * n2 + j
             xi = breakpoints1[i]
             yj = breakpoints2[j]
-            A[idx, 0] = 1.0   # bias
-            A[idx, 1] = xi     # sx * x
-            A[idx, 2] = yj     # sy * y
+            A[idx, 0] = 1.0  # bias
+            A[idx, 1] = xi  # sx * x
+            A[idx, 2] = yj  # sy * y
             for k, (a, b, c) in enumerate(hyperplanes):
                 A[idx, 3 + k] = builtins.max(0.0, a * xi + b * yj + c)
             b_vec[idx] = values[i][j]
@@ -572,21 +577,26 @@ def piecewise_linear_2d(
     base_sy = solution[2].item()
     weights = solution[3:]
 
-    # Filter out near-zero ReLU units
+    # Filter out near-zero neurons
     active = []
     for k in range(K):
         if _builtin_abs(weights[k].item()) > 1e-10:
             active.append((hyperplanes[k], weights[k].item()))
 
-    if len(active) == 0 and _builtin_abs(base_sx) < 1e-10 and _builtin_abs(base_sy) < 1e-10:
+    if (
+        len(active) == 0
+        and _builtin_abs(base_sx) < 1e-10
+        and _builtin_abs(base_sy) < 1e-10
+    ):
         from torchwright.ops.inout_nodes import create_literal_value
+
         return create_literal_value(torch.tensor([bias_val]))
 
     # Build L -> ReLU -> L weight matrices
-    d_int = len(active) if active else 1
-    input_proj = torch.zeros(d_int, 2)
-    input_bias = torch.zeros(d_int)
-    output_proj = torch.zeros(d_int, 1)
+    d_hidden = len(active) if active else 1
+    input_proj = torch.zeros(d_hidden, 2)
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, 1)
     output_bias = torch.tensor([bias_val])
 
     for k, ((a, b, c), w) in enumerate(active):
@@ -628,7 +638,7 @@ def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) ->
         step: Grid spacing. Exact for multiples of step. Smaller values
             give better accuracy for non-grid inputs at the cost of more
             breakpoints.
-        d_max: Maximum ReLU units per FFN layer. When more breakpoints
+        d_max: Maximum neurons per MLP sublayer. When more breakpoints
             are needed, they are split into chunks of this size.
 
     Returns:
@@ -643,23 +653,28 @@ def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) ->
         breakpoints.append(x)
         x += step
 
-    return piecewise_linear(inp, breakpoints, lambda x: x * x, d_max=d_max, name="square")
+    return piecewise_linear(
+        inp, breakpoints, lambda x: x * x, d_max=d_max, name="square"
+    )
 
 
 def square_signed(
-    inp: Node, max_abs: float, step: float = 1.0, d_max: int = 1024,
+    inp: Node,
+    max_abs: float,
+    step: float = 1.0,
+    d_max: int = 1024,
 ) -> Node:
     """Compute x² for signed inputs via piecewise-linear interpolation.
 
     Unlike :func:`square` (which only handles non-negative inputs),
     this handles x in [-max_abs, max_abs] directly — no ``abs`` needed.
-    This saves one ReLU layer when used inside :func:`signed_multiply`.
+    This saves one MLP sublayer when used inside :func:`signed_multiply`.
 
     Args:
         inp: 1D scalar node with value in [-max_abs, max_abs].
         max_abs: Maximum absolute value of input.
         step: Grid spacing.
-        d_max: Maximum ReLU units per FFN layer.
+        d_max: Maximum neurons per MLP sublayer.
 
     Returns:
         1D scalar node containing x².
@@ -673,7 +688,9 @@ def square_signed(
         breakpoints.append(x)
         x += step
 
-    return piecewise_linear(inp, breakpoints, lambda x: x * x, d_max=d_max, name="square_signed")
+    return piecewise_linear(
+        inp, breakpoints, lambda x: x * x, d_max=d_max, name="square_signed"
+    )
 
 
 def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
@@ -715,7 +732,10 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
         return float(sum(1 for k in range(1, n + 1) if x > k * divisor - 0.5))
 
     return piecewise_linear(
-        inp, breakpoints, _staircase, input_scale=step_sharpness,
+        inp,
+        breakpoints,
+        _staircase,
+        input_scale=step_sharpness,
         name="thermometer_floor_div",
     )
 
@@ -740,11 +760,11 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
 
 
 def clamp(inp: Node, lo: float, hi: float) -> Node:
-    """Clamp a scalar to [lo, hi] in a single FFN layer.
+    """Clamp a scalar to [lo, hi] in a single MLP sublayer.
 
     Uses :func:`piecewise_linear` with 4 breakpoints to implement an
     identity passthrough in [lo, hi] with sharp clamping at the edges.
-    Much cheaper than a compare+select pair (1 ReLU layer vs 6).
+    Much cheaper than a compare+select pair (1 MLP sublayer vs 6).
 
     Args:
         inp: 1D scalar node.
@@ -786,7 +806,7 @@ def reciprocal(
         min_value: Lower bound on input (must be > 0).
         max_value: Upper bound on input.
         step: Grid spacing.
-        d_max: Maximum ReLU units per FFN layer.
+        d_max: Maximum neurons per MLP sublayer.
 
     Returns:
         1D scalar node containing 1/x.
@@ -801,7 +821,9 @@ def reciprocal(
         breakpoints.append(x)
         x += step
 
-    return piecewise_linear(inp, breakpoints, lambda x: 1.0 / x, d_max=d_max, name="reciprocal")
+    return piecewise_linear(
+        inp, breakpoints, lambda x: 1.0 / x, d_max=d_max, name="reciprocal"
+    )
 
 
 def floor_int(inp: Node, min_value: int, max_value: int) -> Node:
@@ -840,9 +862,11 @@ def floor_int(inp: Node, min_value: int, max_value: int) -> Node:
     lo, hi = float(min_value), float(max_value)
 
     return piecewise_linear(
-        inp, breakpoints,
+        inp,
+        breakpoints,
         lambda x: builtins.max(lo, builtins.min(hi, float(_math.floor(x)))),
-        input_scale=step_sharpness, name="floor_int",
+        input_scale=step_sharpness,
+        name="floor_int",
     )
 
 
@@ -880,22 +904,22 @@ def multiply_integers(
     Implementation:
         s = a + b                          range [0, 2*max_value], Linear (free)
         d = a - b                          range [-max_value, max_value], Linear (free)
-        s² = square(s)                     1+ FFN layers
+        s² = square(s)                     1+ MLP sublayers
         d²:
-          deep    → |d| = abs(d), |d|² = square(|d|)        2 FFN layers
-          shallow → square_signed(d)                         1 FFN layer (~2× width)
+          deep    → |d| = abs(d), |d|² = square(|d|)        2 MLP sublayers
+          shallow → square_signed(d)                         1 MLP sublayer (~2× width)
         result = (s² - d²) / 4              Linear (free)
 
-    Total cost: 3 FFN layers (deep, default) or 2 FFN layers (shallow).
+    Total cost: 3 MLP sublayers (deep, default) or 2 MLP sublayers (shallow).
 
     Args:
         inp1: 1D scalar node, integer value in [0, max_value].
         inp2: 1D scalar node, integer value in [0, max_value].
         max_value: Upper bound on each input.
         strategy: ``"deep"`` (default, abs+square, narrower) or ``"shallow"``
-            (square_signed, saves 1 FFN layer at ~2× the width on the
+            (square_signed, saves 1 MLP sublayer at ~2× the width on the
             d branch).  Use ``"shallow"`` only when the target ``d`` can
-            fit ``2*max_value + 1`` ReLU units in a single FFN layer.
+            fit ``2*max_value + 1`` neurons in a single MLP sublayer.
 
     Returns:
         1D scalar node containing inp1 * inp2.
@@ -937,11 +961,11 @@ def signed_multiply(
     Two implementations of the squarings are available:
 
     - ``"deep"`` (default): ``abs(s)`` then ``square(abs_s)`` per branch.
-      Depth 2 per branch (1 abs layer + 1 square layer), narrower FFN
-      width (~``2*ceil(max_sum/step)`` ReLU units total).
+      Depth 2 per branch (1 abs layer + 1 square layer), narrower MLP
+      hidden width (~``2*ceil(max_sum/step)`` neurons total).
     - ``"shallow"``: ``square_signed(s)`` per branch.  Depth 1 per branch,
-      roughly 2× the FFN width (~``2*ceil(2*max_sum/step)`` ReLU units).
-      Saves 1 FFN layer.
+      roughly 2× the MLP hidden width (~``2*ceil(2*max_sum/step)`` neurons).
+      Saves 1 MLP sublayer.
 
     Args:
         inp1: 1D scalar node with value in [-max_abs1, max_abs1].
@@ -952,10 +976,10 @@ def signed_multiply(
         max_abs_output: Optional tighter bound on the result magnitude.
             When provided, the output is clamped to [-max_abs_output,
             max_abs_output].
-        d_max: Maximum ReLU units per FFN layer.
+        d_max: Maximum neurons per MLP sublayer.
         strategy: ``"deep"`` (default) or ``"shallow"``.  Use
             ``"shallow"`` only when the target ``d`` can fit
-            ``2 * (2*max_sum/step + 1)`` ReLU units in a single layer.
+            ``2 * (2*max_sum/step + 1)`` neurons in a single MLP sublayer.
 
     Returns:
         1D scalar node containing inp1 * inp2.
@@ -964,8 +988,8 @@ def signed_multiply(
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"
 
-    s = add(inp1, inp2)                # a+b
-    d = subtract(inp1, inp2)           # a-b
+    s = add(inp1, inp2)  # a+b
+    d = subtract(inp1, inp2)  # a-b
     max_sum = max_abs1 + max_abs2
 
     if strategy == "shallow":
@@ -996,9 +1020,7 @@ def signed_multiply(
 # ---------------------------------------------------------------------------
 
 
-def reduce_min(
-    keys: List[Node], values: List[Node]
-) -> Tuple[Node, Node]:
+def reduce_min(keys: List[Node], values: List[Node]) -> Tuple[Node, Node]:
     """Find the (key, value) pair with the minimum key.
 
     Uses a binary tree reduction with ``ceil(log2(N))`` stages.
@@ -1040,9 +1062,7 @@ def reduce_min(
     return cur_keys[0], cur_vals[0]
 
 
-def reduce_max(
-    keys: List[Node], values: List[Node]
-) -> Tuple[Node, Node]:
+def reduce_max(keys: List[Node], values: List[Node]) -> Tuple[Node, Node]:
     """Find the (key, value) pair with the maximum key.
 
     Uses a binary tree reduction with ``ceil(log2(N))`` stages.

@@ -80,9 +80,9 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     """
     # If value1 == c, result is 1
     # else result is -1
-    # We'll use a FFN:
+    # We'll use an MLP:
     # y = 2.0*speed * max(1.0/speed + c @ value - c @ c, 0) - 1.0
-    # d_int = 1
+    # d_hidden = 1
     speed = embedding_step_sharpness
     input_proj = vector.unsqueeze(0)  # We're dotting vector into value
     input_bias = 1.0 / speed - vector @ vector
@@ -118,7 +118,7 @@ def cond_add_vector(
     assert len(cond) == 1
     assert len(true_vector) == len(false_vector) == len(inp)
 
-    # We need 2 FFN entries, we'll use the equation:
+    # We need 2 MLP entries, we'll use the equation:
     # y= c * [max(step_sharpness*x, 0) - max(step_sharpness*x - 1, 0)]
     # And rely on the residual connection
 

@@ -110,7 +110,7 @@ Each autoregressive position computes one screen column:
 2. **Shared products**: compute `Px * sin(angle)` and `Py * cos(angle)` once.
    These are reused across all segment tests.
 3. **Per-segment intersection** (all segments in parallel):
-   - `num_t = (A-P) × (B-A)` — linear in P → **free** (no FFN cost)
+   - `num_t = (A-P) × (B-A)` — linear in P → **free** (no MLP cost)
    - `den = D × (B-A)` — linear in D → **free**
    - Validity checks (t > 0, 0 ≤ u ≤ 1) via sign comparisons
    - Mask invalid intersections
@@ -217,8 +217,8 @@ Three alternative BSP-for-rendering approaches were analyzed:
 up a precomputed Potentially Visible Set, and only test those segments. This
 genuinely reduces width (300 → 80 segments), but segment endpoints are now
 **runtime values** loaded from a table instead of **constants** baked into
-weights. This means intersection math requires `multiply_integers` (~3 FFN
-layers) instead of being free. Net result: spend ~8 layers (BSP traversal +
+weights. This means intersection math requires `multiply_integers` (~3 MLP
+sublayers) instead of being free. Net result: spend ~8 layers (BSP traversal +
 table lookup + runtime multiplies) to save ~6 layers (shorter reduction). A
 net loss of ~2 layers, plus PVS correctness risk in open areas.
 
@@ -243,10 +243,10 @@ single-height walls.
 
 Each BSP node has a splitting line. The test "which side of the line is the
 player on?" is linear in (Px, Py) — a single Linear node (free) followed by
-one `compare` (1 FFN layer). All ~200 BSP node tests run in parallel in **1
-FFN layer**. Then per-subsector leaf identification uses `bool_all_true` over
-~12 ancestor decisions in **2 FFN layers**. Sector property lookup via
-`map_to_table` adds **1 FFN layer**.
+one `compare` (1 MLP sublayer). All ~200 BSP node tests run in parallel in **1
+MLP sublayer**. Then per-subsector leaf identification uses `bool_all_true` over
+~12 ancestor decisions in **2 MLP sublayers**. Sector property lookup via
+`map_to_table` adds **1 MLP sublayer**.
 
 **Total BSP cost: ~4 layers, ~360 peak columns** (freed before rendering
 starts). This is cheap, authentic to Doom, and enables real features.
@@ -264,9 +264,9 @@ blog post narrative:
 ## Layer Budget
 
 Constraints: **≤120 layers, d_model ≤ 8192**. Layer counts below are based on
-the cost of the underlying primitives: `compare` = 1 FFN layer, `select` = 2
-FFN layers (cond_add_vector + ReLU gate), `reduce_min` stage = 3 FFN layers
-(compare + 2× parallel select), `multiply_integers` = 3 FFN layers.
+the cost of the underlying primitives: `compare` = 1 MLP sublayer, `select` = 2
+MLP sublayers (cond_add_vector + ReLU gate), `reduce_min` stage = 3 MLP sublayers
+(compare + 2× parallel select), `multiply_integers` = 3 MLP sublayers.
 
 ### Per-Column Rendering Pipeline
 
@@ -477,7 +477,7 @@ side comparison with a reference Doom-style renderer.
 **Estimate:** ~80 layers, d_model ~1024-2048.
 
 **Key risk:** texture data is large. Doom textures are 64×64 = 4096 pixels.
-A single `map_to_table` with 4096 entries needs d_int = 4096. Split lookup
+A single `map_to_table` with 4096 entries needs d_hidden = 4096. Split lookup
 (by column then by row, 2 layers) is the likely approach. Total texture
 parameter count could be significant. Texture encoding strategy should be
 validated early in this phase.
@@ -627,7 +627,7 @@ Width grows with number of active entities (enemies + projectiles + items).
 - **Column output encoding**: exact layout of RGB values in the residual stream
   per position. One row per residual-stream dimension, or packed differently?
 - **Texture encoding**: Doom textures are 64×64 or 128×128 pixels. A single
-  `map_to_table` with 4096+ entries needs d_int=4096, which may exceed d_model.
+  `map_to_table` with 4096+ entries needs d_hidden=4096, which may exceed d_model.
   Split lookup (by column then by row) needs 2 layers but requires an
   intermediate representation. Texture data dominates parameter count.
 - **Floor/ceiling rendering**: Doom renders floors/ceilings as horizontal

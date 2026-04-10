@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 
 from torchwright.compiler.components.attn import AttnLayerComponent
-from torchwright.compiler.feature_assignment import ResidualStreamState
+from torchwright.compiler.residual_assignment import ResidualStreamState
 from torchwright.graph import PosEncoding
 
 

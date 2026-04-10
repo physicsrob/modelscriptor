@@ -41,7 +41,7 @@ def _verify(output_node, n_pos, input_values, pos_encoding=None, max_layers=100)
         verbose=False,
         max_layers=max_layers,
     )
-    assert net.feature_assignment is not None
+    assert net.residual_assignment is not None
 
     result = net.compute(n_pos, input_values)
     assert output_node in result
@@ -74,7 +74,7 @@ def test_compile_linear():
 
 
 def test_compile_relu_chain():
-    """Input -> Linear -> ReLU -> Linear (the FFN pattern)."""
+    """Input -> Linear -> ReLU -> Linear (the MLP pattern)."""
     x = create_input("x", 4)
     l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
     r = ReLU(l1)
@@ -103,7 +103,7 @@ def test_compile_add():
 
 
 def test_compile_select():
-    """select(cond, true, false) — uses cond_add_vector + ffn_layer."""
+    """select(cond, true, false) — uses cond_add_vector + mlp_layer."""
     cond = create_input("cond", 1)
     true_val = create_input("true_val", 4)
     false_val = create_input("false_val", 4)
@@ -139,7 +139,7 @@ def test_compile_attend_to_offset():
 
 
 def test_compile_map_to_table():
-    """map_to_table — table lookup via FFN (large d_intermediate)."""
+    """map_to_table — table lookup via MLP (large d_hidden)."""
     x = create_input("x", 2)
     table = {
         torch.tensor([1.0, 0.0]): torch.tensor([10.0]),
@@ -273,14 +273,14 @@ def test_compile_add_relu():
 
 
 def test_compile_add_const():
-    """add_const — FFN bias-only addition via Add."""
+    """add_const — MLP bias-only addition via Add."""
     v = create_input("v", 1)
     out = add_const(v, 100.0)
     _verify(out, n_pos=1, input_values={"v": torch.tensor([[1.0]])})
 
 
 def test_compile_cond_add_vector():
-    """cond_add_vector — FFN multiplexer + Add."""
+    """cond_add_vector — MLP multiplexer + Add."""
     cond = create_input("cond", 1)
     x = create_literal_value(torch.tensor([15.0, 25.0]))
     out = cond_add_vector(
@@ -300,7 +300,7 @@ def test_compile_cond_add_vector():
 
 
 def test_compile_relu_add():
-    """relu_add — fused ReLU(a+b) via concatenate + FFN."""
+    """relu_add — fused ReLU(a+b) via concatenate + MLP."""
     v1 = create_input("v1", 3)
     v2 = create_input("v2", 3)
     out = relu_add(v1, v2)

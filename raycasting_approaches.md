@@ -7,12 +7,12 @@ The question is which maps best to torchwright's computation model.
 
 Two resources matter:
 
-- **Depth** (layers): each `linear_relu_linear` is one FFN sublayer. Sequential
+- **Depth** (layers): each `linear_relu_linear` is one MLP sublayer. Sequential
   dependencies stack layers. This is the primary bottleneck — more layers means
   a bigger transformer.
 - **Width** (d_model columns): values live in the residual stream. Independent
   operations at the same depth share a layer. The compiler packs multiple
-  independent FFN chains into a single layer as long as their intermediate
+  independent MLP chains into a single layer as long as their intermediate
   dimensions fit (see `scheduler.py:291-301`).
 
 Key implication: **N independent multiplications cost the same depth as 1
@@ -49,12 +49,12 @@ State variables: ~8 (ray_x, ray_y, side_dist_x, side_dist_y, map_x, map_y,
 hit, wall_dist, side).
 
 Per iteration:
-- `done_fn`: 1 FFN layer (compare hit flag)
-- `step_fn`: ~5-8 FFN layers (compare side distances, conditional advance,
+- `done_fn`: 1 MLP sublayer (compare hit flag)
+- `step_fn`: ~5-8 MLP sublayers (compare side distances, conditional advance,
   map lookup)
-- `select` per state variable: 8 FFN layers
-- `select` for done flag: 1 FFN layer
-- **Total per iteration: ~15-18 FFN layers**
+- `select` per state variable: 8 MLP sublayers
+- `select` for done flag: 1 MLP sublayer
+- **Total per iteration: ~15-18 MLP sublayers**
 
 Max iterations: diagonal of grid = ~11 for 8×8, ~90 for 64×64.
 
@@ -121,15 +121,15 @@ For 8×8 grid: max 7 vertical + 7 horizontal = 14 crossings.
 For 64×64 grid: max 63 + 63 = 126 crossings.
 
 Per-crossing computation (all crossings in parallel = same layers):
-- Distance: `first + i * delta` — 1 fixed-point multiply + 1 add ≈ 4 FFN layers
-- Cross-coordinate: `player + distance * direction` — 1 fixed-point multiply ≈ 3 FFN layers
-- Floor: `thermometer_floor_div` ≈ 1 FFN layer
-- Map lookup: `scalar_lookup` or `map_to_table` ≈ 1 FFN layer
-- Mask non-walls: `select(is_wall, distance, BIG)` ≈ 1 FFN layer
-- **Total: ~10 FFN layers (independent of crossing count)**
+- Distance: `first + i * delta` — 1 fixed-point multiply + 1 add ≈ 4 MLP sublayers
+- Cross-coordinate: `player + distance * direction` — 1 fixed-point multiply ≈ 3 MLP sublayers
+- Floor: `thermometer_floor_div` ≈ 1 MLP sublayer
+- Map lookup: `scalar_lookup` or `map_to_table` ≈ 1 MLP sublayer
+- Mask non-walls: `select(is_wall, distance, BIG)` ≈ 1 MLP sublayer
+- **Total: ~10 MLP sublayers (independent of crossing count)**
 
 Min-reduction:
-- Each stage: `compare` (1 FFN) + `select` on distance+metadata (3-4 FFN) ≈ 5 layers
+- Each stage: `compare` (1 MLP) + `select` on distance+metadata (3-4 MLP) ≈ 5 layers
 - Stages: `ceil(log2(14))` = 4 for 8×8, `ceil(log2(126))` = 7 for 64×64
 - **Total: ~20 layers for 8×8, ~35 layers for 64×64**
 
@@ -175,17 +175,17 @@ For 8×8 grid: ~50-80 wall segments depending on layout.
 For E1M1: potentially 500+ segments.
 
 Per-segment intersection:
-- 2D cross products: 2 multiplies + subtract ≈ 7 FFN layers
-- Bounds checking: 2-4 comparisons ≈ 4 FFN layers
-- Direction check: 1 comparison ≈ 1 FFN layer
-- **Total: ~12 FFN layers**
+- 2D cross products: 2 multiplies + subtract ≈ 7 MLP sublayers
+- Bounds checking: 2-4 comparisons ≈ 4 MLP sublayers
+- Direction check: 1 comparison ≈ 1 MLP sublayer
+- **Total: ~12 MLP sublayers**
 
 Min-reduction (avoiding division via cross-multiply comparison):
-- Each stage: 2 multiplies + compare + select ≈ 10 FFN layers
+- Each stage: 2 multiplies + compare + select ≈ 10 MLP sublayers
 - Stages: `ceil(log2(80))` ≈ 7 for 8×8
 - **Total: ~70 layers for reduction**
 
-Final distance computation (1 division for the winner): ~5 FFN layers.
+Final distance computation (1 division for the winner): ~5 MLP sublayers.
 
 **Total depth for 8×8: ~87 layers.**
 **Total depth for E1M1: ~130+ layers.**
@@ -250,13 +250,13 @@ The initial segment estimate (~87 layers) assumed expensive per-segment
 intersection math. But most of it is free:
 
 - `num_t = (A-P) × (B-A)`: segment endpoints (A, B) are constants baked into
-  weights. This is linear in P → **free** (Linear node, no FFN cost).
+  weights. This is linear in P → **free** (Linear node, no MLP cost).
 - `den = D × (B-A)`: linear in D → **free**.
 - The bilinear term `(A-P) × D` requires multiplying runtime values, but the
   expensive products (`Px*Dy`, `Py*Dx`) are **shared across all segments** —
-  computed once (~3 FFN layers).
+  computed once (~3 MLP sublayers).
 
-So per-segment cost is just validity checks and masking (~4-5 FFN layers,
+So per-segment cost is just validity checks and masking (~4-5 MLP sublayers,
 parallelized across all segments in the same layers).
 
 The main remaining cost is the min-reduction. Two options:

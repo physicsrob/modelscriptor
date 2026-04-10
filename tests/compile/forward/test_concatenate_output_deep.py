@@ -2,7 +2,7 @@
 
 When the output node is a Concatenate whose leaf children finish at
 different depths, the scheduler must keep the shallow leaf's residual
-stream columns allocated until the final FeatureAssignment step.
+stream columns allocated until the final ResidualAssignment step.
 Otherwise `residual_map.get_indices(leaf)` raises KeyError because
 the columns were freed while deeper subgraphs were still compiling.
 """
@@ -35,7 +35,11 @@ def test_concatenate_output_mixed_depth():
     output = Concatenate([shallow, deep])
 
     module = compile_headless(
-        output, pos_encoding, d=1024, d_head=16, verbose=False,
+        output,
+        pos_encoding,
+        d=1024,
+        d_head=16,
+        verbose=False,
     )
 
     # Verify correctness: a=1 > 0.5 so shallow selects a=1; deep = 1/(1*1 * 1)
@@ -43,7 +47,9 @@ def test_concatenate_output_mixed_depth():
     result = module(inp)
     assert result.shape == (1, 2)
     assert result[0, 0].item() == pytest.approx(1.0, abs=0.2)  # shallow = a = 1.0
-    assert result[0, 1].item() == pytest.approx(4 / 3, abs=0.2)  # deep: reciprocal interpolates 1.0 between breakpoints 0.5 and 1.5
+    assert result[0, 1].item() == pytest.approx(
+        4 / 3, abs=0.2
+    )  # deep: reciprocal interpolates 1.0 between breakpoints 0.5 and 1.5
 
 
 # Allow running with pytest

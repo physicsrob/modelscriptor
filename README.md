@@ -71,7 +71,7 @@ stream and set the weights so the transformer computes them correctly.
 
 A state is a label for a point in the transformer's forward pass. It names a
 specific moment -- "the residual stream right after attention finishes" or "the
-residual stream right before the FFN layer." It is not the vector itself, and
+residual stream right before the MLP sublayer." It is not the vector itself, and
 it is not a slice of the vector. It's a label for *when*.
 
 A simple 1-layer transformer has states at each boundary:
@@ -79,9 +79,9 @@ A simple 1-layer transformer has states at each boundary:
 ```
 → attn_in_state    (residual stream before attention)
     [attention runs]
-→ ffn_in_state     (residual stream after attention, before FFN)
-    [FFN runs]
-→ ffn_out_state    (residual stream after FFN)
+→ mlp_in_state     (residual stream after attention, before MLP)
+    [MLP runs]
+→ mlp_out_state    (residual stream after MLP)
 ```
 
 At each state, some set of nodes are **alive** -- their values are sitting in
@@ -89,6 +89,63 @@ the residual stream, either because they were just computed or because they're
 being passed through for later use. The compiler tracks which nodes are alive at
 each state, and assigns each alive node to specific columns in the residual
 stream at that state.
+
+
+## Glossary
+
+TorchWright is closely related to Anthropic's mechanistic-interpretability
+"circuits" work, so we try to use the same vocabulary where it exists.
+A few terms are TorchWright-specific (`column`, `state`, `chain`, `slot`)
+because they describe the compiler's internals.
+
+**Architecture (transformer-side):**
+
+- **residual stream** — The fixed-width vector that carries all information
+  between transformer layers. Same meaning as in the circuits literature.
+- **column** — One dimension of the residual stream. The "whiteboard with
+  numbered columns" metaphor below. (Anthropic would just say "dimension";
+  we use *column* because it pairs naturally with allocation.)
+- **`d`** (in code) / **`d_model`** (in prose) — The width of the residual
+  stream. We use the short name in code for brevity.
+- **layer** — One full transformer block: attention sublayer + MLP sublayer.
+- **attention sublayer** — Multi-head attention + skip connection.
+- **MLP sublayer** — `Linear → ReLU → Linear` + skip connection. We
+  previously called this an "FFN sublayer"; we now use *MLP* to align with
+  the circuits literature. Both names refer to the same thing.
+- **attention head** — One head within multi-head attention, parameterised
+  by `W_Q`, `W_K`, `W_V`, `W_O`. Same meaning as in the circuits work.
+- **neuron** — One dimension of the MLP's hidden layer (the intermediate
+  representation between `linear1` and `linear2`). Anthropic uses both
+  *MLP neuron* and *ReLU unit* for this concept; we use **neuron**.
+- **`d_hidden`** — Width of the MLP's hidden layer (number of neurons per
+  MLP sublayer).
+
+**Computation graph (TorchWright-specific):**
+
+- **node** — A value in the computation graph. A `Linear` node *is* its
+  output vector; nodes know their width and their input nodes.
+- **chain** — A `Linear → ReLU → Linear` pattern in the graph. The
+  compiler maps each chain to one MLP sublayer.
+- **state** (`ResidualStreamState`) — A label for a specific point in the
+  forward pass — e.g., "the residual stream right after attention." A
+  state is *not* the vector itself; it is a name for *when* the vector
+  exists.
+- **residual assignment** (`ResidualAssignment`) — The mapping of graph
+  nodes to residual-stream columns at each state. We previously called
+  this `FeatureAssignment`; renamed to avoid colliding with the
+  circuits-literature meaning of *feature* (an interpretable direction in
+  activation space).
+- **slot** — A scheduler-internal term for an allocated neuron in the
+  MLP hidden layer.
+- **dead node** — A node whose downstream consumers are all already
+  computed; its columns can be reclaimed.
+
+**A word on "feature":** in the circuits literature *feature* means an
+interpretable direction in activation space, the central object of
+mechanistic interpretability. We don't use the word in that sense, and
+we deliberately avoid it as a synonym for "node," "column," or
+"assignment" so that anyone coming from the circuits work isn't
+constantly translating.
 
 
 ## The Residual Stream Allocation Problem
@@ -111,7 +168,7 @@ stream at the same time, they need different columns.
 
 **Skip connections preserve positions.** A transformer's skip connection is just
 addition: `x + f(x)`. It doesn't rearrange anything. So if `input` is at
-columns [0-9] before the FFN layer, it's still at columns [0-9] after the skip
+columns [0-9] before the MLP sublayer, it's still at columns [0-9] after the skip
 connection. Any value that flows through a skip connection must keep its column
 assignment.
 
@@ -130,7 +187,7 @@ so physical adjacency is never required. This eliminates fragmentation entirely.
 
 The compiler works **forward** from inputs to outputs, building the transformer
 one layer at a time. At each layer, a scheduler decides what to compute using
-the attention sublayer and FFN sublayer, then a weight writer sets the
+the attention sublayer and MLP sublayer, then a weight writer sets the
 corresponding weight matrices.
 
 ### The skip connection
@@ -164,7 +221,7 @@ to specific columns maps here. This includes:
 - Column management: cancellations and additions into existing columns are
   just targeted writes with the right values
 
-**FFN.** The FFN sublayer's internal structure is Linear → ReLU → Linear,
+**MLP.** The MLP sublayer's internal structure is Linear → ReLU → Linear,
 so it directly handles graph operations with the same shape:
 - Linear → ReLU → Linear chains
 - Standalone ReLU nodes
@@ -189,7 +246,7 @@ on top of the raw graph nodes. These are what examples typically use:
 - **Arithmetic**: `add_const`, `negate`, `subtract`, `multiply_const`
 - **Logic**: `equals_vector`, `bool_not`, `bool_all_true`, `bool_any_true`
 - **Table lookups**: `map_to_table` -- maps an embedding-valued input to an
-  embedding-valued output via an FFN lookup table
+  embedding-valued output via an MLP lookup table
 - **Selection**: `select` (if/else), `switch` (multi-way dispatch)
 - **Sequence operations**: `output_sequence`, `remove_leading_0s`
 - **Embedding arithmetic**: `sum_digits`, `sum_digit_seqs` -- digit-by-digit

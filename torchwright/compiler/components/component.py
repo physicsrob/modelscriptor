@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from torchwright.compiler.feature_assignment import ResidualStreamState
+from torchwright.compiler.residual_assignment import ResidualStreamState
 
 
 class Component(ABC):

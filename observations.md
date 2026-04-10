@@ -5,43 +5,43 @@ transformer weights.  Intended as raw material for blog writing.
 
 ---
 
-## Texture mapping requires O(tex_height) FFN layers, and you can't beat it
+## Texture mapping requires O(tex_height) MLP sublayers, and you can't beat it
 
 Wall texture mapping needs to assign a runtime texture color to each
 screen row based on which texture band that row falls in.  This is a
 "select from N runtime values based on a runtime condition" operation.
 
-In a transformer FFN layer (Linear → ReLU → Linear), the output is a
+In a transformer MLP sublayer (Linear → ReLU → Linear), the output is a
 *linear* function of the hidden units.  You can compute a step function
 of the condition in the hidden layer, and you can pass the texture color
 through the hidden layer, but you can't *multiply* them — that would
 require a product of two hidden-unit outputs, and the output projection
 is linear.
 
-So each texture band requires two ReLU layers: one to compute the band
+So each texture band requires two MLP sublayers: one to compute the band
 mask (`in_range`), one to select the color (`broadcast_select`).  For
-a 64-row texture, that's 128 FFN layers in the naive approach.
+a 64-row texture, that's 128 MLP sublayers in the naive approach.
 
 **The constant is improvable, not the scaling.**  By processing bands in
 groups (e.g., 8 at a time), computing all masks and selects within a
 group in parallel, summing the group's results, then freeing the
 intermediate columns before the next group, we bring the cost down to
-~2 layers per group.  For 64 rows in groups of 8: ~16 FFN layers
+~2 layers per group.  For 64 rows in groups of 8: ~16 MLP sublayers
 instead of 128.  The scheduler can pack independent `in_range` and
-`broadcast_select` calls into the same physical FFN layer as long as
-their combined ReLU unit count fits within d_model.
+`broadcast_select` calls into the same physical MLP sublayer as long as
+their combined neuron count fits within d_model.
 
 This is a fundamental property of the architecture: **selecting from K
-runtime values costs O(K) ReLU layers**.  Compile-time values are free
+runtime values costs O(K) MLP sublayers**.  Compile-time values are free
 (baked into weights), but runtime values — like texture pixels that
-came out of a `map_to_table` lookup — must be routed through the ReLU
+came out of a `map_to_table` lookup — must be routed through the MLP
 bottleneck.  No binary decomposition or hierarchical scheme avoids this,
 because the selection requires multiplying a runtime indicator by a
-runtime value, which takes a full ReLU layer.
+runtime value, which takes a full MLP sublayer.
 
 The practical consequence: texture height is the scarce resource.  Width
 is cheap (handled by a single `map_to_table` lookup keyed by the u
-coordinate), but each row of vertical resolution costs ~2 FFN layers
+coordinate), but each row of vertical resolution costs ~2 MLP sublayers
 divided by the group packing factor.  DOOM's 64-tall textures are
 feasible (~16-22 layers with grouping) but 128-tall textures would eat
 half the layer budget.
@@ -63,14 +63,14 @@ transformer as a substrate for sparse computation.
 
 **Three levels of waste, each multiplicative:**
 
-1. **Layer scheduling sparsity.**  Each FFN layer has d slots (e.g.,
+1. **Layer scheduling sparsity.**  Each MLP sublayer has d slots (e.g.,
    1024), but a `compare` op uses 2.  A `signed_multiply` creates a
    4-deep sequential chain where each intermediate layer might only fill
    a handful of slots.  The scheduler packs independent ops into the
    same layer when data dependencies allow, but most layers end up
    5-15% utilized on slots alone.
 
-2. **Weight sparsity within used slots.**  Even a "used" FFN slot has a
+2. **Weight sparsity within used slots.**  Even a "used" MLP slot has a
    weight column of width d in linear1 and a weight row of width d in
    linear2.  But a typical op reads from 1-4 residual stream positions
    and writes to 1-4 positions.  So within each "used" slot, ~99% of
@@ -84,7 +84,7 @@ transformer as a substrate for sparse computation.
 
 Concretely at d=1024: each layer has ~6.3M parameters.  A typical layer
 uses 5-15 attention heads (~0.5M allocated, far fewer non-zero) and
-10-50 FFN slots (~100K allocated, most weights zero).  Total non-zero
+10-50 MLP slots (~100K allocated, most weights zero).  Total non-zero
 weight entries per layer might be in the low thousands out of millions.
 
 **The reason d must be large is not computation but memory.**  The
@@ -112,14 +112,14 @@ rendering pipeline, and it appears in almost every stage:
 - Texture u-normalization: adj_num_u · (1/abs_den)
 - Collision detection: old_y·dx, old_x·dy
 
-Each `signed_multiply` compiles to ~4 FFN layers via the polarization
+Each `signed_multiply` compiles to ~4 MLP sublayers via the polarization
 identity: a·b = (|a+b|² − |a−b|²) / 4.  This requires two `abs` ops
-(1 FFN each, using ReLU(x) + ReLU(−x)) and two `square` ops (1 FFN
+(1 MLP each, using ReLU(x) + ReLU(−x)) and two `square` ops (1 MLP
 each, via piecewise-linear approximation).  The intermediate values also
 consume residual stream columns while alive, adding storage pressure.
 
 This is interesting because multiplication feels like a "basic" op, but
-in a ReLU network it's genuinely hard.  A ReLU layer computes
+in a ReLU network it's genuinely hard.  An MLP sublayer computes
 piecewise-linear functions of its input.  Multiplication is bilinear —
 you can approximate x² with a piecewise-linear function (that's what
 `square` does), but you can't compute it exactly in one layer.  The
@@ -129,9 +129,9 @@ architecture.
 
 **Hypothetical improvement:** a native 2D piecewise-linear lookup
 (`piecewise_linear_2d`) that takes two scalar inputs and produces one
-output in a single FFN layer.  This would tabulate a·b directly on a
+output in a single MLP sublayer.  This would tabulate a·b directly on a
 grid, cutting each multiply from 4 layers to 1.  The cost would be
-grid_size² ReLU units per multiply, so a 40×40 grid uses 1,600 FFN
+grid_size² neurons per multiply, so a 40×40 grid uses 1,600 MLP
 slots — feasible at d≥2048 but tight at d=1024.  Whether the 4× depth
 reduction is worth the width cost depends on whether the pipeline is
 depth-bound or width-bound.  (For the rendering pipeline, it's almost
@@ -179,7 +179,7 @@ columns), exactly like a CPU compiler trading instructions for spills.
 
 A counterintuitive cost ranking:
 
-| Operation | FFN layers | Why |
+| Operation | MLP sublayers | Why |
 |-----------|-----------|-----|
 | 1/x (reciprocal) | 1 | Piecewise-linear in 1 variable — just a lookup table |
 | x mod n | ~1 | floor(x/n) is piecewise-linear, then x - n·floor(x/n) is free |
@@ -193,7 +193,7 @@ a runtime division into a 1-layer lookup.  The renderer exploits this
 aggressively — all per-segment signed_inv_den, abs_den, and sign_den
 values are precomputed in a single `piecewise_linear_nd` call.
 
-The lesson: **univariate nonlinear functions are cheap (1 FFN layer via
+The lesson: **univariate nonlinear functions are cheap (1 MLP sublayer via
 piecewise-linear approximation), bivariate ones are expensive (require
 decomposition into univariate parts).**  Any time you can restructure a
 bivariate computation into a univariate lookup + free linear ops, you

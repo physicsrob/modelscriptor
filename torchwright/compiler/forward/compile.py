@@ -10,30 +10,30 @@ from typing import Optional
 import torch
 
 from torchwright.compiler.device import get_device
-from torchwright.compiler.feature_assignment import FeatureAssignment
+from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.scheduler import LayerScheduler
 from torchwright.compiler.forward.weight_writer import (
     AttnHeadOp,
-    FFNOp,
+    MLPOp,
     write_attn_sublayer,
-    write_ffn_sublayer,
+    write_mlp_sublayer,
 )
 from torchwright.compiler.transformer import HeadlessTransformer
-from torchwright.compiler.feature_assignment import flatten_concat_nodes
+from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Node, Linear, Concatenate
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 
 
 def _count_layer_params(
-    attn_ops: list[AttnHeadOp], ffn_ops: list[FFNOp], d: int, d_head: int
+    attn_ops: list[AttnHeadOp], mlp_ops: list[MLPOp], d: int, d_head: int
 ) -> int:
     """Count transformer parameters used by one layer's ops.
 
     Attention ops consume whole heads (4 * d * d_head params each).
-    FFN ops consume slots (2*d + 2 params each) or bias entries (1 each).
+    MLP ops consume slots (2*d + 2 params each) or bias entries (1 each).
     """
     params_per_head = 4 * d * d_head
 
@@ -51,9 +51,9 @@ def _count_layer_params(
 
     slots_used = 0
     bias_entries = 0
-    for op in ffn_ops:
-        if op.ffn_slots:
-            slots_used += len(op.ffn_slots)
+    for op in mlp_ops:
+        if op.mlp_slots:
+            slots_used += len(op.mlp_slots)
         if op.op_type in ("compute_literal_value", "compute_bias"):
             bias_entries += len(op.target_cols)
 
@@ -131,9 +131,11 @@ def forward_compile(
         occupied_before = d - residual_map.get_free_count()
 
         layer = net.add_layer(append=True)
-        attn_ops, ffn_ops, biased_linears = scheduler.schedule_layer(residual_map, computed)
+        attn_ops, mlp_ops, biased_linears = scheduler.schedule_layer(
+            residual_map, computed
+        )
         write_attn_sublayer(layer, attn_ops, residual_map, pos_encoding)
-        write_ffn_sublayer(layer, ffn_ops, residual_map, set(biased_linears))
+        write_mlp_sublayer(layer, mlp_ops, residual_map, set(biased_linears))
 
         # Mark Concatenate nodes as computed when all leaf inputs are done
         for node in graph.get_all_nodes():
@@ -141,12 +143,12 @@ def forward_compile(
                 if all(leaf in computed for leaf in flatten_concat_nodes([node])):
                     computed.add(node)
 
-        layer_params = _count_layer_params(attn_ops, ffn_ops, d, d_head)
+        layer_params = _count_layer_params(attn_ops, mlp_ops, d, d_head)
         total_params += layer_params
         occupied_after = d - residual_map.get_free_count()
 
         if verbose:
-            n_ops = len(attn_ops) + len(ffn_ops)
+            n_ops = len(attn_ops) + len(mlp_ops)
             layer_capacity = layer.num_params()
             pct_params = 100 * layer_params / layer_capacity if layer_capacity else 0
             pct_before = 100 * occupied_before // d
@@ -172,22 +174,22 @@ def forward_compile(
             f"({pct_used:.1f}%)"
         )
 
-    # Ensure at least one layer exists for FeatureAssignment states
+    # Ensure at least one layer exists for ResidualAssignment states
     if not net.layers:
         net.add_layer(append=True)
 
-    # 4. Build FeatureAssignment bridge from saved input indices
+    # 4. Build ResidualAssignment bridge from saved input indices
     in_state = net.layers[0].attn.in_state
-    out_state = net.layers[-1].ffn.out_state
-    fa = FeatureAssignment({in_state, out_state})
+    out_state = net.layers[-1].mlp.out_state
+    ra = ResidualAssignment({in_state, out_state})
     for node, indices in input_indices.items():
-        fa.assign(in_state, node, indices)
+        ra.assign(in_state, node, indices)
     if isinstance(output_node, Concatenate):
         for leaf in flatten_concat_nodes([output_node]):
-            fa.assign(out_state, leaf, residual_map.get_indices(leaf))
+            ra.assign(out_state, leaf, residual_map.get_indices(leaf))
     else:
-        fa.assign(out_state, output_node, residual_map.get_indices(output_node))
-    net.feature_assignment = fa
+        ra.assign(out_state, output_node, residual_map.get_indices(output_node))
+    net.residual_assignment = ra
 
     if device == "auto":
         net.to(get_device(verbose=verbose))

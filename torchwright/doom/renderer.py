@@ -35,10 +35,10 @@ from torchwright.ops.map_select import broadcast_select, in_range, map_to_table,
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
-
 # ---------------------------------------------------------------------------
 # Stage 1: Trig lookup
 # ---------------------------------------------------------------------------
+
 
 def trig_lookup(ray_angle: Node) -> Tuple[Node, Node]:
     """Look up (cos, sin) via piecewise-linear interpolation over 256 entries.
@@ -52,8 +52,12 @@ def trig_lookup(ray_angle: Node) -> Tuple[Node, Node]:
     table = generate_trig_table()  # (256, 2): col0=cos, col1=sin
     breakpoints = list(range(256))
 
-    ray_cos = piecewise_linear(ray_angle, breakpoints, lambda i: float(table[int(i), 0]), name="trig_cos")
-    ray_sin = piecewise_linear(ray_angle, breakpoints, lambda i: float(table[int(i), 1]), name="trig_sin")
+    ray_cos = piecewise_linear(
+        ray_angle, breakpoints, lambda i: float(table[int(i), 0]), name="trig_cos"
+    )
+    ray_sin = piecewise_linear(
+        ray_angle, breakpoints, lambda i: float(table[int(i), 1]), name="trig_sin"
+    )
     return ray_cos, ray_sin
 
 
@@ -63,8 +67,26 @@ def trig_lookup(ray_angle: Node) -> Tuple[Node, Node]:
 
 # Distance breakpoints: dense near 0 where 1/x is steep, sparse far away.
 _DIST_BREAKPOINTS = [
-    0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0,
-    6.0, 8.0, 10.0, 13.0, 16.0, 20.0, 25.0, 30.0, 35.0, 40.0,
+    0.5,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    2.0,
+    2.5,
+    3.0,
+    4.0,
+    5.0,
+    6.0,
+    8.0,
+    10.0,
+    13.0,
+    16.0,
+    20.0,
+    25.0,
+    30.0,
+    35.0,
+    40.0,
 ]
 
 # perp_cos breakpoints: covers typical FOV range.
@@ -79,8 +101,8 @@ def _wall_height_lookup(
 ) -> Tuple[Node, Node, Node]:
     """Compute wall_top, wall_bottom, wall_height via a single 2D lookup.
 
-    Replaces the 6-FFN chain (clamp → signed_multiply → clamp →
-    reciprocal → multiply_const → Linear) with 1 FFN layer.
+    Replaces the 6-MLP chain (clamp → signed_multiply → clamp →
+    reciprocal → multiply_const → Linear) with 1 MLP sublayer.
 
     Args:
         closest_dist: Scalar distance to nearest wall.
@@ -104,8 +126,10 @@ def _wall_height_lookup(
         return float(H) / perp
 
     wall_height = piecewise_linear_2d(
-        clamped_dist, perp_cos,
-        _DIST_BREAKPOINTS, _COS_BREAKPOINTS,
+        clamped_dist,
+        perp_cos,
+        _DIST_BREAKPOINTS,
+        _COS_BREAKPOINTS,
         _wall_h,
         name="wall_height_2d",
     )
@@ -113,11 +137,15 @@ def _wall_height_lookup(
     center = float(H) / 2.0
     half_height = multiply_const(wall_height, 0.5)
     wall_top = Linear(
-        half_height, torch.tensor([[-1.0]]), torch.tensor([center]),
+        half_height,
+        torch.tensor([[-1.0]]),
+        torch.tensor([center]),
         name="wall_top",
     )
     wall_bottom = Linear(
-        half_height, torch.tensor([[1.0]]), torch.tensor([center]),
+        half_height,
+        torch.tensor([[1.0]]),
+        torch.tensor([center]),
         name="wall_bottom",
     )
     return wall_top, wall_bottom, wall_height
@@ -129,14 +157,40 @@ def _wall_height_lookup(
 
 # Position breakpoints: dense near 0, sparser at extremes.
 _POS_BREAKPOINTS = [
-    -20.0, -15.0, -10.0, -7.0, -5.0, -3.0, -2.0, -1.0, -0.5,
+    -20.0,
+    -15.0,
+    -10.0,
+    -7.0,
+    -5.0,
+    -3.0,
+    -2.0,
+    -1.0,
+    -0.5,
     0.0,
-    0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0,
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    7.0,
+    10.0,
+    15.0,
+    20.0,
 ]
 
 # Trig value breakpoints: full [-1, 1] range.
 _TRIG_BREAKPOINTS = [
-    -1.0, -0.9, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 0.9, 1.0,
+    -1.0,
+    -0.9,
+    -0.75,
+    -0.5,
+    -0.25,
+    0.0,
+    0.25,
+    0.5,
+    0.75,
+    0.9,
+    1.0,
 ]
 
 
@@ -146,20 +200,24 @@ def _shared_products(
     ray_cos: Node,
     ray_sin: Node,
 ) -> Tuple[Node, Node]:
-    """Compute px*sin(θ) and py*cos(θ) via 2D lookups (1 FFN each).
+    """Compute px*sin(θ) and py*cos(θ) via 2D lookups (1 MLP sublayer each).
 
-    Replaces two ``signed_multiply`` calls (~3 FFN each) with two
-    ``piecewise_linear_2d`` lookups (1 FFN each, parallel).
+    Replaces two ``signed_multiply`` calls (~3 MLP sublayers each) with two
+    ``piecewise_linear_2d`` lookups (1 MLP sublayer each, parallel).
     """
     px_sin = piecewise_linear_2d(
-        player_x, ray_sin,
-        _POS_BREAKPOINTS, _TRIG_BREAKPOINTS,
+        player_x,
+        ray_sin,
+        _POS_BREAKPOINTS,
+        _TRIG_BREAKPOINTS,
         lambda x, s: x * s,
         name="px_sin_2d",
     )
     py_cos = piecewise_linear_2d(
-        player_y, ray_cos,
-        _POS_BREAKPOINTS, _TRIG_BREAKPOINTS,
+        player_y,
+        ray_cos,
+        _POS_BREAKPOINTS,
+        _TRIG_BREAKPOINTS,
         lambda y, c: y * c,
         name="py_cos_2d",
     )
@@ -172,12 +230,35 @@ def _shared_products(
 
 # adj_num_u breakpoints: ranges from 0 to ~max_coord (sign-normalized).
 _U_BREAKPOINTS = [
-    0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 30.0, 40.0,
+    0.0,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    8.0,
+    12.0,
+    20.0,
+    30.0,
+    40.0,
 ]
 
 # abs_den breakpoints: from small (glancing angles) to large.
 _DEN_BREAKPOINTS = [
-    0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 25.0, 40.0,
+    0.01,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+    15.0,
+    25.0,
+    40.0,
 ]
 
 
@@ -189,28 +270,32 @@ def _u_norm_lookup(
 ) -> Node:
     """Compute texture column index via a single 2D lookup.
 
-    Replaces the 7-FFN chain (clamp → reciprocal → signed_multiply →
-    clamp → multiply_const → thermometer_floor_div) with 1 FFN layer.
+    Replaces the 7-MLP chain (clamp → reciprocal → signed_multiply →
+    clamp → multiply_const → thermometer_floor_div) with 1 MLP sublayer.
 
     Returns a scalar node containing floor(clamp(u/den, 0, 1) * tex_w),
     i.e. an integer in [0, tex_w-1].
     """
+
     def _tex_col(u, d):
         d_safe = builtins.max(0.01, builtins.min(2.0 * max_coord, d))
         u_norm = builtins.max(0.0, builtins.min(1.0 - 1e-4, u / d_safe))
         return builtins.min(tex_w - 1, builtins.max(0, int(u_norm * tex_w)))
 
     return piecewise_linear_2d(
-        winning_adj_num_u, winning_abs_den,
-        _U_BREAKPOINTS, _DEN_BREAKPOINTS,
+        winning_adj_num_u,
+        winning_abs_den,
+        _U_BREAKPOINTS,
+        _DEN_BREAKPOINTS,
         lambda u, d: float(_tex_col(u, d)),
         name="tex_col_2d",
     )
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: Per-segment intersection (Linear nodes — zero FFN cost)
+# Stage 3: Per-segment intersection (Linear nodes — zero MLP cost)
 # ---------------------------------------------------------------------------
+
 
 def _segment_intersection(
     cos_sin: Node,
@@ -220,7 +305,7 @@ def _segment_intersection(
 ) -> Tuple[Node, Node, Node]:
     """Compute (den, num_t, num_u) for one segment.
 
-    All outputs are scalar Linear nodes — zero FFN layers.
+    All outputs are scalar Linear nodes — zero MLP sublayers.
 
     Args:
         cos_sin: Concatenate([ray_cos, ray_sin]), shared across segments.
@@ -240,13 +325,16 @@ def _segment_intersection(
 
     # num_t = (ax*ey - ay*ex) + ex*py - ey*px  (linear in px, py)
     const_t = seg.ax * ey - seg.ay * ex
-    num_t = Linear(px_py, torch.tensor([[-ey], [ex]]),
-                   torch.tensor([const_t]), name="num_t")
+    num_t = Linear(
+        px_py, torch.tensor([[-ey], [ex]]), torch.tensor([const_t]), name="num_t"
+    )
 
     # num_u = (ax*sin - ay*cos) + (py_cos - px_sin)
-    num_u = Linear(trig_and_products,
-                   torch.tensor([[-seg.ay], [seg.ax], [-1.0], [1.0]]),
-                   name="num_u")
+    num_u = Linear(
+        trig_and_products,
+        torch.tensor([[-seg.ay], [seg.ax], [-1.0], [1.0]]),
+        name="num_u",
+    )
 
     return den, num_t, num_u
 
@@ -304,8 +392,10 @@ def _segment_distance(
     # sign-normalized num_t, so use the absolute reciprocal.
     abs_inv_den = select(sign_den, signed_inv_den, negate(signed_inv_den))
     dist = signed_multiply(
-        adj_num_t, abs_inv_den,
-        max_abs1=max_num_t, max_abs2=max_inv_den,
+        adj_num_t,
+        abs_inv_den,
+        max_abs1=max_num_t,
+        max_abs2=max_inv_den,
         step=1.0,
         max_abs_output=BIG_DISTANCE,
     )
@@ -348,8 +438,10 @@ def _segment_distance_and_texinfo(
 
     abs_inv_den = select(sign_den, signed_inv_den, negate(signed_inv_den))
     dist = signed_multiply(
-        adj_num_t, abs_inv_den,
-        max_abs1=max_num_t, max_abs2=max_inv_den,
+        adj_num_t,
+        abs_inv_den,
+        max_abs1=max_num_t,
+        max_abs2=max_inv_den,
         step=1.0,
         max_abs_output=BIG_DISTANCE,
     )
@@ -360,7 +452,8 @@ def _segment_distance_and_texinfo(
 
     # Texture metadata: carry through reduce_min
     tex_id_node = LiteralValue(
-        torch.tensor([float(texture_id)]), name=f"tex_id_{texture_id}",
+        torch.tensor([float(texture_id)]),
+        name=f"tex_id_{texture_id}",
     )
     valid_meta = Concatenate([tex_id_node, adj_num_u, abs_den])
     invalid_meta = LiteralValue(torch.tensor([0.0, 0.0, 1.0]), name="invalid_meta")
@@ -378,11 +471,11 @@ def _build_angle_lookup(
     For each segment, den = cos(angle)*ey - sin(angle)*ex is fully determined
     by the ray angle and constant segment endpoints. Precomputing 1/den, |den|,
     and sign(den) for all 256 angles eliminates runtime reciprocal and sign
-    normalization (saves ~5 ReLU layers on the per-segment critical path).
+    normalization (saves ~5 MLP sublayers on the per-segment critical path).
 
     Returns a list of (signed_inv_den, abs_den, sign_den) node tuples,
     one per segment.  All segments share a single piecewise_linear lookup
-    (1 FFN layer total, regardless of segment count).
+    (1 MLP sublayer total, regardless of segment count).
     """
     trig_table = generate_trig_table()
     n_segs = len(segments)
@@ -408,9 +501,12 @@ def _build_angle_lookup(
                 row.extend([1.0 / den, builtins.abs(den), 1.0 if den > 0 else -1.0])
         return row
 
-    # Single lookup: 1 FFN layer, outputs 3*N values
+    # Single lookup: 1 MLP sublayer, outputs 3*N values
     all_data = piecewise_linear(
-        ray_angle, breakpoints, _angle_row, name="angle_lookup",
+        ray_angle,
+        breakpoints,
+        _angle_row,
+        name="angle_lookup",
     )
 
     # Split into per-segment (signed_inv_den, abs_den, sign_den) triples
@@ -448,6 +544,7 @@ def _extract_matrix(d_in: int, idx: int) -> torch.Tensor:
 # Stage 7: Column fill
 # ---------------------------------------------------------------------------
 
+
 def _column_fill(
     wall_top: Node,
     wall_bottom: Node,
@@ -463,7 +560,7 @@ def _column_fill(
       1. Base layer: floor color where row >= wall_bottom, ceiling elsewhere.
       2. Overlay: wall color in [wall_top, wall_bottom).
 
-    Cost: 4 FFN layers (2 in_range + 2 broadcast_select).
+    Cost: 4 MLP sublayers (2 in_range + 2 broadcast_select).
     """
     H = config.screen_height
     ceil_node = LiteralValue(torch.tensor(list(config.ceiling_color)), name="ceiling")
@@ -498,11 +595,11 @@ def _textured_column_fill(
     Divides the wall into *tex_height* horizontal bands.  Each band
     gets the corresponding texture row color.  Bands are processed in
     groups: within each group, the ``in_range`` and ``broadcast_select``
-    calls are independent and pack into a small number of FFN layers.
+    calls are independent and pack into a small number of MLP sublayers.
     Group results are summed (free) and the intermediates freed before
     the next group, keeping peak residual-stream width manageable.
 
-    Cost: ~2 FFN layers per group + 3 for base/composite.
+    Cost: ~2 MLP sublayers per group + 3 for base/composite.
 
     Args:
         wall_top: Scalar node -- top of wall in screen rows.
@@ -514,7 +611,7 @@ def _textured_column_fill(
         config: Render configuration.
         group_size: Number of bands processed in parallel per group.
             Larger groups use more residual-stream width but fewer
-            FFN layers.
+            MLP sublayers.
 
     Returns:
         Node of width H*3 (one RGB per screen row).
@@ -545,10 +642,14 @@ def _textured_column_fill(
             lo_k = float(k) / tex_height
             hi_k = float(k + 1) / tex_height
             boundary_lo = Linear(
-                wt_wh, torch.tensor([[1.0], [lo_k]]), name=f"band_lo_{k}",
+                wt_wh,
+                torch.tensor([[1.0], [lo_k]]),
+                name=f"band_lo_{k}",
             )
             boundary_hi = Linear(
-                wt_wh, torch.tensor([[1.0], [hi_k]]), name=f"band_hi_{k}",
+                wt_wh,
+                torch.tensor([[1.0], [hi_k]]),
+                name=f"band_hi_{k}",
             )
             band_mask = in_range(boundary_lo, boundary_hi, H)
 
@@ -557,9 +658,7 @@ def _textured_column_fill(
                 extract[k * 3 + c, c] = 1.0
             row_color = Linear(tex_column_colors, extract, name=f"tex_row_{k}")
 
-            band_fills.append(
-                broadcast_select(band_mask, row_color, zeros_H3, H, 3)
-            )
+            band_fills.append(broadcast_select(band_mask, row_color, zeros_H3, H, 3))
 
         group_sums.append(sum_nodes(band_fills))
 
@@ -627,13 +726,21 @@ def build_textured_rendering_pipeline(
     tex_metas = []
     for i, seg in enumerate(segments):
         _den, num_t, num_u = _segment_intersection(
-            cos_sin, px_py, trig_and_products, seg,
+            cos_sin,
+            px_py,
+            trig_and_products,
+            seg,
         )
         signed_inv_den, abs_den_node, sign_den = angle_data[i]
         tid = seg.texture_id if seg.texture_id >= 0 else 0
         dist, tex_meta = _segment_distance_and_texinfo(
-            num_t, num_u, signed_inv_den, abs_den_node, sign_den,
-            max_coord, tid,
+            num_t,
+            num_u,
+            signed_inv_den,
+            abs_den_node,
+            sign_den,
+            max_coord,
+            tid,
         )
         distances.append(dist)
         tex_metas.append(tex_meta)
@@ -651,18 +758,27 @@ def build_textured_rendering_pipeline(
     # Extract winning metadata
     d_meta = 3
     winning_tex_id = Linear(
-        winning_meta, _extract_matrix(d_meta, 0), name="win_tex_id",
+        winning_meta,
+        _extract_matrix(d_meta, 0),
+        name="win_tex_id",
     )
     winning_adj_num_u = Linear(
-        winning_meta, _extract_matrix(d_meta, 1), name="win_adj_num_u",
+        winning_meta,
+        _extract_matrix(d_meta, 1),
+        name="win_adj_num_u",
     )
     winning_abs_den = Linear(
-        winning_meta, _extract_matrix(d_meta, 2), name="win_abs_den",
+        winning_meta,
+        _extract_matrix(d_meta, 2),
+        name="win_abs_den",
     )
 
     # --- Stage 6: Wall height (2D lookup) ---
     wall_top, wall_bottom, wall_height = _wall_height_lookup(
-        closest_dist, perp_cos, config, max_coord,
+        closest_dist,
+        perp_cos,
+        config,
+        max_coord,
     )
 
     # --- Stage 7: u normalization (2D lookup) ---
@@ -686,13 +802,19 @@ def build_textured_rendering_pipeline(
 
     # --- Stage 9: Textured column fill ---
     return _textured_column_fill(
-        wall_top, wall_bottom, wall_height, tex_column_colors, tex_h, config,
+        wall_top,
+        wall_bottom,
+        wall_height,
+        tex_column_colors,
+        tex_h,
+        config,
     )
 
 
 # ---------------------------------------------------------------------------
 # Full graph
 # ---------------------------------------------------------------------------
+
 
 def build_rendering_pipeline(
     player_x: Node,
@@ -723,7 +845,7 @@ def build_rendering_pipeline(
     # Stage 1: Trig lookup
     ray_cos, ray_sin = trig_lookup(ray_angle)
 
-    # Stage 2: Shared products (2D lookups — 1 FFN each, parallel)
+    # Stage 2: Shared products (2D lookups — 1 MLP sublayer each, parallel)
     px_sin, py_cos = _shared_products(player_x, player_y, ray_cos, ray_sin)
 
     # Shared Concatenates — created once, reused by all segments
@@ -732,7 +854,7 @@ def build_rendering_pipeline(
     trig_and_products = Concatenate([ray_cos, ray_sin, px_sin, py_cos])
 
     # Per-angle lookup: precompute signed_inv_den, abs_den, sign_den for
-    # all segments in a single piecewise_linear (1 FFN layer).
+    # all segments in a single piecewise_linear (1 MLP sublayer).
     # Eliminates runtime reciprocal + sign normalization per segment.
     if len(segments) > 0:
         angle_data = _build_angle_lookup(ray_angle, segments)
@@ -742,11 +864,19 @@ def build_rendering_pipeline(
     colors = []
     for i, seg in enumerate(segments):
         _den, num_t, num_u = _segment_intersection(
-            cos_sin, px_py, trig_and_products, seg,
+            cos_sin,
+            px_py,
+            trig_and_products,
+            seg,
         )
         signed_inv_den, abs_den_node, sign_den = angle_data[i]
         dist = _segment_distance(
-            num_t, num_u, signed_inv_den, abs_den_node, sign_den, max_coord,
+            num_t,
+            num_u,
+            signed_inv_den,
+            abs_den_node,
+            sign_den,
+            max_coord,
         )
         distances.append(dist)
         colors.append(LiteralValue(torch.tensor(list(seg.color)), name="seg_color"))
@@ -763,7 +893,10 @@ def build_rendering_pipeline(
 
     # Stage 6: Wall height (2D lookup)
     wall_top, wall_bottom, wall_height = _wall_height_lookup(
-        closest_dist, perp_cos, config, max_coord,
+        closest_dist,
+        perp_cos,
+        config,
+        max_coord,
     )
 
     # Stage 7: Column fill
@@ -799,8 +932,13 @@ def build_renderer_graph(
     ray_angle = create_input("ray_angle", 1)
 
     output = build_rendering_pipeline(
-        player_x, player_y, ray_angle, perp_cos,
-        segments, config, max_coord,
+        player_x,
+        player_y,
+        ray_angle,
+        perp_cos,
+        segments,
+        config,
+        max_coord,
     )
 
     return output, pos_encoding
