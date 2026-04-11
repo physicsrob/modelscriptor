@@ -275,27 +275,65 @@ def _u_norm_lookup(
     tex_w: int,
     max_coord: float,
 ) -> Node:
-    """Compute texture column index via a single 2D lookup.
+    """Compute the integer texture column index ``floor(num_u * tex_w / abs_den)``.
 
-    Replaces the 7-MLP chain (clamp → reciprocal → signed_multiply →
-    clamp → multiply_const → thermometer_floor_div) with 1 MLP sublayer.
+    Earlier versions of this op used :func:`piecewise_linear_2d` over
+    ``(num_u, abs_den)`` with sparse breakpoints, which collapses the
+    whole "divide and floor" pipeline into a single MLP sublayer.  But
+    the function being approximated is a ``tex_w``-step staircase
+    over a 2D domain, and bilinear interpolation between sparse grid
+    vertices cannot resolve every step — for typical wall hits the
+    output landed 1–2 columns off the true value, which manifested
+    visually as a consistent texture-mapping offset across the
+    rendered wall (the "wrong starting point" the demo gif showed).
 
-    Returns a scalar node containing floor(clamp(u/den, 0, 1) * tex_w),
-    i.e. an integer in [0, tex_w-1].
+    The reformulation uses :func:`linear_bin_index`, which is the
+    purpose-built primitive for "continuous coordinate → integer bin
+    over a runtime range":
+
+    * ``num_u`` is the per-segment u-coordinate before normalisation.
+    * ``abs_den`` is the magnitude of the ray-segment denominator
+      (the per-angle scale that ``num_u`` should be divided by).
+    * Bin range is ``[0, abs_den]``, divided into ``tex_w`` bins.
+    * Output is ``floor((num_u - 0) * tex_w / (abs_den - 0))``
+      clamped to ``[0, tex_w - 1]`` — exactly the texture column index.
+
+    Cost: ~5 MLP sublayers (1 reciprocal + ~3 signed_multiply + 1
+    floor_int) instead of 1 — but called once per screen column, so
+    the total graph depth grows by ~4 sublayers, not by a factor.
+
+    Args:
+        winning_adj_num_u: Scalar node — the winning segment's u
+            numerator (sign-normalised so it's non-negative).
+        winning_abs_den: Scalar node — the winning segment's
+            ``|den|`` value (always positive, bounded above by the
+            wall length × ray-direction extreme).
+        tex_w: Texture width in pixels (compile-time).
+        max_coord: World coordinate bound — used to set the
+            reciprocal lookup's range.
+
+    Returns:
+        Scalar node carrying an integer in ``[0, tex_w - 1]``.
     """
+    from torchwright.graph.misc import LiteralValue
 
-    def _tex_col(u, d):
-        d_safe = builtins.max(0.01, builtins.min(2.0 * max_coord, d))
-        u_norm = builtins.max(0.0, builtins.min(1.0 - 1e-4, u / d_safe))
-        return builtins.min(tex_w - 1, builtins.max(0, int(u_norm * tex_w)))
-
-    return piecewise_linear_2d(
+    zero = LiteralValue(torch.tensor([0.0]), name="u_norm_zero")
+    return linear_bin_index(
         winning_adj_num_u,
+        zero,
         winning_abs_den,
-        _U_BREAKPOINTS,
-        _DEN_BREAKPOINTS,
-        lambda u, d: float(_tex_col(u, d)),
-        name="tex_col_2d",
+        n_bins=tex_w,
+        # |abs_den| for box-room geometry sits in roughly
+        # [0.5, 2 * max_coord]: smaller than 0.5 means an extremely
+        # glancing ray (those are unlikely to be the winning segment
+        # via reduce_min anyway), and the upper bound is the longest
+        # wall edge.  Tight bounds → better signed_multiply precision
+        # AND fewer neurons.
+        min_range=0.5,
+        max_range=2.0 * max_coord,
+        n_reciprocal_breakpoints=48,
+        mul_step=0.25,
+        name="u_norm_bin",
     )
 
 
