@@ -117,12 +117,29 @@ def render_column(
     if perp_distance <= 0.0:
         return column
 
-    # Wall height and vertical span
-    wall_height = h / perp_distance
-    half_wall = wall_height / 2.0
+    # Wall height and vertical span (center-sampling rasterization).
+    #
+    # Row ``i`` is part of the wall iff its centre ``i + 0.5`` falls in
+    # the open-on-the-right interval ``[wall_top_f, wall_bottom_f)``.
+    # Equivalently the integer wall row range is
+    # ``[ceil(wall_top_f - 0.5), ceil(wall_bottom_f - 0.5))``.  The
+    # texture row for screen row ``i`` is then computed at the same
+    # centre ``i + 0.5`` against the **fractional** wall edges, so the
+    # texture sampling is geometrically meaningful instead of being
+    # quantised to whichever ``int()``-rounded wall_top happens to land
+    # at.  This matches what the compiled graph does (its
+    # ``in_range(wall_top, wall_bottom, ...)`` mask uses the same
+    # ``i + 0.5`` centres, and the textured fill samples
+    # ``linear_bin_index(y_abs + 0.5, wall_top, wall_bottom, tex_h)``).
+    import math as _math
+
+    wall_height_f = h / perp_distance
     center_f = h / 2.0
-    wall_top = max(0, int(center_f - half_wall))
-    wall_bottom = min(h, int(center_f + half_wall))
+    wall_top_f = center_f - wall_height_f / 2.0
+    wall_bottom_f = center_f + wall_height_f / 2.0
+
+    wall_top = max(0, _math.ceil(wall_top_f - 0.5))
+    wall_bottom = min(h, _math.ceil(wall_bottom_f - 0.5))
 
     if wall_top < wall_bottom:
         column[:wall_top] = config.ceiling_color
@@ -133,7 +150,7 @@ def render_column(
             tw, th = tex.shape[0], tex.shape[1]
             tex_col = min(int(best_u * tw), tw - 1)
             for row in range(wall_top, wall_bottom):
-                v = (row - wall_top) / (wall_bottom - wall_top)
+                v = ((row + 0.5) - wall_top_f) / wall_height_f
                 tex_row = min(int(v * th), th - 1)
                 column[row] = tex[tex_col, tex_row]
         else:

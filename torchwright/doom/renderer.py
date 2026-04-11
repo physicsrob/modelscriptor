@@ -780,15 +780,23 @@ def _textured_column_fill(
 
     row_rgbs: List[Node] = []
     for y_idx in range(rows_per_patch):
-        # y_abs = patch_row_start + y_idx  (free Linear, y_idx baked in)
-        y_abs = Linear(
+        # y_centre = patch_row_start + y_idx + 0.5  (free Linear, y_idx
+        # and the +0.5 baked into the bias).  The +0.5 makes this the
+        # row's CENTRE, matching the center-sampling rasterisation rule
+        # the wall_masks composite below also uses (via in_range, which
+        # tests centres ``i + 0.5`` against the wall interval).  Without
+        # the offset the texture would be sampled at the row's top edge
+        # while the composite mask would test its centre, leaving a
+        # half-row mismatch between which screen rows look "wall" and
+        # which texture row each one samples.
+        y_centre = Linear(
             patch_row_start,
             torch.tensor([[1.0]]),
-            torch.tensor([float(y_idx)]),
-            name=f"y_abs_row_{y_idx}",
+            torch.tensor([float(y_idx) + 0.5]),
+            name=f"y_centre_row_{y_idx}",
         )
         tex_row_idx = linear_bin_index(
-            y_abs, wall_top, wall_bottom, tex_height,
+            y_centre, wall_top, wall_bottom, tex_height,
             min_range=min_wall_height,
             max_range=max_wall_height,
             n_reciprocal_breakpoints=48,
