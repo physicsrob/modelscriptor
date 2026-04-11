@@ -1,6 +1,6 @@
 """Compile renderer and game graphs to HeadlessTransformerModule and run them."""
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -21,6 +21,7 @@ def compile_renderer(
     d_head: int = 16,
     device: str = "cpu",
     verbose: bool = True,
+    d_hidden: Optional[int] = None,
 ):
     """Compile a flat-shaded renderer to a HeadlessTransformerModule.
 
@@ -32,6 +33,7 @@ def compile_renderer(
         d_head: Attention head dimension.
         device: Target device.
         verbose: Print compilation stats.
+        d_hidden: Per-layer MLP hidden width; defaults to ``d``.
 
     Returns:
         HeadlessTransformerModule ready for inference.
@@ -41,6 +43,7 @@ def compile_renderer(
         output_node, pos_encoding,
         d=d, d_head=d_head,
         device=device, verbose=verbose,
+        d_hidden=d_hidden,
     )
     module.eval()
     return module
@@ -109,6 +112,7 @@ def compile_game(
     d_head: int = 16,
     device: str = "cpu",
     verbose: bool = True,
+    d_hidden: Optional[int] = None,
 ):
     """Compile the game + rendering graph to a HeadlessTransformerModule.
 
@@ -125,6 +129,7 @@ def compile_game(
         d_head: Attention head dimension.
         device: Target device.
         verbose: Print compilation stats.
+        d_hidden: Per-layer MLP hidden width; defaults to ``d``.
 
     Returns:
         HeadlessTransformerModule ready for inference.
@@ -140,6 +145,7 @@ def compile_game(
         d=d, d_head=d_head,
         max_layers=200,
         device=device, verbose=verbose,
+        d_hidden=d_hidden,
     )
     module.eval()
     return module

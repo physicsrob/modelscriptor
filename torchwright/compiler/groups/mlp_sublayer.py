@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from torchwright.compiler.components.linear import LinearLayerComponent
@@ -9,15 +11,22 @@ class MLPSubLayer:
     """MLP sublayer: linear1 -> relu -> linear2 + residual skip.
 
     Forward: out = linear2(relu(linear1(inp))) + inp
+
+    ``d`` is the residual stream width; ``d_hidden`` is the MLP hidden
+    width (the number of neurons / packed slots per layer).  They are
+    independent — passing ``d_hidden=None`` defaults it to ``d``.
     """
 
-    def __init__(self, d: int):
+    def __init__(self, d: int, d_hidden: Optional[int] = None):
+        if d_hidden is None:
+            d_hidden = d
         self.d = d
+        self.d_hidden = d_hidden
         self.in_state = ResidualStreamState(name="MLPSubLayer In State")
         self.out_state = ResidualStreamState(name="MLPSubLayer Out State")
-        self.linear1 = LinearLayerComponent(d, name="linear1")
-        self.relu = ReLULayerComponent(d, name="relu")
-        self.linear2 = LinearLayerComponent(d, name="linear2")
+        self.linear1 = LinearLayerComponent(d, d_hidden, name="linear1")
+        self.relu = ReLULayerComponent(d_hidden, name="relu")
+        self.linear2 = LinearLayerComponent(d_hidden, d, name="linear2")
 
     def forward(self, inp: torch.Tensor, return_states=False):
         states = {}
@@ -43,9 +52,3 @@ class MLPSubLayer:
         self.relu.to(device)
         self.linear2.to(device)
         return self
-
-    def resize(self, new_d):
-        self.d = new_d
-        self.linear1.resize(new_d)
-        self.linear2.resize(new_d)
-        self.relu.resize(new_d)

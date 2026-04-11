@@ -6,8 +6,9 @@ from torchwright.compiler.components.component import Component
 class ReLULayerComponent(Component):
     """ReLU activation component. No parameters."""
 
-    def __init__(self, d: int, name: str = ""):
-        super().__init__(d, name)
+    def __init__(self, d_hidden: int, name: str = ""):
+        super().__init__(d_hidden, name)
+        self.d_hidden = d_hidden
 
     def __repr__(self):
         return f"ReLULayerComponent(name='{self.name}')"

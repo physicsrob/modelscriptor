@@ -36,10 +36,16 @@ class LayerScheduler:
     """
 
     def __init__(
-        self, graph: GraphAnalyzer, d: int, d_head: int, pos_encoding: PosEncoding
+        self,
+        graph: GraphAnalyzer,
+        d: int,
+        d_head: int,
+        pos_encoding: PosEncoding,
+        d_hidden: Optional[int] = None,
     ):
         self.graph = graph
         self.d = d
+        self.d_hidden = d if d_hidden is None else d_hidden
         self.d_head = d_head
         self.n_heads = d // d_head
         self.pos_encoding = pos_encoding
@@ -288,8 +294,11 @@ class LayerScheduler:
             )
         else:
             chains.sort(key=lambda c: -self.graph.get_critical_path_length(c[2]))
+        # NOTE: ``d_hidden`` here is the per-chain hidden width (``len(relu)``).
+        # ``self.d_hidden`` is the layer-wide MLP hidden pool size.  Same name,
+        # different scopes — chains are packed into the layer pool.
         for l1, relu, l2, d_hidden, exclusive in chains:
-            if next_slot + d_hidden > self.d:
+            if next_slot + d_hidden > self.d_hidden:
                 continue
             target_cols = self._try_allocate(l2, residual_map)
             if target_cols is None:
@@ -319,7 +328,7 @@ class LayerScheduler:
         )
         for node in standalone_relus:
             d_relu = len(node)
-            if next_slot + d_relu > self.d:
+            if next_slot + d_relu > self.d_hidden:
                 continue
             target_cols = self._try_allocate(node, residual_map)
             if target_cols is None:
