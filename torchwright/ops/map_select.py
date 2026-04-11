@@ -311,8 +311,49 @@ def broadcast_select(
     picks true_value or false_value based on its mask. Values can be
     broadcast (same for all slots) or per-slot (different per slot).
 
+    **Robustness at fractional masks.**  This op is composed of four
+    ReLU units per ``(slot, channel)``, structured as
+
+    ::
+
+        unit_pos_t = ReLU( half_big * mask_i + true_ij )
+        unit_pos_b = ReLU( half_big * mask_i )
+        unit_neg_t = ReLU(-half_big * mask_i + false_ij)
+        unit_neg_b = ReLU(-half_big * mask_i )
+
+        gated_true  = unit_pos_t - unit_pos_b   # ≈ true_ij  at mask=+1, 0 at mask=-1
+        gated_false = unit_neg_t - unit_neg_b   # ≈ false_ij at mask=-1, 0 at mask=+1
+        out_ij      = gated_true + gated_false
+
+    The two ``_b`` units are pure-mask carriers that *cancel* the
+    ``half_big`` offset that the corresponding ``_t`` unit picks up
+    when the mask is fully on.  The previous formulation
+    ``unit_a + unit_b - half_big`` (a single output bias of
+    ``-half_big``) is correct only when exactly one of the two units is
+    fully active — i.e. when ``mask`` is exactly ``+1`` or ``-1``.  At
+    fractional masks (``mask ∈ (-1, 1)``) **both** units fall into
+    their ReLU's positive zone with values smaller than ``half_big``,
+    and the ``-half_big`` output bias under-cancels: the output
+    collapses to ``true + false - half_big ≈ -500``, a sentinel that
+    propagates through any downstream consumer.
+
+    The four-unit form here cancels the ``half_big`` carry on a
+    *per-unit* basis instead of via a single output bias.  At
+    fractional masks the worst-case output is the sum
+    ``true_ij + false_ij`` (instead of ``-half_big``), which for the
+    common usage pattern (positive RGB values, ``false = 0``) is
+    bounded in ``[0, 1]``.  No more catastrophic ``-500`` leaks at
+    inputs that fall into the ramp zone of an upstream ``in_range``
+    or ``compare``.
+
+    Cost: doubles the hidden width (``4 * n_slots * d_fill`` instead
+    of ``2 * n_slots * d_fill``) and uses no output bias.
+
     Args:
-        masks: Node of width n_slots. Each value is 1.0 (true) or -1.0 (false).
+        masks: Node of width n_slots. Each value is 1.0 (true) or
+            -1.0 (false).  Fractional values are **safe** but produce
+            a smooth blend of ``true`` and ``false`` rather than a
+            sharp choice — see the robustness discussion above.
         true_value: Node of width d_fill (broadcast to all slots)
             or n_slots*d_fill (per-slot values).
         false_value: Same shape options as true_value.
@@ -329,7 +370,7 @@ def broadcast_select(
     assert false_is_broadcast or len(false_value) == n_slots * d_fill
 
     half_big = big_offset / 2.0
-    d_hidden = 2 * n_slots * d_fill
+    d_hidden = 4 * n_slots * d_fill
     inp = Concatenate([masks, true_value, false_value])
     d_input = len(inp)
 
@@ -341,31 +382,43 @@ def broadcast_select(
     input_proj = torch.zeros(d_hidden, d_input)
     input_bias = torch.zeros(d_hidden)
     output_proj = torch.zeros(d_hidden, n_slots * d_fill)
-    output_bias = torch.full((n_slots * d_fill,), -half_big)
+    # Output bias is zero — every half_big offset is cancelled
+    # locally by the matching ``_b`` carrier unit.
+    output_bias = torch.zeros(n_slots * d_fill)
 
     for i in range(n_slots):
         for j in range(d_fill):
             out_idx = i * d_fill + j
-            unit_a = 2 * out_idx  # routes true_value
-            unit_b = 2 * out_idx + 1  # routes false_value
+            unit_pos_t = 4 * out_idx
+            unit_pos_b = 4 * out_idx + 1
+            unit_neg_t = 4 * out_idx + 2
+            unit_neg_b = 4 * out_idx + 3
 
-            # Unit A: ReLU(half_big * mask_i + true_ij)
-            input_proj[unit_a, mask_offset + i] = half_big
+            # unit_pos_t = ReLU(half_big * mask_i + true_ij)
+            input_proj[unit_pos_t, mask_offset + i] = half_big
             if true_is_broadcast:
-                input_proj[unit_a, true_offset + j] = 1.0
+                input_proj[unit_pos_t, true_offset + j] = 1.0
             else:
-                input_proj[unit_a, true_offset + i * d_fill + j] = 1.0
+                input_proj[unit_pos_t, true_offset + i * d_fill + j] = 1.0
 
-            # Unit B: ReLU(-half_big * mask_i + false_ij)
-            input_proj[unit_b, mask_offset + i] = -half_big
+            # unit_pos_b = ReLU(half_big * mask_i)
+            input_proj[unit_pos_b, mask_offset + i] = half_big
+
+            # unit_neg_t = ReLU(-half_big * mask_i + false_ij)
+            input_proj[unit_neg_t, mask_offset + i] = -half_big
             if false_is_broadcast:
-                input_proj[unit_b, false_offset + j] = 1.0
+                input_proj[unit_neg_t, false_offset + j] = 1.0
             else:
-                input_proj[unit_b, false_offset + i * d_fill + j] = 1.0
+                input_proj[unit_neg_t, false_offset + i * d_fill + j] = 1.0
 
-            # Output: rA + rB - half_big
-            output_proj[unit_a, out_idx] = 1.0
-            output_proj[unit_b, out_idx] = 1.0
+            # unit_neg_b = ReLU(-half_big * mask_i)
+            input_proj[unit_neg_b, mask_offset + i] = -half_big
+
+            # output = (unit_pos_t - unit_pos_b) + (unit_neg_t - unit_neg_b)
+            output_proj[unit_pos_t, out_idx] = 1.0
+            output_proj[unit_pos_b, out_idx] = -1.0
+            output_proj[unit_neg_t, out_idx] = 1.0
+            output_proj[unit_neg_b, out_idx] = -1.0
 
     return linear_relu_linear(
         input_node=inp,

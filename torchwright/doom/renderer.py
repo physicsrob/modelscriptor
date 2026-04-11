@@ -16,8 +16,10 @@ from torchwright.graph.misc import LiteralValue
 from torchwright.ops.arithmetic_ops import (
     abs,
     add,
+    add_const,
     clamp,
     compare,
+    linear_bin_index,
     multiply_const,
     negate,
     piecewise_linear,
@@ -30,7 +32,13 @@ from torchwright.ops.arithmetic_ops import (
     thermometer_floor_div,
 )
 from torchwright.ops.logic_ops import bool_all_true
-from torchwright.ops.map_select import broadcast_select, in_range, map_to_table, select
+from torchwright.ops.map_select import (
+    broadcast_select,
+    dynamic_extract,
+    in_range,
+    map_to_table,
+    select,
+)
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
@@ -607,39 +615,61 @@ def _textured_column_fill(
     tex_column_colors: Node,
     tex_height: int,
     config: RenderConfig,
-    sum_fanout: int = 4,
+    max_coord: float = 20.0,
     patch_row_start: Optional[Node] = None,
     rows_per_patch: Optional[int] = None,
 ) -> Node:
     """Fill a screen column with textured wall and solid floor/ceiling.
 
-    Divides the wall into *tex_height* horizontal bands.  Each band gets
-    the corresponding texture row color via an ``in_range`` mask +
-    ``broadcast_select``, and all bands are summed into the final
-    textured wall.
+    For each screen row ``y`` in the patch, compute which texture row
+    it samples — ``tex_row(y) = floor((y - wall_top) /
+    (wall_bottom - wall_top) * tex_height)`` — then look up the
+    corresponding RGB from ``tex_column_colors``.  This mirrors the
+    reference ``render_column`` exactly.
 
-    The per-band fill tensors are each ``H*3`` wide, so at tex_size=64 /
-    H=200 a flat sum would hold ``64 * 600 = 38,400`` residual-stream
-    columns simultaneously.  ``sum_fanout`` caps how many of those bands
-    live on the stream at once by chaining the sum through a running
-    accumulator inside :func:`sum_nodes`; this trades a few extra
-    Linears for a dramatically lower peak width.
+    This replaces an earlier band-sum-over-tex-rows formulation whose
+    per-band ``in_range`` masks underflowed or overlapped whenever
+    ``wall_height < tex_height`` (far walls, big textures), producing
+    catastrophic pixel values because many bands "won" the same screen
+    row and their RGB contributions summed.  The per-screen-row
+    formulation is O(rows_per_patch) in depth and correct at any
+    ``wall_height / tex_height`` ratio.
+
+    The heavy lifting is split between two primitives:
+
+    * :func:`torchwright.ops.linear_bin_index` takes the runtime
+      ``(y, wall_top, wall_bottom)`` tuple and returns an integer
+      texture row index in ``[0, tex_height - 1]``.
+    * :func:`torchwright.ops.dynamic_extract` reads the 3-wide RGB
+      slice from ``tex_column_colors`` at that index.
+
+    Both are unit-tested in ``tests/ops/test_resampling_primitives.py``
+    — correctness of this fill reduces to correctness of those two
+    ops plus the outer composite mask.
 
     Args:
-        wall_top: Scalar node -- top of wall in screen rows.
-        wall_bottom: Scalar node -- bottom of wall in screen rows.
-        wall_height: Scalar node -- wall_bottom - wall_top.
-        tex_column_colors: Node of width ``tex_height * 3`` -- RGB for
+        wall_top: Scalar node — top of wall in full-frame screen rows.
+        wall_bottom: Scalar node — bottom of wall in full-frame rows.
+        wall_height: Scalar node — ``wall_bottom - wall_top``.  Present
+            for API compatibility with callers; the fill derives range
+            internally via ``wall_top`` and ``wall_bottom``.
+        tex_column_colors: Node of width ``tex_height * 3`` — RGB for
             each texture row in this column.
-        tex_height: Number of texture rows.
+        tex_height: Number of texture rows (compile-time).
         config: Render configuration.
-        sum_fanout: Max operands live per reduction step in the final
-            band sum.  ``4`` keeps peak per-column at ~``sum_fanout *
-            H*3`` plus the running accumulator and is a sweet spot for
-            tex_size 8..64 at H in [80, 200].
+        max_coord: World-coordinate magnitude bound, used upstream by
+            :func:`_wall_height_lookup` to set the ``wall_height``
+            range.  The fill uses it to size the reciprocal lookup
+            inside ``linear_bin_index``.
+        patch_row_start: Scalar node — the y-offset (in full-frame
+            coordinates) of the first row in the current patch.
+            Defaults to 0 for unsharded renders.
+        rows_per_patch: Height of the patch.  Defaults to the full
+            screen height.
 
     Returns:
-        Node of width H*3 (one RGB per screen row).
+        Node of width ``rows_per_patch * 3`` — one RGB per screen row
+        in the patch.
     """
     H = config.screen_height
     if rows_per_patch is None:
@@ -650,9 +680,9 @@ def _textured_column_fill(
     if patch_row_start is None:
         patch_row_start = LiteralValue(torch.tensor([0.0]), name="patch_row_start_0")
 
+    # --- Base (non-wall) column: floor below wall_bottom, ceiling above ---
     ceil_node = LiteralValue(torch.tensor(list(config.ceiling_color)), name="ceiling")
     floor_node = LiteralValue(torch.tensor(list(config.floor_color)), name="floor")
-
     wall_top_local = subtract(wall_top, patch_row_start)
     wall_bottom_local = subtract(wall_bottom, patch_row_start)
     h_local = Linear(
@@ -661,49 +691,52 @@ def _textured_column_fill(
         torch.tensor([float(H)]),
         name="h_local_bound",
     )
-
-    # Base column: floor below wall_bottom, ceiling above
     floor_masks = in_range(wall_bottom_local, h_local, rows_per_patch)
     base = broadcast_select(
         floor_masks, floor_node, ceil_node, rows_per_patch, 3,
     )
 
-    # Band boundaries: boundary_k = wall_top + k * wall_height / tex_height,
-    # shifted into patch-relative coordinates via a -1.0 coefficient on
-    # patch_row_start. Still free (Linear).
-    wt_wh_prs = Concatenate([wall_top, wall_height, patch_row_start])
-    zeros_patch = LiteralValue(
-        torch.zeros(rows_per_patch * 3), name="zeros_tex"
-    )
+    # --- Textured wall: per-screen-row texture sampling ---
+    #
+    # For each screen row in the patch, compute its full-frame y as
+    # ``patch_row_start + y_idx`` (free Linear, since y_idx is a
+    # compile-time constant), index into the (wall_top, wall_bottom)
+    # range via ``linear_bin_index`` to pick the matching tex row, and
+    # dynamically extract that row's RGB from ``tex_column_colors``.
+    #
+    # ``linear_bin_index`` needs tight (min_range, max_range) bounds on
+    # wall_height to keep its internal signed_multiply precise: loose
+    # bounds inflate absolute error.  ``_wall_height_lookup`` clamps
+    # wall_height to [H/max_dist, 2*H], so we use those as the bounds.
+    max_dist = 2.0 * max_coord
+    min_wall_height = max(float(H) / max_dist, 0.5)
+    max_wall_height = 2.0 * float(H)
 
-    band_fills: List[Node] = []
-    for k in range(tex_height):
-        lo_k = float(k) / tex_height
-        hi_k = float(k + 1) / tex_height
-        boundary_lo = Linear(
-            wt_wh_prs,
-            torch.tensor([[1.0], [lo_k], [-1.0]]),
-            name=f"band_lo_{k}",
+    row_rgbs: List[Node] = []
+    for y_idx in range(rows_per_patch):
+        # y_abs = patch_row_start + y_idx  (free Linear, y_idx baked in)
+        y_abs = Linear(
+            patch_row_start,
+            torch.tensor([[1.0]]),
+            torch.tensor([float(y_idx)]),
+            name=f"y_abs_row_{y_idx}",
         )
-        boundary_hi = Linear(
-            wt_wh_prs,
-            torch.tensor([[1.0], [hi_k], [-1.0]]),
-            name=f"band_hi_{k}",
+        tex_row_idx = linear_bin_index(
+            y_abs, wall_top, wall_bottom, tex_height,
+            min_range=min_wall_height,
+            max_range=max_wall_height,
+            n_reciprocal_breakpoints=48,
+            mul_step=0.25,
+            name=f"tex_row_idx_{y_idx}",
         )
-        band_mask = in_range(boundary_lo, boundary_hi, rows_per_patch)
-
-        extract = torch.zeros(tex_height * 3, 3)
-        for c in range(3):
-            extract[k * 3 + c, c] = 1.0
-        row_color = Linear(tex_column_colors, extract, name=f"tex_row_{k}")
-
-        band_fills.append(
-            broadcast_select(band_mask, row_color, zeros_patch, rows_per_patch, 3)
+        row_rgb = dynamic_extract(
+            tex_column_colors, tex_row_idx, tex_height, 3,
         )
+        row_rgbs.append(row_rgb)
 
-    textured_wall = sum_nodes(band_fills, max_fanout=sum_fanout)
+    textured_wall = Concatenate(row_rgbs)
 
-    # Composite: wall region gets textured_wall, rest keeps base
+    # --- Composite: wall region gets textured_wall, rest keeps base ---
     wall_masks = in_range(wall_top_local, wall_bottom_local, rows_per_patch)
     return broadcast_select(
         wall_masks, textured_wall, base, rows_per_patch, 3,
@@ -828,20 +861,52 @@ def build_textured_rendering_pipeline(
     tex_col_idx = _u_norm_lookup(winning_adj_num_u, winning_abs_den, tex_w, max_coord)
 
     # --- Stage 8: Texture column lookup ---
-    # Build map_to_table keyed by (texture_id, col_idx) → tex_height*3 values
-    tex_key_to_value = {}
-    for tid, tex in enumerate(textures):
-        tw = tex.shape[0]
-        for col in range(tw):
-            # key = [texture_id, column_index]
-            key = torch.tensor([float(tid), float(col)])
-            # value = all row colors for this column, flattened
-            val = torch.tensor(tex[col].flatten(), dtype=torch.float32)
-            tex_key_to_value[key] = val
+    #
+    # Use :func:`piecewise_linear` with vector output over a flat
+    # ``(texture_id * tex_w + col)`` key space.  The previous
+    # implementation used :func:`map_to_table` with two-dimensional
+    # ``(texture_id, column_index)`` keys, which was catastrophically
+    # wrong for non-trivial textures: ``map_to_table``'s linear
+    # dot-product scoring fires on every key whose
+    # dot-product-with-input exceeds ``key @ key - 1`` — so for input
+    # ``(0, 7)`` and keys ``(0, 0), (0, 1), ... (0, 7)`` every unit
+    # fires with varying magnitudes and the Linear sum becomes a
+    # weighted combination of several texture columns instead of just
+    # one (surfaced as pixel values in ``[0.37, 1.97]`` instead of
+    # the expected ``[0, 1]``).
+    #
+    # ``piecewise_linear`` with integer breakpoints and vector output
+    # is the right shape: at any integer ``flat_key`` it returns the
+    # exact corresponding texture column's RGB, and it costs one MLP
+    # sublayer with roughly one hidden neuron per breakpoint
+    # regardless of the output width.  For non-integer ``flat_key``
+    # (possible under upstream arithmetic wiggle) it linearly
+    # interpolates between the two adjacent columns — far better than
+    # ``map_to_table``'s sum-everything behaviour.
+    num_tex = len(textures)
+    n_keys = num_tex * tex_w
 
-    default_val = torch.zeros(tex_h * 3)
-    tex_lookup_input = Concatenate([winning_tex_id, tex_col_idx])
-    tex_column_colors = map_to_table(tex_lookup_input, tex_key_to_value, default_val)
+    flat_key = add(
+        multiply_const(winning_tex_id, float(tex_w)),
+        tex_col_idx,
+    )
+
+    def _tex_column_values(flat_idx: float) -> List[float]:
+        """Vector-valued lookup: ``(tid, col)`` → flattened
+        ``tex_h * 3``-wide RGB for that texture column."""
+        k = int(round(flat_idx))
+        if 0 <= k < n_keys:
+            tid = k // tex_w
+            col = k % tex_w
+            return [float(v) for v in textures[tid][col].flatten()]
+        return [0.0] * (tex_h * 3)
+
+    tex_column_colors = piecewise_linear(
+        flat_key,
+        breakpoints=[float(k) for k in range(n_keys)],
+        fn=_tex_column_values,
+        name="texture_column_lookup",
+    )
 
     # --- Stage 9: Textured column fill ---
     return _textured_column_fill(
@@ -851,6 +916,7 @@ def build_textured_rendering_pipeline(
         tex_column_colors,
         tex_h,
         config,
+        max_coord=max_coord,
         patch_row_start=patch_row_start,
         rows_per_patch=rows_per_patch,
     )
