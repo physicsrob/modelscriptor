@@ -1,23 +1,25 @@
-"""ONNX export + KV cache tests for HeadlessTransformerModule.
+"""KV-cache protocol tests for the headless streaming cached ONNX exporter.
 
-Separate from test_headless_module.py so that onnxruntime-skip does not
-propagate to the file's full collection.
+Covers prefill, decode, the OnnxHeadlessModule.step API, the dynamic
+causal mask seam, and the meta sidecar schema.  Basic compute()<->ONNX
+parity lives in test_headless_module.py.
 """
 
 import json
 import os
 import tempfile
 
+import numpy as np
 import pytest
 import torch
 
 from torchwright.compiler.export import (
+    HEADLESS_META_FORMAT,
     _meta_path_for,
     compile_headless_to_onnx,
 )
 from torchwright.compiler.forward.compile import forward_compile
-from torchwright.compiler.module import _CachedHeadlessWrapper, to_headless_module
-from torchwright.ops.arithmetic_ops import add
+from torchwright.ops.arithmetic_ops import add, signed_multiply
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
 onnxruntime = pytest.importorskip("onnxruntime")
@@ -26,14 +28,7 @@ D = 256
 D_HEAD = 16
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _empty_past_feeds(n_layers: int, n_heads: int, d_head: int) -> dict:
-    import numpy as np
-
     feeds = {"past_len": np.array(0, dtype=np.int64)}
     for i in range(n_layers):
         feeds[f"past_K_{i}"] = np.zeros((n_heads, 0, d_head), dtype=np.float32)
@@ -49,207 +44,84 @@ def _discover_meta(session):
 
 
 def _build_sample_graph():
-    """Small headless graph with two float inputs and an add."""
+    """A simple multi-input graph large enough to need multiple layers."""
     a = create_input("a", 1)
     b = create_input("b", 1)
-    out = add(a, b)
+    out = signed_multiply(a, b, max_abs1=10, max_abs2=10)
     return out, create_pos_encoding()
 
 
-def _compile_sample_module():
+def _export(output_node, pos_encoding, tmpdir, name="model.onnx"):
+    onnx_path = os.path.join(tmpdir, name)
+    compile_headless_to_onnx(
+        output_node, pos_encoding, onnx_path,
+        d=D, d_head=D_HEAD, max_seq_len=32, verbose=False,
+    )
+    return onnx_path
+
+
+# ---------------------------------------------------------------------------
+# Test 1: Prefill on full sequence matches compute() reference
+# ---------------------------------------------------------------------------
+
+
+def test_headless_onnx_prefill_matches_compute():
     out, pos = _build_sample_graph()
+    a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0]])
+    b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0]])
+
     net = forward_compile(
-        d=D,
-        d_head=D_HEAD,
-        output_node=out,
-        pos_encoding=pos,
-        verbose=False,
-        device=None,
+        d=D, d_head=D_HEAD, output_node=out, pos_encoding=pos, verbose=False,
     )
-    module = to_headless_module(net, out, device=None)
-    module.eval()
-    return module, out, pos
-
-
-# ---------------------------------------------------------------------------
-# Test 1: PT-level wrapper — empty past matches non-cached module
-# ---------------------------------------------------------------------------
-
-
-def test_cached_headless_wrapper_empty_past_matches_module():
-    module, _, _ = _compile_sample_module()
-    wrapper = _CachedHeadlessWrapper(module)
-    wrapper.eval()
-
-    first_attn = module.layers[0][0]
-    n_heads = first_attn.n_heads
-    d_head = first_attn.d_head
-    n_layers = len(module.layers)
-
-    inputs = torch.tensor(
-        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]],
-        dtype=torch.float32,
-    )
-
-    past_len = torch.tensor(0, dtype=torch.long)
-    past_kvs = []
-    for _ in range(n_layers):
-        past_kvs.append(torch.zeros(n_heads, 0, d_head, dtype=torch.float32))
-        past_kvs.append(torch.zeros(n_heads, 0, d_head, dtype=torch.float32))
-
-    with torch.no_grad():
-        expected = module(inputs)
-        out = wrapper(inputs, past_len, *past_kvs)
-    actual = out[0]
-
-    assert torch.allclose(actual, expected, atol=1e-5), (
-        f"Empty-past wrapper diff: {(actual - expected).abs().max().item():.6f}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 2: PT-level wrapper — prefill then decode equals full forward
-# ---------------------------------------------------------------------------
-
-
-def test_cached_headless_wrapper_decode_step_matches_full():
-    module, _, _ = _compile_sample_module()
-    wrapper = _CachedHeadlessWrapper(module)
-    wrapper.eval()
-
-    first_attn = module.layers[0][0]
-    n_heads = first_attn.n_heads
-    d_head = first_attn.d_head
-    n_layers = len(module.layers)
-
-    inputs = torch.tensor(
-        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]],
-        dtype=torch.float32,
-    )
-
-    empty_past_kvs = []
-    for _ in range(n_layers):
-        empty_past_kvs.append(torch.zeros(n_heads, 0, d_head, dtype=torch.float32))
-        empty_past_kvs.append(torch.zeros(n_heads, 0, d_head, dtype=torch.float32))
-
-    with torch.no_grad():
-        expected = module(inputs)
-
-        # Prefill first 4 rows
-        prefill_out = wrapper(
-            inputs[:4], torch.tensor(0, dtype=torch.long), *empty_past_kvs
-        )
-        captured_kvs = list(prefill_out[1:])
-
-        # Decode row 4
-        decode_out = wrapper(
-            inputs[4:5], torch.tensor(4, dtype=torch.long), *captured_kvs
-        )
-        decoded = decode_out[0]
-
-    assert torch.allclose(decoded[0], expected[-1], atol=1e-5), (
-        f"Decode step diff: {(decoded[0] - expected[-1]).abs().max().item():.6f}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 3: ONNX export — prefill matches PT
-# ---------------------------------------------------------------------------
-
-
-def test_headless_onnx_export_prefill_matches_pt():
-    import numpy as np
-
-    out_node, pos = _build_sample_graph()
+    expected = net.compute(
+        n_pos=4, input_values={"a": a_vals, "b": b_vals}
+    )[out].cpu().numpy()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "headless.onnx")
-        compile_headless_to_onnx(
-            out_node, pos, onnx_path, d=D, d_head=D_HEAD, verbose=False
-        )
-
-        assert os.path.exists(_meta_path_for(onnx_path))
-
-        net = forward_compile(
-            d=D,
-            d_head=D_HEAD,
-            output_node=out_node,
-            pos_encoding=pos,
-            verbose=False,
-            device=None,
-        )
-        module = to_headless_module(net, out_node, device=None)
-        module.eval()
-
-        inputs = torch.tensor(
-            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
-            dtype=torch.float32,
-        )
-
-        with torch.no_grad():
-            pt_output = module(inputs).cpu().numpy()
-
-        session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, n_heads, d_head = _discover_meta(session)
-        feeds = {"inputs": inputs.numpy()}
-        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
-        onnx_output = session.run(["output"], feeds)[0]
-
-        assert np.allclose(pt_output, onnx_output, atol=1e-4), (
-            f"Headless ONNX prefill diff: {np.abs(pt_output - onnx_output).max():.6f}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test 4: ONNX export — decode step matches PT full forward
-# ---------------------------------------------------------------------------
-
-
-def test_headless_onnx_decode_step_matches_pt():
-    import numpy as np
-
-    out_node, pos = _build_sample_graph()
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "headless.onnx")
-        compile_headless_to_onnx(
-            out_node, pos, onnx_path, d=D, d_head=D_HEAD, verbose=False
-        )
-
-        net = forward_compile(
-            d=D,
-            d_head=D_HEAD,
-            output_node=out_node,
-            pos_encoding=pos,
-            verbose=False,
-            device=None,
-        )
-        module = to_headless_module(net, out_node, device=None)
-        module.eval()
-
-        inputs = torch.tensor(
-            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]],
-            dtype=torch.float32,
-        )
-
-        with torch.no_grad():
-            pt_output = module(inputs).cpu().numpy()
-
+        onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
         n_layers, n_heads, d_head = _discover_meta(session)
 
-        inputs_np = inputs.numpy()
-
-        # Prefill rows 0..3
-        feeds = {"inputs": inputs_np[:4]}
+        inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
+        feeds = {"inputs": inputs_np}
         feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
-        out_names = ["output"]
+        onnx_out = session.run(["outputs"], feeds)[0]
+
+    assert np.allclose(onnx_out, expected, atol=1e-3), (
+        f"prefill diff: {np.abs(onnx_out - expected).max():.6f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 2: Decode step matches full prefill (dynamic-mask seam)
+# ---------------------------------------------------------------------------
+
+
+def test_headless_onnx_decode_step_matches_full_prefill():
+    out, pos = _build_sample_graph()
+    a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0], [4.0]])
+    b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0], [2.0]])
+    inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = _export(out, pos, tmpdir)
+        session = onnxruntime.InferenceSession(onnx_path)
+        n_layers, n_heads, d_head = _discover_meta(session)
+        out_names = ["outputs"]
         for i in range(n_layers):
             out_names += [f"new_K_{i}", f"new_V_{i}"]
-        outputs = session.run(out_names, feeds)
 
-        past_K = [outputs[1 + 2 * i] for i in range(n_layers)]
-        past_V = [outputs[1 + 2 * i + 1] for i in range(n_layers)]
+        # Full prefill
+        feeds = {"inputs": inputs_np}
+        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        full_outputs = session.run(["outputs"], feeds)[0]
+
+        # Prefill 4 rows + decode 1 row
+        feeds = {"inputs": inputs_np[:4]}
+        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        results = session.run(out_names, feeds)
+        past_K = [results[1 + 2 * i] for i in range(n_layers)]
+        past_V = [results[1 + 2 * i + 1] for i in range(n_layers)]
 
         feeds = {
             "inputs": inputs_np[4:5],
@@ -258,59 +130,87 @@ def test_headless_onnx_decode_step_matches_pt():
         for i in range(n_layers):
             feeds[f"past_K_{i}"] = past_K[i]
             feeds[f"past_V_{i}"] = past_V[i]
-        outputs = session.run(out_names, feeds)
-        decode_output = outputs[0]
+        decode_out = session.run(["outputs"], feeds)[0]
 
-        assert np.allclose(pt_output[-1], decode_output[0], atol=1e-4), (
-            f"Decode diff: {np.abs(pt_output[-1] - decode_output[0]).max():.6f}"
-        )
+    assert np.allclose(full_outputs[-1], decode_out[0], atol=1e-3), (
+        f"decode seam diff: {np.abs(full_outputs[-1] - decode_out[0]).max():.6f}"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Test 5: meta sidecar records input names in alphabetical order
+# Test 3: OnnxHeadlessModule.step API threads the cache correctly
 # ---------------------------------------------------------------------------
 
 
-def test_headless_onnx_sidecar_input_names_order():
+def test_onnx_headless_module_step_matches_full_call():
+    from torchwright.compiler.onnx_load import OnnxHeadlessModule
+
+    out, pos = _build_sample_graph()
+    a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0], [4.0]])
+    b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0], [2.0]])
+    inputs = torch.cat([a_vals, b_vals], dim=1)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = _export(out, pos, tmpdir)
+        module = OnnxHeadlessModule(onnx_path)
+
+        # Independent call: prefill full sequence, drop cache
+        full = module(inputs)
+
+        # Stateful call: prefill 4, then decode 1
+        past = module.empty_past()
+        prefill_out, past = module.step(inputs[:4], past)
+        decode_out, past = module.step(inputs[4:5], past)
+
+    assert torch.allclose(full[:4], prefill_out, atol=1e-3), (
+        f"prefill portion diff: {(full[:4] - prefill_out).abs().max().item():.6f}"
+    )
+    assert torch.allclose(full[4], decode_out[0], atol=1e-3), (
+        f"decode row diff: {(full[4] - decode_out[0]).abs().max().item():.6f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 4: empty_past has the right shape
+# ---------------------------------------------------------------------------
+
+
+def test_onnx_headless_module_empty_past_shape():
+    from torchwright.compiler.onnx_load import OnnxHeadlessModule
+
+    out, pos = _build_sample_graph()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = _export(out, pos, tmpdir)
+        module = OnnxHeadlessModule(onnx_path)
+        past_K, past_V = module.empty_past()
+        assert len(past_K) == module._n_layers
+        assert len(past_V) == module._n_layers
+        for K in past_K:
+            assert K.shape == (module._n_heads, 0, module._d_head)
+        for V in past_V:
+            assert V.shape == (module._n_heads, 0, module._d_head)
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Meta sidecar schema + input name ordering
+# ---------------------------------------------------------------------------
+
+
+def test_headless_onnx_sidecar_schema():
     zebra = create_input("zebra", 1)
     alpha = create_input("alpha", 1)
     middle = create_input("middle", 1)
-    out_node = add(add(zebra, alpha), middle)
+    out = add(add(zebra, alpha), middle)
     pos = create_pos_encoding()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "headless.onnx")
-        compile_headless_to_onnx(
-            out_node, pos, onnx_path, d=D, d_head=D_HEAD, verbose=False
-        )
-
+        onnx_path = _export(out, pos, tmpdir)
         meta_path = _meta_path_for(onnx_path)
         with open(meta_path) as f:
             data = json.load(f)
 
-        assert data["format"] == "torchwright.headless.v1"
-        assert data["input_names"] == ["alpha", "middle", "zebra"]
-        assert data["cached"] is True
-
-        session = onnxruntime.InferenceSession(onnx_path)
-        inputs_info = {inp.name: inp for inp in session.get_inputs()}
-        assert int(inputs_info["inputs"].shape[1]) == len(data["input_names"])
-
-
-# ---------------------------------------------------------------------------
-# Test 6: OnnxHeadlessModule refuses KV-cached models
-# ---------------------------------------------------------------------------
-
-
-def test_onnx_headless_loader_rejects_cached_model():
-    from torchwright.compiler.onnx_load import OnnxHeadlessModule
-
-    out_node, pos = _build_sample_graph()
-    with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "cached.onnx")
-        compile_headless_to_onnx(
-            out_node, pos, onnx_path, d=D, d_head=D_HEAD, verbose=False
-        )
-
-        with pytest.raises(NotImplementedError, match="KV-cached"):
-            OnnxHeadlessModule(onnx_path)
+    assert data["format"] == HEADLESS_META_FORMAT
+    assert data["input_names"] == ["alpha", "middle", "zebra"]
+    # The sidecar should not carry any "cached" discriminator — there's
+    # only one protocol now.
+    assert "cached" not in data

@@ -5,7 +5,6 @@ Requires: onnxruntime, numpy.
 """
 
 import json
-import os
 import sys
 from dataclasses import dataclass
 from typing import Iterator, List
@@ -111,15 +110,22 @@ def generate(
 
 
 def _load(onnx_path: str) -> _Model:
-    """Load an ONNX model, its vocab sidecar, and discover KV-cache shape metadata."""
+    """Load an ONNX model, its meta sidecar, and discover KV-cache shape metadata."""
     import onnxruntime  # type: ignore[import-untyped]
 
-    base, _ = os.path.splitext(onnx_path)
-    vocab_path = base + ".vocab.json"
+    from torchwright.compiler.export import TOKEN_META_FORMAT, _meta_path_for
 
-    with open(vocab_path) as f:
-        vocab_data = json.load(f)
-    vocab = _Vocab(vocab_data["vocab"])
+    meta_path = _meta_path_for(onnx_path)
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    fmt = meta.get("format")
+    if fmt != TOKEN_META_FORMAT:
+        raise ValueError(
+            f"{meta_path}: unexpected format {fmt!r}, "
+            f"expected {TOKEN_META_FORMAT!r}"
+        )
+    vocab = _Vocab(meta["vocab"])
     session = onnxruntime.InferenceSession(onnx_path)
 
     inputs = {inp.name: inp for inp in session.get_inputs()}
@@ -164,7 +170,7 @@ def run_repl(
 ) -> None:
     """Load an ONNX model and run an interactive REPL.
 
-    Expects a vocab file at <onnx_path_without_ext>.vocab.json.
+    Expects a meta file at <onnx_path_without_ext>.meta.json (token format).
 
     Args:
         onnx_path: Path to the .onnx model file.
