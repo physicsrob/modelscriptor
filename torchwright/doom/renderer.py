@@ -69,35 +69,8 @@ def trig_lookup(ray_angle: Node) -> Tuple[Node, Node]:
 
 
 # ---------------------------------------------------------------------------
-# Wall height from distance (2D lookup)
+# Wall height from distance
 # ---------------------------------------------------------------------------
-
-# Distance breakpoints: dense near 0 where 1/x is steep, sparse far away.
-_DIST_BREAKPOINTS = [
-    0.5,
-    0.75,
-    1.0,
-    1.25,
-    1.5,
-    2.0,
-    2.5,
-    3.0,
-    4.0,
-    5.0,
-    6.0,
-    8.0,
-    10.0,
-    13.0,
-    16.0,
-    20.0,
-    25.0,
-    30.0,
-    35.0,
-    40.0,
-]
-
-# perp_cos breakpoints: covers typical FOV range.
-_COS_BREAKPOINTS = [0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
 
 
 def _wall_height_lookup(
@@ -106,14 +79,43 @@ def _wall_height_lookup(
     config: RenderConfig,
     max_coord: float,
 ) -> Tuple[Node, Node, Node]:
-    """Compute wall_top, wall_bottom, wall_height via a single 2D lookup.
+    """Compute wall_top, wall_bottom, wall_height from the closest hit.
 
-    Replaces the 6-MLP chain (clamp → signed_multiply → clamp →
-    reciprocal → multiply_const → Linear) with 1 MLP sublayer.
+    The math is ``wall_height = H / (closest_dist * perp_cos)``,
+    clamped so the no-hit case (``closest_dist = BIG_DISTANCE``)
+    degenerates to a tiny wall instead of extrapolating wildly.
+
+    Earlier versions used a single ``piecewise_linear_2d`` over
+    ``(closest_dist, perp_cos)`` with sparse breakpoints, collapsing
+    the whole "multiply, clamp, reciprocal, scale" pipeline into one
+    MLP sublayer.  But the function being approximated is ``H/(d*c)``,
+    which has steep gradients near small ``d*c``, and the bilinear
+    interpolant on the sparse grid (~20 × 8 vertices) gave a few
+    percent error in ``wall_height`` for typical wall hits — enough
+    to push the wall band 1-2 screen rows off the reference's
+    location and visibly thin out the wall in the rendered output.
+
+    The reformulation here is the explicit decomposition:
+
+    1. ``perp_dist = signed_multiply(closest_dist, perp_cos)``
+       — both inputs are positive scalars, output bounded above
+       by ``max_dist`` and below by ``min_dist`` after clamping.
+    2. ``inv_perp_dist = 1/perp_dist`` via ``piecewise_linear`` with
+       **geometric** breakpoints (constant relative error per
+       segment, ~1% across the whole range with 48 breakpoints).
+    3. ``wall_height = H * inv_perp_dist`` — free ``Linear``.
+    4. ``wall_top``/``wall_bottom`` — free ``Linear`` from
+       ``wall_height`` (vertically centred wall).
+
+    Cost: ~5 MLP sublayers (signed_multiply ~3 + clamp 1 + reciprocal
+    1) instead of 1 — but called once per screen column, so the
+    total graph depth grows by ~4 sublayers, not by a factor.  See
+    the matching note on :func:`_u_norm_lookup` for the same reasoning.
 
     Args:
         closest_dist: Scalar distance to nearest wall.
-        perp_cos: Fish-eye correction cosine (scalar).
+        perp_cos: Fish-eye correction cosine (scalar) in roughly
+            ``[0.65, 1.0]``.
         config: Render configuration.
         max_coord: Upper bound on coordinate magnitudes.
 
@@ -122,25 +124,51 @@ def _wall_height_lookup(
     """
     H = config.screen_height
     max_dist = 2.0 * max_coord
+    min_dist = 0.5
 
-    # Clamp distance before the 2D lookup so BIG_DISTANCE (no-hit)
-    # maps to a tiny wall height instead of extrapolating wildly.
-    clamped_dist = clamp(closest_dist, 0.5, max_dist)
-
-    def _wall_h(d, c):
-        d_safe = builtins.max(0.5, builtins.min(max_dist, d))
-        perp = builtins.max(0.5, builtins.min(max_dist, d_safe * c))
-        return float(H) / perp
-
-    wall_height = piecewise_linear_2d(
-        clamped_dist,
+    # 1. perp_dist = closest_dist * perp_cos.  Both positive but use
+    #    signed_multiply since we don't have an unsigned version with
+    #    matching API.  Output bounded by max_dist (closest_dist is
+    #    already roughly ≤ max_dist for hits, BIG_DISTANCE for no-hit;
+    #    perp_cos ≤ 1.0 always).
+    perp_dist = signed_multiply(
+        closest_dist,
         perp_cos,
-        _DIST_BREAKPOINTS,
-        _COS_BREAKPOINTS,
-        _wall_h,
-        name="wall_height_2d",
+        max_abs1=BIG_DISTANCE,
+        max_abs2=1.0,
+        max_abs_output=BIG_DISTANCE,
+        step=0.5,
     )
 
+    # 2. Clamp perp_dist to [min_dist, max_dist] so the reciprocal
+    #    lookup stays in its valid range and the no-hit case
+    #    (closest_dist == BIG_DISTANCE) collapses to wall_height =
+    #    H / max_dist (a small wall, not 0).
+    clamped_perp_dist = clamp(perp_dist, min_dist, max_dist)
+
+    # 3. inv_perp_dist via geometric-breakpoint piecewise_linear.
+    #    Geometric spacing gives constant relative error per segment;
+    #    48 breakpoints over [0.5, 40] gives ~1% relative error on
+    #    the reciprocal across the whole range.
+    n_bp = 48
+    ratio = (max_dist / min_dist) ** (1.0 / (n_bp - 1))
+    bps: List[float] = [min_dist * (ratio ** k) for k in range(n_bp)]
+    bps[0] = min_dist
+    bps[-1] = max_dist
+    inv_perp_dist = piecewise_linear(
+        clamped_perp_dist,
+        bps,
+        lambda d: 1.0 / d,
+        name="wall_height_inv_perp_dist",
+    )
+
+    # 4. wall_height = H * inv_perp_dist.  Free Linear.
+    wall_height = multiply_const(inv_perp_dist, float(H))
+
+    # 5. wall_top, wall_bottom from wall_height (free Linears).  The
+    #    wall is always vertically centred at H/2 — see the note in
+    #    _textured_column_fill for why this assumption is currently
+    #    baked in upstream.
     center = float(H) / 2.0
     half_height = multiply_const(wall_height, 0.5)
     wall_top = Linear(
