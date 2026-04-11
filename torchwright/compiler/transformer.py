@@ -64,7 +64,16 @@ class HeadlessTransformer:
         self,
         n_pos: int,
         input_values: Dict[str, Any],
+        past_len: int = 0,
     ):
+        """Build the initial residual stream for ``n_pos`` positions.
+
+        ``past_len`` shifts the positional encoding so the new rows
+        correspond to absolute positions ``past_len .. past_len + n_pos - 1``
+        — used by cached decode to continue from an existing past.
+        Literals, InputNode values, and Embedding lookups are
+        position-independent so they are unaffected by ``past_len``.
+        """
         assert self.residual_assignment
         in_state = self.layers[0].attn.in_state
         res_stream = torch.zeros((n_pos, self.d))
@@ -80,7 +89,7 @@ class HeadlessTransformer:
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = value[:, i]
             elif isinstance(node, PosEncoding):
-                encoding = node.get_pos_encoding(n_pos)
+                encoding = node.get_pos_encoding(past_len + n_pos)[past_len:]
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = encoding[:, i]
             elif isinstance(node, Concatenate):
@@ -159,46 +168,3 @@ class HeadlessTransformer:
             indices = self.residual_assignment.get_node_indices(out_state, node)
             result[node] = res[:, indices]
         return result
-
-    def generate(
-        self,
-        output_node: Node,
-        embedding: "Embedding",
-        input_tokens: List[str],
-        max_new_tokens: int = 15,
-    ) -> List[str]:
-        """Autoregressive generation with KV cache.
-
-        Returns the generated tokens (not including input_tokens).
-        """
-        assert self.residual_assignment
-        out_state = self.layers[-1].mlp.out_state
-        indices = self.residual_assignment.get_node_indices(out_state, output_node)
-
-        tokens = list(input_tokens)
-        input_values: Dict[str, Any] = {"embedding_input": tokens}
-
-        # Prefill: process all input tokens at once
-        res_stream = self.get_input_res_stream(len(tokens), input_values).to(
-            self.device
-        )
-        res, kvs = self.forward_cached(res_stream)
-
-        generated: List[str] = []
-        for _ in range(max_new_tokens):
-            # Decode last position
-            vec = res[-1, indices]
-            dists = torch.cdist(vec.unsqueeze(0).cpu(), embedding.table)
-            next_token = embedding.tokenizer.decode_id(dists.argmin().item())
-            if next_token == "<eos>":
-                break
-            generated.append(next_token)
-            tokens.append(next_token)
-
-            # Generate step: only the new token's residual stream
-            input_values = {"embedding_input": tokens}
-            full_res = self.get_input_res_stream(len(tokens), input_values)
-            new_inp = full_res[-1:].to(self.device)
-            res, kvs = self.forward_cached(new_inp, kvs)
-
-        return generated

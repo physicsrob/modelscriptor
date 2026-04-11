@@ -6,7 +6,7 @@ Usage:
 
 import argparse
 
-from torchwright.compiler.export import compile_and_emit_onnx
+from torchwright.compiler.export import compile_headless_to_onnx
 from torchwright.doom.renderer import build_renderer_graph
 from torchwright.reference_renderer.scenes import (
     box_room,
@@ -94,7 +94,7 @@ def main():
         )
         max_layers = 200
 
-    compile_and_emit_onnx(
+    compile_headless_to_onnx(
         output_node=output_node,
         pos_encoding=pos_encoding,
         output_path=output_path,
