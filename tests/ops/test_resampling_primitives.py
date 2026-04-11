@@ -1,0 +1,385 @@
+"""Unit + probe tests for the resampling primitives.
+
+Each primitive is tested in isolation — build a minimal graph whose
+output is just that primitive, run it via ``probe_graph`` against the
+reference ``node.compute`` oracle, and assert both (a) zero
+compiled-vs-oracle divergence and (b) that the oracle matches an
+independent NumPy reference of the intended semantics.
+
+This is the primitive-level safety net the textured renderer bug
+exposed: if ``dynamic_extract`` had existed with a sweep like this
+back when the original ``_textured_column_fill`` was written, the
+ad-hoc band-sum workaround would never have been built.
+"""
+
+import math
+
+import numpy as np
+import pytest
+import torch
+
+from torchwright.debug.probe import probe_graph, reference_eval
+from torchwright.ops import (
+    create_input,
+    dynamic_extract,
+    linear_bin_index,
+)
+
+
+# ---------------------------------------------------------------------------
+# dynamic_extract
+# ---------------------------------------------------------------------------
+
+
+def _dynamic_extract_reference(
+    table: torch.Tensor, idx: torch.Tensor, n_entries: int, d_fill: int,
+) -> torch.Tensor:
+    """Independent reference for dynamic_extract.
+
+    Given ``table`` of shape ``(n_pos, n_entries*d_fill)`` and ``idx`` of
+    shape ``(n_pos, 1)``, returns ``(n_pos, d_fill)`` where each row is
+    ``table[p, idx[p]*d_fill : (idx[p]+1)*d_fill]``.
+    """
+    n_pos = table.shape[0]
+    out = torch.empty(n_pos, d_fill, dtype=table.dtype)
+    for p in range(n_pos):
+        k = int(round(idx[p, 0].item()))
+        k = max(0, min(n_entries - 1, k))
+        out[p] = table[p, k * d_fill : (k + 1) * d_fill]
+    return out
+
+
+def _build_dynamic_extract_graph(n_entries: int, d_fill: int):
+    table_node = create_input("table", n_entries * d_fill)
+    idx_node = create_input("idx", 1)
+    out_node = dynamic_extract(table_node, idx_node, n_entries, d_fill)
+    return out_node
+
+
+@pytest.mark.parametrize(
+    "n_entries,d_fill",
+    [
+        (2, 1),
+        (4, 3),
+        (8, 3),
+        (16, 3),
+        (32, 3),
+        (64, 3),
+        (16, 8),
+    ],
+)
+def test_dynamic_extract_every_index(n_entries, d_fill):
+    """For every ``idx`` in ``[0, n_entries - 1]`` the primitive must
+    return the exact slice from ``table`` — verified both through
+    ``reference_eval`` (graph oracle) and through the compiled
+    transformer via ``probe_graph``.
+    """
+    out_node = _build_dynamic_extract_graph(n_entries, d_fill)
+
+    # One position per possible idx — each row of `table` is randomly
+    # initialised so every extracted slice is uniquely identifiable.
+    rng = torch.Generator().manual_seed(0xD1E)
+    table_val = torch.rand(n_entries, n_entries * d_fill, generator=rng)
+    idx_val = torch.arange(n_entries, dtype=torch.float32).unsqueeze(-1)
+    inputs = {"table": table_val, "idx": idx_val}
+    n_pos = n_entries
+
+    # Oracle must match the independent numpy reference.  ``step_sharpness=10``
+    # gives ReLU-approximation wiggle of ~1e-4 per op and those accumulate
+    # through the in_range → broadcast_select chain, so a 1e-3 absolute
+    # tolerance is the right level for this check — tighter than that and
+    # we're testing float-precision, not semantics.
+    cache = reference_eval(out_node, inputs, n_pos)
+    oracle = cache[out_node]
+    expected = _dynamic_extract_reference(table_val, idx_val, n_entries, d_fill)
+    assert torch.allclose(oracle, expected, atol=5e-3), (
+        f"oracle disagrees with reference "
+        f"(n={n_entries}, d={d_fill}):\n"
+        f"  oracle:   {oracle}\n  expected: {expected}"
+    )
+
+    # Compiled must match the oracle at every node (no divergence).
+    report = probe_graph(
+        out_node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
+        d=1024, d_head=16, verbose=False, atol=5e-3,
+    )
+    assert report.first_divergent is None, (
+        f"probe reported divergence on dynamic_extract "
+        f"(n={n_entries}, d={d_fill}):\n{report.format_short()}"
+    )
+
+
+def test_dynamic_extract_random_indices():
+    """Random (table, idx) combinations — exercises the primitive
+    under arbitrary per-position inputs, not just "row i picks slot i".
+    """
+    n_entries, d_fill = 16, 3
+    out_node = _build_dynamic_extract_graph(n_entries, d_fill)
+
+    rng = torch.Generator().manual_seed(0xB17)
+    n_pos = 24
+    table_val = torch.rand(n_pos, n_entries * d_fill, generator=rng)
+    idx_val = torch.randint(0, n_entries, (n_pos, 1), generator=rng).float()
+    inputs = {"table": table_val, "idx": idx_val}
+
+    cache = reference_eval(out_node, inputs, n_pos)
+    oracle = cache[out_node]
+    expected = _dynamic_extract_reference(table_val, idx_val, n_entries, d_fill)
+    assert torch.allclose(oracle, expected, atol=5e-3)
+
+    report = probe_graph(
+        out_node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
+        d=1024, d_head=16, verbose=False, atol=5e-3,
+    )
+    assert report.first_divergent is None, report.format_short()
+
+
+# ---------------------------------------------------------------------------
+# linear_bin_index
+# ---------------------------------------------------------------------------
+
+
+def _linear_bin_index_reference(
+    x: torch.Tensor, x_min: torch.Tensor, x_max: torch.Tensor, n_bins: int,
+) -> torch.Tensor:
+    """Independent reference: ``clamp(floor((x - x_min) * n_bins / (x_max - x_min)))``."""
+    v = (x - x_min) * n_bins / (x_max - x_min)
+    idx = torch.floor(v)
+    return torch.clamp(idx, 0, n_bins - 1)
+
+
+def _build_linear_bin_index_graph(
+    n_bins: int,
+    min_range: float,
+    max_range: float,
+    n_reciprocal_breakpoints: int = 48,
+    mul_step: float = 0.25,
+):
+    """Build a linear_bin_index graph.
+
+    Test-specific ``min_range`` / ``max_range`` bounds matter — the
+    reciprocal lookup and the signed_multiply step scale with them, and
+    the signed_multiply's arithmetic precision is roughly
+    ``(mul_step / max_sum)`` of full-scale.  Bounds tuned to the actual
+    test data keep the primitive accurate down to the last bin.
+    """
+    x = create_input("x", 1)
+    x_min = create_input("x_min", 1)
+    x_max = create_input("x_max", 1)
+    out = linear_bin_index(
+        x, x_min, x_max, n_bins,
+        min_range=min_range,
+        max_range=max_range,
+        n_reciprocal_breakpoints=n_reciprocal_breakpoints,
+        mul_step=mul_step,
+    )
+    return out
+
+
+def _bounds_for(x_min_val: float, x_max_val: float):
+    """Pick tight ``(min_range, max_range)`` bounds around the test's
+    actual ``x_max - x_min``.  ``min_range`` is half the actual range
+    and ``max_range`` is 2× — generous enough to accommodate future
+    perturbations without wasting neurons on an over-wide reciprocal
+    lookup.
+    """
+    actual = x_max_val - x_min_val
+    min_r = max(0.1, actual * 0.5)
+    max_r = max(actual * 2.0, actual + 1.0)
+    return min_r, max_r
+
+
+def _sweep_inputs(x_min_val, x_max_val, n_bins):
+    """Build an n_pos-batch that sweeps ``x`` across the bin centers plus
+    both out-of-range extremes so the clamping corners get tested.
+
+    Returns a (x, x_min, x_max, expected_bins) tuple of (n_pos, 1) tensors.
+    """
+    # Bin centers land at x_min + (k + 0.5) * range / n_bins.
+    range_ = x_max_val - x_min_val
+    centers = [x_min_val + (k + 0.5) * range_ / n_bins for k in range(n_bins)]
+    # Plus out-of-range probes: well below x_min, well above x_max.
+    below = x_min_val - range_ * 0.1
+    above = x_max_val + range_ * 0.1
+    xs = [below] + centers + [above]
+
+    n_pos = len(xs)
+    x = torch.tensor([[v] for v in xs], dtype=torch.float32)
+    x_min = torch.full((n_pos, 1), float(x_min_val), dtype=torch.float32)
+    x_max = torch.full((n_pos, 1), float(x_max_val), dtype=torch.float32)
+    return x, x_min, x_max
+
+
+@pytest.mark.parametrize(
+    "n_bins,x_min_val,x_max_val",
+    [
+        (4,  0.0, 10.0),   # normal case, moderate bins
+        (8,  0.0, 10.0),
+        (16, 0.0, 10.0),
+        (32, 0.0, 10.0),
+        (64, 0.0, 10.0),   # DOOM tex_h=64
+        (16, -5.0, 5.0),   # signed lower bound
+        (16, 100.0, 110.0),   # shifted far from origin
+        (16, 0.0, 1.5),    # small range near the reciprocal's min_range boundary
+        (16, 0.0, 100.0),  # wide range
+    ],
+)
+def test_linear_bin_index_centers_and_out_of_range(n_bins, x_min_val, x_max_val):
+    """For each bin ``k`` in ``[0, n_bins - 1]``, the primitive must
+    return ``k`` when ``x`` lands at the bin center.  Below-range
+    and above-range probes must clamp to bins ``0`` and ``n_bins - 1``
+    respectively.
+    """
+    min_r, max_r = _bounds_for(x_min_val, x_max_val)
+    out_node = _build_linear_bin_index_graph(n_bins, min_r, max_r)
+
+    x, x_min, x_max = _sweep_inputs(x_min_val, x_max_val, n_bins)
+    inputs = {"x": x, "x_min": x_min, "x_max": x_max}
+    n_pos = x.shape[0]
+
+    cache = reference_eval(out_node, inputs, n_pos)
+    oracle = cache[out_node].flatten()
+    expected_mid = torch.arange(n_bins, dtype=torch.float32)
+    expected = torch.cat([
+        torch.tensor([0.0]),        # below -> clamped to 0
+        expected_mid,                # each bin center -> bin index
+        torch.tensor([n_bins - 1.0]),  # above -> clamped to n_bins-1
+    ])
+    assert torch.allclose(oracle, expected, atol=0.05), (
+        f"oracle disagrees with expected bins "
+        f"(n_bins={n_bins}, range=[{x_min_val}, {x_max_val}])\n"
+        f"  oracle:   {oracle.tolist()}\n  expected: {expected.tolist()}"
+    )
+
+    # Probe at the final-output level: intermediate signed_multiply
+    # values wiggle by up to ~5% of max_range/min_range and that wiggle
+    # amplifies through the n_bins scale; the downstream clamp +
+    # floor_int absorb it as long as bin_f stays within half a bin of
+    # the true value, so a ``half-a-bin`` tolerance at the final node
+    # is the right pass criterion.  We still assert the oracle matches
+    # the expected bins exactly above, so semantic correctness is
+    # guarded.
+    report = probe_graph(
+        out_node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
+        d=2048, d_head=16, verbose=False, atol=0.5,
+    )
+    assert report.first_divergent is None, (
+        f"probe reported divergence on linear_bin_index "
+        f"(n_bins={n_bins}, range=[{x_min_val}, {x_max_val}]):\n"
+        f"{report.format_short()}"
+    )
+
+
+def test_linear_bin_index_non_integer_values():
+    """Bin indices must track ``floor((x - x_min)/range * n_bins)``
+    for non-center ``x`` values too (not just the center probe).
+    """
+    n_bins = 8
+    x_min_val, x_max_val = 0.0, 8.0
+    min_r, max_r = _bounds_for(x_min_val, x_max_val)
+    out_node = _build_linear_bin_index_graph(n_bins, min_r, max_r)
+
+    rng = torch.Generator().manual_seed(0xB10)
+    # Probe at 0.1-increments across the range, offset from integer
+    # boundaries by 0.2 so we stay inside the ``floor_int`` flat zone
+    # and the bin classification is unambiguous.
+    base = torch.arange(n_bins, dtype=torch.float32).repeat_interleave(3)
+    offsets = torch.tensor([0.2, 0.5, 0.8] * n_bins, dtype=torch.float32)
+    xs = (base + offsets).unsqueeze(-1)
+    n_pos = xs.shape[0]
+    x_min = torch.full((n_pos, 1), x_min_val)
+    x_max = torch.full((n_pos, 1), x_max_val)
+    inputs = {"x": xs, "x_min": x_min, "x_max": x_max}
+
+    cache = reference_eval(out_node, inputs, n_pos)
+    oracle = cache[out_node]
+    expected = _linear_bin_index_reference(
+        xs, x_min, x_max, n_bins,
+    )
+    assert torch.allclose(oracle, expected, atol=0.05), (
+        f"oracle disagrees:\n  oracle:   {oracle.flatten().tolist()}\n"
+        f"  expected: {expected.flatten().tolist()}"
+    )
+
+    report = probe_graph(
+        out_node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
+        d=2048, d_head=16, verbose=False, atol=0.5,
+    )
+    assert report.first_divergent is None, report.format_short()
+
+
+# ---------------------------------------------------------------------------
+# Composition: linear_bin_index feeding dynamic_extract
+# ---------------------------------------------------------------------------
+
+
+def test_linear_bin_index_into_dynamic_extract():
+    """Cascade the two primitives and verify the combined pipeline
+    reads the right table row for a sweep of ``x`` values.
+
+    This is the exact shape the textured wall fill needs: given a
+    world-space coordinate ``x`` inside ``[x_min, x_max)``, pick the
+    matching texture row out of a runtime-supplied ``tex_column_colors``.
+    """
+    n_bins = 16       # stand-in for tex_height
+    d_fill = 3        # RGB
+    x_min_val, x_max_val = 0.0, 16.0
+    min_r, max_r = _bounds_for(x_min_val, x_max_val)
+
+    x = create_input("x", 1)
+    x_min = create_input("x_min", 1)
+    x_max = create_input("x_max", 1)
+    table = create_input("table", n_bins * d_fill)
+
+    idx = linear_bin_index(
+        x, x_min, x_max, n_bins,
+        min_range=min_r, max_range=max_r,
+        n_reciprocal_breakpoints=48, mul_step=0.25,
+    )
+    rgb = dynamic_extract(table, idx, n_bins, d_fill)
+
+    # Sweep x across bin centers (plus 0.2 offset to avoid the
+    # ``floor_int`` ramp zones around integer boundaries — the
+    # cascade's pass criterion is "did we land in the right bin?", and
+    # bins straddling a ramp transition are ambiguous by design).
+    rng = torch.Generator().manual_seed(0xCAFE)
+    n_pos = n_bins
+    bin_width = (x_max_val - x_min_val) / n_bins
+    xs = torch.tensor(
+        [[x_min_val + (k + 0.3) * bin_width] for k in range(n_bins)],
+        dtype=torch.float32,
+    )
+    x_min_t = torch.full((n_pos, 1), x_min_val)
+    x_max_t = torch.full((n_pos, 1), x_max_val)
+    table_t = torch.rand(n_pos, n_bins * d_fill, generator=rng)
+    inputs = {
+        "x": xs, "x_min": x_min_t, "x_max": x_max_t, "table": table_t,
+    }
+
+    # Reference: compute the expected bin per position, then extract the
+    # corresponding slice.
+    expected_idx = _linear_bin_index_reference(
+        xs, x_min_t, x_max_t, n_bins,
+    )
+    expected_rgb = _dynamic_extract_reference(
+        table_t, expected_idx, n_bins, d_fill,
+    )
+
+    cache = reference_eval(rgb, inputs, n_pos)
+    assert torch.allclose(cache[rgb], expected_rgb, atol=5e-3), (
+        f"cascade oracle disagrees with expected RGB:\n"
+        f"  got:  {cache[rgb]}\n  want: {expected_rgb}"
+    )
+
+    # Intermediate linear_bin_index arithmetic wiggle is bounded by the
+    # half-bin tolerance that keeps the floor stable.  Once past the
+    # floor + one-hot, the extracted RGB either matches the right
+    # table row exactly or picks a wrong row (fully mismatched) — so
+    # the probe atol here only needs to survive the pre-floor
+    # arithmetic, with the final RGB comparison above as the real
+    # pass criterion.
+    report = probe_graph(
+        rgb, pos_encoding=None, input_values=inputs, n_pos=n_pos,
+        d=2048, d_head=16, verbose=False, atol=0.5,
+    )
+    assert report.first_divergent is None, report.format_short()

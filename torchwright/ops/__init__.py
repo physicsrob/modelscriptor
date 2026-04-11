@@ -7,6 +7,7 @@ from torchwright.ops.arithmetic_ops import (
     ceil_int,
     compare,
     concat,
+    linear_bin_index,
     max,
     min,
     floor_int,
@@ -39,6 +40,9 @@ from torchwright.ops.logic_ops import (
 
 # Selection and lookup
 from torchwright.ops.map_select import (
+    broadcast_select,
+    dynamic_extract,
+    in_range,
     map_to_table,
     select,
     switch,

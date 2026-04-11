@@ -196,6 +196,108 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     )
 
 
+def dynamic_extract(
+    table: Node,
+    idx: Node,
+    n_entries: int,
+    d_fill: int,
+) -> Node:
+    """Read a ``d_fill``-wide slice from a runtime-valued table at a runtime index.
+
+    Given ``table`` of width ``n_entries * d_fill``, laid out slot-major
+    so entry ``i`` occupies columns ``[i*d_fill, (i+1)*d_fill)``, and a
+    scalar ``idx`` carrying an integer in ``[0, n_entries - 1]``,
+    returns the ``d_fill``-wide slice
+    ``table[idx*d_fill : (idx+1)*d_fill]``.
+
+    This is the missing resampling primitive: torchwright has
+    :func:`map_to_table` for *compile-time constant* tables and
+    :func:`broadcast_select` for *runtime masks over runtime values*,
+    but nothing that directly implements "index a runtime table at a
+    runtime scalar".  The composition is small —
+
+    1. ``in_range(idx, idx + 1, n_entries)`` emits a width-``n_entries``
+       mask with ``+1`` at slot ``floor(idx)`` and ``-1`` elsewhere.
+    2. ``broadcast_select(mask, table, zero_d_fill, n_entries, d_fill)``
+       keeps the selected slot's ``d_fill`` values and zeros out the
+       rest, producing a width-``n_entries*d_fill`` intermediate.
+    3. A free ``Linear`` sums across slots to collapse the intermediate
+       down to a ``d_fill``-wide output.
+
+    — but pulling it out into its own op lets callers say "extract row
+    ``idx`` from the table" instead of hand-assembling masks and
+    worrying about whether ``broadcast_select``'s broadcasting rules
+    match their layout.  Most of the recent DOOM fill bugs came from
+    ad-hoc hand-assembled versions of this exact pattern.
+
+    Contract:
+
+    * ``idx`` must carry an integer in ``[0, n_entries - 1]``.  Exact
+      integer values select cleanly; off-integer inputs round toward
+      the nearest slot with the boundary at ``k + 0.5``.  Out-of-range
+      inputs produce an all-zero output.  Callers who need clamp
+      semantics should clamp before calling (one extra MLP sublayer).
+    * ``table`` is read once per forward pass — the mask is applied at
+      build time to the same runtime node, not recomputed per row.
+
+    Cost: two MLP sublayers (the ``in_range`` and ``broadcast_select``)
+    plus one free ``Linear``.  Hidden-width use is
+    ``4*n_entries + 2*n_entries*d_fill`` neurons.
+
+    Args:
+        table: Runtime node of width ``n_entries * d_fill``.
+        idx: Scalar node carrying an integer in ``[0, n_entries - 1]``.
+        n_entries: Number of logical entries in ``table`` (compile-time).
+        d_fill: Width of each entry (compile-time).
+
+    Returns:
+        A ``d_fill``-wide node carrying the selected entry.
+    """
+    from torchwright.graph import Linear
+    from torchwright.graph.misc import LiteralValue
+    from torchwright.ops.arithmetic_ops import add_const
+
+    assert len(idx) == 1, "idx must be a 1D scalar node"
+    assert len(table) == n_entries * d_fill, (
+        f"table has width {len(table)}; expected n_entries*d_fill = "
+        f"{n_entries * d_fill}"
+    )
+    assert n_entries >= 1, "n_entries must be at least 1"
+    assert d_fill >= 1, "d_fill must be at least 1"
+
+    # Step 1: one-hot mask over n_entries.  in_range(idx, idx+1, n) fires
+    # at the single slot whose center is in [idx, idx+1) — that slot is
+    # floor(idx) for integer idx and the nearest slot under rounding
+    # otherwise.
+    idx_plus_one = add_const(idx, 1.0)
+    one_hot = in_range(idx, idx_plus_one, n_entries)
+
+    # Step 2: zero out every slot except the selected one.  The output
+    # is width n_entries * d_fill with zeros at every slot the mask
+    # marks as -1.
+    zero_d_fill = LiteralValue(
+        torch.zeros(d_fill), name="dynamic_extract_zero",
+    )
+    masked = broadcast_select(
+        masks=one_hot,
+        true_value=table,
+        false_value=zero_d_fill,
+        n_slots=n_entries,
+        d_fill=d_fill,
+    )
+
+    # Step 3: collapse n_entries slots down to d_fill via a sparse free
+    # Linear.  Because exactly one slot is non-zero (the selected one),
+    # the "sum across slots" degenerates to "copy the selected slot" —
+    # no arithmetic error, even under the ReLU-approximation wiggle of
+    # the mask at its boundaries.
+    sum_matrix = torch.zeros(n_entries * d_fill, d_fill)
+    for slot in range(n_entries):
+        for c in range(d_fill):
+            sum_matrix[slot * d_fill + c, c] = 1.0
+    return Linear(masked, sum_matrix, name="dynamic_extract_sum")
+
+
 def broadcast_select(
     masks: Node,
     true_value: Node,

@@ -734,8 +734,22 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     Implemented via :func:`piecewise_linear` with a staircase whose
     transition width is ``1 / step_sharpness``.
 
+    .. warning::
+       **Integer inputs only.**  Each staircase ramp is centred on
+       ``k * divisor - 0.5`` — that's *between* two valid integer
+       outputs, exactly where real-valued inputs near a bin boundary
+       sit.  A float input like ``0.5`` lands directly inside the
+       ramp zone ``[0.45, 0.55]`` and the staircase interpolates to
+       ``~0.54`` instead of rounding cleanly.  If your input is a
+       continuous float scalar (e.g. the output of a ``multiply`` or
+       ``piecewise_linear``), use :func:`floor_int` instead — it
+       places its ramps *at* integer boundaries so the flat zones
+       cover the between-integer range where floats live.
+
     Args:
-        inp: 1D scalar node with integer value in [0, max_value].
+        inp: 1D scalar node with **integer** value in [0, max_value].
+            Continuous-float inputs will interpolate junk inside the
+            ramp zones — see warning.
         divisor: The divisor for floor division.
         max_value: Upper bound on input (determines number of steps).
 
@@ -787,6 +801,157 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     assert divisor > 0, "divisor must be positive"
     q = thermometer_floor_div(inp, divisor, max_value)
     return subtract(inp, multiply_const(q, float(divisor)))
+
+
+def linear_bin_index(
+    x: Node,
+    x_min: Node,
+    x_max: Node,
+    n_bins: int,
+    min_range: float = 0.5,
+    max_range: float = 200.0,
+    n_reciprocal_breakpoints: int = 32,
+    mul_step: float = 0.5,
+    name: str = "linear_bin_index",
+) -> Node:
+    """Map a continuous coordinate onto an integer bin index.
+
+    Computes ::
+
+        bin = clamp(floor((x - x_min) * n_bins / (x_max - x_min)),
+                    0, n_bins - 1)
+
+    for runtime scalars ``x``, ``x_min``, ``x_max`` and a compile-time
+    ``n_bins``.  This is the "continuous → discrete bin" side of
+    resampling: paired with :func:`dynamic_extract` it gives texture
+    sampling, histogram bucketing, dispatch tables, and every other
+    "which of ``n_bins`` things am I looking at right now" query.
+
+    Decomposition (and why each piece exists):
+
+    1. ``range_ = x_max - x_min`` — free Linear.
+    2. ``clamp(range_, min_range, max_range)`` — a runtime range that
+       drops to zero would blow up the reciprocal.  Clamping bounds the
+       reciprocal at ``1/min_range`` instead.  Costs 1 MLP sublayer.
+    3. ``inv_range = 1/clamped_range`` — **geometric** breakpoints, not
+       linear, because ``1/x`` has steep gradient near small ``x`` and
+       geometric spacing gives constant *relative* error across the
+       whole range.  Costs 1 MLP sublayer with ~``n_reciprocal_breakpoints``
+       neurons.
+    4. ``delta = x - x_min`` — free Linear.
+    5. ``clamped_delta = clamp(delta, -max_range, max_range)`` — keeps
+       the multiplication within its declared input bounds even when
+       the caller sends an ``x`` far outside ``[x_min, x_max]``.
+    6. ``normalized = signed_multiply(clamped_delta, inv_range,
+       max_abs_output=max_range/min_range)`` — the one non-trivial cost,
+       ~3 MLP sublayers.  Bounded via ``max_abs_output`` so downstream
+       ops see a defined output range.
+    7. ``bin_f = multiply_const(normalized, float(n_bins))`` — free.
+    8. ``clamp(bin_f, 0, n_bins - 0.5)`` — clamp to the valid floor
+       domain.  Callers who pass out-of-range ``x`` land on the nearest
+       endpoint bin instead of wandering off into the staircase's
+       extrapolation zone.
+    9. ``thermometer_floor_div(..., divisor=1, max_value=n_bins-1)`` —
+       the actual floor-to-integer step.
+
+    Total cost: ~6 MLP sublayers at step sharpness ~1.  Depth is
+    dominated by the ``signed_multiply``.  The primitive is designed
+    for "call once per query"; if a caller needs many bin indices over
+    the same ``(x_min, x_max)`` with different ``x`` values, the cheap
+    path is to hoist ``inv_range`` out and do the per-query arithmetic
+    as a free ``Linear`` — see the textured wall fill for an example.
+
+    Args:
+        x: Scalar node — continuous coordinate to bin.
+        x_min: Scalar node — lower edge of the value range.
+        x_max: Scalar node — upper edge.  Must satisfy
+            ``x_max - x_min >= min_range`` for correct output; smaller
+            ranges are clamped to ``min_range`` before the reciprocal.
+        n_bins: Number of discrete bins (compile-time).  Output is an
+            integer in ``[0, n_bins - 1]``.
+        min_range: Smallest representable value of ``x_max - x_min``.
+            Smaller values need more reciprocal breakpoints to stay
+            accurate.
+        max_range: Largest representable value of ``x_max - x_min``.
+        n_reciprocal_breakpoints: Number of geometrically-spaced
+            breakpoints used by the internal ``1/range`` lookup.  More
+            breakpoints → tighter relative error on the reciprocal;
+            typically ``log(max_range/min_range) / log(1 + tolerance)``.
+            Default 32 gives ≲1% relative error over a 400× range.
+        mul_step: Grid spacing passed to the internal ``signed_multiply``
+            for the ``delta × inv_range`` product.
+
+    Returns:
+        Scalar node carrying an integer in ``[0, n_bins - 1]``.
+    """
+    assert len(x) == 1, "x must be a 1D scalar node"
+    assert len(x_min) == 1, "x_min must be a 1D scalar node"
+    assert len(x_max) == 1, "x_max must be a 1D scalar node"
+    assert n_bins >= 1, "n_bins must be at least 1"
+    assert 0 < min_range < max_range, (
+        "need 0 < min_range < max_range for the reciprocal lookup"
+    )
+    assert n_reciprocal_breakpoints >= 2, (
+        "need at least 2 breakpoints for the geometric reciprocal lookup"
+    )
+
+    # 1. range and its clamp.
+    range_ = subtract(x_max, x_min)
+    clamped_range = clamp(range_, min_range, max_range)
+
+    # 2. 1/range via a geometric breakpoint lookup.  Geometric spacing
+    #    gives constant relative error per segment: error_rel ≈ (r-1)²/4
+    #    where r is the per-step ratio.  For 32 breakpoints over a
+    #    400× range, r ≈ 1.22 and error_rel ≈ 1.2%.
+    ratio = (max_range / min_range) ** (1.0 / (n_reciprocal_breakpoints - 1))
+    bps: List[float] = [min_range * (ratio ** k) for k in range(n_reciprocal_breakpoints)]
+    # Pin the endpoints so float rounding can't drift them.
+    bps[0] = min_range
+    bps[-1] = max_range
+    # The breakpoints must be strictly ascending — trivially true for
+    # geometric spacing but assert in case min_range == max_range sneaks
+    # through numerically.
+    assert all(bps[i] < bps[i + 1] for i in range(len(bps) - 1)), (
+        "geometric breakpoints collapsed — check min_range/max_range"
+    )
+    inv_range = piecewise_linear(
+        clamped_range,
+        bps,
+        lambda r: 1.0 / r,
+        name=f"{name}_inv_range",
+    )
+
+    # 3. delta and its clamp.  Pre-clamping keeps the multiplication
+    #    inputs inside the declared bounds even under adversarial
+    #    caller behaviour.
+    delta = subtract(x, x_min)
+    clamped_delta = clamp(delta, -max_range, max_range)
+
+    # 4. normalized = delta × (1/range).  Signed because delta may be
+    #    negative when x < x_min.
+    max_abs_normalized = max_range / min_range
+    normalized = signed_multiply(
+        clamped_delta,
+        inv_range,
+        max_abs1=max_range,
+        max_abs2=1.0 / min_range,
+        max_abs_output=max_abs_normalized,
+        step=mul_step,
+    )
+
+    # 5. Scale by n_bins (free Linear), clamp to the valid floor domain,
+    #    then staircase-floor.  The (n_bins - 0.5) upper clamp ensures
+    #    that an x at or past x_max lands on bin (n_bins - 1) rather
+    #    than the non-existent bin n_bins.  We use ``floor_int`` rather
+    #    than ``thermometer_floor_div`` because ``bin_f`` is a continuous
+    #    float that rarely lands on an integer — ``floor_int`` places
+    #    its staircase ramps AT integer boundaries (leaving the flat
+    #    between-integer region clean), whereas ``thermometer_floor_div``
+    #    places them at ``k - 0.5`` which is designed for integer
+    #    inputs and produces interpolated junk on non-integer floats.
+    bin_f = multiply_const(normalized, float(n_bins))
+    clamped_bin_f = clamp(bin_f, 0.0, float(n_bins) - 0.5)
+    return floor_int(clamped_bin_f, min_value=0, max_value=n_bins - 1)
 
 
 def clamp(inp: Node, lo: float, hi: float) -> Node:
@@ -857,10 +1022,27 @@ def reciprocal(
 
 
 def floor_int(inp: Node, min_value: int, max_value: int) -> Node:
-    """Compute floor(x) using a piecewise-linear staircase.
+    """Compute floor(x) for a continuous-valued scalar input.
 
-    Places a steep ramp at each integer boundary using half-integer
-    thresholds (like :func:`thermometer_floor_div`).
+    Places a steep ramp at each integer boundary ``k`` spanning
+    ``[k - eps, k]`` (where ``eps = 1 / step_sharpness``).  The flat
+    zone between ramps covers ``[k, k + 1 - eps]`` — the natural home
+    of floating-point scalars like ``0.5`` or ``k + 0.3`` — so
+    float inputs well inside a bin produce exact integer output.
+
+    Use ``floor_int`` when the input is a *continuous* scalar
+    (output of ``multiply``, ``piecewise_linear``, etc.) and you want
+    its ``floor`` as an integer.  Use :func:`thermometer_floor_div`
+    *only* when the input is already integer-valued with a
+    compile-time-known bound — the two ops place their staircase
+    ramps at different thresholds and aren't interchangeable.
+
+    Both ops have a ``~eps``-wide ramp zone near each integer boundary
+    where the output is an interpolated intermediate value.  If a
+    caller is passing inputs that are specifically near integer
+    boundaries, either clamp/round upstream, shift by ``0.5 - eps/2``
+    to move the boundary into the flat zone, or raise
+    ``step_sharpness`` at the cost of MLP sublayer precision.
 
     Args:
         inp: 1D scalar node with value in [min_value, max_value].
@@ -997,12 +1179,39 @@ def signed_multiply(
       roughly 2× the MLP hidden width (~``2*ceil(2*max_sum/step)`` neurons).
       Saves 1 MLP sublayer.
 
+    **Precision vs. bounds (read this if the caller cares about small
+    relative errors).** The absolute error in the output scales with
+    ``step × max_sum`` where ``max_sum = max_abs1 + max_abs2``, not
+    with ``|inp1 * inp2|``.  Loose bounds are quietly expensive: a
+    caller declaring ``max_abs1 = 200`` when its actual data never
+    exceeds ``10`` pays the full ``200``-scale error budget on every
+    output.  The relative error on a product whose magnitude is
+    ``|a*b|`` is roughly ``(step × max_sum) / (4 * |a*b|)`` — so
+    halving ``max_sum`` doubles effective precision at zero neuron
+    cost.  Hidden width scales linearly with ``max_sum / step``, so
+    tightening the bounds also *reduces* neuron count.
+
+    If tuning bounds isn't possible but finer precision is needed,
+    shrink ``step`` — precision improves linearly, hidden width grows
+    linearly.  ``step = 0.25`` with ``max_sum = 20`` gives ``~80``
+    neurons per square op; ``step = 0.1`` gives ``~200``.
+
+    Pathological inputs: when one of the factors is near zero
+    (e.g. ``a = 1e-3``) and the other is near its bound (``|b| =
+    max_abs2``), the polarization identity subtracts two nearly-equal
+    squares, magnifying interpolation error.  Callers computing small
+    products at the tail of a wide input distribution should either
+    clamp upstream or drop ``step`` further.
+
     Args:
         inp1: 1D scalar node with value in [-max_abs1, max_abs1].
         inp2: 1D scalar node with value in [-max_abs2, max_abs2].
-        max_abs1: Maximum absolute value of *inp1*.
-        max_abs2: Maximum absolute value of *inp2*.
-        step: Grid spacing for accuracy.
+        max_abs1: Maximum absolute value of *inp1*.  Tighter bounds
+            → better precision AND fewer neurons; see the precision
+            note above.
+        max_abs2: Maximum absolute value of *inp2*.  Same story.
+        step: Grid spacing for accuracy.  Smaller → more neurons,
+            more precision.
         max_abs_output: Optional tighter bound on the result magnitude.
             When provided, the output is clamped to [-max_abs_output,
             max_abs_output].
