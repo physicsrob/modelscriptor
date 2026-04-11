@@ -319,6 +319,14 @@ def build_game_graph(
     input_strafe_right = create_input("input_strafe_right", 1)
     input_turn_left = create_input("input_turn_left", 1)
     input_turn_right = create_input("input_turn_right", 1)
+    # Per-step feedback: the host threads the previous step's emitted
+    # (col_idx, patch_idx_in_col) back in as these inputs so the graph
+    # can compute the new values via a local delta instead of
+    # back-solving the position from the positional encoding.  At
+    # step 0 the values are ignored — is_pos_0 forces the outputs to
+    # (0, 0) regardless.
+    prev_col_idx = create_input("prev_col_idx", 1)
+    prev_patch_idx_in_col = create_input("prev_patch_idx_in_col", 1)
     seed_angle = create_input("seed_angle", 1)
     seed_x = create_input("seed_x", 1)
     seed_y = create_input("seed_y", 1)
@@ -363,10 +371,25 @@ def build_game_graph(
     eff_seed_x = _extract(7, "eff_seed_x")
     eff_seed_y = _extract(8, "eff_seed_y")
 
-    # === Graph-derived col_idx + patch_row_start ===
+    # === Graph-derived col_idx + patch_row_start (delta from host input) ===
     # Each position renders a single rows_per_patch-tall patch of a single
-    # screen column. Positions iterate raster-order: (col_idx, patch_idx)
-    # = divmod(position, shards_per_col).
+    # screen column.  Positions iterate raster-order: (col_idx, patch_idx)
+    # = divmod(position, shards_per_col).  Rather than back-solve that
+    # from a positional-encoding scalar (which is only accurate to ~310
+    # positions before the sin approximation drifts), the host threads
+    # the previous step's emitted (col_idx, patch_idx_in_col) back in as
+    # inputs and the graph computes the new values via a one-step
+    # increment with a wrap on the shards boundary:
+    #
+    #     patch_new = (prev_patch + 1) mod shards_per_col
+    #     wrap      = floor_div(prev_patch + 1, shards_per_col)    {0, 1}
+    #     col_new   = prev_col + wrap
+    #
+    # At position 0 the delta would produce garbage (there is no prior
+    # step), so we select-override both outputs to 0 using the existing
+    # is_pos_0 flag — which is driven by position_scalar but only needs
+    # a threshold at 0.5 (position_scalar(0) = 0 exactly, so the compare
+    # is trivially safe at any sequence length).
     W = config.screen_width
     H = config.screen_height
     fov = config.fov_columns
@@ -375,14 +398,19 @@ def build_game_graph(
         f"screen_height {H} must be divisible by rows_per_patch {rp}"
     )
     shards_per_col = H // rp
-    total_positions = W * shards_per_col
 
-    col_idx = thermometer_floor_div(
-        position_scalar, shards_per_col, max_value=total_positions,
+    patch_plus_one = add_const(prev_patch_idx_in_col, 1.0)
+    patch_new_from_delta = mod_const(
+        patch_plus_one, shards_per_col, max_value=shards_per_col,
     )
-    patch_idx_in_col = mod_const(
-        position_scalar, shards_per_col, max_value=total_positions,
+    wrap = thermometer_floor_div(
+        patch_plus_one, shards_per_col, max_value=shards_per_col,
     )
+    col_new_from_delta = add(prev_col_idx, wrap)
+
+    zero_col_patch = LiteralValue(torch.tensor([0.0]), name="zero_col_patch")
+    col_idx = select(is_pos_0, zero_col_patch, col_new_from_delta)
+    patch_idx_in_col = select(is_pos_0, zero_col_patch, patch_new_from_delta)
     patch_row_start = multiply_const(patch_idx_in_col, float(rp))
 
     # Integer-exact: matches the host-side

@@ -2,7 +2,6 @@
 
 import math
 
-import numpy as np
 import pytest
 
 from torchwright.doom.game import GameState, update_state
@@ -13,7 +12,7 @@ from torchwright.reference_renderer.collision import (
 )
 from torchwright.reference_renderer.scenes import box_room, multi_room
 from torchwright.reference_renderer.trig import generate_trig_table
-from torchwright.reference_renderer.types import RenderConfig, Segment
+from torchwright.reference_renderer.types import Segment
 
 
 @pytest.fixture
@@ -212,7 +211,7 @@ class TestMovementWithCollision:
         assert state.x > 4.0, f"Didn't reach room B: x={state.x}"
 
 
-# ── State carry + rendered frame correctness ─────────────────────────
+# ── State carry ──────────────────────────────────────────────────────
 
 
 class TestStateCarry:
@@ -226,45 +225,3 @@ class TestStateCarry:
             )
         expected_x = 0.5 * n_frames * float(trig_table[0, 0])
         assert state.x == pytest.approx(expected_x, abs=1e-6)
-
-    def test_rendered_frame_matches_static(self, trig_table, box_segments):
-        """After moving, rendered frame matches static rendering at same position.
-
-        This validates that the state carry loop produces identical results
-        to rendering at the final coordinates directly.
-        """
-        from torchwright.doom.compile import compile_renderer, render_frame_compiled
-        from torchwright.reference_renderer.render import render_frame
-
-        config = RenderConfig(
-            screen_width=16, screen_height=12, fov_columns=8,
-            trig_table=trig_table,
-            ceiling_color=(0.0, 0.0, 0.0),
-            floor_color=(0.5, 0.5, 0.5),
-        )
-
-        # Move a few frames
-        state = GameState(x=0, y=0, angle=0, move_speed=0.3)
-        for _ in range(5):
-            state = update_state(
-                state, PlayerInput(forward=True), box_segments, trig_table,
-            )
-
-        # Render from the moved position using compiled transformer
-        module = compile_renderer(
-            box_segments, config, max_coord=10.0, d=1024, d_head=16, verbose=False,
-        )
-        compiled = render_frame_compiled(module, state.x, state.y, state.angle, config)
-
-        # Compare against reference renderer at the same position
-        ref = render_frame(state.x, state.y, state.angle, box_segments, config)
-
-        # Allow boundary pixel tolerance (same as Phase 2 tests)
-        H, W = compiled.shape[:2]
-        mismatched = np.abs(compiled - ref) > 0.15
-        n_bad = mismatched.any(axis=2).sum()
-        max_boundary = 2 * W
-        assert n_bad <= max_boundary, (
-            f"{n_bad}/{H * W} pixels differ after movement "
-            f"(pos=({state.x:.2f}, {state.y:.2f}), angle={state.angle})"
-        )

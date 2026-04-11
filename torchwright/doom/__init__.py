@@ -1,8 +1,7 @@
-from torchwright.doom.renderer import build_renderer_graph
-from torchwright.doom.compile import compile_renderer, render_frame_compiled
+from torchwright.doom.compile import compile_game, step_frame_compiled, step_frame_iter
 
 __all__ = [
-    "build_renderer_graph",
-    "compile_renderer",
-    "render_frame_compiled",
+    "compile_game",
+    "step_frame_compiled",
+    "step_frame_iter",
 ]

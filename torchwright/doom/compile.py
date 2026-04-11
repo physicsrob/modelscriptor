@@ -17,97 +17,7 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.doom.game import GameState
 from torchwright.doom.input import PlayerInput
-from torchwright.doom.renderer import build_renderer_graph
-from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
-
-
-def compile_renderer(
-    segments: List[Segment],
-    config: RenderConfig,
-    max_coord: float = 20.0,
-    d: int = 512,
-    d_head: int = 16,
-    device: str = "cpu",
-    verbose: bool = True,
-    d_hidden: Optional[int] = None,
-):
-    """Compile a flat-shaded renderer to a HeadlessTransformerModule.
-
-    Args:
-        segments: Wall segments (geometry baked into weights).
-        config: Render configuration.
-        max_coord: Upper bound on coordinate magnitudes.
-        d: Residual stream width (d_model).
-        d_head: Attention head dimension.
-        device: Target device.
-        verbose: Print compilation stats.
-        d_hidden: Per-layer MLP hidden width; defaults to ``d``.
-
-    Returns:
-        HeadlessTransformerModule ready for inference.
-    """
-    output_node, pos_encoding = build_renderer_graph(segments, config, max_coord)
-    module = compile_headless(
-        output_node, pos_encoding,
-        d=d, d_head=d_head,
-        device=device, verbose=verbose,
-        d_hidden=d_hidden,
-    )
-    module.eval()
-    return module
-
-
-def render_frame_compiled(
-    module,
-    player_x: float,
-    player_y: float,
-    player_angle: int,
-    config: RenderConfig,
-) -> np.ndarray:
-    """Render a full frame using a compiled HeadlessTransformerModule.
-
-    Pre-computes ray_angle and perp_cos per column, runs the module,
-    and reshapes the output into an (H, W, 3) image array.
-
-    Args:
-        module: Compiled HeadlessTransformerModule.
-        player_x, player_y: Player world coordinates.
-        player_angle: Player facing direction (0-255).
-        config: Render configuration.
-
-    Returns:
-        np.ndarray of shape (H, W, 3) with float RGB values.
-    """
-    W = config.screen_width
-    H = config.screen_height
-    trig = config.trig_table
-
-    # Build input tensor: (W, 4) with columns [perp_cos, player_x, player_y, ray_angle]
-    # (alphabetical order matching input_names)
-    inputs = torch.zeros(W, 4)
-    for col in range(W):
-        col_offset = col - W // 2
-        ray_angle = (player_angle + col_offset * config.fov_columns // W) % 256
-        angle_diff = (ray_angle - player_angle) % 256
-        perp_cos = trig[angle_diff, 0]
-
-        inputs[col, 0] = perp_cos     # perp_cos
-        inputs[col, 1] = player_x     # player_x
-        inputs[col, 2] = player_y     # player_y
-        inputs[col, 3] = ray_angle    # ray_angle
-
-    with torch.no_grad():
-        output = module(inputs)  # (W, H*3)
-
-    # Reshape to (H, W, 3)
-    frame = output.cpu().numpy().reshape(W, H, 3).transpose(1, 0, 2)
-    return frame
-
-
-# ---------------------------------------------------------------------------
-# Phase 3: Game graph (game logic + rendering in one forward pass)
-# ---------------------------------------------------------------------------
 
 
 def compile_game(
@@ -171,24 +81,35 @@ EXPECTED_INPUT_NAMES = (
     "input_strafe_right",
     "input_turn_left",
     "input_turn_right",
+    "prev_col_idx",
+    "prev_patch_idx_in_col",
     "seed_angle",
     "seed_x",
     "seed_y",
 )
 
+N_INPUTS = len(EXPECTED_INPUT_NAMES)
+_IDX_PREV_COL = EXPECTED_INPUT_NAMES.index("prev_col_idx")
+_IDX_PREV_PATCH = EXPECTED_INPUT_NAMES.index("prev_patch_idx_in_col")
+
 
 def _seed_row(state: GameState, inputs: PlayerInput) -> torch.Tensor:
-    """Build step-0's (1, 9) input row from the seed state + real inputs."""
-    row = torch.zeros(1, 9)
+    """Build step-0's (1, N_INPUTS) input row from the seed state + real inputs.
+
+    The prev_col_idx / prev_patch_idx_in_col slots are left at 0; at
+    position 0 the graph's is_pos_0 select overrides the delta output
+    to (0, 0) regardless of what's passed.
+    """
+    row = torch.zeros(1, N_INPUTS)
     row[0, 0] = float(inputs.backward)
     row[0, 1] = float(inputs.forward)
     row[0, 2] = float(inputs.strafe_left)
     row[0, 3] = float(inputs.strafe_right)
     row[0, 4] = float(inputs.turn_left)
     row[0, 5] = float(inputs.turn_right)
-    row[0, 6] = float(state.angle)
-    row[0, 7] = float(state.x)
-    row[0, 8] = float(state.y)
+    row[0, EXPECTED_INPUT_NAMES.index("seed_angle")] = float(state.angle)
+    row[0, EXPECTED_INPUT_NAMES.index("seed_x")] = float(state.x)
+    row[0, EXPECTED_INPUT_NAMES.index("seed_y")] = float(state.y)
     return row
 
 
@@ -202,11 +123,14 @@ def step_frame_iter(
 
     Calls ``module.step()`` once per (col, patch) position, threading
     the KV cache across calls.  Step 0 receives the seed state + real
-    player inputs; subsequent steps pass a zero row and rely on phase
-    α's ``get_prev_value`` attention to retrieve the seed from the
-    cache.  The graph emits ``col_idx`` and ``patch_row_start`` as
-    trailing scalars in each step's output, so the host is a dumb
-    stitcher: it just reads those indices and pastes the patch.
+    player inputs; subsequent steps pass a zero row for the player
+    inputs (the graph broadcasts the seed from step 0 via
+    ``get_prev_value``) plus the previous step's emitted
+    ``(col_idx, patch_idx_in_col)`` so the graph can compute the new
+    values via a local delta.  The graph emits ``col_idx`` and
+    ``patch_row_start`` as trailing scalars in each step's output, so
+    the host is a dumb stitcher: it just reads those indices and pastes
+    the patch without knowing the sharding layout.
 
     Yields:
         ``(col_idx, patch_row_start, patch_pixels)`` per position, where
@@ -234,24 +158,30 @@ def step_frame_iter(
     past = module.empty_past()
 
     # Step 0: real inputs + seed state. Populates the KV cache so
-    # subsequent zero-input decodes can attend back to the seed.
+    # subsequent zero-input decodes can attend back to the seed.  The
+    # prev_col / prev_patch slots are ignored at pos 0 (is_pos_0
+    # override forces the outputs to (0, 0)).
     with torch.no_grad():
         out, past = module.step(_seed_row(state, inputs), past)
 
     col_idx = int(round(out[0, pixel_width].item()))
     patch_row_start = int(round(out[0, pixel_width + 1].item()))
+    patch_idx_in_col = patch_row_start // rp
     new_x = out[0, pixel_width + 2].item()
     new_y = out[0, pixel_width + 3].item()
     new_angle_raw = out[0, pixel_width + 4].item()
     patch = out[0, :pixel_width].cpu().numpy().reshape(rp, 3)
     yield col_idx, patch_row_start, patch
 
-    zero_row = torch.zeros(1, 9)
     for _ in range(1, total_steps):
+        row = torch.zeros(1, N_INPUTS)
+        row[0, _IDX_PREV_COL] = float(col_idx)
+        row[0, _IDX_PREV_PATCH] = float(patch_idx_in_col)
         with torch.no_grad():
-            out, past = module.step(zero_row, past)
+            out, past = module.step(row, past)
         col_idx = int(round(out[0, pixel_width].item()))
         patch_row_start = int(round(out[0, pixel_width + 1].item()))
+        patch_idx_in_col = patch_row_start // rp
         patch = out[0, :pixel_width].cpu().numpy().reshape(rp, 3)
         yield col_idx, patch_row_start, patch
 

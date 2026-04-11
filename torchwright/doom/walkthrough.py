@@ -230,6 +230,11 @@ def main():
              "Required for --mode transformer. Scene/width/height/fov "
              "must match the config used at export.",
     )
+    parser.add_argument(
+        "--device", choices=["cpu", "gpu"], default="cpu",
+        help="onnxruntime execution device. gpu requires onnxruntime-gpu "
+             "and a working CUDA runtime.",
+    )
     args = parser.parse_args()
 
     trig_table = generate_trig_table()
@@ -260,7 +265,7 @@ def main():
             raise SystemExit(
                 "transformer mode requires --onnx <path>. "
                 "Compile the graph first with "
-                f"`python -m torchwright.doom.to_onnx --mode game --scene {args.scene} "
+                f"`python -m torchwright.doom.to_onnx --scene {args.scene} "
                 f"--width {args.width} --height {args.height} --fov {args.fov} "
                 f"--tex-size {args.tex_size}`."
             )
@@ -268,8 +273,13 @@ def main():
         from torchwright.compiler.onnx_load import OnnxHeadlessModule
         from torchwright.doom.compile import step_frame_compiled
 
-        print(f"Loading {args.onnx}...")
-        module = OnnxHeadlessModule(args.onnx)
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if args.device == "gpu"
+            else ["CPUExecutionProvider"]
+        )
+        print(f"Loading {args.onnx} (providers={providers})...")
+        module = OnnxHeadlessModule(args.onnx, providers=providers)
 
         def frame_fn(state, inputs):
             return step_frame_compiled(module, state, inputs, config)

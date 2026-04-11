@@ -30,7 +30,6 @@ from torchwright.ops.arithmetic_ops import (
     thermometer_floor_div,
 )
 from torchwright.ops.logic_ops import bool_all_true
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 from torchwright.ops.map_select import broadcast_select, in_range, map_to_table, select
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
@@ -956,48 +955,3 @@ def build_rendering_pipeline(
         patch_row_start=patch_row_start,
         rows_per_patch=rows_per_patch,
     )
-
-
-def build_renderer_graph(
-    segments: List[Segment],
-    config: RenderConfig,
-    max_coord: float = 20.0,
-    patch_row_start: Optional[Node] = None,
-    rows_per_patch: Optional[int] = None,
-) -> Tuple[Node, "PosEncoding"]:
-    """Build the complete per-column rendering graph (Phase 2 standalone).
-
-    Creates InputNodes and calls build_rendering_pipeline.  For Phase 3+,
-    use build_rendering_pipeline directly with computed nodes.
-
-    Inputs (per position, alphabetical order for headless module):
-        perp_cos:  cos(ray_angle - player_angle) for fish-eye correction
-        player_x:  world x coordinate
-        player_y:  world y coordinate
-        ray_angle: integer 0-255, index into trig table
-
-    Output: H*3 floats — RGB for each row of this screen column.
-
-    Returns:
-        (output_node, pos_encoding) tuple for compilation.
-    """
-    pos_encoding = create_pos_encoding()
-
-    perp_cos = create_input("perp_cos", 1)
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    ray_angle = create_input("ray_angle", 1)
-
-    output = build_rendering_pipeline(
-        player_x,
-        player_y,
-        ray_angle,
-        perp_cos,
-        segments,
-        config,
-        max_coord,
-        patch_row_start=patch_row_start,
-        rows_per_patch=rows_per_patch,
-    )
-
-    return output, pos_encoding
