@@ -306,18 +306,35 @@ def _emit_cached_preamble(nodes: list, seq_input_name: str) -> None:
     """Emit nodes that produce ``pos`` and ``mask_bool_3d`` tensors.
 
     Requires:
-      - graph input ``past_len``: scalar int64
+      - graph input ``past_len``: scalar int64 — the absolute *query*
+        position the new rows live at.  Drives the positional-encoding
+        slice.  Does **not** have to equal ``past_K_0.shape[1]``; the
+        host may hand over a trimmed cache with a larger ``past_len`` to
+        get correct pos encodings for a sliding-window runtime.
       - graph input ``seq_input_name``: first dim is ``n_new``
+      - graph input ``past_K_0``: shape ``(n_heads, past_cache_len,
+        d_head)`` — the actual past cache length is read from its shape
+        at runtime and drives the mask geometry.
       - initializer ``pos_encoding_full``: (max_seq_len, d_pos)
       - scalar initializers from :func:`_add_scalar_inits`
 
     Produces:
-      - ``pos``: (n_new, d_pos) float, sliced from pos_encoding_full
-      - ``mask_bool_3d``: (1, n_new, n_total) bool, True where a query
-        position must NOT attend to a key position.  Applied via
-        ``Where(mask_bool_3d, -1000, logits)`` — this overwrites masked
-        logits (unlike an additive -1000 mask, which is numerically
-        unsafe when the original logits can dominate the additive shift).
+      - ``pos``: (n_new, d_pos) float, sliced from pos_encoding_full at
+        ``[past_len : past_len + n_new]``.
+      - ``mask_bool_3d``: (1, n_new, past_cache_len + n_new) bool, True
+        where a query position must NOT attend to a key position.
+        Applied via ``Where(mask_bool_3d, -1000, logits)`` — this
+        overwrites masked logits (unlike an additive -1000 mask, which
+        is numerically unsafe when the original logits can dominate the
+        additive shift).
+
+    The mask is derived from the *actual cache length* (the shape-[1] of
+    ``past_K_0``) rather than the ``past_len`` input, so that callers
+    can pass a trimmed cache with a different ``past_len`` without
+    creating a shape mismatch against the attention logits.  When
+    ``past_len == past_cache_len`` (the normal non-trimmed case) this
+    emission is bit-identical in behaviour to the simpler
+    ``past_len + n_new`` construction it replaces.
     """
 
     def add(op, ins, outs, **attrs):
@@ -326,27 +343,36 @@ def _emit_cached_preamble(nodes: list, seq_input_name: str) -> None:
     # n_new as 0-D scalar: Shape(seq_input)[0]
     add("Shape", [seq_input_name], ["_seq_shape"])
     add("Gather", ["_seq_shape", "_i64_zero_s"], ["_n_new_s"], axis=0)
-    # n_total = past_len + n_new  (both 0-D scalars)
-    add("Add", ["past_len", "_n_new_s"], ["_n_total_s"])
+
+    # past_cache_len as 0-D scalar: Shape(past_K_0)[1]
+    # Every layer's past_K has the same shape-[1]; pick layer 0.
+    add("Shape", ["past_K_0"], ["_past_K_shape"])
+    add("Gather", ["_past_K_shape", "_i64_one_s"], ["_past_cache_len_s"], axis=0)
+
+    # Mask geometry uses the actual cache length, not past_len.
+    # n_total_mask = past_cache_len + n_new
+    add("Add", ["_past_cache_len_s", "_n_new_s"], ["_n_total_mask_s"])
 
     # Dynamic causal mask — True where a new row must NOT attend to a column.
-    # Row r corresponds to absolute position past_len + r; column c is
-    # absolute position c.  mask[r, c] = c > past_len + r.
+    # Row r is local to the cache+new window: abs-within-window = past_cache_len + r.
+    # Column c is the same local index. mask[r, c] = c > past_cache_len + r.
     add("Range", ["_i64_zero_s", "_n_new_s", "_i64_one_s"], ["_rows"])
-    add("Range", ["_i64_zero_s", "_n_total_s", "_i64_one_s"], ["_cols"])
-    add("Add", ["_rows", "past_len"], ["_abs_rows"])  # (n_new,)
+    add("Range", ["_i64_zero_s", "_n_total_mask_s", "_i64_one_s"], ["_cols"])
+    add("Add", ["_rows", "_past_cache_len_s"], ["_abs_rows"])  # (n_new,)
     add("Unsqueeze", ["_abs_rows", "_axes1_1d"], ["_abs_rows_col"])  # (n_new, 1)
-    add("Unsqueeze", ["_cols", "_axes0_1d"], ["_cols_row"])  # (1, n_total)
-    add("Greater", ["_cols_row", "_abs_rows_col"], ["_mask_bool"])  # (n_new, n_total)
-    add("Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"])  # (1, n_new, n_total)
+    add("Unsqueeze", ["_cols", "_axes0_1d"], ["_cols_row"])  # (1, n_total_mask)
+    add("Greater", ["_cols_row", "_abs_rows_col"], ["_mask_bool"])  # (n_new, n_total_mask)
+    add("Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"])  # (1, n_new, n_total_mask)
 
-    # Positional encoding slice:
-    # pos_encoding_full[past_len : past_len + n_new]
+    # Positional encoding slice uses past_len directly — this is the one
+    # place past_len still matters, so the host can set the "absolute
+    # query position" independently of the cache length.
+    add("Add", ["past_len", "_n_new_s"], ["_pos_slice_end_s"])
     add("Unsqueeze", ["past_len", "_axes0_1d"], ["_past_len_1d"])
-    add("Unsqueeze", ["_n_total_s", "_axes0_1d"], ["_n_total_1d"])
+    add("Unsqueeze", ["_pos_slice_end_s", "_axes0_1d"], ["_pos_slice_end_1d"])
     add(
         "Slice",
-        ["pos_encoding_full", "_past_len_1d", "_n_total_1d", "_axes0_1d"],
+        ["pos_encoding_full", "_past_len_1d", "_pos_slice_end_1d", "_axes0_1d"],
         ["pos"],
     )
 
@@ -944,7 +970,10 @@ class CompiledHeadless:
         return (past_K, past_V)
 
     def step(
-        self, inputs: torch.Tensor, past: tuple
+        self,
+        inputs: torch.Tensor,
+        past: tuple,
+        past_len: Optional[int] = None,
     ) -> tuple:
         """Cached forward step.
 
@@ -953,6 +982,15 @@ class CompiledHeadless:
             past: ``(past_K_tuple, past_V_tuple)`` from a prior step or
                 :meth:`empty_past`.  Each tuple has length ``n_layers``
                 and each entry is ``(n_heads, n_past, d_head)``.
+            past_len: Optional absolute query position for the new rows.
+                When ``None`` (default), derived from
+                ``past_K[0].shape[1]`` — i.e. "the new rows sit right
+                after everything in the cache", which is the normal
+                decoding protocol.  Callers using a sliding-window
+                runtime may pass the true global position here while
+                handing over a trimmed cache; the positional encoding
+                slice uses this value while the attention mask uses the
+                cache's actual shape.
 
         Returns:
             ``(outputs, new_past)`` where ``outputs`` is
@@ -962,7 +1000,8 @@ class CompiledHeadless:
         past_K, past_V = past
         assert len(past_K) == self._n_layers
         assert len(past_V) == self._n_layers
-        past_len = int(past_K[0].shape[1])
+        if past_len is None:
+            past_len = int(past_K[0].shape[1])
 
         res_stream = self._build_res_stream(inputs, past_len=past_len)
         past_kvs = [(past_K[i], past_V[i]) for i in range(self._n_layers)]

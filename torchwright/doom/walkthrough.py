@@ -235,7 +235,15 @@ def main():
         help="onnxruntime execution device. gpu requires onnxruntime-gpu "
              "and a working CUDA runtime.",
     )
+    parser.add_argument(
+        "--cache-lookback", type=int, default=10,
+        help="Trim the KV cache handed to module.step to the most-recent "
+             "N entries (default: 10). Positional encodings stay correct "
+             "because past_len is threaded separately.  Pass a negative "
+             "number to disable trimming.",
+    )
     args = parser.parse_args()
+    cache_lookback = args.cache_lookback if args.cache_lookback >= 0 else None
 
     trig_table = generate_trig_table()
     config = RenderConfig(
@@ -282,7 +290,9 @@ def main():
         module = OnnxHeadlessModule(args.onnx, providers=providers)
 
         def frame_fn(state, inputs):
-            return step_frame_compiled(module, state, inputs, config)
+            return step_frame_compiled(
+                module, state, inputs, config, cache_lookback=cache_lookback,
+            )
     else:
         def frame_fn(state, inputs):
             new_state = update_state(state, inputs, segments, trig_table)

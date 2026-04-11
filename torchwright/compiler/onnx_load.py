@@ -22,7 +22,7 @@ Two usage shapes:
 
 import json
 import os
-from typing import List, Protocol, Tuple
+from typing import List, Optional, Protocol, Tuple
 
 import numpy as np
 import torch
@@ -52,7 +52,10 @@ class HeadlessRuntime(Protocol):
     def __call__(self, inputs: torch.Tensor) -> torch.Tensor: ...
 
     def step(
-        self, inputs: torch.Tensor, past: PastKV
+        self,
+        inputs: torch.Tensor,
+        past: PastKV,
+        past_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, PastKV]: ...
 
     def empty_past(self) -> PastKV: ...
@@ -125,7 +128,10 @@ class OnnxHeadlessModule:
         return (past_K, past_V)
 
     def step(
-        self, inputs: torch.Tensor, past: PastKV
+        self,
+        inputs: torch.Tensor,
+        past: PastKV,
+        past_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, PastKV]:
         """Run one cached-protocol call and return (outputs, new_past).
 
@@ -135,6 +141,13 @@ class OnnxHeadlessModule:
                 :meth:`empty_past`.  Each tuple has length ``n_layers``
                 and each entry is a ``(n_heads, n_past, d_head)`` torch
                 tensor.
+            past_len: Optional absolute query position for the new rows.
+                When ``None`` (default), derived from
+                ``past_K[0].shape[1]``.  Callers using a sliding-window
+                runtime may pass the true global position here while
+                handing over a trimmed cache; the graph's pos-encoding
+                slice uses this value while the attention mask uses the
+                cache's actual shape.
 
         Returns:
             ``(outputs, new_past)`` where ``outputs`` is a
@@ -146,7 +159,8 @@ class OnnxHeadlessModule:
         assert len(past_V) == self._n_layers
 
         inputs_np = inputs.detach().cpu().numpy().astype(np.float32, copy=False)
-        past_len = int(past_K[0].shape[1])
+        if past_len is None:
+            past_len = int(past_K[0].shape[1])
 
         feeds: dict = {
             "inputs": inputs_np,

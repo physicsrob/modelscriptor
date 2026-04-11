@@ -125,11 +125,27 @@ def _seed_row(state: GameState, inputs: PlayerInput) -> torch.Tensor:
     return row
 
 
+def _trim_past(past, keep: int):
+    """Slice a ``(past_K_tuple, past_V_tuple)`` along dim=1 to the last
+    ``keep`` entries.  No-op when the cache already has ``<= keep``
+    entries.  Used by :func:`step_frame_iter` when ``cache_lookback`` is
+    set to bound the KV cache it hands back to ``module.step`` without
+    shrinking the graph's notion of ``past_len``.
+    """
+    past_K, past_V = past
+    if past_K and past_K[0].shape[1] <= keep:
+        return past
+    trimmed_K = tuple(k[:, -keep:, :] for k in past_K)
+    trimmed_V = tuple(v[:, -keep:, :] for v in past_V)
+    return (trimmed_K, trimmed_V)
+
+
 def step_frame_iter(
     module,
     state: GameState,
     inputs: PlayerInput,
     config: RenderConfig,
+    cache_lookback: Optional[int] = 10,
 ) -> Iterator[Tuple[int, int, np.ndarray]]:
     """Run one game frame as an autoregressive rollout with full feedback.
 
@@ -148,6 +164,19 @@ def step_frame_iter(
     pastes each patch at the *input-side* ``(cur_col, cur_patch * rp)``
     — which it already knows, since it just wrote those values into the
     input row.
+
+    Args:
+        cache_lookback: Optional bound on how many past KV entries to
+            thread back into ``module.step``.  ``None`` keeps the full
+            cache (stock decode protocol); an integer ``k`` trims the
+            cache to the last ``k`` entries before each call.  Default
+            is ``10``.  The graph's ``past_len`` input is always set to
+            the true global step number, so positional encodings for
+            the new row are correct regardless of how much of the cache
+            was trimmed (see ``_emit_cached_preamble``).  Trimming is
+            only *correct* for graphs whose compiled attention does not
+            actually read cross-position K/V to carry semantic signal —
+            the post-Option-A DOOM graph qualifies.
 
     Yields:
         ``(col_idx, patch_row_start, patch_pixels)`` per position, where
@@ -184,7 +213,8 @@ def step_frame_iter(
     # Step 0: pass cur=(0, 0), real seed state, real player inputs.
     _t0 = time.perf_counter()
     with torch.no_grad():
-        out, past = module.step(_seed_row(state, inputs), past)
+        # past_len=0 both by shape and by convention.
+        out, past = module.step(_seed_row(state, inputs), past, past_len=0)
     _dt_ms = (time.perf_counter() - _t0) * 1000
     print(f"  module.step  step=0/{total_steps}  past_len=0  {_dt_ms:.1f}ms")
 
@@ -212,13 +242,23 @@ def step_frame_iter(
         row[0, _IDX_SEED_ANGLE] = float(carried_angle_raw)
         # Player-input slots stay zero — the game-logic chain degenerates
         # to a passthrough and re-emits the carried state.
+
+        # Trim the cache handed to the graph while keeping past_len at
+        # the true global step number so positional encodings stay
+        # correct.
+        if cache_lookback is not None:
+            past_for_step = _trim_past(past, cache_lookback)
+        else:
+            past_for_step = past
+
         _t0 = time.perf_counter()
         with torch.no_grad():
-            out, past = module.step(row, past)
+            out, past = module.step(row, past_for_step, past_len=_step)
         _dt_ms = (time.perf_counter() - _t0) * 1000
+        cached_len = past[0][0].shape[1] if past[0] else 0
         print(
             f"  module.step  step={_step}/{total_steps}  "
-            f"past_len={_step}  {_dt_ms:.1f}ms"
+            f"past_len={_step}  cache_len={cached_len}  {_dt_ms:.1f}ms"
         )
         patch = out[0, :pixel_width].cpu().numpy().reshape(rp, 3)
         yield cur_col, cur_patch * rp, patch
@@ -246,6 +286,7 @@ def step_frame_compiled(
     state: GameState,
     inputs: PlayerInput,
     config: RenderConfig,
+    cache_lookback: Optional[int] = 10,
 ) -> Tuple[np.ndarray, GameState]:
     """Run one game frame via the cached-protocol generate loop.
 
@@ -254,12 +295,15 @@ def step_frame_compiled(
     returning the new game state. The host is a dumb stitcher: it
     doesn't know anything about the iteration order or patch layout —
     the graph tells it where each patch belongs.
+
+    ``cache_lookback`` is forwarded to :func:`step_frame_iter` — see
+    its docstring for the semantics and safety guarantees.
     """
     W = config.screen_width
     H = config.screen_height
 
     frame = np.zeros((H, W, 3), dtype=np.float32)
-    it = step_frame_iter(module, state, inputs, config)
+    it = step_frame_iter(module, state, inputs, config, cache_lookback=cache_lookback)
     try:
         while True:
             col_idx, patch_row_start, patch_pixels = next(it)
