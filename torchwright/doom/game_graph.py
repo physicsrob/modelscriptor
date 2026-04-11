@@ -282,30 +282,44 @@ def build_game_graph(
 ) -> Tuple[Node, "PosEncoding"]:
     """Build the complete game logic + rendering graph.
 
-    One forward pass processes player inputs, updates position with
-    collision detection, and renders the scene.  The host writes seed
-    state and player inputs at position 0 only; rows 1..W-1 of the input
-    tensor are zero.  The graph broadcasts position 0's inputs across
-    all positions via ``get_prev_value`` and derives per-column
-    ``angle_offset`` and ``perp_cos`` from the position encoding.
+    One forward pass computes one (col, patch_idx_in_col) patch of one
+    frame.  The graph is **fully position-independent**: every input row
+    carries the state the graph needs to render that position, and the
+    graph emits the "next" state for the host to thread back in on the
+    following step.  There is no cross-position attention, no
+    ``get_prev_value`` seed broadcast, and no consultation of
+    ``position_scalar``.
 
-    Inputs (per position, alphabetical order).  Only row 0 is populated
-    by the host:
+    Inputs (per position, alphabetical order):
 
-        input_backward:     0.0 or 1.0
-        input_forward:      0.0 or 1.0
-        input_strafe_left:  0.0 or 1.0
-        input_strafe_right: 0.0 or 1.0
-        input_turn_left:    0.0 or 1.0
-        input_turn_right:   0.0 or 1.0
-        seed_angle:         seed facing direction (0-255)
-        seed_x:             seed x position
-        seed_y:             seed y position
+        cur_col_idx:         screen column being rendered this step
+        cur_patch_idx_in_col: patch index within the column this step
+        input_backward:      0.0 or 1.0      (real at step 0; 0 elsewhere)
+        input_forward:       0.0 or 1.0      (real at step 0; 0 elsewhere)
+        input_strafe_left:   0.0 or 1.0      (real at step 0; 0 elsewhere)
+        input_strafe_right:  0.0 or 1.0      (real at step 0; 0 elsewhere)
+        input_turn_left:     0.0 or 1.0      (real at step 0; 0 elsewhere)
+        input_turn_right:    0.0 or 1.0      (real at step 0; 0 elsewhere)
+        seed_angle:          current player angle (the seed at step 0; the
+                             carried-forward post-update value after that)
+        seed_x:              current player x (likewise)
+        seed_y:              current player y (likewise)
 
-    Output per position: H*3 pixel values + 3 state values
-    (new_x, new_y, new_angle).  The state values are identical at every
-    position because the broadcast pattern feeds identical inputs into
-    the game-logic subgraph everywhere.
+    Game logic runs at every step on ``(seed_{x,y,angle}, input_*)``.  At
+    step 0 the inputs are real player inputs and the game-logic update
+    fires for real.  At steps ≥ 1 the inputs are all zero and the
+    game-logic chain degenerates to a passthrough: ``new_angle = old``,
+    ``dx = dy = 0``, ``resolved_x = seed_x``, ``resolved_y = seed_y``.
+    So the host just has to carry ``(new_x, new_y, new_angle)`` forward
+    from step 0's output.
+
+    Output per position (see Concatenate at the bottom of the function):
+
+        H*3 pixel values         -- the patch rendered from resolved_{x,y,angle}
+        next_col_idx             -- col for step t+1 (feedback)
+        next_patch_idx_in_col    -- patch for step t+1 (feedback)
+        resolved_x, resolved_y   -- post-update player position (feedback)
+        new_angle                -- post-update player angle (feedback)
 
     Returns:
         (output_node, pos_encoding) tuple for compilation.
@@ -313,83 +327,19 @@ def build_game_graph(
     pos_encoding = create_pos_encoding()
 
     # Create inputs (alphabetical order — matches HeadlessTransformerModule)
+    cur_col_idx = create_input("cur_col_idx", 1)
+    cur_patch_idx_in_col = create_input("cur_patch_idx_in_col", 1)
     input_backward = create_input("input_backward", 1)
     input_forward = create_input("input_forward", 1)
     input_strafe_left = create_input("input_strafe_left", 1)
     input_strafe_right = create_input("input_strafe_right", 1)
     input_turn_left = create_input("input_turn_left", 1)
     input_turn_right = create_input("input_turn_right", 1)
-    # Per-step feedback: the host threads the previous step's emitted
-    # (col_idx, patch_idx_in_col) back in as these inputs so the graph
-    # can compute the new values via a local delta instead of
-    # back-solving the position from the positional encoding.  At
-    # step 0 the values are ignored — is_pos_0 forces the outputs to
-    # (0, 0) regardless.
-    prev_col_idx = create_input("prev_col_idx", 1)
-    prev_patch_idx_in_col = create_input("prev_patch_idx_in_col", 1)
     seed_angle = create_input("seed_angle", 1)
     seed_x = create_input("seed_x", 1)
     seed_y = create_input("seed_y", 1)
 
-    # === Position-0 seed broadcast ===
-    # is_pos_0 is +1 at position 0 and -1 elsewhere.  get_position_scalar
-    # returns exactly 0.0 at pos 0 (sin(0)=0) and ~k at pos k>0, so the
-    # 0.5 threshold is unambiguous at position 0 itself.
-    position_scalar = pos_encoding.get_position_scalar()
-    is_pos_0 = compare(
-        position_scalar, 0.5, true_level=-1.0, false_level=1.0,
-    )
-
-    # Broadcast pos-0 values to all positions in a single attention head:
-    # pack the 9 scalars into one width-9 node and call get_prev_value
-    # once (d_head=16 has room for 9).
-    seeds_packed = Concatenate([
-        input_backward,
-        input_forward,
-        input_strafe_left,
-        input_strafe_right,
-        input_turn_left,
-        input_turn_right,
-        seed_angle,
-        seed_x,
-        seed_y,
-    ])
-    broadcast = pos_encoding.get_prev_value(seeds_packed, is_pos_0)
-
-    def _extract(idx: int, name: str) -> Node:
-        m = torch.zeros(9, 1)
-        m[idx, 0] = 1.0
-        return Linear(broadcast, m, name=name)
-
-    eff_input_backward = _extract(0, "eff_input_backward")
-    eff_input_forward = _extract(1, "eff_input_forward")
-    eff_input_strafe_left = _extract(2, "eff_input_strafe_left")
-    eff_input_strafe_right = _extract(3, "eff_input_strafe_right")
-    eff_input_turn_left = _extract(4, "eff_input_turn_left")
-    eff_input_turn_right = _extract(5, "eff_input_turn_right")
-    eff_seed_angle = _extract(6, "eff_seed_angle")
-    eff_seed_x = _extract(7, "eff_seed_x")
-    eff_seed_y = _extract(8, "eff_seed_y")
-
-    # === Graph-derived col_idx + patch_row_start (delta from host input) ===
-    # Each position renders a single rows_per_patch-tall patch of a single
-    # screen column.  Positions iterate raster-order: (col_idx, patch_idx)
-    # = divmod(position, shards_per_col).  Rather than back-solve that
-    # from a positional-encoding scalar (which is only accurate to ~310
-    # positions before the sin approximation drifts), the host threads
-    # the previous step's emitted (col_idx, patch_idx_in_col) back in as
-    # inputs and the graph computes the new values via a one-step
-    # increment with a wrap on the shards boundary:
-    #
-    #     patch_new = (prev_patch + 1) mod shards_per_col
-    #     wrap      = floor_div(prev_patch + 1, shards_per_col)    {0, 1}
-    #     col_new   = prev_col + wrap
-    #
-    # At position 0 the delta would produce garbage (there is no prior
-    # step), so we select-override both outputs to 0 using the existing
-    # is_pos_0 flag — which is driven by position_scalar but only needs
-    # a threshold at 0.5 (position_scalar(0) = 0 exactly, so the compare
-    # is trivially safe at any sequence length).
+    # === Sharding layout ===
     W = config.screen_width
     H = config.screen_height
     fov = config.fov_columns
@@ -399,24 +349,33 @@ def build_game_graph(
     )
     shards_per_col = H // rp
 
-    patch_plus_one = add_const(prev_patch_idx_in_col, 1.0)
-    patch_new_from_delta = mod_const(
+    # === Autoregressive delta: predict next (col, patch) for feedback ===
+    #
+    #     next_patch = (cur_patch + 1) mod shards_per_col
+    #     wrap       = floor_div(cur_patch + 1, shards_per_col)   {0, 1}
+    #     next_col   = cur_col + wrap
+    #
+    # The host writes (cur_col=0, cur_patch=0) at step 0 and threads this
+    # step's (next_col, next_patch) into the next step's (cur_col,
+    # cur_patch) slots.  No position-0 special case — the graph treats
+    # every step uniformly.
+    patch_plus_one = add_const(cur_patch_idx_in_col, 1.0)
+    next_patch_idx_in_col = mod_const(
         patch_plus_one, shards_per_col, max_value=shards_per_col,
     )
     wrap = thermometer_floor_div(
         patch_plus_one, shards_per_col, max_value=shards_per_col,
     )
-    col_new_from_delta = add(prev_col_idx, wrap)
+    next_col_idx = add(cur_col_idx, wrap)
 
-    zero_col_patch = LiteralValue(torch.tensor([0.0]), name="zero_col_patch")
-    col_idx = select(is_pos_0, zero_col_patch, col_new_from_delta)
-    patch_idx_in_col = select(is_pos_0, zero_col_patch, patch_new_from_delta)
-    patch_row_start = multiply_const(patch_idx_in_col, float(rp))
+    # This step's patch_row_start feeds the renderer (not the feedback
+    # output — which uses next_patch_idx_in_col as its raw index).
+    cur_patch_row_start = multiply_const(cur_patch_idx_in_col, float(rp))
 
     # Integer-exact: matches the host-side
     #     angle_offset = (col - W//2) * fov_columns // W
     # when (W//2)*fov_columns % W == 0 (satisfied by the test fixtures).
-    col_times_fov = multiply_const(col_idx, float(fov))
+    col_times_fov = multiply_const(cur_col_idx, float(fov))
     ao_unsigned = thermometer_floor_div(
         col_times_fov, W, max_value=fov * W,
     )
@@ -427,29 +386,34 @@ def build_game_graph(
     perp_angle = mod_const(perp_shifted, 256, max_value=256 + fov)
     perp_cos, _perp_sin = trig_lookup(perp_angle)
 
-    # === Game Logic Phase (consumes effective_* from broadcast) ===
+    # === Game Logic Phase ===
+    #
+    # Runs at every step on the current-state inputs.  At step 0 the
+    # player inputs are real and the update fires; at steps ≥ 1 they are
+    # all zero and every op degenerates to a passthrough, so
+    # resolved_{x,y,angle} simply equals the carried-forward seed_*.
 
     # 1. Angle update
     new_angle = _compute_new_angle(
-        eff_seed_angle,
-        eff_input_turn_left,
-        eff_input_turn_right,
+        seed_angle,
+        input_turn_left,
+        input_turn_right,
         turn_speed,
     )
 
     # 2. Velocity from inputs
     dx, dy = _compute_velocity(
         new_angle,
-        eff_input_forward,
-        eff_input_backward,
-        eff_input_strafe_left,
-        eff_input_strafe_right,
+        input_forward,
+        input_backward,
+        input_strafe_left,
+        input_strafe_right,
         move_speed,
     )
 
     # 3. Collision detection + position resolution
     resolved_x, resolved_y = _resolve_collision_graph(
-        eff_seed_x, eff_seed_y, dx, dy, segments, max_coord, move_speed,
+        seed_x, seed_y, dx, dy, segments, max_coord, move_speed,
     )
 
     # === Rendering Phase ===
@@ -462,24 +426,24 @@ def build_game_graph(
         pixels = build_textured_rendering_pipeline(
             resolved_x, resolved_y, ray_angle, perp_cos,
             segments, config, textures, max_coord,
-            patch_row_start=patch_row_start,
+            patch_row_start=cur_patch_row_start,
             rows_per_patch=rp,
         )
     else:
         pixels = build_rendering_pipeline(
             resolved_x, resolved_y, ray_angle, perp_cos,
             segments, config, max_coord,
-            patch_row_start=patch_row_start,
+            patch_row_start=cur_patch_row_start,
             rows_per_patch=rp,
         )
 
-    # 6. Output: pixels + self-identifying destination + updated state.
-    # col_idx and patch_row_start travel with the patch so the host is
-    # a dumb stitcher that just reads them and indexes the frame buffer.
+    # 6. Output: pixels + next (col, patch) feedback + carried state.
+    # The host pastes at the input-side (cur_col, cur_patch * rp) — which
+    # it already knows, since it just wrote them into the input row.
     output = Concatenate([
         pixels,
-        col_idx,
-        patch_row_start,
+        next_col_idx,
+        next_patch_idx_in_col,
         resolved_x,
         resolved_y,
         new_angle,

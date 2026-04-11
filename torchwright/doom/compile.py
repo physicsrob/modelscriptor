@@ -9,6 +9,7 @@ graph is unchanged between prefill and cached execution — causal
 attention makes the two modes mathematically identical.
 """
 
+import time
 from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -75,41 +76,52 @@ def compile_game(
 
 
 EXPECTED_INPUT_NAMES = (
+    "cur_col_idx",
+    "cur_patch_idx_in_col",
     "input_backward",
     "input_forward",
     "input_strafe_left",
     "input_strafe_right",
     "input_turn_left",
     "input_turn_right",
-    "prev_col_idx",
-    "prev_patch_idx_in_col",
     "seed_angle",
     "seed_x",
     "seed_y",
 )
 
 N_INPUTS = len(EXPECTED_INPUT_NAMES)
-_IDX_PREV_COL = EXPECTED_INPUT_NAMES.index("prev_col_idx")
-_IDX_PREV_PATCH = EXPECTED_INPUT_NAMES.index("prev_patch_idx_in_col")
+_IDX_CUR_COL = EXPECTED_INPUT_NAMES.index("cur_col_idx")
+_IDX_CUR_PATCH = EXPECTED_INPUT_NAMES.index("cur_patch_idx_in_col")
+_IDX_INPUT_BACKWARD = EXPECTED_INPUT_NAMES.index("input_backward")
+_IDX_INPUT_FORWARD = EXPECTED_INPUT_NAMES.index("input_forward")
+_IDX_INPUT_STRAFE_LEFT = EXPECTED_INPUT_NAMES.index("input_strafe_left")
+_IDX_INPUT_STRAFE_RIGHT = EXPECTED_INPUT_NAMES.index("input_strafe_right")
+_IDX_INPUT_TURN_LEFT = EXPECTED_INPUT_NAMES.index("input_turn_left")
+_IDX_INPUT_TURN_RIGHT = EXPECTED_INPUT_NAMES.index("input_turn_right")
+_IDX_SEED_ANGLE = EXPECTED_INPUT_NAMES.index("seed_angle")
+_IDX_SEED_X = EXPECTED_INPUT_NAMES.index("seed_x")
+_IDX_SEED_Y = EXPECTED_INPUT_NAMES.index("seed_y")
 
 
 def _seed_row(state: GameState, inputs: PlayerInput) -> torch.Tensor:
-    """Build step-0's (1, N_INPUTS) input row from the seed state + real inputs.
+    """Build step-0's (1, N_INPUTS) input row.
 
-    The prev_col_idx / prev_patch_idx_in_col slots are left at 0; at
-    position 0 the graph's is_pos_0 select overrides the delta output
-    to (0, 0) regardless of what's passed.
+    cur_col_idx / cur_patch_idx_in_col are 0 (top-left of the frame).
+    seed_{x,y,angle} and input_* are the real values the game logic
+    consumes to produce the post-update state.
     """
     row = torch.zeros(1, N_INPUTS)
-    row[0, 0] = float(inputs.backward)
-    row[0, 1] = float(inputs.forward)
-    row[0, 2] = float(inputs.strafe_left)
-    row[0, 3] = float(inputs.strafe_right)
-    row[0, 4] = float(inputs.turn_left)
-    row[0, 5] = float(inputs.turn_right)
-    row[0, EXPECTED_INPUT_NAMES.index("seed_angle")] = float(state.angle)
-    row[0, EXPECTED_INPUT_NAMES.index("seed_x")] = float(state.x)
-    row[0, EXPECTED_INPUT_NAMES.index("seed_y")] = float(state.y)
+    row[0, _IDX_CUR_COL] = 0.0
+    row[0, _IDX_CUR_PATCH] = 0.0
+    row[0, _IDX_INPUT_BACKWARD] = float(inputs.backward)
+    row[0, _IDX_INPUT_FORWARD] = float(inputs.forward)
+    row[0, _IDX_INPUT_STRAFE_LEFT] = float(inputs.strafe_left)
+    row[0, _IDX_INPUT_STRAFE_RIGHT] = float(inputs.strafe_right)
+    row[0, _IDX_INPUT_TURN_LEFT] = float(inputs.turn_left)
+    row[0, _IDX_INPUT_TURN_RIGHT] = float(inputs.turn_right)
+    row[0, _IDX_SEED_ANGLE] = float(state.angle)
+    row[0, _IDX_SEED_X] = float(state.x)
+    row[0, _IDX_SEED_Y] = float(state.y)
     return row
 
 
@@ -119,18 +131,23 @@ def step_frame_iter(
     inputs: PlayerInput,
     config: RenderConfig,
 ) -> Iterator[Tuple[int, int, np.ndarray]]:
-    """Run one game frame as a cached autoregressive rollout.
+    """Run one game frame as an autoregressive rollout with full feedback.
 
-    Calls ``module.step()`` once per (col, patch) position, threading
-    the KV cache across calls.  Step 0 receives the seed state + real
-    player inputs; subsequent steps pass a zero row for the player
-    inputs (the graph broadcasts the seed from step 0 via
-    ``get_prev_value``) plus the previous step's emitted
-    ``(col_idx, patch_idx_in_col)`` so the graph can compute the new
-    values via a local delta.  The graph emits ``col_idx`` and
-    ``patch_row_start`` as trailing scalars in each step's output, so
-    the host is a dumb stitcher: it just reads those indices and pastes
-    the patch without knowing the sharding layout.
+    The graph is fully position-independent: every step's input row
+    carries ``(cur_col_idx, cur_patch_idx_in_col, seed_{x,y,angle},
+    input_*)``, and every step's output row emits the patch's rendered
+    pixels plus ``(next_col_idx, next_patch_idx_in_col, new_x, new_y,
+    new_angle)`` — everything the next step needs to reconstruct its own
+    input row.  Step 0 carries real player inputs; the game-logic update
+    fires there for real, and its post-update state becomes the
+    ``seed_*`` values the host threads forward to all subsequent steps.
+    Steps ≥ 1 pass zero player inputs, so the graph's game-logic chain
+    degenerates to a passthrough and simply re-emits the carried state.
+
+    Because there is no cross-position attention in the graph, the host
+    pastes each patch at the *input-side* ``(cur_col, cur_patch * rp)``
+    — which it already knows, since it just wrote those values into the
+    input row.
 
     Yields:
         ``(col_idx, patch_row_start, patch_pixels)`` per position, where
@@ -155,40 +172,70 @@ def step_frame_iter(
     total_steps = W * shards_per_col
     pixel_width = rp * 3
 
+    # Output layout: [pixels..., next_col, next_patch, new_x, new_y, new_angle]
+    _OUT_NEXT_COL = pixel_width
+    _OUT_NEXT_PATCH = pixel_width + 1
+    _OUT_NEW_X = pixel_width + 2
+    _OUT_NEW_Y = pixel_width + 3
+    _OUT_NEW_ANGLE = pixel_width + 4
+
     past = module.empty_past()
 
-    # Step 0: real inputs + seed state. Populates the KV cache so
-    # subsequent zero-input decodes can attend back to the seed.  The
-    # prev_col / prev_patch slots are ignored at pos 0 (is_pos_0
-    # override forces the outputs to (0, 0)).
+    # Step 0: pass cur=(0, 0), real seed state, real player inputs.
+    _t0 = time.perf_counter()
     with torch.no_grad():
         out, past = module.step(_seed_row(state, inputs), past)
+    _dt_ms = (time.perf_counter() - _t0) * 1000
+    print(f"  module.step  step=0/{total_steps}  past_len=0  {_dt_ms:.1f}ms")
 
-    col_idx = int(round(out[0, pixel_width].item()))
-    patch_row_start = int(round(out[0, pixel_width + 1].item()))
-    patch_idx_in_col = patch_row_start // rp
-    new_x = out[0, pixel_width + 2].item()
-    new_y = out[0, pixel_width + 3].item()
-    new_angle_raw = out[0, pixel_width + 4].item()
+    # Paste at the step-0 input position (0, 0).
+    cur_col = 0
+    cur_patch = 0
     patch = out[0, :pixel_width].cpu().numpy().reshape(rp, 3)
-    yield col_idx, patch_row_start, patch
+    yield cur_col, cur_patch * rp, patch
 
-    for _ in range(1, total_steps):
+    # Read step-0's feedback scalars: they become the next step's input.
+    next_col = int(round(out[0, _OUT_NEXT_COL].item()))
+    next_patch = int(round(out[0, _OUT_NEXT_PATCH].item()))
+    carried_x = out[0, _OUT_NEW_X].item()
+    carried_y = out[0, _OUT_NEW_Y].item()
+    carried_angle_raw = out[0, _OUT_NEW_ANGLE].item()
+
+    for _step in range(1, total_steps):
+        cur_col = next_col
+        cur_patch = next_patch
         row = torch.zeros(1, N_INPUTS)
-        row[0, _IDX_PREV_COL] = float(col_idx)
-        row[0, _IDX_PREV_PATCH] = float(patch_idx_in_col)
+        row[0, _IDX_CUR_COL] = float(cur_col)
+        row[0, _IDX_CUR_PATCH] = float(cur_patch)
+        row[0, _IDX_SEED_X] = float(carried_x)
+        row[0, _IDX_SEED_Y] = float(carried_y)
+        row[0, _IDX_SEED_ANGLE] = float(carried_angle_raw)
+        # Player-input slots stay zero — the game-logic chain degenerates
+        # to a passthrough and re-emits the carried state.
+        _t0 = time.perf_counter()
         with torch.no_grad():
             out, past = module.step(row, past)
-        col_idx = int(round(out[0, pixel_width].item()))
-        patch_row_start = int(round(out[0, pixel_width + 1].item()))
-        patch_idx_in_col = patch_row_start // rp
+        _dt_ms = (time.perf_counter() - _t0) * 1000
+        print(
+            f"  module.step  step={_step}/{total_steps}  "
+            f"past_len={_step}  {_dt_ms:.1f}ms"
+        )
         patch = out[0, :pixel_width].cpu().numpy().reshape(rp, 3)
-        yield col_idx, patch_row_start, patch
+        yield cur_col, cur_patch * rp, patch
 
+        next_col = int(round(out[0, _OUT_NEXT_COL].item()))
+        next_patch = int(round(out[0, _OUT_NEXT_PATCH].item()))
+        carried_x = out[0, _OUT_NEW_X].item()
+        carried_y = out[0, _OUT_NEW_Y].item()
+        carried_angle_raw = out[0, _OUT_NEW_ANGLE].item()
+
+    # The post-update game state is whatever we carried forward from
+    # step 0 — it's been passing through the zero-input game-logic chain
+    # at every subsequent step unchanged.
     return GameState(
-        x=new_x,
-        y=new_y,
-        angle=round(new_angle_raw) % 256,
+        x=carried_x,
+        y=carried_y,
+        angle=round(carried_angle_raw) % 256,
         move_speed=state.move_speed,
         turn_speed=state.turn_speed,
     )
