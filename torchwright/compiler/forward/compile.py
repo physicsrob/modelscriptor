@@ -154,6 +154,17 @@ def forward_compile(
             f"{'Stream in':>10}  {'Stream out':>11}  {'Time':>10}"
         )
 
+    # Per-layer snapshots of ``residual_map._node_to_indices``, one per
+    # sublayer boundary.  Consumed by :mod:`torchwright.debug.probe` so
+    # it can look up where each graph node lives in the compiled
+    # residual stream at intermediate layers.  Each entry is
+    # ``(ResidualStreamState, {Node: List[int]})`` keyed by the sublayer
+    # whose post-skip tensor carries those values.  Only the
+    # post-MLP-sublayer state is captured per layer — attn+mlp are both
+    # scheduled inside a single ``schedule_layer`` call, so there is no
+    # clean observation point between them.
+    sublayer_snapshots: list = []
+
     # 3. Layer loop — seed with input node params (Embedding, etc.)
     total_params = sum(n.num_params() for n in input_nodes)
     total_layer_time = 0.0
@@ -208,6 +219,17 @@ def forward_compile(
                 flush=True,
             )
 
+        # Snapshot the live residual-column assignments at the end of
+        # this layer's MLP sublayer.  Copying the dict is deliberate:
+        # subsequent layers will mutate residual_map via reassign/free
+        # and we need the frozen "as of this state" view.
+        sublayer_snapshots.append(
+            (
+                layer.mlp.out_state,
+                {n: list(cols) for n, cols in residual_map._node_to_indices.items()},
+            )
+        )
+
         if on_layer_compiled is not None:
             on_layer_compiled(i, layer)
     else:
@@ -240,9 +262,20 @@ def forward_compile(
     # 4. Build ResidualAssignment bridge from saved input indices
     in_state = net.layers[0].attn.in_state
     out_state = net.layers[-1].mlp.out_state
-    ra = ResidualAssignment({in_state, out_state})
+    # Include the per-sublayer snapshots so the debug probe can look up
+    # where each graph node lives in the residual stream at any
+    # intermediate point.  The top-level in_state / out_state are still
+    # populated with input + output indices for the runtime's
+    # get_input_res_stream / compute paths.
+    all_states = {in_state, out_state}
+    for state, _ in sublayer_snapshots:
+        all_states.add(state)
+    ra = ResidualAssignment(all_states)
     for node, indices in input_indices.items():
         ra.assign(in_state, node, indices)
+    for state, snapshot in sublayer_snapshots:
+        for node, cols in snapshot.items():
+            ra.assign(state, node, list(cols))
     if isinstance(output_node, Concatenate):
         for leaf in flatten_concat_nodes([output_node]):
             ra.assign(out_state, leaf, residual_map.get_indices(leaf))
