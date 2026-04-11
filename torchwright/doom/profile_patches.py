@@ -44,11 +44,19 @@ from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig
 
 
-# Matches the per-layer verbose line from forward_compile:
+# Matches the per-layer verbose line from forward_compile.
+#
+# Example with dense layer (density >10%):
 #   "  0         30 ops     18,677,788/2,516,... (74.2%)  656/20480 ( 3%)  674/20480 ( 3%)  2270.8ms ..."
+# Example with sparse layer (density <10%):
+#   " 46          7 ops  1,835,520/33,560,576 ( 5.5%)    267/2048 (13%) ..."
+#
+# The density is printed as {:>4.1f}%, so densities <10.0% are prefixed
+# with a space — `( 5.5%)`, not `(5.5%)`. Easy to miss; cost us a round
+# of analysis before we caught it.
 _LAYER_LINE_RE = re.compile(
     r"^\s*(\d+)\s+(\d+)\s+ops\s+"
-    r"([\d,]+)/[\d,]+\s*\([\d.]+%\)\s+"
+    r"([\d,]+)/[\d,]+\s*\(\s*[\d.]+%\)\s+"
     r"(\d+)/\d+\s*\(\s*\d+%\)\s+"
     r"(\d+)/\d+\s*\(\s*\d+%\)\s+"
     r"([\d.]+)ms"
@@ -245,6 +253,18 @@ def _profile_one(
     if not layer_rows:
         raise RuntimeError(
             "Could not parse layer stats from forward_compile verbose output"
+        )
+    # Sanity: the parser must catch every layer line. A silent undercount
+    # here once cost us an entire round of wrong recommendations — density
+    # <10% prints as "( 5.5%)" (leading space), and the regex needs to
+    # allow that. If this assertion fires, fix the regex, don't just
+    # accept the shorter list.
+    if len(layer_rows) != n_layers:
+        sample = "\n".join(buf.getvalue().splitlines()[-5:])
+        raise RuntimeError(
+            f"Parser mismatch: forward_compile reported {n_layers} layers "
+            f"but regex matched only {len(layer_rows)}. Last 5 verbose "
+            f"lines:\n{sample}"
         )
     layer_params = sum(r[2] for r in layer_rows)
     peak_d = max(max(r[3], r[4]) for r in layer_rows)
