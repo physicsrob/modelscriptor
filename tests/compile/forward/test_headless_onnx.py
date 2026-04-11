@@ -290,7 +290,27 @@ def test_headless_onnx_sidecar_input_names_order():
 
         assert data["format"] == "torchwright.headless.v1"
         assert data["input_names"] == ["alpha", "middle", "zebra"]
+        assert data["cached"] is True
 
         session = onnxruntime.InferenceSession(onnx_path)
         inputs_info = {inp.name: inp for inp in session.get_inputs()}
         assert int(inputs_info["inputs"].shape[1]) == len(data["input_names"])
+
+
+# ---------------------------------------------------------------------------
+# Test 6: OnnxHeadlessModule refuses KV-cached models
+# ---------------------------------------------------------------------------
+
+
+def test_onnx_headless_loader_rejects_cached_model():
+    from torchwright.compiler.onnx_load import OnnxHeadlessModule
+
+    out_node, pos = _build_sample_graph()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = os.path.join(tmpdir, "cached.onnx")
+        compile_headless_to_onnx(
+            out_node, pos, onnx_path, d=D, d_head=D_HEAD, verbose=False
+        )
+
+        with pytest.raises(NotImplementedError, match="KV-cached"):
+            OnnxHeadlessModule(onnx_path)

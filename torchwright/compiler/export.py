@@ -160,6 +160,25 @@ def _meta_path_for(onnx_path: str) -> str:
     return base + ".meta.json"
 
 
+HEADLESS_META_FORMAT = "torchwright.headless.v1"
+
+
+def _write_headless_meta(
+    onnx_path: str, input_names: List[str], cached: bool
+) -> str:
+    meta_path = _meta_path_for(onnx_path)
+    with open(meta_path, "w") as f:
+        json.dump(
+            {
+                "format": HEADLESS_META_FORMAT,
+                "input_names": list(input_names),
+                "cached": cached,
+            },
+            f,
+        )
+    return meta_path
+
+
 def compile_to_onnx(
     output_node: Node,
     pos_encoding: PosEncoding,
@@ -242,8 +261,11 @@ def emit_headless_onnx(
     reclaim each layer's torch storage before the next layer runs.
 
     Writes two files:
-        ``<output_path>``                    — the ONNX model
-        ``<output_path>.input_names.json``   — ordered input column names
+        ``<output_path>``              — the ONNX model
+        ``<stem>.meta.json``           — ordered input column names + format tag
+
+    ``cached`` in the sidecar is ``false``: this path emits a plain
+    feed-forward graph (no KV cache inputs/outputs).
     """
     assert compiled.residual_assignment is not None
     d = compiled.d
@@ -478,9 +500,7 @@ def emit_headless_onnx(
     onnx.save_model(model, output_path)
     t_save = time.perf_counter() - t0
 
-    sidecar_path = output_path + ".input_names.json"
-    with open(sidecar_path, "w") as f:
-        json.dump({"input_names": input_names}, f)
+    sidecar_path = _write_headless_meta(output_path, input_names, cached=False)
 
     if verbose:
         print(
@@ -742,6 +762,13 @@ def compile_and_emit_onnx(
     one layer's dense size plus the cumulative sparse bytes — 5-10 GB for
     a 320x200 tex-64 game graph instead of the 50-100 GB that holding all
     layers dense would require.
+
+    Writes two files:
+        ``<output_path>``      — the ONNX model
+        ``<stem>.meta.json``   — ordered input column names + format tag
+
+    ``cached`` in the sidecar is ``false``: this path emits a plain
+    feed-forward graph (no KV cache inputs/outputs).
     """
     dense_inits: list = []
     sparse_inits: list = []
@@ -958,9 +985,7 @@ def compile_and_emit_onnx(
     onnx.save_model(model, output_path)
     t_save = time.perf_counter() - t0
 
-    sidecar_path = output_path + ".input_names.json"
-    with open(sidecar_path, "w") as f:
-        json.dump({"input_names": input_names}, f)
+    sidecar_path = _write_headless_meta(output_path, input_names, cached=False)
 
     if verbose:
         print(
@@ -1047,11 +1072,15 @@ def compile_headless_to_onnx(
     max_layers: int = 100,
     verbose: bool = True,
 ) -> None:
-    """Compile a graph with raw float I/O to ONNX + meta sidecar.
+    """Compile a graph with raw float I/O to a KV-cached ONNX model.
 
     Produces two files:
-        <output_path>          -- the ONNX model
-        <output_path>.meta.json -- input column names (alphabetical order)
+        ``<output_path>``      — the ONNX model (KV-cache prefill/decode protocol)
+        ``<stem>.meta.json``   — ordered input column names + format tag
+
+    The sidecar records ``cached: true``, distinguishing this output from
+    the feed-forward graphs produced by :func:`emit_headless_onnx` and
+    :func:`compile_and_emit_onnx`.
 
     The module being exported must be CPU-resident — pass ``device=None``
     paths through ``to_headless_module``. If you have a CUDA-resident
@@ -1094,15 +1123,9 @@ def compile_headless_to_onnx(
         print(f"Exporting ONNX: {n_layers} layers, {n_params:,} parameters")
     _export_headless_onnx_cached(module, output_path)
 
-    meta_path = _meta_path_for(output_path)
-    with open(meta_path, "w") as f:
-        json.dump(
-            {
-                "format": "torchwright.headless.v1",
-                "input_names": list(module.input_names),
-            },
-            f,
-        )
+    meta_path = _write_headless_meta(
+        output_path, module.input_names, cached=True
+    )
 
     if verbose:
         model_size = os.path.getsize(output_path)
