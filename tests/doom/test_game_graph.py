@@ -191,3 +191,49 @@ def test_compiled_multi_frame(box_game_module, box_segments, small_config, trig_
     assert state_compiled.x == pytest.approx(state_ref.x, abs=0.3)
     assert state_compiled.y == pytest.approx(state_ref.y, abs=0.3)
     assert state_compiled.angle == state_ref.angle
+
+
+# ── Patch equivalence: sharded output matches unsharded ───────────────
+
+
+def test_compiled_patch_equivalence(box_segments, small_config):
+    """Compile once unsharded and once with rows_per_patch=6 (divides H=12).
+
+    The dumb stitcher reassembles the patches using the col_idx /
+    patch_row_start scalars emitted by the graph, and the final frame
+    should match the unsharded render pixel-for-pixel (within a small
+    numeric tolerance).
+    """
+    state = GameState(x=0.0, y=0.0, angle=0, move_speed=0.3, turn_speed=4)
+    inputs = PlayerInput()
+
+    unsharded = compile_game(
+        box_segments, small_config,
+        max_coord=10.0, move_speed=0.3, turn_speed=4,
+        d=1024, d_head=16, verbose=False,
+    )
+    sharded = compile_game(
+        box_segments, small_config,
+        max_coord=10.0, move_speed=0.3, turn_speed=4,
+        d=1024, d_head=16, verbose=False,
+        rows_per_patch=6,
+    )
+
+    assert unsharded.metadata.get("rows_per_patch") == small_config.screen_height
+    assert sharded.metadata.get("rows_per_patch") == 6
+
+    frame_u, _ = step_frame_compiled(unsharded, state, inputs, small_config)
+    frame_s, _ = step_frame_compiled(sharded, state, inputs, small_config)
+
+    assert frame_u.shape == frame_s.shape
+    np.testing.assert_allclose(frame_s, frame_u, atol=0.01)
+
+
+def test_metadata_plumbing_in_memory(box_segments, small_config):
+    """compile_game stashes rows_per_patch in module metadata."""
+    m = compile_game(
+        box_segments, small_config,
+        max_coord=10.0, d=1024, d_head=16, verbose=False,
+        rows_per_patch=4,
+    )
+    assert m.metadata == {"rows_per_patch": 4}

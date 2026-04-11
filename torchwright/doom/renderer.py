@@ -550,30 +550,50 @@ def _column_fill(
     wall_bottom: Node,
     wall_color: Node,
     config: RenderConfig,
+    patch_row_start: Optional[Node] = None,
+    rows_per_patch: Optional[int] = None,
 ) -> Node:
-    """Fill a screen column with ceiling, wall, and floor colors.
+    """Fill a screen-column patch with ceiling, wall, and floor colors.
 
-    Uses vectorized in_range + broadcast_select to avoid per-row node
-    fan-out that deadlocks the compiler scheduler.
-
-    Two-pass approach:
-      1. Base layer: floor color where row >= wall_bottom, ceiling elsewhere.
-      2. Overlay: wall color in [wall_top, wall_bottom).
+    When unsharded (``patch_row_start=0``, ``rows_per_patch=H``) this
+    produces an entire column; with a smaller ``rows_per_patch`` it
+    produces just the ``rows_per_patch``-row slice starting at
+    ``patch_row_start``. Boundaries are shifted into patch-relative
+    coordinates via ``subtract``.
 
     Cost: 4 MLP sublayers (2 in_range + 2 broadcast_select).
     """
     H = config.screen_height
+    if rows_per_patch is None:
+        rows_per_patch = H
+    assert H % rows_per_patch == 0, (
+        f"screen_height {H} must be divisible by rows_per_patch {rows_per_patch}"
+    )
+    if patch_row_start is None:
+        patch_row_start = LiteralValue(torch.tensor([0.0]), name="patch_row_start_0")
+
     ceil_node = LiteralValue(torch.tensor(list(config.ceiling_color)), name="ceiling")
     floor_node = LiteralValue(torch.tensor(list(config.floor_color)), name="floor")
-    h_node = LiteralValue(torch.tensor([float(H)]), name="h_bound")
+
+    # Shift wall_top / wall_bottom into patch-relative coordinates.
+    wall_top_local = subtract(wall_top, patch_row_start)
+    wall_bottom_local = subtract(wall_bottom, patch_row_start)
+    # The effective "H" for the base-layer floor test is the row count
+    # remaining above the patch, i.e. H - patch_row_start.
+    h_local = Linear(
+        patch_row_start,
+        torch.tensor([[-1.0]]),
+        torch.tensor([float(H)]),
+        name="h_local_bound",
+    )
 
     # Step 1: Base column — floor below wall_bottom, ceiling above
-    floor_masks = in_range(wall_bottom, h_node, H)
-    base = broadcast_select(floor_masks, floor_node, ceil_node, H, 3)
+    floor_masks = in_range(wall_bottom_local, h_local, rows_per_patch)
+    base = broadcast_select(floor_masks, floor_node, ceil_node, rows_per_patch, 3)
 
     # Step 2: Overlay wall color in [wall_top, wall_bottom)
-    wall_masks = in_range(wall_top, wall_bottom, H)
-    return broadcast_select(wall_masks, wall_color, base, H, 3)
+    wall_masks = in_range(wall_top_local, wall_bottom_local, rows_per_patch)
+    return broadcast_select(wall_masks, wall_color, base, rows_per_patch, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +609,8 @@ def _textured_column_fill(
     tex_height: int,
     config: RenderConfig,
     sum_fanout: int = 4,
+    patch_row_start: Optional[Node] = None,
+    rows_per_patch: Optional[int] = None,
 ) -> Node:
     """Fill a screen column with textured wall and solid floor/ceiling.
 
@@ -621,52 +643,72 @@ def _textured_column_fill(
         Node of width H*3 (one RGB per screen row).
     """
     H = config.screen_height
+    if rows_per_patch is None:
+        rows_per_patch = H
+    assert H % rows_per_patch == 0, (
+        f"screen_height {H} must be divisible by rows_per_patch {rows_per_patch}"
+    )
+    if patch_row_start is None:
+        patch_row_start = LiteralValue(torch.tensor([0.0]), name="patch_row_start_0")
+
     ceil_node = LiteralValue(torch.tensor(list(config.ceiling_color)), name="ceiling")
     floor_node = LiteralValue(torch.tensor(list(config.floor_color)), name="floor")
-    h_node = LiteralValue(torch.tensor([float(H)]), name="h_bound")
+
+    wall_top_local = subtract(wall_top, patch_row_start)
+    wall_bottom_local = subtract(wall_bottom, patch_row_start)
+    h_local = Linear(
+        patch_row_start,
+        torch.tensor([[-1.0]]),
+        torch.tensor([float(H)]),
+        name="h_local_bound",
+    )
 
     # Base column: floor below wall_bottom, ceiling above
-    floor_masks = in_range(wall_bottom, h_node, H)
-    base = broadcast_select(floor_masks, floor_node, ceil_node, H, 3)
+    floor_masks = in_range(wall_bottom_local, h_local, rows_per_patch)
+    base = broadcast_select(
+        floor_masks, floor_node, ceil_node, rows_per_patch, 3,
+    )
 
-    # Band boundaries: boundary_k = wall_top + k * wall_height / tex_height
-    # Each is a Linear function of (wall_top, wall_height) -- free.
-    wt_wh = Concatenate([wall_top, wall_height])
-    zeros_H3 = LiteralValue(torch.zeros(H * 3), name="zeros_tex")
+    # Band boundaries: boundary_k = wall_top + k * wall_height / tex_height,
+    # shifted into patch-relative coordinates via a -1.0 coefficient on
+    # patch_row_start. Still free (Linear).
+    wt_wh_prs = Concatenate([wall_top, wall_height, patch_row_start])
+    zeros_patch = LiteralValue(
+        torch.zeros(rows_per_patch * 3), name="zeros_tex"
+    )
 
-    # Build all bands as independent graph nodes and hand the whole list
-    # to sum_nodes with a fanout cap.  The chained reduction inside
-    # sum_nodes + the scheduler's dead-node freeing keeps only
-    # ``sum_fanout`` bands + the running accumulator alive at any step;
-    # the rest are lazily computed as the reduction advances.
     band_fills: List[Node] = []
     for k in range(tex_height):
         lo_k = float(k) / tex_height
         hi_k = float(k + 1) / tex_height
         boundary_lo = Linear(
-            wt_wh,
-            torch.tensor([[1.0], [lo_k]]),
+            wt_wh_prs,
+            torch.tensor([[1.0], [lo_k], [-1.0]]),
             name=f"band_lo_{k}",
         )
         boundary_hi = Linear(
-            wt_wh,
-            torch.tensor([[1.0], [hi_k]]),
+            wt_wh_prs,
+            torch.tensor([[1.0], [hi_k], [-1.0]]),
             name=f"band_hi_{k}",
         )
-        band_mask = in_range(boundary_lo, boundary_hi, H)
+        band_mask = in_range(boundary_lo, boundary_hi, rows_per_patch)
 
         extract = torch.zeros(tex_height * 3, 3)
         for c in range(3):
             extract[k * 3 + c, c] = 1.0
         row_color = Linear(tex_column_colors, extract, name=f"tex_row_{k}")
 
-        band_fills.append(broadcast_select(band_mask, row_color, zeros_H3, H, 3))
+        band_fills.append(
+            broadcast_select(band_mask, row_color, zeros_patch, rows_per_patch, 3)
+        )
 
     textured_wall = sum_nodes(band_fills, max_fanout=sum_fanout)
 
     # Composite: wall region gets textured_wall, rest keeps base
-    wall_masks = in_range(wall_top, wall_bottom, H)
-    return broadcast_select(wall_masks, textured_wall, base, H, 3)
+    wall_masks = in_range(wall_top_local, wall_bottom_local, rows_per_patch)
+    return broadcast_select(
+        wall_masks, textured_wall, base, rows_per_patch, 3,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +725,8 @@ def build_textured_rendering_pipeline(
     config: RenderConfig,
     textures: List[np.ndarray],
     max_coord: float = 20.0,
+    patch_row_start: Optional[Node] = None,
+    rows_per_patch: Optional[int] = None,
 ) -> Node:
     """Build a textured rendering pipeline.
 
@@ -808,6 +852,8 @@ def build_textured_rendering_pipeline(
         tex_column_colors,
         tex_h,
         config,
+        patch_row_start=patch_row_start,
+        rows_per_patch=rows_per_patch,
     )
 
 
@@ -824,6 +870,8 @@ def build_rendering_pipeline(
     segments: List[Segment],
     config: RenderConfig,
     max_coord: float = 20.0,
+    patch_row_start: Optional[Node] = None,
+    rows_per_patch: Optional[int] = None,
 ) -> Node:
     """Build the rendering pipeline from graph nodes.
 
@@ -900,13 +948,22 @@ def build_rendering_pipeline(
     )
 
     # Stage 7: Column fill
-    return _column_fill(wall_top, wall_bottom, wall_color, config)
+    return _column_fill(
+        wall_top,
+        wall_bottom,
+        wall_color,
+        config,
+        patch_row_start=patch_row_start,
+        rows_per_patch=rows_per_patch,
+    )
 
 
 def build_renderer_graph(
     segments: List[Segment],
     config: RenderConfig,
     max_coord: float = 20.0,
+    patch_row_start: Optional[Node] = None,
+    rows_per_patch: Optional[int] = None,
 ) -> Tuple[Node, "PosEncoding"]:
     """Build the complete per-column rendering graph (Phase 2 standalone).
 
@@ -939,6 +996,8 @@ def build_renderer_graph(
         segments,
         config,
         max_coord,
+        patch_row_start=patch_row_start,
+        rows_per_patch=rows_per_patch,
     )
 
     return output, pos_encoding

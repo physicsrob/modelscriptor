@@ -7,7 +7,7 @@ All positions compute game logic redundantly (same inputs → same result),
 then each position renders its own screen column.
 """
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -278,6 +278,7 @@ def build_game_graph(
     move_speed: float = 0.3,
     turn_speed: int = 4,
     textures=None,
+    rows_per_patch: Optional[int] = None,
 ) -> Tuple[Node, "PosEncoding"]:
     """Build the complete game logic + rendering graph.
 
@@ -362,13 +363,31 @@ def build_game_graph(
     eff_seed_x = _extract(7, "eff_seed_x")
     eff_seed_y = _extract(8, "eff_seed_y")
 
-    # === Graph-derived per-column angle_offset and perp_cos ===
+    # === Graph-derived col_idx + patch_row_start ===
+    # Each position renders a single rows_per_patch-tall patch of a single
+    # screen column. Positions iterate raster-order: (col_idx, patch_idx)
+    # = divmod(position, shards_per_col).
+    W = config.screen_width
+    H = config.screen_height
+    fov = config.fov_columns
+    rp = rows_per_patch if rows_per_patch is not None else H
+    assert H % rp == 0, (
+        f"screen_height {H} must be divisible by rows_per_patch {rp}"
+    )
+    shards_per_col = H // rp
+    total_positions = W * shards_per_col
+
+    col_idx = thermometer_floor_div(
+        position_scalar, shards_per_col, max_value=total_positions,
+    )
+    patch_idx_in_col = mod_const(
+        position_scalar, shards_per_col, max_value=total_positions,
+    )
+    patch_row_start = multiply_const(patch_idx_in_col, float(rp))
+
     # Integer-exact: matches the host-side
     #     angle_offset = (col - W//2) * fov_columns // W
     # when (W//2)*fov_columns % W == 0 (satisfied by the test fixtures).
-    W = config.screen_width
-    fov = config.fov_columns
-    col_idx = thermometer_floor_div(position_scalar, 1, max_value=W)
     col_times_fov = multiply_const(col_idx, float(fov))
     ao_unsigned = thermometer_floor_div(
         col_times_fov, W, max_value=fov * W,
@@ -415,14 +434,27 @@ def build_game_graph(
         pixels = build_textured_rendering_pipeline(
             resolved_x, resolved_y, ray_angle, perp_cos,
             segments, config, textures, max_coord,
+            patch_row_start=patch_row_start,
+            rows_per_patch=rp,
         )
     else:
         pixels = build_rendering_pipeline(
             resolved_x, resolved_y, ray_angle, perp_cos,
             segments, config, max_coord,
+            patch_row_start=patch_row_start,
+            rows_per_patch=rp,
         )
 
-    # 6. Output: pixels + updated state
-    output = Concatenate([pixels, resolved_x, resolved_y, new_angle])
+    # 6. Output: pixels + self-identifying destination + updated state.
+    # col_idx and patch_row_start travel with the patch so the host is
+    # a dumb stitcher that just reads them and indexes the frame buffer.
+    output = Concatenate([
+        pixels,
+        col_idx,
+        patch_row_start,
+        resolved_x,
+        resolved_y,
+        new_angle,
+    ])
 
     return output, pos_encoding

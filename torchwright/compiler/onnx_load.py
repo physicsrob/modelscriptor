@@ -43,10 +43,11 @@ class HeadlessRuntime(Protocol):
     Lets callers type-hint "either :class:`CompiledHeadless` or
     :class:`OnnxHeadlessModule`" without importing both — a function
     that renders a frame or runs a decode step only needs to know that
-    it has ``input_names`` and the three callables below.
+    it has ``input_names``, ``metadata``, and the three callables below.
     """
 
     input_names: List[str]
+    metadata: dict
 
     def __call__(self, inputs: torch.Tensor) -> torch.Tensor: ...
 
@@ -89,6 +90,7 @@ class OnnxHeadlessModule:
                 f"expected {HEADLESS_META_FORMAT!r}"
             )
         self.input_names: List[str] = list(meta["input_names"])
+        self.metadata: dict = dict(meta.get("extra") or {})
 
         self._session = ort.InferenceSession(
             onnx_path,

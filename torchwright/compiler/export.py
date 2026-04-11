@@ -64,6 +64,27 @@ def _write_meta(onnx_path: str, meta: dict) -> str:
     return meta_path
 
 
+def _write_headless_meta(
+    onnx_path: str,
+    input_names: List[str],
+    extra: Optional[dict] = None,
+) -> str:
+    """Write the headless sidecar JSON, optionally with an ``extra`` dict.
+
+    ``extra`` is a free-form dict for per-export metadata (e.g. DOOM's
+    ``rows_per_patch`` — surfaced to the host via
+    :class:`OnnxHeadlessModule.metadata`). Kept totally general so the
+    compiler layer has no project-specific keys.
+    """
+    meta: dict = {
+        "format": HEADLESS_META_FORMAT,
+        "input_names": list(input_names),
+    }
+    if extra:
+        meta["extra"] = dict(extra)
+    return _write_meta(onnx_path, meta)
+
+
 # ---------------------------------------------------------------------------
 # Positional encoding buffer (numpy; no torch dependency at runtime)
 # ---------------------------------------------------------------------------
@@ -461,6 +482,7 @@ def compile_headless_to_onnx(
     max_seq_len: int = 512,
     max_layers: int = 200,
     verbose: bool = True,
+    extra_metadata: Optional[dict] = None,
 ) -> None:
     """Compile a float-I/O graph to a KV-cached ONNX model.
 
@@ -622,9 +644,10 @@ def compile_headless_to_onnx(
     onnx.save_model(model, output_path)
     t_save = time.perf_counter() - t0
 
-    meta_path = _write_meta(
+    meta_path = _write_headless_meta(
         output_path,
-        {"format": HEADLESS_META_FORMAT, "input_names": list(input_names)},
+        list(input_names),
+        extra=extra_metadata,
     )
 
     if verbose:
@@ -871,12 +894,14 @@ class CompiledHeadless:
         net,
         input_specs: List[tuple],
         output_indices: torch.Tensor,
+        metadata: Optional[dict] = None,
     ) -> None:
         self._net = net
         # input_specs: list of (name, start_col, width) in input-tensor column order.
         self._input_specs = list(input_specs)
         self._output_indices = output_indices
         self.input_names: List[str] = [name for name, _, _ in input_specs]
+        self.metadata: dict = dict(metadata or {})
 
         # KV cache shape metadata — discovered from the compiled transformer
         # so empty_past() can build zero-length tensors of the right shape.
@@ -954,6 +979,7 @@ def compile_headless(
     max_layers: int = 100,
     verbose: bool = True,
     device: str = "cpu",
+    extra_metadata: Optional[dict] = None,
 ) -> CompiledHeadless:
     """Compile a headless graph to an in-process callable.
 
@@ -997,4 +1023,6 @@ def compile_headless(
         dtype=torch.long,
     )
 
-    return CompiledHeadless(net, input_specs, output_indices)
+    return CompiledHeadless(
+        net, input_specs, output_indices, metadata=extra_metadata,
+    )

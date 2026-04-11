@@ -9,7 +9,7 @@ graph is unchanged between prefill and cached execution — causal
 attention makes the two modes mathematically identical.
 """
 
-from typing import Iterator, List, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -118,6 +118,7 @@ def compile_game(
     d_head: int = 16,
     device: str = "cpu",
     verbose: bool = True,
+    rows_per_patch: Optional[int] = None,
 ):
     """Compile the game + rendering graph to a HeadlessTransformerModule.
 
@@ -143,12 +144,15 @@ def compile_game(
     output_node, pos_encoding = build_game_graph(
         segments, config, max_coord, move_speed, turn_speed,
         textures=textures,
+        rows_per_patch=rows_per_patch,
     )
+    rp = rows_per_patch if rows_per_patch is not None else config.screen_height
     module = compile_headless(
         output_node, pos_encoding,
         d=d, d_head=d_head,
         max_layers=200,
         device=device, verbose=verbose,
+        extra_metadata={"rows_per_patch": rp},
     )
     module.eval()
     return module
@@ -187,54 +191,63 @@ def step_frame_iter(
     state: GameState,
     inputs: PlayerInput,
     config: RenderConfig,
-) -> Iterator[Tuple[int, np.ndarray]]:
+) -> Iterator[Tuple[int, int, np.ndarray]]:
     """Run one game frame as a cached autoregressive rollout.
 
-    Calls ``module.step()`` once per screen column, threading the KV
-    cache across calls.  Step 0 receives the seed state + real player
-    inputs; steps 1..W-1 pass a zero row and rely on phase α's
-    ``get_prev_value`` attention to retrieve the seed from the cache.
+    Calls ``module.step()`` once per (col, patch) position, threading
+    the KV cache across calls.  Step 0 receives the seed state + real
+    player inputs; subsequent steps pass a zero row and rely on phase
+    α's ``get_prev_value`` attention to retrieve the seed from the
+    cache.  The graph emits ``col_idx`` and ``patch_row_start`` as
+    trailing scalars in each step's output, so the host is a dumb
+    stitcher: it just reads those indices and pastes the patch.
 
     Yields:
-        ``(col_idx, col_pixels)`` per column, where ``col_pixels`` is an
-        ``(H, 3)`` ``float32`` RGB array.  Consumers can render columns
-        progressively as they arrive.
+        ``(col_idx, patch_row_start, patch_pixels)`` per position, where
+        ``patch_pixels`` is a ``(rows_per_patch, 3)`` ``float32`` RGB
+        array slicing a single screen column.
 
     Returns (via ``StopIteration.value``):
-        The updated ``GameState`` for the next frame.  All positions in
-        the rollout compute the same post-game-logic state because
-        steps 1..W-1 receive zero player inputs, so any column's state
-        slice would suffice — we read it from step 0.
+        The updated ``GameState`` for the next frame.
     """
     assert tuple(module.input_names) == EXPECTED_INPUT_NAMES, (
         f"Compiled module has stale input names {module.input_names}; "
-        f"expected {EXPECTED_INPUT_NAMES}. Recompile after the phase-α refactor."
+        f"expected {EXPECTED_INPUT_NAMES}."
     )
 
     W = config.screen_width
     H = config.screen_height
+    rp = int(module.metadata.get("rows_per_patch", H))
+    assert H % rp == 0, (
+        f"screen_height {H} must be divisible by rows_per_patch {rp}"
+    )
+    shards_per_col = H // rp
+    total_steps = W * shards_per_col
+    pixel_width = rp * 3
+
     past = module.empty_past()
 
-    # Step 0: real inputs + seed state.  Produces column 0 and populates
-    # the KV cache for subsequent steps to attend back into.
+    # Step 0: real inputs + seed state. Populates the KV cache so
+    # subsequent zero-input decodes can attend back to the seed.
     with torch.no_grad():
-        out0, past = module.step(_seed_row(state, inputs), past)
+        out, past = module.step(_seed_row(state, inputs), past)
 
-    col0 = out0[0, : H * 3].cpu().numpy().reshape(H, 3)
-    yield 0, col0
+    col_idx = int(round(out[0, pixel_width].item()))
+    patch_row_start = int(round(out[0, pixel_width + 1].item()))
+    new_x = out[0, pixel_width + 2].item()
+    new_y = out[0, pixel_width + 3].item()
+    new_angle_raw = out[0, pixel_width + 4].item()
+    patch = out[0, :pixel_width].cpu().numpy().reshape(rp, 3)
+    yield col_idx, patch_row_start, patch
 
-    new_x = out0[0, H * 3].item()
-    new_y = out0[0, H * 3 + 1].item()
-    new_angle_raw = out0[0, H * 3 + 2].item()
-
-    # Steps 1..W-1: zero-row decodes.  The graph's get_prev_value
-    # attention reads step 0's seed from the cache at every step, so
-    # game logic is effectively the identity on the cached state.
     zero_row = torch.zeros(1, 9)
-    for col in range(1, W):
+    for _ in range(1, total_steps):
         with torch.no_grad():
             out, past = module.step(zero_row, past)
-        yield col, out[0, : H * 3].cpu().numpy().reshape(H, 3)
+        col_idx = int(round(out[0, pixel_width].item()))
+        patch_row_start = int(round(out[0, pixel_width + 1].item()))
+        patch = out[0, :pixel_width].cpu().numpy().reshape(rp, 3)
+        yield col_idx, patch_row_start, patch
 
     return GameState(
         x=new_x,
@@ -253,20 +266,11 @@ def step_frame_compiled(
 ) -> Tuple[np.ndarray, GameState]:
     """Run one game frame via the cached-protocol generate loop.
 
-    Consumes :func:`step_frame_iter` to the end, assembling the per-column
-    yields into an ``(H, W, 3)`` frame and returning the new game state.
-
-    Args:
-        module: Compiled DOOM game module — any :class:`HeadlessRuntime`
-            (``CompiledHeadless`` or ``OnnxHeadlessModule``) with
-            ``.step()`` + ``.empty_past()``.
-        state: Current game state (seeded at step 0).
-        inputs: Player input flags for this frame.
-        config: Render configuration.
-
-    Returns:
-        ``(frame, new_state)`` where frame is ``(H, W, 3)`` float RGB
-        and ``new_state`` is the post-game-logic state.
+    Consumes :func:`step_frame_iter` to the end, assembling the
+    self-identifying patch yields into an ``(H, W, 3)`` frame and
+    returning the new game state. The host is a dumb stitcher: it
+    doesn't know anything about the iteration order or patch layout —
+    the graph tells it where each patch belongs.
     """
     W = config.screen_width
     H = config.screen_height
@@ -275,8 +279,9 @@ def step_frame_compiled(
     it = step_frame_iter(module, state, inputs, config)
     try:
         while True:
-            col_idx, col_pixels = next(it)
-            frame[:, col_idx, :] = col_pixels
+            col_idx, patch_row_start, patch_pixels = next(it)
+            rp = patch_pixels.shape[0]
+            frame[patch_row_start : patch_row_start + rp, col_idx, :] = patch_pixels
     except StopIteration as stop:
         new_state: GameState = stop.value
 

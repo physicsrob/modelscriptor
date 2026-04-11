@@ -36,6 +36,12 @@ def main():
     parser.add_argument("--height", type=int, default=80)
     parser.add_argument("--fov", type=int, default=32)
     parser.add_argument(
+        "--rows-per-patch", type=int, default=8,
+        help="Vertical patch height (game mode only). Must divide --height. "
+             "Default: 8 (the analysis-picked shipping target for full DOOM). "
+             "Pass --rows-per-patch <height> for the unsharded phase-α path.",
+    )
+    parser.add_argument(
         "--d", type=int, default=None,
         help="Residual stream width. Defaults: 512 (renderer), 1024 (game). "
              "Use a larger value (e.g. 4096 for game) for higher quality.",
@@ -91,8 +97,17 @@ def main():
             segments, config, max_coord,
             move_speed=0.3, turn_speed=4,
             textures=textures,
+            rows_per_patch=args.rows_per_patch,
         )
         max_layers = 200
+
+    rp = args.rows_per_patch if args.rows_per_patch is not None else config.screen_height
+    if args.mode == "game":
+        max_seq_len = config.screen_width * (config.screen_height // rp)
+        extra_metadata = {"rows_per_patch": rp}
+    else:
+        max_seq_len = config.screen_width
+        extra_metadata = None
 
     compile_headless_to_onnx(
         output_node=output_node,
@@ -100,9 +115,10 @@ def main():
         output_path=output_path,
         d=d,
         d_head=args.d_head,
-        max_seq_len=config.screen_width,
+        max_seq_len=max_seq_len,
         max_layers=max_layers,
         verbose=True,
+        extra_metadata=extra_metadata,
     )
 
 
