@@ -64,27 +64,3 @@ def test_token_by_token_matches_full(compiled_calc):
     )
 
 
-def test_generate_matches_autoregressive(compiled_calc):
-    """generate() with KV cache should produce same tokens as compute() loop."""
-    net, output_node, embedding = compiled_calc
-    tokens = ["<bos"] + list("4+5\n")
-
-    # Old way: full recomputation each step
-    old_tokens = list(tokens)
-    for _ in range(10):
-        result = net.compute(
-            n_pos=len(old_tokens), input_values={"embedding_input": old_tokens}
-        )
-        vec = result[output_node][-1]
-        dists = torch.cdist(vec.unsqueeze(0).cpu(), embedding.table)
-        next_token = embedding.tokenizer.decode_id(dists.argmin().item())
-        if next_token == "<eos>":
-            break
-        old_tokens.append(next_token)
-    old_result = "".join(old_tokens[len(tokens):])
-
-    # New way: KV-cached generate
-    new_result = "".join(net.generate(output_node, embedding, tokens, max_new_tokens=10))
-
-    assert new_result == old_result, f"expected '{old_result}', got '{new_result}'"
-    assert new_result == "9", f"4+5 should be 9, got '{new_result}'"

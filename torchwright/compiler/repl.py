@@ -113,9 +113,9 @@ def _load(onnx_path: str) -> _Model:
     """Load an ONNX model, its meta sidecar, and discover KV-cache shape metadata."""
     import onnxruntime  # type: ignore[import-untyped]
 
-    from torchwright.compiler.export import TOKEN_META_FORMAT, _meta_path_for
+    from torchwright.compiler.export import TOKEN_META_FORMAT, meta_path_for
 
-    meta_path = _meta_path_for(onnx_path)
+    meta_path = meta_path_for(onnx_path)
     with open(meta_path) as f:
         meta = json.load(f)
 

@@ -15,7 +15,7 @@ import torch
 
 from torchwright.compiler.export import (
     HEADLESS_META_FORMAT,
-    _meta_path_for,
+    meta_path_for,
     compile_headless_to_onnx,
 )
 from torchwright.compiler.forward.compile import forward_compile
@@ -95,6 +95,52 @@ def test_headless_onnx_prefill_matches_compute():
 # ---------------------------------------------------------------------------
 # Test 2: Decode step matches full prefill (dynamic-mask seam)
 # ---------------------------------------------------------------------------
+
+
+def test_headless_onnx_chunked_decode_matches_full_prefill():
+    """Prefill 2 rows, then decode a 3-row chunk.  Exercises the dynamic
+    mask at past_len>0 and n_new>1, a combination the single-row decode
+    test does not cover.
+    """
+    out, pos = _build_sample_graph()
+    a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0], [4.0]])
+    b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0], [2.0]])
+    inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = _export(out, pos, tmpdir)
+        session = onnxruntime.InferenceSession(onnx_path)
+        n_layers, n_heads, d_head = _discover_meta(session)
+        out_names = ["outputs"]
+        for i in range(n_layers):
+            out_names += [f"new_K_{i}", f"new_V_{i}"]
+
+        # Full prefill (ground truth)
+        feeds = {"inputs": inputs_np}
+        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        full_outputs = session.run(["outputs"], feeds)[0]
+
+        # Prefill 2 rows
+        feeds = {"inputs": inputs_np[:2]}
+        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        results = session.run(out_names, feeds)
+        past_K = [results[1 + 2 * i] for i in range(n_layers)]
+        past_V = [results[1 + 2 * i + 1] for i in range(n_layers)]
+
+        # Decode a chunk of 3 rows (past_len=2, n_new=3)
+        feeds = {
+            "inputs": inputs_np[2:5],
+            "past_len": np.array(2, dtype=np.int64),
+        }
+        for i in range(n_layers):
+            feeds[f"past_K_{i}"] = past_K[i]
+            feeds[f"past_V_{i}"] = past_V[i]
+        chunk_out = session.run(["outputs"], feeds)[0]
+
+    assert np.allclose(full_outputs[2:5], chunk_out, atol=1e-3), (
+        f"chunked decode diff: "
+        f"{np.abs(full_outputs[2:5] - chunk_out).max():.6f}"
+    )
 
 
 def test_headless_onnx_decode_step_matches_full_prefill():
@@ -205,7 +251,7 @@ def test_headless_onnx_sidecar_schema():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
-        meta_path = _meta_path_for(onnx_path)
+        meta_path = meta_path_for(onnx_path)
         with open(meta_path) as f:
             data = json.load(f)
 

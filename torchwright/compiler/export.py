@@ -29,7 +29,6 @@ big graphs (e.g. the DOOM renderer) fit in realistic RAM.
 """
 
 import json
-import math
 import os
 import time
 from typing import Callable, List, Optional
@@ -53,13 +52,13 @@ TOKEN_META_FORMAT = "torchwright.token.v1"
 # ---------------------------------------------------------------------------
 
 
-def _meta_path_for(onnx_path: str) -> str:
+def meta_path_for(onnx_path: str) -> str:
     base, _ = os.path.splitext(onnx_path)
     return base + ".meta.json"
 
 
 def _write_meta(onnx_path: str, meta: dict) -> str:
-    meta_path = _meta_path_for(onnx_path)
+    meta_path = meta_path_for(onnx_path)
     with open(meta_path, "w") as f:
         json.dump(meta, f)
     return meta_path
@@ -71,14 +70,17 @@ def _write_meta(onnx_path: str, meta: dict) -> str:
 
 
 def _compute_pos_encoding(d_pos: int, max_seq_len: int) -> np.ndarray:
-    pe = np.zeros((max_seq_len, d_pos), dtype=np.float32)
-    div_term = np.exp(
-        np.arange(0, d_pos, 2, dtype=np.float32) * -(math.log(10000.0) / d_pos)
+    """Precomputed pos encoding buffer for the ONNX ``pos_encoding_full``
+    initializer.  Delegates to :meth:`PosEncoding.get_pos_encoding` so
+    the ONNX graph and ``HeadlessTransformer.compute`` share one source
+    of truth — any drift would silently break reference parity.
+    """
+    return (
+        PosEncoding(d_pos)
+        .get_pos_encoding(max_seq_len)
+        .numpy()
+        .astype(np.float32, copy=False)
     )
-    positions = np.arange(max_seq_len, dtype=np.float32)
-    pe[:, 0::2] = np.sin(positions[:, None] * div_term[None, :])
-    pe[:, 1::2] = np.cos(positions[:, None] * div_term[None, :])
-    return pe
 
 
 # ---------------------------------------------------------------------------
@@ -198,15 +200,6 @@ def _add_scalar_inits(dense_inits: list) -> None:
             data_type=TensorProto.INT64,
             dims=[],
             vals=np.array(1, dtype=np.int64).tobytes(),
-            raw=True,
-        )
-    )
-    dense_inits.append(
-        helper.make_tensor(
-            name="_f32_zero_s",
-            data_type=TensorProto.FLOAT,
-            dims=[],
-            vals=np.array(0.0, dtype=np.float32).tobytes(),
             raw=True,
         )
     )

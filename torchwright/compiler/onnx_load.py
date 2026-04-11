@@ -2,7 +2,10 @@
 
 Provides ``OnnxHeadlessModule`` — an ``onnxruntime``-backed callable
 that speaks the KV-cache prefill/decode protocol produced by
-:func:`torchwright.compiler.export.compile_headless_to_onnx`.
+:func:`torchwright.compiler.export.compile_headless_to_onnx` — plus a
+:class:`HeadlessRuntime` :class:`typing.Protocol` that describes the
+shared interface with the in-memory
+:class:`torchwright.compiler.export.CompiledHeadless`.
 
 Two usage shapes:
 
@@ -19,15 +22,41 @@ Two usage shapes:
 
 import json
 import os
-from typing import List, Tuple
+from typing import List, Protocol, Tuple
 
 import numpy as np
 import torch
 
-from torchwright.compiler.export import HEADLESS_META_FORMAT, _meta_path_for
+from torchwright.compiler.export import HEADLESS_META_FORMAT, meta_path_for
 
 
-PastKV = Tuple[Tuple[np.ndarray, ...], ...]
+# Past state is a pair (past_K_tuple, past_V_tuple) where each inner
+# tuple has one torch.Tensor of shape (n_heads, n_past, d_head) per
+# layer.  Both CompiledHeadless and OnnxHeadlessModule use this exact
+# representation so past tensors can be threaded between runtimes.
+PastKV = Tuple[Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]]
+
+
+class HeadlessRuntime(Protocol):
+    """Structural type for any headless runtime (in-memory or ONNX).
+
+    Lets callers type-hint "either :class:`CompiledHeadless` or
+    :class:`OnnxHeadlessModule`" without importing both — a function
+    that renders a frame or runs a decode step only needs to know that
+    it has ``input_names`` and the three callables below.
+    """
+
+    input_names: List[str]
+
+    def __call__(self, inputs: torch.Tensor) -> torch.Tensor: ...
+
+    def step(
+        self, inputs: torch.Tensor, past: PastKV
+    ) -> Tuple[torch.Tensor, PastKV]: ...
+
+    def empty_past(self) -> PastKV: ...
+
+    def eval(self) -> "HeadlessRuntime": ...
 
 
 class OnnxHeadlessModule:
@@ -44,7 +73,7 @@ class OnnxHeadlessModule:
     def __init__(self, onnx_path: str, providers=None) -> None:
         import onnxruntime as ort
 
-        meta_path = _meta_path_for(onnx_path)
+        meta_path = meta_path_for(onnx_path)
         if not os.path.exists(meta_path):
             raise FileNotFoundError(
                 f"Missing sidecar {meta_path}. Re-export with "
@@ -88,11 +117,9 @@ class OnnxHeadlessModule:
 
     def empty_past(self) -> PastKV:
         """Zero-length past tensors suitable for a first prefill call."""
-        zeros = np.zeros(
-            (self._n_heads, 0, self._d_head), dtype=np.float32
-        )
-        past_K = tuple(zeros.copy() for _ in range(self._n_layers))
-        past_V = tuple(zeros.copy() for _ in range(self._n_layers))
+        zeros = torch.zeros(self._n_heads, 0, self._d_head)
+        past_K = tuple(zeros.clone() for _ in range(self._n_layers))
+        past_V = tuple(zeros.clone() for _ in range(self._n_layers))
         return (past_K, past_V)
 
     def step(
@@ -102,13 +129,15 @@ class OnnxHeadlessModule:
 
         Args:
             inputs: ``(n_new, d_input)`` float tensor.
-            past: ``(past_K_list, past_V_list)`` as returned by a prior
-                call or by :meth:`empty_past`.
+            past: ``(past_K_tuple, past_V_tuple)`` from a prior step or
+                :meth:`empty_past`.  Each tuple has length ``n_layers``
+                and each entry is a ``(n_heads, n_past, d_head)`` torch
+                tensor.
 
         Returns:
-            Tuple of ``(outputs, new_past)``.  ``outputs`` is a
-            ``(n_new, d_output)`` torch tensor. ``new_past`` carries
-            the accumulated K/V across all layers.
+            ``(outputs, new_past)`` where ``outputs`` is a
+            ``(n_new, d_output)`` torch tensor and ``new_past`` matches
+            the shape of ``past`` with the new rows appended.
         """
         past_K, past_V = past
         assert len(past_K) == self._n_layers
@@ -122,19 +151,25 @@ class OnnxHeadlessModule:
             "past_len": np.array(past_len, dtype=np.int64),
         }
         for i in range(self._n_layers):
-            feeds[f"past_K_{i}"] = past_K[i]
-            feeds[f"past_V_{i}"] = past_V[i]
+            feeds[f"past_K_{i}"] = (
+                past_K[i].detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+            feeds[f"past_V_{i}"] = (
+                past_V[i].detach().cpu().numpy().astype(np.float32, copy=False)
+            )
 
         results = self._session.run(self._out_names, feeds)
         outputs = torch.from_numpy(results[0])
 
-        new_K: list = []
-        new_V: list = []
-        for i in range(self._n_layers):
-            new_K.append(results[1 + 2 * i])
-            new_V.append(results[1 + 2 * i + 1])
+        new_K = tuple(
+            torch.from_numpy(results[1 + 2 * i]) for i in range(self._n_layers)
+        )
+        new_V = tuple(
+            torch.from_numpy(results[1 + 2 * i + 1])
+            for i in range(self._n_layers)
+        )
 
-        return outputs, (tuple(new_K), tuple(new_V))
+        return outputs, (new_K, new_V)
 
     def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
         """Convenience: stateless prefill that discards the cache.
