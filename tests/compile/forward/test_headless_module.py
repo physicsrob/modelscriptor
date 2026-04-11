@@ -249,7 +249,7 @@ def test_emit_headless_onnx_matches_headless_module(tmp_path):
     onnx_path = str(tmp_path / "model.onnx")
     emit_headless_onnx(net_for_onnx, out, onnx_path, max_seq_len=32, verbose=False)
 
-    assert (tmp_path / "model.onnx.input_names.json").exists()
+    assert (tmp_path / "model.meta.json").exists()
 
     session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
     input_name = session.get_inputs()[0].name
