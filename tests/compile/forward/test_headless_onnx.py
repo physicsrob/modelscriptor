@@ -214,3 +214,56 @@ def test_headless_onnx_sidecar_schema():
     # The sidecar should not carry any "cached" discriminator — there's
     # only one protocol now.
     assert "cached" not in data
+
+
+# ---------------------------------------------------------------------------
+# Test 6: CompiledHeadless.step (in-memory cached path)
+# ---------------------------------------------------------------------------
+
+
+def test_compiled_headless_step_matches_call():
+    """step(inputs, empty_past) on a full sequence == module(inputs)."""
+    from torchwright.compiler.export import compile_headless
+
+    out, pos = _build_sample_graph()
+    module = compile_headless(out, pos, d=D, d_head=D_HEAD, verbose=False)
+
+    a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0], [4.0]])
+    b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0], [2.0]])
+    inputs = torch.cat([a_vals, b_vals], dim=1)
+
+    with torch.no_grad():
+        full = module(inputs)
+        step_out, _ = module.step(inputs, module.empty_past())
+
+    assert torch.allclose(full, step_out, atol=1e-4), (
+        f"step diff: {(full - step_out).abs().max().item():.6f}"
+    )
+
+
+def test_compiled_headless_step_prefill_decode_matches_full():
+    """Prefill 4 + decode 1 matches a single full-sequence forward."""
+    from torchwright.compiler.export import compile_headless
+
+    out, pos = _build_sample_graph()
+    module = compile_headless(out, pos, d=D, d_head=D_HEAD, verbose=False)
+
+    a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0], [4.0]])
+    b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0], [2.0]])
+    inputs = torch.cat([a_vals, b_vals], dim=1)
+
+    with torch.no_grad():
+        full = module(inputs)
+        past = module.empty_past()
+        prefill_out, past = module.step(inputs[:4], past)
+        decode_out, past = module.step(inputs[4:5], past)
+
+    assert torch.allclose(full[:4], prefill_out, atol=1e-4), (
+        f"prefill diff: {(full[:4] - prefill_out).abs().max().item():.6f}"
+    )
+    assert torch.allclose(full[4], decode_out[0], atol=1e-4), (
+        f"decode diff: {(full[4] - decode_out[0]).abs().max().item():.6f}"
+    )
+    # past_K should have grown to n_total = 5
+    past_K, _ = past
+    assert past_K[0].shape[1] == 5

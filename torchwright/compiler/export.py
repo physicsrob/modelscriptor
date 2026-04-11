@@ -859,12 +859,18 @@ def compile_to_onnx(
 
 
 class CompiledHeadless:
-    """Callable wrapper around :meth:`HeadlessTransformer.forward`.
+    """Callable wrapper around :class:`HeadlessTransformer`.
 
-    Exposes the same ``module(inputs) -> outputs`` shape as
-    :class:`torchwright.compiler.onnx_load.OnnxHeadlessModule`, so both
-    paths are drop-in interchangeable for callers that only need
-    independent per-query inference.
+    Exposes the same three-method surface as
+    :class:`torchwright.compiler.onnx_load.OnnxHeadlessModule`:
+
+    - ``module(inputs)``: stateless per-query inference — runs the
+      non-cached ``forward()`` path and returns outputs.
+    - ``module.step(inputs, past)``: autoregressive step — runs
+      ``forward_cached()`` with the given past and returns
+      ``(outputs, new_past)``.
+    - ``module.empty_past()``: zero-length KV cache tuple suitable as
+      the initial state for a decode sequence.
     """
 
     def __init__(
@@ -879,17 +885,69 @@ class CompiledHeadless:
         self._output_indices = output_indices
         self.input_names: List[str] = [name for name, _, _ in input_specs]
 
-    def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
-        n_pos = inputs.shape[0]
+        # KV cache shape metadata — discovered from the compiled transformer
+        # so empty_past() can build zero-length tensors of the right shape.
+        first_attn = net.layers[0].attn.attn
+        self._n_heads = first_attn.n_heads
+        self._d_head = first_attn.d_head
+        self._n_layers = len(net.layers)
+
+    def _build_res_stream(
+        self, inputs: torch.Tensor, past_len: int
+    ) -> torch.Tensor:
+        n_new = inputs.shape[0]
         input_values = {
             name: inputs[:, start : start + width]
             for name, start, width in self._input_specs
         }
-        res_stream = self._net.get_input_res_stream(n_pos, input_values).to(
-            self._net.device
-        )
+        return self._net.get_input_res_stream(
+            n_new, input_values, past_len=past_len
+        ).to(self._net.device)
+
+    def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Stateless per-query inference — uses the non-cached ``forward()``."""
+        res_stream = self._build_res_stream(inputs, past_len=0)
         res = self._net.forward(res_stream)
         return res[:, self._output_indices]
+
+    def empty_past(
+        self,
+    ) -> tuple:
+        """Zero-length past tensors suitable for a first prefill call."""
+        zeros = torch.zeros(self._n_heads, 0, self._d_head)
+        past_K = tuple(zeros.clone() for _ in range(self._n_layers))
+        past_V = tuple(zeros.clone() for _ in range(self._n_layers))
+        return (past_K, past_V)
+
+    def step(
+        self, inputs: torch.Tensor, past: tuple
+    ) -> tuple:
+        """Cached forward step.
+
+        Args:
+            inputs: ``(n_new, d_input)`` float tensor for the new rows.
+            past: ``(past_K_tuple, past_V_tuple)`` from a prior step or
+                :meth:`empty_past`.  Each tuple has length ``n_layers``
+                and each entry is ``(n_heads, n_past, d_head)``.
+
+        Returns:
+            ``(outputs, new_past)`` where ``outputs`` is
+            ``(n_new, d_output)`` and ``new_past`` has the same shape
+            as ``past`` but with the new rows appended.
+        """
+        past_K, past_V = past
+        assert len(past_K) == self._n_layers
+        assert len(past_V) == self._n_layers
+        past_len = int(past_K[0].shape[1])
+
+        res_stream = self._build_res_stream(inputs, past_len=past_len)
+        past_kvs = [(past_K[i], past_V[i]) for i in range(self._n_layers)]
+        res, new_kvs = self._net.forward_cached(res_stream, past_kvs=past_kvs)
+
+        new_K = tuple(kv[0] for kv in new_kvs)
+        new_V = tuple(kv[1] for kv in new_kvs)
+        outputs = res[:, self._output_indices]
+        return outputs, (new_K, new_V)
 
     def eval(self) -> "CompiledHeadless":
         return self
