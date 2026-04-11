@@ -30,6 +30,7 @@ def compile_renderer(
     d_head: int = 16,
     device: str = "cpu",
     verbose: bool = True,
+    d_hidden: Optional[int] = None,
 ):
     """Compile a flat-shaded renderer to a HeadlessTransformerModule.
 
@@ -41,6 +42,7 @@ def compile_renderer(
         d_head: Attention head dimension.
         device: Target device.
         verbose: Print compilation stats.
+        d_hidden: Per-layer MLP hidden width; defaults to ``d``.
 
     Returns:
         HeadlessTransformerModule ready for inference.
@@ -50,6 +52,7 @@ def compile_renderer(
         output_node, pos_encoding,
         d=d, d_head=d_head,
         device=device, verbose=verbose,
+        d_hidden=d_hidden,
     )
     module.eval()
     return module
@@ -119,6 +122,7 @@ def compile_game(
     device: str = "cpu",
     verbose: bool = True,
     rows_per_patch: Optional[int] = None,
+    d_hidden: Optional[int] = None,
 ):
     """Compile the game + rendering graph to a HeadlessTransformerModule.
 
@@ -135,6 +139,7 @@ def compile_game(
         d_head: Attention head dimension.
         device: Target device.
         verbose: Print compilation stats.
+        d_hidden: Per-layer MLP hidden width; defaults to ``d``.
 
     Returns:
         HeadlessTransformerModule ready for inference.
@@ -153,6 +158,7 @@ def compile_game(
         max_layers=200,
         device=device, verbose=verbose,
         extra_metadata={"rows_per_patch": rp},
+        d_hidden=d_hidden,
     )
     module.eval()
     return module

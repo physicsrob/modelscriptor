@@ -25,6 +25,7 @@ class HeadlessTransformer:
 
     layers: List[TransformerLayer]
     d: int
+    d_hidden: int
     d_head: int
     pos_encoding: Optional[PosEncoding]
     residual_assignment: Optional[ResidualAssignment]
@@ -34,8 +35,10 @@ class HeadlessTransformer:
         d: int,
         d_head: int,
         pos_encoding: Optional[PosEncoding] = None,
+        d_hidden: Optional[int] = None,
     ):
         self.d = d
+        self.d_hidden = d if d_hidden is None else d_hidden
         self.d_head = d_head
         self.pos_encoding = pos_encoding
         self.layers = []
@@ -53,7 +56,9 @@ class HeadlessTransformer:
         return self
 
     def add_layer(self, append: bool = False) -> TransformerLayer:
-        layer = TransformerLayer(self.d, self.d_head, self.pos_encoding)
+        layer = TransformerLayer(
+            self.d, self.d_head, self.pos_encoding, d_hidden=self.d_hidden
+        )
         if append:
             self.layers.append(layer)
         else:
