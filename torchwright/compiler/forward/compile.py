@@ -30,12 +30,18 @@ from torchwright.graph.relu import ReLU
 
 
 def _count_layer_params(
-    attn_ops: list[AttnHeadOp], mlp_ops: list[MLPOp], d: int, d_head: int
+    attn_ops: list[AttnHeadOp],
+    mlp_ops: list[MLPOp],
+    d: int,
+    d_head: int,
 ) -> int:
     """Count transformer parameters used by one layer's ops.
 
     Attention ops consume whole heads (4 * d * d_head params each).
     MLP ops consume slots (2*d + 2 params each) or bias entries (1 each).
+    The per-slot cost is independent of ``d_hidden`` — each occupied
+    hidden slot still costs one column in linear1 plus one row in linear2
+    plus two biases.
     """
     params_per_head = 4 * d * d_head
 
@@ -72,6 +78,7 @@ def forward_compile(
     max_layers: int = 100,
     device: Optional[str] = "auto",
     on_layer_compiled: Optional[Callable[[int, TransformerLayer], None]] = None,
+    d_hidden: Optional[int] = None,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -84,6 +91,9 @@ def forward_compile(
         max_layers: Safety limit on number of layers.
         device: Target device — "auto" (default) uses GPU if available,
                 "cpu"/"cuda" to force, or None to skip moving.
+        d_hidden: MLP hidden width per layer (the per-layer pool of
+            ``L1->ReLU->L2`` neurons).  Independent of ``d``; defaults
+            to ``d`` for backwards compatibility.
         on_layer_compiled: Optional streaming hook, called with
             ``(layer_index, layer)`` after each layer's weights are fully
             written.  The callback may extract weight tensors and then
@@ -105,14 +115,17 @@ def forward_compile(
     if pos_encoding is None:
         pos_encoding = PosEncoding(d_pos=d_head)
 
+    if d_hidden is None:
+        d_hidden = d
+
     # 2. Initialize
-    net = HeadlessTransformer(d, d_head, pos_encoding)
+    net = HeadlessTransformer(d, d_head, pos_encoding, d_hidden=d_hidden)
     residual_map = ResidualStreamMap(d)
     residual_map.allocate(pos_encoding)
     for node in input_nodes:
         residual_map.allocate(node)
     computed = set(input_nodes)
-    scheduler = LayerScheduler(graph, d, d_head, pos_encoding)
+    scheduler = LayerScheduler(graph, d, d_head, pos_encoding, d_hidden=d_hidden)
 
     # Save input indices before scheduling (scheduling may free/reassign them)
     input_indices: dict[Node, list[int]] = {
@@ -126,8 +139,10 @@ def forward_compile(
     # Per-layer tensor capacity (Q/K/V/O attention matrices + linear1/linear2
     # weights & biases).  Computed once instead of via `layer.num_params()` so
     # the verbose log still works after `on_layer_compiled` nulls the layer's
-    # weight attributes.
-    layer_capacity = 6 * d * d + 2 * d
+    # weight attributes.  Decomposes as 4*d*d (attention QKVO) +
+    # 2*d*d_hidden (rectangular MLP matrices) + d_hidden (linear1 bias) +
+    # d (linear2 bias).
+    layer_capacity = 4 * d * d + 2 * d * d_hidden + d_hidden + d
 
     if verbose:
         print(
@@ -201,8 +216,8 @@ def forward_compile(
             f"{len(graph.get_all_nodes() - computed)} nodes remaining."
         )
 
-    # layer_capacity is constant per layer (6*d*d + 2*d); avoids touching
-    # layer tensors, which may have been freed by on_layer_compiled.
+    # layer_capacity is constant per layer; avoids touching layer tensors,
+    # which may have been freed by on_layer_compiled.
     transformer_params = layer_capacity * len(net.layers)
     if verbose:
         pct_used = 100 * total_params / transformer_params if transformer_params else 0

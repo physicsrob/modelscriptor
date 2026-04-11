@@ -14,9 +14,10 @@ class TransformerLayer:
         d: int,
         d_head: int,
         pos_encoding: Optional[PosEncoding] = None,
+        d_hidden: Optional[int] = None,
     ):
         self.attn = AttnSubLayer(d, d_head, pos_encoding)
-        self.mlp = MLPSubLayer(d)
+        self.mlp = MLPSubLayer(d, d_hidden)
 
     def to(self, device):
         self.attn.to(device)

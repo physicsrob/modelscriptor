@@ -461,6 +461,7 @@ def compile_headless_to_onnx(
     max_seq_len: int = 512,
     max_layers: int = 200,
     verbose: bool = True,
+    d_hidden: Optional[int] = None,
 ) -> None:
     """Compile a float-I/O graph to a KV-cached ONNX model.
 
@@ -477,6 +478,10 @@ def compile_headless_to_onnx(
 
     Prefill = empty past tensors + past_len=0.  Decode = feed back the
     new_K_i / new_V_i from a previous run and set past_len accordingly.
+
+    ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
+    when omitted; pass an explicit value to decouple the MLP intermediate
+    width from the residual stream width.
     """
     dense_inits: list = []
     sparse_inits: list = []
@@ -494,6 +499,7 @@ def compile_headless_to_onnx(
         max_layers=max_layers,
         device=None,
         on_layer_compiled=on_layer_compiled,
+        d_hidden=d_hidden,
     )
     t_compile = time.perf_counter() - t0
 
@@ -954,6 +960,7 @@ def compile_headless(
     max_layers: int = 100,
     verbose: bool = True,
     device: str = "cpu",
+    d_hidden: Optional[int] = None,
 ) -> CompiledHeadless:
     """Compile a headless graph to an in-process callable.
 
@@ -962,6 +969,10 @@ def compile_headless(
     ``module(inputs) -> outputs`` interface.  For production use (saved
     artifact, autoregressive decode, fast startup), use
     :func:`compile_headless_to_onnx` instead.
+
+    ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
+    when omitted; pass an explicit value to decouple the MLP intermediate
+    width from the residual stream width.
     """
     net = forward_compile(
         d=d,
@@ -971,6 +982,7 @@ def compile_headless(
         verbose=verbose,
         max_layers=max_layers,
         device=device,
+        d_hidden=d_hidden,
     )
 
     assert net.residual_assignment is not None
