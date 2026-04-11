@@ -427,11 +427,30 @@ def test_parameters_are_registered():
 # Test 11: ONNX export and inference roundtrip
 # ---------------------------------------------------------------------------
 
-onnxruntime = pytest.importorskip("onnxruntime")
+def _empty_past_feeds(n_layers: int, n_heads: int, d_head: int) -> dict:
+    import numpy as np
+
+    feeds = {"past_len": np.array(0, dtype=np.int64)}
+    for i in range(n_layers):
+        feeds[f"past_K_{i}"] = np.zeros((n_heads, 0, d_head), dtype=np.float32)
+        feeds[f"past_V_{i}"] = np.zeros((n_heads, 0, d_head), dtype=np.float32)
+    return feeds
+
+
+def _discover_meta(session):
+    inputs = {inp.name: inp for inp in session.get_inputs()}
+    n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
+    shape0 = inputs["past_K_0"].shape
+    return n_layers, int(shape0[0]), int(shape0[2])
 
 
 def test_onnx_export_and_inference():
-    """Export to ONNX via compile_to_onnx, load with onnxruntime, verify output matches PyTorch."""
+    """Export to ONNX via compile_to_onnx, load with onnxruntime, verify output matches PyTorch.
+
+    Feeds the cached protocol (empty past, past_len=0) which should be
+    mathematically equivalent to the non-cached full-sequence forward.
+    """
+    onnxruntime = pytest.importorskip("onnxruntime")
     from torchwright.compiler.export import compile_to_onnx
 
     output_node, pos_encoding, embedding = _build_1digit()
@@ -480,7 +499,10 @@ def test_onnx_export_and_inference():
             pt_logits = module(token_ids).cpu().numpy()
 
         session = onnxruntime.InferenceSession(onnx_path)
-        onnx_logits = session.run(None, {"token_ids": token_ids.cpu().numpy()})[0]
+        n_layers, n_heads, d_head = _discover_meta(session)
+        feeds = {"token_ids": token_ids.cpu().numpy()}
+        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        onnx_logits = session.run(["logits"], feeds)[0]
 
         assert (
             pt_logits.argmax(axis=-1).tolist() == onnx_logits.argmax(axis=-1).tolist()
@@ -492,10 +514,17 @@ def test_onnx_export_and_inference():
         ), f"ONNX max diff: {np.abs(pt_logits - onnx_logits).max():.6f}"
 
 
-def test_onnx_repl_generate():
-    """Test the standalone REPL generate function against an ONNX model."""
+def test_onnx_cached_decode_step_matches_full_pt():
+    """Cached decode: prefill first N-1 tokens, then feed 1 token with past.
+
+    Compares the final logit row against the non-cached PT forward on the
+    full sequence. This catches causal-mask boundary errors at the
+    prefill→decode transition.
+    """
+    onnxruntime = pytest.importorskip("onnxruntime")
+    import numpy as np
+
     from torchwright.compiler.export import compile_to_onnx
-    from torchwright.compiler.repl import generate, _Vocab
 
     output_node, pos_encoding, embedding = _build_1digit()
 
@@ -511,12 +540,120 @@ def test_onnx_repl_generate():
             verbose=False,
         )
 
-        import json
+        net = forward_compile(
+            d=D,
+            d_head=D_HEAD,
+            output_node=output_node,
+            pos_encoding=pos_encoding,
+            verbose=False,
+        )
+        module = to_module(net, embedding, output_node)
+        module.eval()
+        device = next(module.parameters()).device
 
-        with open(os.path.join(tmpdir, "adder.vocab.json")) as f:
-            vocab = _Vocab(json.load(f)["vocab"])
+        tokens = ["<bos", "1", "+", "2", "\n"]
+        token_ids = torch.tensor(
+            [embedding.tokenizer.get_token_id(t) for t in tokens],
+            dtype=torch.long,
+            device=device,
+        )
+
+        with torch.no_grad():
+            pt_logits = module(token_ids).cpu().numpy()
 
         session = onnxruntime.InferenceSession(onnx_path)
+        n_layers, n_heads, d_head = _discover_meta(session)
+
+        ids_np = token_ids.cpu().numpy()
+
+        # Prefill on first N-1 tokens
+        feeds = {"token_ids": ids_np[:-1]}
+        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        out_names = ["logits"]
+        for i in range(n_layers):
+            out_names += [f"new_K_{i}", f"new_V_{i}"]
+        outputs = session.run(out_names, feeds)
+
+        past_K = [outputs[1 + 2 * i] for i in range(n_layers)]
+        past_V = [outputs[1 + 2 * i + 1] for i in range(n_layers)]
+        past_len = ids_np.shape[0] - 1
+
+        # Decode step with the single last token
+        feeds = {
+            "token_ids": ids_np[-1:],
+            "past_len": np.array(past_len, dtype=np.int64),
+        }
+        for i in range(n_layers):
+            feeds[f"past_K_{i}"] = past_K[i]
+            feeds[f"past_V_{i}"] = past_V[i]
+        outputs = session.run(out_names, feeds)
+        decode_logits = outputs[0]  # (1, vocab_size)
+
+        assert np.allclose(
+            pt_logits[-1], decode_logits[0], atol=1e-4
+        ), f"Decode step diff: {np.abs(pt_logits[-1] - decode_logits[0]).max():.6f}"
+
+
+def test_onnx_repl_model_metadata_discovery():
+    """_load() recovers n_layers, n_heads, d_head from the cached ONNX graph."""
+    pytest.importorskip("onnxruntime")
+    from torchwright.compiler.export import compile_to_onnx
+    from torchwright.compiler.repl import _load
+
+    output_node, pos_encoding, embedding = _build_1digit()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        compile_to_onnx(
+            output_node,
+            pos_encoding,
+            embedding,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            verbose=False,
+        )
+
+        net = forward_compile(
+            d=D,
+            d_head=D_HEAD,
+            output_node=output_node,
+            pos_encoding=pos_encoding,
+            verbose=False,
+        )
+        module = to_module(net, embedding, output_node)
+        expected_n_layers = len(module.layers)
+        first_attn = module.layers[0][0]
+        expected_n_heads = first_attn.n_heads
+        expected_d_head = first_attn.d_head
+
+        model = _load(onnx_path)
+        assert model.n_layers == expected_n_layers
+        assert model.n_heads == expected_n_heads
+        assert model.d_head == expected_d_head
+
+
+def test_onnx_repl_generate():
+    """Test the standalone REPL generate function against an ONNX model."""
+    pytest.importorskip("onnxruntime")
+    from torchwright.compiler.export import compile_to_onnx
+    from torchwright.compiler.repl import _load, generate
+
+    output_node, pos_encoding, embedding = _build_1digit()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        compile_to_onnx(
+            output_node,
+            pos_encoding,
+            embedding,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            verbose=False,
+        )
+
+        model = _load(onnx_path)
 
         test_cases = [
             ("1+1\n", "2"),
@@ -524,7 +661,7 @@ def test_onnx_repl_generate():
             ("4+5\n", "9"),
         ]
         for input_str, expected in test_cases:
-            result = "".join(generate(session, vocab, input_str))
+            result = "".join(generate(model, input_str))
             assert (
                 result == expected
             ), f"For {input_str}: expected '{expected}' but got '{result}'"
