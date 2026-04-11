@@ -117,12 +117,12 @@ def compile_game(
     move_speed: float = 0.3,
     turn_speed: int = 4,
     textures=None,
-    d: int = 2048,
+    d: int = 1024,
     d_head: int = 16,
     device: str = "cpu",
     verbose: bool = True,
     rows_per_patch: Optional[int] = None,
-    d_hidden: Optional[int] = 4096,
+    d_hidden: Optional[int] = None,
 ):
     """Compile the game + rendering graph to a HeadlessTransformerModule.
 
@@ -135,16 +135,11 @@ def compile_game(
         textures: Optional list of (W, H, 3) texture arrays for wall
             textures.  When provided, segments must have ``texture_id``
             set to index into this list.
-        d: Residual stream width (d_model). Default 2048 is the dev
-            sweet spot at full DOOM dims (rp=8) — enough headroom for
-            the current graph with some slack for adding features.
+        d: Residual stream width (d_model).
         d_head: Attention head dimension.
         device: Target device.
         verbose: Print compilation stats.
-        d_hidden: Per-layer MLP hidden width. Default 4096 is the
-            measured optimum at d=2048 rp=8 — roughly halves the layer
-            count vs d_hidden=d, cutting KV cache traffic. Pass ``None``
-            to fall back to ``d_hidden=d``.
+        d_hidden: Per-layer MLP hidden width; defaults to ``d``.
 
     Returns:
         HeadlessTransformerModule ready for inference.
