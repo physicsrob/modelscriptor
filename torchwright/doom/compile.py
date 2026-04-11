@@ -1,6 +1,15 @@
-"""Compile renderer and game graphs to HeadlessTransformerModule and run them."""
+"""Compile DOOM graphs and run them via the cached-protocol KV-cache loop.
 
-from typing import List, Tuple
+A compiled game graph is executed as a vanilla-transformer autoregressive
+rollout: one ``module.step()`` call per screen column, threading the KV
+cache across calls.  Step 0 receives the seed state and real player
+inputs; steps 1..W-1 pass a zero row and rely on phase α's
+``get_prev_value`` attention to read the seed from the cache.  The
+graph is unchanged between prefill and cached execution — causal
+attention makes the two modes mathematically identical.
+"""
+
+from typing import Iterator, List, Tuple
 
 import numpy as np
 import torch
@@ -158,29 +167,44 @@ EXPECTED_INPUT_NAMES = (
 )
 
 
-def step_frame_compiled(
+def _seed_row(state: GameState, inputs: PlayerInput) -> torch.Tensor:
+    """Build step-0's (1, 9) input row from the seed state + real inputs."""
+    row = torch.zeros(1, 9)
+    row[0, 0] = float(inputs.backward)
+    row[0, 1] = float(inputs.forward)
+    row[0, 2] = float(inputs.strafe_left)
+    row[0, 3] = float(inputs.strafe_right)
+    row[0, 4] = float(inputs.turn_left)
+    row[0, 5] = float(inputs.turn_right)
+    row[0, 6] = float(state.angle)
+    row[0, 7] = float(state.x)
+    row[0, 8] = float(state.y)
+    return row
+
+
+def step_frame_iter(
     module,
     state: GameState,
     inputs: PlayerInput,
     config: RenderConfig,
-) -> Tuple[np.ndarray, GameState]:
-    """Run one game frame: update state + render.
+) -> Iterator[Tuple[int, np.ndarray]]:
+    """Run one game frame as a cached autoregressive rollout.
 
-    Writes the seed state and player inputs into **row 0 only** of a
-    ``(W, 9)`` input tensor; rows 1..W-1 stay zero.  The compiled graph
-    broadcasts row 0 across all positions internally and derives the
-    per-column ``angle_offset`` / ``perp_cos`` from the position
-    encoding.
+    Calls ``module.step()`` once per screen column, threading the KV
+    cache across calls.  Step 0 receives the seed state + real player
+    inputs; steps 1..W-1 pass a zero row and rely on phase α's
+    ``get_prev_value`` attention to retrieve the seed from the cache.
 
-    Args:
-        module: Compiled game HeadlessTransformerModule.
-        state: Current game state (used as the seed at row 0).
-        inputs: Player input flags for this frame.
-        config: Render configuration.
+    Yields:
+        ``(col_idx, col_pixels)`` per column, where ``col_pixels`` is an
+        ``(H, 3)`` ``float32`` RGB array.  Consumers can render columns
+        progressively as they arrive.
 
-    Returns:
-        (frame, new_state) where frame is (H, W, 3) float array
-        and new_state is the updated GameState.
+    Returns (via ``StopIteration.value``):
+        The updated ``GameState`` for the next frame.  All positions in
+        the rollout compute the same post-game-logic state because
+        steps 1..W-1 receive zero player inputs, so any column's state
+        slice would suffice — we read it from step 0.
     """
     assert tuple(module.input_names) == EXPECTED_INPUT_NAMES, (
         f"Compiled module has stale input names {module.input_names}; "
@@ -189,32 +213,71 @@ def step_frame_compiled(
 
     W = config.screen_width
     H = config.screen_height
+    past = module.empty_past()
 
-    # (W, 9) input tensor — only row 0 is populated.
-    inp = torch.zeros(W, 9)
-    inp[0, 0] = float(inputs.backward)
-    inp[0, 1] = float(inputs.forward)
-    inp[0, 2] = float(inputs.strafe_left)
-    inp[0, 3] = float(inputs.strafe_right)
-    inp[0, 4] = float(inputs.turn_left)
-    inp[0, 5] = float(inputs.turn_right)
-    inp[0, 6] = float(state.angle)
-    inp[0, 7] = float(state.x)
-    inp[0, 8] = float(state.y)
-
+    # Step 0: real inputs + seed state.  Produces column 0 and populates
+    # the KV cache for subsequent steps to attend back into.
     with torch.no_grad():
-        output = module(inp)  # (W, H*3 + 3)
+        out0, past = module.step(_seed_row(state, inputs), past)
 
-    # Extract pixels: first H*3 columns
-    pixels = output[:, :H * 3].cpu().numpy().reshape(W, H, 3).transpose(1, 0, 2)
+    col0 = out0[0, : H * 3].cpu().numpy().reshape(H, 3)
+    yield 0, col0
 
-    # Extract state from position 0 (all positions compute the same state).
-    new_x = output[0, H * 3].item()
-    new_y = output[0, H * 3 + 1].item()
-    new_angle = round(output[0, H * 3 + 2].item()) % 256
+    new_x = out0[0, H * 3].item()
+    new_y = out0[0, H * 3 + 1].item()
+    new_angle_raw = out0[0, H * 3 + 2].item()
 
-    new_state = GameState(
-        x=new_x, y=new_y, angle=new_angle,
-        move_speed=state.move_speed, turn_speed=state.turn_speed,
+    # Steps 1..W-1: zero-row decodes.  The graph's get_prev_value
+    # attention reads step 0's seed from the cache at every step, so
+    # game logic is effectively the identity on the cached state.
+    zero_row = torch.zeros(1, 9)
+    for col in range(1, W):
+        with torch.no_grad():
+            out, past = module.step(zero_row, past)
+        yield col, out[0, : H * 3].cpu().numpy().reshape(H, 3)
+
+    return GameState(
+        x=new_x,
+        y=new_y,
+        angle=round(new_angle_raw) % 256,
+        move_speed=state.move_speed,
+        turn_speed=state.turn_speed,
     )
-    return pixels, new_state
+
+
+def step_frame_compiled(
+    module,
+    state: GameState,
+    inputs: PlayerInput,
+    config: RenderConfig,
+) -> Tuple[np.ndarray, GameState]:
+    """Run one game frame via the cached-protocol generate loop.
+
+    Consumes :func:`step_frame_iter` to the end, assembling the per-column
+    yields into an ``(H, W, 3)`` frame and returning the new game state.
+
+    Args:
+        module: Compiled DOOM game module — any :class:`HeadlessRuntime`
+            (``CompiledHeadless`` or ``OnnxHeadlessModule``) with
+            ``.step()`` + ``.empty_past()``.
+        state: Current game state (seeded at step 0).
+        inputs: Player input flags for this frame.
+        config: Render configuration.
+
+    Returns:
+        ``(frame, new_state)`` where frame is ``(H, W, 3)`` float RGB
+        and ``new_state`` is the post-game-logic state.
+    """
+    W = config.screen_width
+    H = config.screen_height
+
+    frame = np.zeros((H, W, 3), dtype=np.float32)
+    it = step_frame_iter(module, state, inputs, config)
+    try:
+        while True:
+            col_idx, col_pixels = next(it)
+            frame[:, col_idx, :] = col_pixels
+    except StopIteration as stop:
+        new_state: GameState = stop.value
+
+    return frame, new_state
