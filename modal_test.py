@@ -27,7 +27,7 @@ image = (
 app = modal.App("torchwright-test", image=image)
 
 
-@app.function(gpu="A100", cpu=8, timeout=600)
+@app.function(gpu="T4", cpu=8, timeout=600)
 def run_pytest(file: str = "tests", extra_args: str = "") -> int:
     cmd = [
         sys.executable,

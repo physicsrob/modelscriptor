@@ -16,6 +16,10 @@ import modal
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_sync(groups=["dev"], extra_options="--no-install-project")
+    .uv_pip_install(
+        "nvidia-cublas-cu12", "nvidia-cuda-runtime-cu12",
+        "nvidia-cudnn-cu12", "nvidia-cufft-cu12", "nvidia-curand-cu12",
+    )
     .add_local_file("E8.8.1024.txt", "/root/E8.8.1024.txt")
     .add_local_file("doom1.wad", "/root/doom1.wad")
     .add_local_python_source("torchwright", "examples", "tests")
@@ -36,6 +40,12 @@ def generate_walkthrough(
     scale: int = 4,
     d: int = 2048,
 ) -> bytes:
+    import glob
+    import os
+
+    cuda12_dirs = glob.glob("/.uv/.venv/lib/python3.12/site-packages/nvidia/*/lib")
+    os.environ["LD_LIBRARY_PATH"] = ":".join(cuda12_dirs)
+
     from torchwright.compiler.export import compile_headless_to_onnx
     from torchwright.compiler.onnx_load import OnnxHeadlessModule
     from torchwright.doom.compile import step_frame_compiled
