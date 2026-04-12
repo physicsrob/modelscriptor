@@ -21,6 +21,18 @@ from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
 
+def _make_alt_walls(half=5.0):
+    """Build an alternative L-shaped room layout for level-swap demo."""
+    return [
+        {"ax": half, "ay": -half, "bx": half, "by": 0.0, "tex_id": 0.0},
+        {"ax": half, "ay": 0.0, "bx": 0.0, "by": 0.0, "tex_id": 1.0},
+        {"ax": 0.0, "ay": 0.0, "bx": 0.0, "by": half, "tex_id": 2.0},
+        {"ax": 0.0, "ay": half, "bx": -half, "by": half, "tex_id": 3.0},
+        {"ax": -half, "ay": half, "bx": -half, "by": -half, "tex_id": 0.0},
+        {"ax": -half, "ay": -half, "bx": half, "by": -half, "tex_id": 1.0},
+    ]
+
+
 def play(
     segments: List[Segment],
     config: RenderConfig,
@@ -31,7 +43,7 @@ def play(
     scale: int = 8,
     mode: str = "transformer",
     textures=None,
-    onnx_path: Optional[str] = None,
+    rows_per_patch: int = 10,
 ) -> None:
     """Run an interactive game loop with pygame display.
 
@@ -42,15 +54,14 @@ def play(
         start_angle: Starting facing direction (0-255).
         max_coord: Upper bound on coordinate magnitudes.
         scale: Pixel scaling factor for display window.
-        mode: "transformer" runs inference through a pre-compiled
-            ``.onnx`` model via ``onnxruntime``. "reference" uses the
-            Python implementation as a ground-truth baseline.
-        textures: Optional texture atlas (reference mode only).
-        onnx_path: Path to a game ``.onnx`` produced by
-            ``torchwright.doom.to_onnx``. Required when
-            ``mode="transformer"``. The scene / ``--width`` /
-            ``--height`` / ``--fov`` must match the config used when
-            the ``.onnx`` was built.
+        mode: "transformer" compiles the v2 walls-as-tokens graph and
+            runs inference.  "reference" uses the Python implementation
+            as a ground-truth baseline.
+        textures: Optional texture atlas.
+
+    Press L during play to swap between two level layouts (same
+    compiled weights, different wall tokens) — demonstrates level
+    independence.
     """
     try:
         import pygame
@@ -59,22 +70,28 @@ def play(
         sys.exit(1)
 
     if mode == "transformer":
-        if onnx_path is None:
-            raise ValueError(
-                "transformer mode requires --onnx <path>. "
-                "Compile the graph first with "
-                "`python -m torchwright.doom.to_onnx --mode game --scene <scene> ...`"
-            )
+        from torchwright.doom.compile import (
+            compile_game, step_frame, segments_to_walls,
+        )
 
-        from torchwright.compiler.onnx_load import OnnxHeadlessModule
-        from torchwright.doom.compile import step_frame_compiled
+        walls_a = segments_to_walls(segments)
+        walls_b = _make_alt_walls()
+        max_walls = max(8, len(walls_a), len(walls_b))
 
-        print(f"Loading {onnx_path}...")
-        module = OnnxHeadlessModule(onnx_path)
+        print(f"Compiling game graph ({len(walls_a)} walls, max_walls={max_walls})...")
+        module = compile_game(
+            config, textures,
+            max_walls=max_walls,
+            max_coord=max_coord,
+            d=2048, d_head=32,
+            rows_per_patch=rows_per_patch,
+        )
+        current_walls = [walls_a]  # mutable container for level-swap
 
         def frame_fn(state, inputs):
-            return step_frame_compiled(module, state, inputs, config)
+            return step_frame(module, state, inputs, current_walls[0], config)
     else:
+        current_walls = [None]
         trig_table = config.trig_table
 
         def frame_fn(state, inputs):
@@ -96,12 +113,22 @@ def play(
     running = True
     frame_count = 0
     last_frame_ms = 0.0
+    level_name = "A"
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                running = False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_l and mode == "transformer":
+                    if current_walls[0] is walls_a:
+                        current_walls[0] = walls_b
+                        level_name = "B"
+                    else:
+                        current_walls[0] = walls_a
+                        level_name = "A"
+                    print(f"Level swap → {level_name} (no recompile)")
 
         keys = pygame.key.get_pressed()
         inputs = PlayerInput(
@@ -126,9 +153,10 @@ def play(
         frame_count += 1
         if frame_count % 10 == 0:
             fps = 1000.0 / last_frame_ms if last_frame_ms > 0 else 0
+            lev = f" level={level_name}" if mode == "transformer" else ""
             pygame.display.set_caption(
                 f"{label} | pos=({state.x:.1f}, {state.y:.1f}) "
-                f"angle={state.angle} | {last_frame_ms:.0f}ms ({fps:.1f} fps)"
+                f"angle={state.angle}{lev} | {last_frame_ms:.0f}ms ({fps:.1f} fps)"
             )
 
     pygame.quit()
@@ -151,10 +179,8 @@ def main():
     parser.add_argument("--fov", type=int, default=32)
     parser.add_argument("--scale", type=int, default=8)
     parser.add_argument(
-        "--onnx", type=str, default=None,
-        help="Path to a game .onnx produced by torchwright.doom.to_onnx. "
-             "Required for --mode transformer. Scene/width/height/fov "
-             "must match the config used at export.",
+        "--rows-per-patch", type=int, default=10,
+        help="Vertical patch height. Must divide --height.",
     )
     args = parser.parse_args()
 
@@ -183,7 +209,7 @@ def main():
 
     play(segments, config, start_x, start_y, start_angle,
          max_coord=max_coord, scale=args.scale, mode=args.mode,
-         textures=textures, onnx_path=args.onnx)
+         textures=textures, rows_per_patch=args.rows_per_patch)
 
 
 if __name__ == "__main__":

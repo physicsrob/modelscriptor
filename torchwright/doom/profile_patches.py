@@ -223,9 +223,10 @@ def _profile_one(
     d_head: int,
 ) -> dict:
     output_node, pos_encoding = build_game_graph(
-        segments, config, max_coord,
+        config, textures,
+        max_walls=max(8, len(segments)),
+        max_coord=max_coord,
         move_speed=0.3, turn_speed=4,
-        textures=textures,
         rows_per_patch=rows_per_patch,
     )
 
