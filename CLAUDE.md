@@ -73,3 +73,27 @@ Tests calling `compile_game()` are expensive (~17s to compile, ~2s per
 2. **Don't pass `device="cpu"`** to `compile_headless()` or `compile_game()`.
    The default is `"auto"` which uses GPU when available.  Forcing CPU will
    make inference ~8x slower.
+
+# Walkthrough
+
+## Rendering a Walkthrough
+
+Use `make walkthrough` to compile the DOOM game graph on a Modal A100 and
+generate a GIF walkthrough.  This produces both a transformer-rendered
+`walkthrough.gif` and a reference-rendered `reference.gif`, then opens
+the walkthrough GIF.
+
+    # Render 10 frames (default)
+    make walkthrough
+
+    # Render a specific number of frames
+    make walkthrough ARGS="--frames 5"
+
+    # Use the multi-room scene instead of the default box room
+    make walkthrough ARGS="--scene multi"
+
+    # Combine options
+    make walkthrough ARGS="--frames 20 --scene multi"
+
+All flags (`--width`, `--height`, `--fps`, `--scale`, `--d`, `--d-head`,
+`--rows-per-patch`, `--tex-size`) are passed through via `ARGS=`.
