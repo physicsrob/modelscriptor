@@ -189,7 +189,8 @@ class LayerScheduler:
         compute_candidates = []
         for node in ready:
             if isinstance(node, Attn):
-                compute_candidates.append(("compute_attn", node, 1))
+                n_heads = (node.d_v + self.d_head - 1) // self.d_head
+                compute_candidates.append(("compute_attn", node, n_heads))
             elif isinstance(node, Linear) and not isinstance(node.inputs[0], ReLU):
                 n_heads = self._heads_for_linear(node)
                 compute_candidates.append(("compute_linear", node, n_heads))

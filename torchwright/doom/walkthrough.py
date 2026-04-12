@@ -264,7 +264,7 @@ def main():
             config, textures,
             max_walls=max(8, len(walls)),
             max_coord=max_coord,
-            d=2048, d_head=32,
+            d=2048,
             rows_per_patch=args.rows_per_patch,
         )
 

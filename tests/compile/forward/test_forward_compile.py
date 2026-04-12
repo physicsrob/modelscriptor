@@ -4,6 +4,7 @@ Each test builds a graph, compiles it via forward_compile, and verifies
 the output matches node.compute() with torch.allclose.
 """
 
+import pytest
 import torch
 
 from torchwright.compiler.forward.compile import forward_compile
@@ -522,5 +523,108 @@ def test_compile_three_adds_shared_inputs():
             "x": torch.tensor([[3.0], [7.0]]),
             "y": torch.tensor([[4.0], [2.0]]),
         },
+        max_layers=10,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Attn with separate d_qk / d_v — V/O splitting across heads
+# ---------------------------------------------------------------------------
+
+
+def _build_attn(x_q, x_k, x_v, d_qk, d_v, d_out):
+    """Helper: build an Attn node with separate d_qk and d_v."""
+    from torchwright.graph import Attn
+
+    q_mat = torch.randn(len(x_q), d_qk)
+    k_mat = torch.randn(len(x_k), d_qk)
+    v_mat = torch.randn(len(x_v), d_v)
+    o_mat = torch.randn(d_v, d_out)
+    return Attn(
+        query_in=x_q, key_in=x_k, value_in=x_v,
+        query_matrix=q_mat, key_matrix=k_mat,
+        value_matrix=v_mat, output_matrix=o_mat,
+    )
+
+
+def test_compile_rejects_d_qk_too_large():
+    """Compiler must error when d_qk exceeds d_head.
+
+    Q/K cannot be split across heads (softmax nonlinearity), so
+    d_head must be >= d_qk.
+    """
+    pos = create_pos_encoding()
+    x = create_input("x", 4)
+    out = _build_attn(x, x, x, d_qk=32, d_v=4, d_out=4)
+
+    with pytest.raises(AssertionError, match="d_qk"):
+        forward_compile(
+            d=256, d_head=16, output_node=out,
+            pos_encoding=pos, verbose=False,
+        )
+
+
+def test_compile_split_vo_exact_divisible():
+    """d_v=32, d_head=16 — splits V/O across exactly 2 heads."""
+    x = create_input("x", 8)
+    out = _build_attn(x, x, x, d_qk=4, d_v=32, d_out=8)
+    _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
+
+
+def test_compile_split_vo_with_remainder():
+    """d_v=48, d_head=16 — 3 heads, last chunk padded."""
+    x = create_input("x", 8)
+    out = _build_attn(x, x, x, d_qk=4, d_v=48, d_out=8)
+    _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
+
+
+def test_compile_split_vo_single_dim_qk():
+    """d_qk=1 — scalar attention logit, wide V/O split across 2 heads."""
+    x = create_input("x", 8)
+    out = _build_attn(x, x, x, d_qk=1, d_v=32, d_out=8)
+    _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
+
+
+def test_compile_split_vo_large_ratio():
+    """d_v=64, d_head=8 — 8 V/O heads with tiny d_qk=2."""
+    pos = create_pos_encoding()
+    x = create_input("x", 8)
+    out = _build_attn(x, x, x, d_qk=2, d_v=64, d_out=8)
+
+    net = forward_compile(
+        d=256, d_head=8, output_node=out,
+        pos_encoding=pos, verbose=False, max_layers=10,
+    )
+    result = net.compute(4, {"x": torch.randn(4, 8)})
+    expected = out.compute(4, {"x": result[x].cpu()})
+    actual = result[out]
+    assert torch.allclose(
+        actual.cpu(), expected, atol=1e-4
+    ), f"Max diff: {(actual.cpu() - expected).abs().max().item():.6f}"
+
+
+def test_compile_dqk_equals_dv_unchanged():
+    """d_qk == d_v == 8 — backward compat, single head, padded to d_head=16."""
+    x = create_input("x", 8)
+    out = _build_attn(x, x, x, d_qk=8, d_v=8, d_out=8)
+    _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
+
+
+def test_compile_dv_smaller_than_dhead():
+    """d_qk=4, d_v=8 — both smaller than d_head=16, V padded differently than Q/K."""
+    x = create_input("x", 8)
+    out = _build_attn(x, x, x, d_qk=4, d_v=8, d_out=8)
+    _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
+
+
+def test_compile_split_vo_different_inputs():
+    """Q/K and V come from different input nodes — tests index resolution with split."""
+    qk_in = create_input("qk", 6)
+    v_in = create_input("v", 8)
+    out = _build_attn(qk_in, qk_in, v_in, d_qk=4, d_v=32, d_out=6)
+
+    _verify(
+        out, n_pos=4,
+        input_values={"qk": torch.randn(4, 6), "v": torch.randn(4, 8)},
         max_layers=10,
     )

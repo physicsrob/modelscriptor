@@ -18,16 +18,16 @@ class Attn(Node):
     Inputs are three nodes: ``query_in``, ``key_in``, ``value_in``.
     """
 
-    # query_matrix shape (d_query_in, d_head)
+    # query_matrix shape (d_query_in, d_qk)
     query_matrix: torch.Tensor
 
-    # key_matrix shape (d_key_in, d_head)
+    # key_matrix shape (d_key_in, d_qk)
     key_matrix: torch.Tensor
 
-    # value_matrix shape (d_value_in, d_head)
+    # value_matrix shape (d_value_in, d_v)
     value_matrix: torch.Tensor
 
-    # output_matrix shape (d_head, d_output)
+    # output_matrix shape (d_v, d_output)
     output_matrix: torch.Tensor
 
     def __init__(
@@ -40,15 +40,15 @@ class Attn(Node):
         value_matrix: torch.Tensor,
         output_matrix: torch.Tensor,
     ):
-        self.d_head = query_matrix.shape[1]
+        self.d_qk = query_matrix.shape[1]
+        self.d_v = value_matrix.shape[1]
         self.d_query_in = query_matrix.shape[0]
         self.d_key_in = key_matrix.shape[0]
         self.d_value_in = value_matrix.shape[0]
         super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
 
-        assert query_matrix.shape[1] == self.d_head
-        assert key_matrix.shape[1] == self.d_head
-        assert value_matrix.shape[1] == self.d_head
+        assert key_matrix.shape[1] == self.d_qk
+        assert output_matrix.shape[0] == self.d_v
 
         self.query_matrix = query_matrix
         self.key_matrix = key_matrix
@@ -66,9 +66,9 @@ class Attn(Node):
         assert value_in.shape == (n_pos, self.d_value_in)
 
         key_values = torch.matmul(key_in, self.key_matrix)
-        # key_values shape is (pos, d_head)
+        # key_values shape is (pos, d_qk)
         query_values = torch.matmul(query_in, self.query_matrix)
-        # query_values shape is (pos, d_head)
+        # query_values shape is (pos, d_qk)
         attn_logits = query_values.matmul(key_values.t())
         # attn_logits shape is (query pos, key pos)
 
@@ -82,9 +82,9 @@ class Attn(Node):
 
         attn = torch.softmax(attn_logits, dim=1)
         value_values = torch.matmul(value_in, self.value_matrix)
-        # value_values shape is (pos, d_head)
+        # value_values shape is (pos, d_v)
         values = attn.matmul(value_values)
-        # values shape is now (query pos, d_head)
+        # values shape is now (query pos, d_v)
 
         values_output = values.matmul(self.output_matrix)
         # values shape is now (query pos, d_output)
