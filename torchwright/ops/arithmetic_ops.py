@@ -993,14 +993,18 @@ def reciprocal(
 ) -> Node:
     """Compute 1/x via piecewise-linear interpolation.
 
-    Exact when x is a multiple of ``step``.  Between grid points the
-    result is linearly interpolated.
+    Uses **geometric** breakpoint spacing so that relative interpolation
+    error is roughly constant across the entire ``[min_value, max_value]``
+    range.  ``step`` controls breakpoint density: the number of
+    breakpoints is ``(max_value - min_value) / step``, with a floor
+    of 32 to guarantee reasonable accuracy.
 
     Args:
         inp: 1D scalar node with value in [min_value, max_value].
         min_value: Lower bound on input (must be > 0).
         max_value: Upper bound on input.
-        step: Grid spacing.
+        step: Controls breakpoint density.  Smaller step = more
+            breakpoints = higher accuracy.
         d_max: Maximum neurons per MLP sublayer.
 
     Returns:
@@ -1010,11 +1014,11 @@ def reciprocal(
     assert min_value > 0, "min_value must be positive"
     assert max_value > min_value, "max_value must exceed min_value"
 
-    breakpoints = []
-    x = min_value
-    while x <= max_value + step / 2.0:
-        breakpoints.append(x)
-        x += step
+    n_breakpoints = builtins.max(int((max_value - min_value) / step) + 1, 32)
+    ratio = (max_value / min_value) ** (1.0 / (n_breakpoints - 1))
+    breakpoints = [min_value * (ratio ** k) for k in range(n_breakpoints)]
+    breakpoints[0] = min_value
+    breakpoints[-1] = max_value
 
     return piecewise_linear(
         inp, breakpoints, lambda x: 1.0 / x, d_max=d_max, name="reciprocal"

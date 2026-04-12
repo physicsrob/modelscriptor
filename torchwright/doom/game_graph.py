@@ -50,6 +50,7 @@ from torchwright.ops.arithmetic_ops import (
     signed_multiply,
     square_signed,
     subtract,
+    thermometer_floor_div,
 )
 from torchwright.ops.attention_ops import attend_argmin_unmasked
 from torchwright.ops.inout_nodes import create_input, create_literal_value, create_pos_encoding
@@ -639,12 +640,7 @@ def build_game_graph(
 
     # Ray angle from col_idx + player_angle
     col_times_fov = multiply_const(col_idx, float(fov))
-    ao_raw = piecewise_linear(
-        col_times_fov,
-        [float(i) for i in range(0, fov * W + 1, max(1, W))],
-        lambda x: float(int(x) // W),
-        name="ao_raw",
-    )
+    ao_raw = thermometer_floor_div(col_times_fov, W, fov * (W - 1))
     angle_offset = add_const(ao_raw, float(-(fov // 2)))
     ray_angle_raw = add(player_angle, angle_offset)
     ray_angle_shifted = add_const(ray_angle_raw, 256.0)

@@ -4,6 +4,7 @@ import torch
 
 from torchwright.compiler.components.component import Component
 from torchwright.graph import PosEncoding
+from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 
 
 class AttnLayerComponent(Component):
@@ -46,7 +47,7 @@ class AttnLayerComponent(Component):
 
         attn_logits = torch.bmm(Q, K.transpose(1, 2))  # (n_heads, n_pos, n_pos)
         mask = torch.triu(torch.ones(n_pos, n_pos, device=inp.device), diagonal=1).bool()
-        attn_logits.masked_fill_(mask.unsqueeze(0), -10000.0)
+        attn_logits.masked_fill_(mask.unsqueeze(0), CAUSAL_MASK_SENTINEL)
         attn = torch.softmax(attn_logits, dim=2)
 
         weighted = torch.bmm(attn, V)  # (n_heads, n_pos, d_head)
@@ -87,7 +88,7 @@ class AttnLayerComponent(Component):
             torch.ones(n_new, n_total, device=inp.device),
             diagonal=n_total - n_new + 1,
         ).bool()
-        attn_logits.masked_fill_(mask.unsqueeze(0), -10000.0)
+        attn_logits.masked_fill_(mask.unsqueeze(0), CAUSAL_MASK_SENTINEL)
         attn = torch.softmax(attn_logits, dim=2)
 
         weighted = torch.bmm(attn, V)  # (n_heads, n_new, d_head)

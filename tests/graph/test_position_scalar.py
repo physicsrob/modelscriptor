@@ -31,6 +31,7 @@ from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 #   320   — just above the documented limit
 #   640   — old default game graph (W=64, shards_per_col=10)
 #   1600  — new default game graph (W=160, shards_per_col=10)
+#
 SEQ_LENS = [32, 48, 100, 160, 310, 320, 640, 1600]
 
 

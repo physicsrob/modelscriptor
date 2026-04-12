@@ -251,8 +251,6 @@ def step_frame(
         # Sort output: [type(8), wall_data(5), onehot(max_walls)]
         wall_data = raw_sort[8:13]
         onehot = raw_sort[onehot_sl]
-        # Also read the sel_dist from the sort value (position 7 = 8+5+2 = offset 15 in raw output)
-        # Actually, onehot_sl starts at 8+5 = 13, so dist would be at position... let me print more context
         print(f"  sort[{k}]: wall=[{wall_data[0]:.2f},{wall_data[1]:.2f},{wall_data[2]:.2f},{wall_data[3]:.2f}] "
               f"tex={wall_data[4]:.1f} oh_max={np.argmax(onehot)} raw[13:16]={raw_sort[13:16].tolist()}")
         mask = np.maximum(mask, np.round(onehot))
