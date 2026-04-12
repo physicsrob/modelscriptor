@@ -13,6 +13,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "black",
+    "modal",
     "mypy",
     "pillow",
     "pytest",

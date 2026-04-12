@@ -14,24 +14,18 @@ lint:
 	uv run black .
 	uv run mypy .
 
-LOCKFILE := /tmp/torchwright-test.lock
 LOGFILE := /tmp/torchwright-test.log
-WORKERS := 4
-THREADS := $(shell echo $$(( $(shell nproc) / $(WORKERS) )))
 
 .PHONY: test
 test:
-	@echo "=== Waiting for test lock ($(LOCKFILE)) ===" | tee $(LOGFILE)
+	@echo "=== Running tests on Modal ===" | tee $(LOGFILE)
 	@echo "=== Monitor: make test-logs ===" | tee -a $(LOGFILE)
-	@flock $(LOCKFILE) bash -c ' \
-		echo "=== Lock acquired, running tests ===" | tee -a $(LOGFILE) && \
+	@bash -c ' \
 		start=$$(date +%s) && \
-		OMP_NUM_THREADS=$(THREADS) MKL_NUM_THREADS=$(THREADS) \
-		uv run pytest $(if $(FILE),$(FILE),tests) \
-			-v --tb=short --no-header \
-			--durations=0 \
-			-n $(WORKERS) \
-			$(ARGS) 2>&1 | tee -a $(LOGFILE) ; \
+		uv run modal run modal_test.py \
+			--file $(if $(FILE),$(FILE),tests) \
+			$(if $(ARGS),--args "$(ARGS)") \
+			2>&1 | tee -a $(LOGFILE) ; \
 		rc=$${PIPESTATUS[0]} ; \
 		end=$$(date +%s) && \
 		echo "" | tee -a $(LOGFILE) && \
