@@ -44,7 +44,6 @@ from torchwright.ops.attention_ops import attend_argmin_unmasked
 from torchwright.ops.inout_nodes import create_input, create_literal_value, create_pos_encoding
 from torchwright.ops.logic_ops import bool_all_true, equals_vector
 from torchwright.ops.map_select import in_range, select
-from torchwright.ops.prefix_ops import prefix_sum
 
 from torchwright.doom.renderer import (
     _textured_column_fill,
@@ -131,61 +130,33 @@ def build_combined_graph(
     is_sorted = equals_vector(token_type, E8_SORTED_WALL)
     is_render = equals_vector(token_type, E8_RENDER)
 
-    # --- Broadcast player state from START ---
-    packed_player = Concatenate([player_x, player_y, player_angle])
-    broadcast = pos_encoding.get_prev_value(packed_player, is_start)
-    bcast_px = Linear(broadcast, torch.tensor([[1.0], [0.0], [0.0]]), name="bcast_px")
-    bcast_py = Linear(broadcast, torch.tensor([[0.0], [1.0], [0.0]]), name="bcast_py")
-    bcast_angle = Linear(broadcast, torch.tensor([[0.0], [0.0], [1.0]]), name="bcast_angle")
+    # --- Player state: fed by host at every position (no get_prev_value) ---
+    # The host already knows (px, py, angle) and feeds them directly,
+    # just like the baked game_graph's "Option A" pattern.  This avoids
+    # a get_prev_value attention layer on the critical path.
 
     # =====================================================================
     # WALL POSITIONS: compute distance score + angular key + wall value
     # =====================================================================
 
-    # Wall midpoint distance from player
+    # Wall midpoint distance from player (player_{x,y} fed at every position)
     mid_x = multiply_const(add(wall_ax, wall_bx), 0.5)
     mid_y = multiply_const(add(wall_ay, wall_by), 0.5)
-    w_dx = subtract(mid_x, bcast_px)
-    w_dy = subtract(mid_y, bcast_py)
+    w_dx = subtract(mid_x, player_x)
+    w_dy = subtract(mid_y, player_y)
     dx_sq = square_signed(w_dx, max_abs=40.0, step=1.0)
     dy_sq = square_signed(w_dy, max_abs=40.0, step=1.0)
     dist_sq = add(dx_sq, dy_sq)
     wall_dist = piecewise_linear(dist_sq, _SQRT_BP,
                                   lambda x: math.sqrt(max(0, x)), name="wall_dist")
 
-    # Angular midpoint (cos, sin) — for attention K at both sort and render phases.
-    # Approximate: use (dx/dist, dy/dist) as direction. But div by dist is expensive.
-    # Simpler: use raw (dx, dy) in the K and let the attention match by dot product.
-    # Actually, for the render attention we need (cos_mid, sin_mid).
-    # Use piecewise_linear_2d to compute atan2-like direction from (dx, dy).
-    # Even simpler for the prototype: just carry (dx, dy) and use them directly.
-    # The render Q will be (ray_cos, ray_sin) and K will be (dx, dy).
-    # Q·K = ray_cos*dx + ray_sin*dy ∝ cos(ray_angle - wall_angle) * dist.
-    # This INCREASES with distance — wrong. We want CLOSER walls to win.
-    # Fix: normalize. But normalization is expensive.
-    # Alternative: use attend_argmin with score = wall_dist, validity = angular match.
-    # Actually simplest: just carry wall_dist as a separate score and use
-    # attend_argmin_where(score=wall_dist, validity=is_on_ray).
-    # But "is_on_ray" is a bilinear condition...
-    #
-    # Let's just use the wall-attention Q·K design from the prototype:
-    # The render token builds a custom Attn node targeting sorted walls.
-    # Q includes (ray_cos, ray_sin, 1) scaled by logit_scale.
-    # K includes (wall_cos_mid, wall_sin_mid, wall_bias - dist_scale * wall_dist).
-    # For now, approximate cos_mid ≈ dx/max_dist, sin_mid ≈ dy/max_dist.
-    # These aren't unit vectors but their dot product with (ray_cos, ray_sin)
-    # still peaks when the ray points at the wall, and the distance term
-    # handles depth ordering.
-
     # Sentinel score for non-wall positions
     sentinel = create_literal_value(torch.tensor([99.0]), name="sentinel")
     sort_score = select(is_wall, wall_dist, sentinel)
 
-    # Wall index + position one-hot
-    is_wall_01 = multiply_const(add_const(is_wall, 1.0), 0.5)
-    n_stages = max(5, math.ceil(math.log2(2 * max_walls + 3 + config.screen_width * 10)))
-    wall_count = prefix_sum(pos_encoding, is_wall_01, n_stages=n_stages)
-    wall_index = add_const(wall_count, -1.0)
+    # Wall index: fed by host (0, 1, 2, ... at WALL positions, 0 elsewhere).
+    # No prefix_sum needed — the host knows the order it feeds walls.
+    wall_index = create_input("wall_index", 1)
     wall_index_p1 = add_const(wall_index, 1.0)
     onehot_bool = in_range(wall_index, wall_index_p1, max_walls)
     ones_oh = create_literal_value(torch.ones(max_walls), name="ones_oh")
@@ -249,7 +220,7 @@ def build_combined_graph(
         name="ao_raw",
     )
     angle_offset = add_const(ao_raw, float(-(fov // 2)))
-    ray_angle_raw = add(bcast_angle, angle_offset)
+    ray_angle_raw = add(player_angle, angle_offset)
     ray_angle_shifted = add_const(ray_angle_raw, 256.0)
     from torchwright.ops.arithmetic_ops import mod_const
     ray_angle = mod_const(ray_angle_shifted, 256, 512 + fov)
@@ -344,8 +315,8 @@ def build_combined_graph(
     # --- Parametric intersection ---
     ex = subtract(r_wall_bx, r_wall_ax)
     ey = subtract(r_wall_by, r_wall_ay)
-    dx_r = subtract(r_wall_ax, bcast_px)
-    dy_r = subtract(bcast_py, r_wall_ay)
+    dx_r = subtract(r_wall_ax, player_x)
+    dy_r = subtract(player_y, r_wall_ay)
 
     ey_cos = piecewise_linear_2d(ey, ray_cos, _DIFF_BP, _TRIG_BP, lambda a,b: a*b, name="r_ey_cos")
     ex_sin = piecewise_linear_2d(ex, ray_sin, _DIFF_BP, _TRIG_BP, lambda a,b: a*b, name="r_ex_sin")
@@ -453,6 +424,7 @@ def _build_row(compiled, max_walls, **kwargs):
         "wall_bx": torch.zeros(1),
         "wall_by": torch.zeros(1),
         "wall_tex_id": torch.zeros(1),
+        "wall_index": torch.zeros(1),
         "sort_mask": torch.zeros(max_walls),
         "col_idx": torch.zeros(1),
         "patch_idx": torch.zeros(1),
@@ -524,15 +496,19 @@ def test_combined_renders_box_room():
         out, past = compiled.step(row, past, past_len=step)
     step += 1
 
-    # Prefill: WALL × N
-    for w in walls:
+    # Prefill: WALL × N (host feeds player state + wall_index at every position)
+    for i, w in enumerate(walls):
         row = _build_row(compiled, max_walls,
                          token_type=E8_WALL,
+                         player_x=torch.tensor([px]),
+                         player_y=torch.tensor([py]),
+                         player_angle=torch.tensor([player_angle]),
                          wall_ax=torch.tensor([w["ax"]]),
                          wall_ay=torch.tensor([w["ay"]]),
                          wall_bx=torch.tensor([w["bx"]]),
                          wall_by=torch.tensor([w["by"]]),
-                         wall_tex_id=torch.tensor([w["tex_id"]]))
+                         wall_tex_id=torch.tensor([w["tex_id"]]),
+                         wall_index=torch.tensor([float(i)]))
         with torch.no_grad():
             out, past = compiled.step(row, past, past_len=step)
         step += 1
@@ -549,6 +525,9 @@ def test_combined_renders_box_room():
     for k in range(N):
         row = _build_row(compiled, max_walls,
                          token_type=E8_SORTED_WALL,
+                         player_x=torch.tensor([px]),
+                         player_y=torch.tensor([py]),
+                         player_angle=torch.tensor([player_angle]),
                          sort_mask=torch.tensor(mask, dtype=torch.float32))
         with torch.no_grad():
             out, past = compiled.step(row, past, past_len=step)
@@ -562,6 +541,9 @@ def test_combined_renders_box_room():
     for col in range(W):
         row = _build_row(compiled, max_walls,
                          token_type=E8_RENDER,
+                         player_x=torch.tensor([px]),
+                         player_y=torch.tensor([py]),
+                         player_angle=torch.tensor([player_angle]),
                          col_idx=torch.tensor([float(col)]),
                          patch_idx=torch.tensor([0.0]))
         with torch.no_grad():
