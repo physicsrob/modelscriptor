@@ -40,6 +40,7 @@ from onnx import TensorProto, helper
 
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node, PosEncoding
+from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.misc import InputNode
 
 
@@ -226,10 +227,10 @@ def _add_scalar_inits(dense_inits: list) -> None:
     )
     dense_inits.append(
         helper.make_tensor(
-            name="_f32_neg1000_s",
+            name="_f32_causal_sentinel_s",
             data_type=TensorProto.FLOAT,
             dims=[],
-            vals=np.array(-1000.0, dtype=np.float32).tobytes(),
+            vals=np.array(CAUSAL_MASK_SENTINEL, dtype=np.float32).tobytes(),
             raw=True,
         )
     )
@@ -430,12 +431,13 @@ def _emit_cached_layer_nodes(
     # Attention over the full (past + new) K and V.
     node("Transpose", [f"new_K_{layer_idx}"], [f"{p}_K_T"], perm=[0, 2, 1])
     node("MatMul", [f"{p}_Q", f"{p}_K_T"], [f"{p}_logits"])
-    # Overwrite-mask with -1000 (equivalent to torch's masked_fill).  An
-    # additive -1000 would leave masked positions at "logit - 1000",
-    # which is not dominated by real logits when they reach ~800.
+    # Overwrite-mask with CAUSAL_MASK_SENTINEL (equivalent to torch's
+    # masked_fill).  An additive penalty would leave masked positions at
+    # "logit + penalty", which is not dominated by real logits when they
+    # are very negative (e.g. attend_argmin_unmasked with high query gain).
     node(
         "Where",
-        ["mask_bool_3d", "_f32_neg1000_s", f"{p}_logits"],
+        ["mask_bool_3d", "_f32_causal_sentinel_s", f"{p}_logits"],
         [f"{p}_logits_masked"],
     )
     node("Softmax", [f"{p}_logits_masked"], [f"{p}_weights"], axis=-1)

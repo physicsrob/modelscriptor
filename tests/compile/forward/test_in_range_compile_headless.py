@@ -1,9 +1,7 @@
-"""Minimal reproduction: in_range compiled via compile_headless produces -3.
+"""Test that in_range compiled via compile_headless matches forward_compile.
 
-in_range(lo, hi, n_slots) should produce ±1 for every slot.  It works
-correctly uncompiled (node.compute) and via forward_compile, but
-compile_headless corrupts the output — slots that should read -1.0
-produce -3.0 instead.
+compile_headless sorts inputs alphabetically, so the flat input tensor
+must be ordered [hi, lo] not [lo, hi].  Both paths should produce ±1.
 """
 
 import torch
@@ -15,7 +13,7 @@ from torchwright.ops.map_select import in_range
 
 
 def test_in_range_headless_values_are_pm1():
-    """compile_headless in_range output must be ±1, not -3."""
+    """compile_headless in_range output must be ±1."""
     pos = create_pos_encoding()
     lo = create_input("lo", 1)
     hi = create_input("hi", 1)
@@ -25,8 +23,9 @@ def test_in_range_headless_values_are_pm1():
 
     module = compile_headless(masks, pos, d=256, verbose=False)
 
-    # lo=4, hi=8 → slots 4,5,6,7 should be +1, rest -1
-    result = module(torch.tensor([[4.0, 8.0]])).squeeze(0)
+    # Alphabetical order: hi=8, lo=4 → in_range(4, 8, 32)
+    # Slots 4,5,6,7 should be +1, rest -1
+    result = module(torch.tensor([[8.0, 4.0]])).squeeze(0)
 
     for i in range(N):
         expected = 1.0 if 4 <= i < 8 else -1.0
@@ -45,15 +44,15 @@ def test_in_range_headless_matches_forward_compile():
     N = 32
     masks = in_range(lo, hi, N)
 
-    # forward_compile path (known good)
+    # forward_compile path
     net = forward_compile(d=256, d_head=16, output_node=masks,
                           pos_encoding=pos, verbose=False)
     vals = {"lo": torch.tensor([[4.0]]), "hi": torch.tensor([[8.0]])}
     fc_out = net.compute(1, vals)[masks].squeeze(0)
 
-    # compile_headless path (suspected broken)
+    # compile_headless path (alphabetical: hi first)
     module = compile_headless(masks, pos, d=256, verbose=False)
-    ch_out = module(torch.tensor([[4.0, 8.0]])).squeeze(0)
+    ch_out = module(torch.tensor([[8.0, 4.0]])).squeeze(0)
 
     for i in range(N):
         fc_val = fc_out[i].item()
