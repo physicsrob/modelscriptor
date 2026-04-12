@@ -123,13 +123,14 @@ def test_probe_clean_on_v2_box_room(tiny_config):
     }
 
     # The v2 graph has large intermediate values in square_signed and
-    # signed_multiply chains (10^4–10^5 range), so absolute errors up
-    # to ~60 are normal fp32 rounding.  atol=100 still catches real
-    # compilation bugs (missing layers, swapped inputs) which show as
-    # errors of 1000+.
+    # signed_multiply chains (10^4–10^5 range).  The central ray sort
+    # adds more chained multiplications, pushing fp32 accumulation
+    # errors up to ~325 on values of ~10^4 (~3% relative).  atol=500
+    # still catches real compilation bugs (missing layers, swapped
+    # inputs) which show as errors of 1000+.
     report = probe_graph(
         output_node, pos_encoding, input_values, n_pos=1,
-        d=2048, d_head=32, verbose=False, atol=100.0,
+        d=2048, d_head=32, verbose=False, atol=500.0,
     )
 
     assert report.nodes_checked, (

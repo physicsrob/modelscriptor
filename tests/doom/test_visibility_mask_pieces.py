@@ -38,7 +38,7 @@ class TestCrossDotColumnIndex:
     def col_module(self):
         """Compile: (dx, dy, cos_pa, sin_pa) → column index."""
         from torchwright.ops.arithmetic_ops import (
-            abs, clamp, reciprocal, signed_multiply,
+            abs, clamp, negate, piecewise_linear, reciprocal, signed_multiply,
         )
 
         _TRIG_BP = [-1, -0.9, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 0.9, 1]
@@ -114,7 +114,8 @@ class TestCrossDotColumnIndex:
         sin_pa = math.sin(pa_rad)
         exp_cross, exp_dot, exp_col = self._expected(dx, dy, cos_pa, sin_pa)
 
-        inputs = torch.tensor([[float(dx), float(dy), cos_pa, sin_pa]])
+        # compile_headless sorts inputs alphabetically: [cos_pa, dx, dy, sin_pa]
+        inputs = torch.tensor([[cos_pa, float(dx), float(dy), sin_pa]])
         with torch.no_grad():
             out = col_module(inputs)[0]
         got_cross = out[0].item()
@@ -157,28 +158,29 @@ class TestInRangeMask:
 
     def test_full_coverage(self, mask_module):
         """lo=-1, hi=33: all 32 columns should be +1."""
-        inputs = torch.tensor([[-1.0, 33.0]])
+        # compile_headless sorts inputs alphabetically: [hi, lo]
+        inputs = torch.tensor([[33.0, -1.0]])
         with torch.no_grad():
             mask = mask_module(inputs)[0].numpy()
         assert (mask > 0.5).all(), f"Expected all visible, got {mask}"
 
     def test_no_coverage_above(self, mask_module):
         """lo=33, hi=40: all columns outside [0,32), should be -1."""
-        inputs = torch.tensor([[33.0, 40.0]])
+        inputs = torch.tensor([[40.0, 33.0]])
         with torch.no_grad():
             mask = mask_module(inputs)[0].numpy()
         assert (mask < -0.5).all(), f"Expected all hidden, got {mask}"
 
     def test_no_coverage_below(self, mask_module):
         """lo=-5, hi=-1: all columns outside [0,32), should be -1."""
-        inputs = torch.tensor([[-5.0, -1.0]])
+        inputs = torch.tensor([[-1.0, -5.0]])
         with torch.no_grad():
             mask = mask_module(inputs)[0].numpy()
         assert (mask < -0.5).all(), f"Expected all hidden, got {mask}"
 
     def test_partial_coverage(self, mask_module):
         """lo=10, hi=20: columns 10-19 visible, rest hidden."""
-        inputs = torch.tensor([[10.0, 20.0]])
+        inputs = torch.tensor([[20.0, 10.0]])
         with torch.no_grad():
             mask = mask_module(inputs)[0].numpy()
         for c in range(32):
@@ -188,7 +190,7 @@ class TestInRangeMask:
 
     def test_behind_player(self, mask_module):
         """lo=-2, hi=-1: all behind, should be -1."""
-        inputs = torch.tensor([[-2.0, -1.0]])
+        inputs = torch.tensor([[-1.0, -2.0]])
         with torch.no_grad():
             mask = mask_module(inputs)[0].numpy()
         assert (mask < -0.5).all(), f"Expected all hidden, got {mask}"
