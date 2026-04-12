@@ -964,7 +964,8 @@ class CompiledHeadless:
         self,
     ) -> tuple:
         """Zero-length past tensors suitable for a first prefill call."""
-        zeros = torch.zeros(self._n_heads, 0, self._d_head)
+        device = self._net.device
+        zeros = torch.zeros(self._n_heads, 0, self._d_head, device=device)
         past_K = tuple(zeros.clone() for _ in range(self._n_layers))
         past_V = tuple(zeros.clone() for _ in range(self._n_layers))
         return (past_K, past_V)

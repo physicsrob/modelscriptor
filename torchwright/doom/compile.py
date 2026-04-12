@@ -13,6 +13,7 @@ at RENDER positions.  The only "intelligence" is updating the sort
 mask from the returned one-hot — a bitwise OR.
 """
 
+import time
 from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -52,7 +53,7 @@ def compile_game(
     move_speed: float = 0.3,
     turn_speed: int = 4,
     d: int = 2048,
-    d_head: int = 32,
+    d_head: Optional[int] = None,
     device: str = "cpu",
     verbose: bool = True,
     rows_per_patch: Optional[int] = None,
@@ -64,6 +65,15 @@ def compile_game(
         move_speed, turn_speed,
         rows_per_patch=rows_per_patch,
     )
+    # The render attention d_head = W + 6 (visibility mask + bias + value
+    # passthrough).  Round up to a power of 2 that divides d.
+    if d_head is None:
+        W = config.screen_width
+        min_d_head = W + 6
+        d_head = 1
+        while d_head < min_d_head:
+            d_head *= 2
+        assert d % d_head == 0, f"d={d} not divisible by d_head={d_head}"
     rp = rows_per_patch if rows_per_patch is not None else config.screen_height
     module = compile_headless(
         output_node, pos_encoding,
@@ -78,37 +88,38 @@ def compile_game(
 
 def _build_row(compiled, max_walls, **kwargs):
     """Build a (1, d_input) row for module.step()."""
+    device = compiled._net.device
     defaults = {
-        "col_idx": torch.zeros(1),
-        "input_backward": torch.zeros(1),
-        "input_forward": torch.zeros(1),
-        "input_strafe_left": torch.zeros(1),
-        "input_strafe_right": torch.zeros(1),
-        "input_turn_left": torch.zeros(1),
-        "input_turn_right": torch.zeros(1),
-        "patch_idx": torch.zeros(1),
-        "player_angle": torch.zeros(1),
-        "player_x": torch.zeros(1),
-        "player_y": torch.zeros(1),
-        "sort_mask": torch.zeros(max_walls),
-        "token_type": torch.zeros(8),
-        "wall_ax": torch.zeros(1),
-        "wall_ay": torch.zeros(1),
-        "wall_bx": torch.zeros(1),
-        "wall_by": torch.zeros(1),
-        "wall_index": torch.zeros(1),
-        "wall_tex_id": torch.zeros(1),
+        "col_idx": torch.zeros(1, device=device),
+        "input_backward": torch.zeros(1, device=device),
+        "input_forward": torch.zeros(1, device=device),
+        "input_strafe_left": torch.zeros(1, device=device),
+        "input_strafe_right": torch.zeros(1, device=device),
+        "input_turn_left": torch.zeros(1, device=device),
+        "input_turn_right": torch.zeros(1, device=device),
+        "patch_idx": torch.zeros(1, device=device),
+        "player_angle": torch.zeros(1, device=device),
+        "player_x": torch.zeros(1, device=device),
+        "player_y": torch.zeros(1, device=device),
+        "sort_mask": torch.zeros(max_walls, device=device),
+        "token_type": torch.zeros(8, device=device),
+        "wall_ax": torch.zeros(1, device=device),
+        "wall_ay": torch.zeros(1, device=device),
+        "wall_bx": torch.zeros(1, device=device),
+        "wall_by": torch.zeros(1, device=device),
+        "wall_index": torch.zeros(1, device=device),
+        "wall_tex_id": torch.zeros(1, device=device),
     }
     defaults.update(kwargs)
     d_input = max(s + w for _, s, w in compiled._input_specs)
-    row = torch.zeros(1, d_input)
+    row = torch.zeros(1, d_input, device=device)
     for name, start, width in compiled._input_specs:
         v = defaults[name]
         if isinstance(v, (int, float)):
-            v = torch.tensor([v])
+            v = torch.tensor([v], device=device)
         if v.dim() == 1:
             v = v.unsqueeze(0)
-        row[:, start:start + width] = v
+        row[:, start:start + width] = v.to(device)
     return row
 
 
@@ -153,6 +164,7 @@ def step_frame(
 
     past = module.empty_past()
     step = 0
+    total_steps = 1 + N + 1 + N + W * shards_per_col
     px, py, angle = float(state.x), float(state.y), float(state.angle)
 
     # Output layout indices
@@ -179,15 +191,21 @@ def step_frame(
             **extra,
         )
 
+    def _kv_len(past):
+        return past[0][0].shape[1] if past[0][0].numel() > 0 else 0
+
+    def _step(row, past, step):
+        with torch.no_grad():
+            return module.step(row, past, past_len=step)
+
+    t_frame = time.perf_counter()
+
     # --- Phase 0: Prefill (START + WALL×N + EOS) ---
-    # Host feeds old state + real inputs throughout.  The graph computes
-    # velocity and collision internally; the host just reads the resolved
-    # state from EOS.
+    t0 = time.perf_counter()
 
     # START
     row = _common(token_type=E8_START, **input_kw)
-    with torch.no_grad():
-        out, past = module.step(row, past, past_len=step)
+    out, past = _step(row, past, step)
     step += 1
 
     # WALL × N
@@ -202,15 +220,16 @@ def step_frame(
             wall_index=torch.tensor([float(i)]),
             **input_kw,
         )
-        with torch.no_grad():
-            out, past = module.step(row, past, past_len=step)
+        out, past = _step(row, past, step)
         step += 1
 
     # EOS — graph resolves collision via attention to WALL positions
     row = _common(token_type=E8_EOS, **input_kw)
-    with torch.no_grad():
-        out, past = module.step(row, past, past_len=step)
+    out, past = _step(row, past, step)
     step += 1
+
+    t_prefill = time.perf_counter() - t0
+    print(f"  prefill  {step} steps  kv={_kv_len(past)}  {t_prefill*1000:.0f}ms")
 
     # Read collision-resolved state from EOS output
     px = out[0, 8].item()
@@ -219,20 +238,38 @@ def step_frame(
     angle = new_angle_raw
 
     # --- Phase 1: Sort ---
+    t0 = time.perf_counter()
     mask = np.zeros(max_walls)
     for k in range(N):
         row = _common(
             token_type=E8_SORTED_WALL,
             sort_mask=torch.tensor(mask, dtype=torch.float32),
         )
-        with torch.no_grad():
-            out, past = module.step(row, past, past_len=step)
+        out, past = _step(row, past, step)
         step += 1
-        onehot = out[0, onehot_sl].detach().cpu().numpy()
+        raw_sort = out[0].detach().cpu().numpy()
+        # Sort output: [type(8), wall_data(5), onehot(max_walls)]
+        wall_data = raw_sort[8:13]
+        onehot = raw_sort[onehot_sl]
+        # Also read the sel_dist from the sort value (position 7 = 8+5+2 = offset 15 in raw output)
+        # Actually, onehot_sl starts at 8+5 = 13, so dist would be at position... let me print more context
+        print(f"  sort[{k}]: wall=[{wall_data[0]:.2f},{wall_data[1]:.2f},{wall_data[2]:.2f},{wall_data[3]:.2f}] "
+              f"tex={wall_data[4]:.1f} oh_max={np.argmax(onehot)} raw[13:16]={raw_sort[13:16].tolist()}")
         mask = np.maximum(mask, np.round(onehot))
 
+    t_sort = time.perf_counter() - t0
+    print(f"  sort     {N} steps  kv={_kv_len(past)}  {t_sort*1000:.0f}ms")
+
+    # Print sort results for debugging
+    print(f"  sort results: mask={mask.tolist()}")
+    print(f"  resolved state: px={px:.3f} py={py:.3f} angle={angle:.3f}")
+    # Re-read the last sort output to see what wall was selected
+    print(f"  last sort out[:20]: {out[0, :20].detach().cpu().numpy().tolist()}")
+
     # --- Phase 2: Render ---
+    t0 = time.perf_counter()
     frame = np.zeros((H, W, 3), dtype=np.float32)
+    _diag_printed = False
     for col in range(W):
         for shard in range(shards_per_col):
             row = _common(
@@ -240,12 +277,26 @@ def step_frame(
                 col_idx=torch.tensor([float(col)]),
                 patch_idx=torch.tensor([float(shard)]),
             )
-            with torch.no_grad():
-                out, past = module.step(row, past, past_len=step)
+            out, past = _step(row, past, step)
             step += 1
-            pixels = out[0, pixel_sl].detach().cpu().numpy().reshape(rp, 3)
+            raw_out = out[0].detach().cpu().numpy()
+            if not _diag_printed and col == W // 2 and shard == 0:
+                # Dump first 20 output values at center column
+                print(f"  render diag col={col} shard={shard}: "
+                      f"out[:20]={raw_out[:20].tolist()}")
+                _diag_printed = True
+            pixels = raw_out[pixel_sl].reshape(rp, 3)
             row_start = shard * rp
             frame[row_start:row_start + rp, col, :] = pixels
+
+    t_render = time.perf_counter() - t0
+    render_steps = W * shards_per_col
+    t_total = time.perf_counter() - t_frame
+    print(
+        f"  render   {render_steps} steps  kv={_kv_len(past)}  "
+        f"{t_render*1000:.0f}ms ({t_render/render_steps*1000:.1f}ms/step)  "
+        f"total={t_total*1000:.0f}ms"
+    )
 
     new_state = GameState(
         x=px, y=py,

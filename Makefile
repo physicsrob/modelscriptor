@@ -37,9 +37,8 @@ test:
 test-logs:
 	@tail -f $(LOGFILE)
 
-GIF := walkthrough.gif
-
 .PHONY: walkthrough
 walkthrough:
 	uv run modal run modal_walkthrough.py $(ARGS)
-	xdg-open $(GIF)
+	xdg-open walkthrough.gif
+	xdg-open reference.gif

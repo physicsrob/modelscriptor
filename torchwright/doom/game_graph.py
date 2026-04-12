@@ -345,16 +345,63 @@ def build_game_graph(
     mid_y = multiply_const(add(wall_ay, wall_by), 0.5)
     w_dx = subtract(mid_x, player_x)
     w_dy = subtract(mid_y, player_y)
-    dx_sq = square_signed(w_dx, max_abs=40.0, step=1.0)
-    dy_sq = square_signed(w_dy, max_abs=40.0, step=1.0)
-    dist_sq = add(dx_sq, dy_sq)
-    wall_dist = piecewise_linear(
-        dist_sq, _SQRT_BP,
-        lambda x: math.sqrt(max(0, x)), name="wall_dist",
+
+    # --- Central ray intersection distance for sort score ---
+    # Compute intersection of the central ray (player's viewing direction)
+    # with this wall segment's extended line.  This gives front-to-back
+    # ordering that matches the reference renderer.
+    #
+    # Using the same intersection math as the RENDER phase:
+    #   ex, ey = edge vector (B - A)
+    #   fx = ax - px, gy = py - ay (sign convention matches RENDER)
+    #   den = ey*cos - ex*sin
+    #   num_t = ey*fx + ex*gy
+    #   t = num_t / den  (positive = in front)
+    move_cos, move_sin = trig_lookup(new_angle)
+    w_ex = subtract(wall_bx, wall_ax)
+    w_ey = subtract(wall_by, wall_ay)
+    w_fx = subtract(wall_ax, player_x)
+    w_gy = subtract(player_y, wall_ay)
+
+    sort_ey_cos = piecewise_linear_2d(
+        w_ey, move_cos, _DIFF_BP, _TRIG_BP,
+        lambda a, b: a * b, name="sort_ey_cos",
+    )
+    sort_ex_sin = piecewise_linear_2d(
+        w_ex, move_sin, _DIFF_BP, _TRIG_BP,
+        lambda a, b: a * b, name="sort_ex_sin",
+    )
+    sort_den = subtract(sort_ey_cos, sort_ex_sin)
+
+    sort_ey_fx = piecewise_linear_2d(
+        w_ey, w_fx, _DIFF_BP, _DIFF_BP,
+        lambda a, b: a * b, name="sort_ey_fx",
+    )
+    sort_ex_gy = piecewise_linear_2d(
+        w_ex, w_gy, _DIFF_BP, _DIFF_BP,
+        lambda a, b: a * b, name="sort_ex_gy",
+    )
+    sort_num_t = add(sort_ey_fx, sort_ex_gy)
+
+    sort_sign_den = compare(sort_den, 0.0)
+    sort_abs_den = abs(sort_den)
+    sort_adj_num_t = select(sort_sign_den, sort_num_t, negate(sort_num_t))
+
+    is_sort_den_nz = compare(sort_abs_den, 0.05)
+    is_sort_t_pos = compare(sort_adj_num_t, 0.0)
+
+    sort_inv_den = reciprocal(sort_abs_den, min_value=0.01, max_value=2.0 * max_coord)
+    sort_t = signed_multiply(
+        sort_adj_num_t, sort_inv_den,
+        max_abs1=2.0 * max_coord * max_coord,
+        max_abs2=1.0 / 0.01,
+        step=1.0, max_abs_output=BIG_DISTANCE,
     )
 
+    is_sort_valid = bool_all_true([is_sort_den_nz, is_sort_t_pos])
     sentinel = create_literal_value(torch.tensor([99.0]), name="sentinel")
-    sort_score = select(is_wall, wall_dist, sentinel)
+    center_ray_dist = select(is_sort_valid, sort_t, sentinel)
+    sort_score = select(is_wall, center_ray_dist, sentinel)
 
     # Wall index one-hot (host-fed wall_index: 0, 1, 2, ...)
     wall_index_p1 = add_const(wall_index, 1.0)
@@ -365,7 +412,7 @@ def build_game_graph(
     # Pack wall value: geometry + angular info + onehot
     wall_value_for_sort = Concatenate([
         wall_ax, wall_ay, wall_bx, wall_by, wall_tex_id,
-        w_dx, w_dy, wall_dist,
+        w_dx, w_dy, center_ray_dist,
         position_onehot,
     ])
     d_sort_val = 8 + max_walls
@@ -460,13 +507,134 @@ def build_game_graph(
     # Gate sorted values: zero at non-sorted positions
     zeros_1 = create_literal_value(torch.zeros(1), name="z1")
     zeros_5 = create_literal_value(torch.zeros(5), name="z5")
-    gated_dx = select(is_sorted, sel_dx, zeros_1)
-    gated_dy = select(is_sorted, sel_dy, zeros_1)
-    gated_dist = select(is_sorted, sel_dist, zeros_1)
+    zeros_W = create_literal_value(torch.zeros(W), name="z_W")
     gated_wall_data = select(is_sorted, sel_wall_data, zeros_5)
+    gated_dist = select(is_sorted, sel_dist, zeros_1)
+
+    # --- Visibility mask: column range where this wall is visible ---
+    # Compute atan2 of each wall endpoint relative to the player, then
+    # convert to column indices.  in_range produces a W-wide ±1 mask.
+    #
+    # For endpoint Q at (qx, qy), relative to player at (px, py):
+    #   dqx = qx - px,  dqy = qy - py
+    #   angle_Q = atan2(dqy, dqx) in [0, 255]
+    #   relative angle = angle_Q - player_angle  (centered on view dir)
+    #   col_Q = (relative_angle + fov/2) * W / fov
+
+    sel_ax = _extract_from(sel_wall_data, 5, 0, 1, "sel_ax")
+    sel_ay = _extract_from(sel_wall_data, 5, 1, 1, "sel_ay")
+    sel_bx = _extract_from(sel_wall_data, 5, 2, 1, "sel_bx")
+    sel_by = _extract_from(sel_wall_data, 5, 3, 1, "sel_by")
+
+    dax = subtract(sel_ax, player_x)
+    day = subtract(sel_ay, player_y)
+    dbx = subtract(sel_bx, player_x)
+    dby = subtract(sel_by, player_y)
+
+    # Compute column index where each endpoint projects, using the
+    # decomposition: cross/dot with the viewing direction gives the
+    # tangent of the relative angle, then 1D atan maps to column.
+    #
+    #   cross_A = cos(PA)*day - sin(PA)*dax  (perpendicular component)
+    #   dot_A   = cos(PA)*dax + sin(PA)*day  (parallel component)
+    #   tan_rel_A = cross_A / dot_A
+    #   col_A = atan(tan_rel_A) * W/fov_rad + W/2
+    #
+    # For the FOV, fov_rad = fov * 2*pi/256.  Walls behind the player
+    # (dot < 0) get column indices outside [0, W], which in_range
+    # correctly excludes.
+    sort_cos, sort_sin = trig_lookup(new_angle)
+
+    cross_a = subtract(
+        piecewise_linear_2d(sort_cos, day, _TRIG_BP, _DIFF_BP,
+                            lambda a, b: a * b, name="cos_day_a"),
+        piecewise_linear_2d(sort_sin, dax, _TRIG_BP, _DIFF_BP,
+                            lambda a, b: a * b, name="sin_dax_a"),
+    )
+    dot_a = add(
+        piecewise_linear_2d(sort_cos, dax, _TRIG_BP, _DIFF_BP,
+                            lambda a, b: a * b, name="cos_dax_a"),
+        piecewise_linear_2d(sort_sin, day, _TRIG_BP, _DIFF_BP,
+                            lambda a, b: a * b, name="sin_day_a"),
+    )
+    cross_b = subtract(
+        piecewise_linear_2d(sort_cos, dby, _TRIG_BP, _DIFF_BP,
+                            lambda a, b: a * b, name="cos_dby_b"),
+        piecewise_linear_2d(sort_sin, dbx, _TRIG_BP, _DIFF_BP,
+                            lambda a, b: a * b, name="sin_dbx_b"),
+    )
+    dot_b = add(
+        piecewise_linear_2d(sort_cos, dbx, _TRIG_BP, _DIFF_BP,
+                            lambda a, b: a * b, name="cos_dbx_b"),
+        piecewise_linear_2d(sort_sin, dby, _TRIG_BP, _DIFF_BP,
+                            lambda a, b: a * b, name="sin_dby_b"),
+    )
+
+    # tan_rel = cross / dot.  Clamp dot away from 0 for stability.
+    # Walls behind the player (dot < 0) get large |tan| → col far
+    # outside [0, W], naturally excluded by in_range.
+    dot_a_sign = compare(dot_a, 0.0)
+    dot_a_abs = abs(dot_a)
+    dot_a_clamped = select(
+        compare(dot_a_abs, 0.1),
+        dot_a_abs,
+        create_literal_value(torch.tensor([0.1]), name="dot_min"),
+    )
+    inv_dot_a = reciprocal(dot_a_clamped, min_value=0.1, max_value=2.0 * max_coord)
+    signed_inv_dot_a = select(dot_a_sign, inv_dot_a, negate(inv_dot_a))
+    tan_a = signed_multiply(cross_a, signed_inv_dot_a,
+                            max_abs1=max_coord, max_abs2=1.0 / 0.1,
+                            step=0.5, max_abs_output=20.0)
+
+    dot_b_sign = compare(dot_b, 0.0)
+    dot_b_abs = abs(dot_b)
+    dot_b_clamped = select(
+        compare(dot_b_abs, 0.1),
+        dot_b_abs,
+        create_literal_value(torch.tensor([0.1]), name="dot_min_b"),
+    )
+    inv_dot_b = reciprocal(dot_b_clamped, min_value=0.1, max_value=2.0 * max_coord)
+    signed_inv_dot_b = select(dot_b_sign, inv_dot_b, negate(inv_dot_b))
+    tan_b = signed_multiply(cross_b, signed_inv_dot_b,
+                            max_abs1=max_coord, max_abs2=1.0 / 0.1,
+                            step=0.5, max_abs_output=20.0)
+
+    # atan(tan_rel) → relative angle in discrete units, then → column
+    # For small FOV, atan(x) ≈ x within the FOV range.  Use piecewise
+    # linear for accuracy across [-20, 20] range.
+    _ATAN_BP = [-20, -10, -5, -3, -2, -1.5, -1, -0.75, -0.5, -0.25,
+                0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 10, 20]
+    fov_rad = float(fov) * math.pi / 128.0
+    col_from_tan_scale = float(W) / fov_rad
+
+    col_a = piecewise_linear(
+        tan_a, _ATAN_BP,
+        lambda t: math.atan(t) * col_from_tan_scale + W / 2.0,
+        name="col_a",
+    )
+    col_b = piecewise_linear(
+        tan_b, _ATAN_BP,
+        lambda t: math.atan(t) * col_from_tan_scale + W / 2.0,
+        name="col_b",
+    )
+
+    # min/max of col_a, col_b for in_range.
+    # Clamp to [-2, W+2] because in_range overflows with distant bounds.
+    from torchwright.ops.arithmetic_ops import clamp
+    col_a_c = clamp(col_a, -2.0, float(W + 2))
+    col_b_c = clamp(col_b, -2.0, float(W + 2))
+
+    a_lt_b = compare(subtract(col_b_c, col_a_c), 0.0)
+    vis_lo = select(a_lt_b, col_a_c, col_b_c)
+    vis_hi = select(a_lt_b, col_b_c, col_a_c)
+
+    vis_mask = in_range(vis_lo, vis_hi, W)
+    gated_vis_mask = select(is_sorted, vis_mask, zeros_W)
+
+    is_sorted_01 = multiply_const(add_const(is_sorted, 1.0), 0.5)
 
     # =====================================================================
-    # RENDER: attend to sorted walls, parametric intersection, pixels
+    # RENDER: visibility-masked wall selection + parametric intersection
     # =====================================================================
 
     # Ray angle from col_idx + player_angle
@@ -487,53 +655,70 @@ def build_game_graph(
     perp_angle = mod_const(perp_shifted, 256, 256 + fov)
     perp_cos, _perp_sin = trig_lookup(perp_angle)
 
-    # --- Render attention: angular-similarity wall selection ---
-    RENDER_GAIN = 80.0
-    WALL_BIAS = 30.0
-    DIST_SCALE = 1.0
+    # --- Render attention: visibility-masked wall selection ---
+    # The attention score is dominated by the dot product of the render
+    # token's column one-hot with the sorted wall's visibility mask.
+    # Among visible walls, earlier sort order (lower position) wins.
+    #
+    # Query (at RENDER): col_onehot (W) + is_render (1)
+    # Key (at SORTED_WALL): vis_mask (W) + is_sorted (1)
+    # Value (at SORTED_WALL): wall_data (5)
 
-    gated_ray_cos = select(is_render, ray_cos, zeros_1)
-    gated_ray_sin = select(is_render, ray_sin, zeros_1)
+    # Column one-hot: +1 at col_idx, -1 elsewhere → map to 0/1
+    col_p1 = add_const(col_idx, 1.0)
+    col_onehot = in_range(col_idx, col_p1, W)
+    col_onehot_01 = multiply_const(add_const(col_onehot, 1.0), 0.5)
+    gated_col_onehot = select(is_render, col_onehot_01, zeros_W)
     is_render_01 = multiply_const(add_const(is_render, 1.0), 0.5)
-    is_sorted_01 = multiply_const(add_const(is_sorted, 1.0), 0.5)
+
+    # Render attention: visibility-masked nearest-wall selection.
+    #
+    # Score = VIS_GAIN * vis_mask[col]            — visible (+1) vs hidden (-1)
+    #       + VIS_GAIN * SORTED_BIAS * is_sorted  — bonus for sorted tokens
+    #       - VIS_GAIN * DIST_SCALE * dist         — prefer closer walls
+    #
+    # The visibility match (±1) dominates: a 2*VIS_GAIN swing between
+    # visible and hidden walls.  Among visible walls, the distance
+    # tiebreak selects the nearest.
+    VIS_GAIN = 200.0
+    SORTED_BIAS = 100.0
+    DIST_SCALE = 5.0
 
     render_attn_in = Concatenate([
         pos_encoding,
-        gated_ray_cos, gated_ray_sin, is_render_01,
-        gated_dx, gated_dy, gated_dist, is_sorted_01,
+        gated_col_onehot, is_render_01,
+        gated_vis_mask, is_sorted_01, gated_dist,
         gated_wall_data,
     ])
 
     d_pe = len(pos_encoding)
-    s_ray_cos = d_pe
-    s_ray_sin = d_pe + 1
-    s_is_render = d_pe + 2
-    s_dx = d_pe + 3
-    s_dy = d_pe + 4
-    s_dist = d_pe + 5
-    s_is_sorted = d_pe + 6
-    s_wall_data = d_pe + 7
+    s_col_oh = d_pe
+    s_is_render = d_pe + W
+    s_vis_mask = d_pe + W + 1
+    s_is_sorted = d_pe + 2 * W + 1
+    s_dist = d_pe + 2 * W + 2
+    s_wall_data = d_pe + 2 * W + 3
 
-    d_head_render = 3 + 5
+    d_head_render = W + 1 + 5
 
     q_matrix = torch.zeros(len(render_attn_in), d_head_render)
-    q_matrix[s_ray_cos, 0] = RENDER_GAIN
-    q_matrix[s_ray_sin, 1] = RENDER_GAIN
-    q_matrix[s_is_render, 2] = RENDER_GAIN
+    for c in range(W):
+        q_matrix[s_col_oh + c, c] = VIS_GAIN
+    q_matrix[s_is_render, W] = VIS_GAIN
 
     k_matrix = torch.zeros(len(render_attn_in), d_head_render)
-    k_matrix[s_dx, 0] = 1.0
-    k_matrix[s_dy, 1] = 1.0
-    k_matrix[s_is_sorted, 2] = WALL_BIAS
-    k_matrix[s_dist, 2] = -DIST_SCALE
+    for c in range(W):
+        k_matrix[s_vis_mask + c, c] = 1.0
+    k_matrix[s_is_sorted, W] = SORTED_BIAS
+    k_matrix[s_dist, W] = -DIST_SCALE
 
     v_matrix = torch.zeros(len(render_attn_in), d_head_render)
     for i in range(5):
-        v_matrix[s_wall_data + i, 3 + i] = 1.0
+        v_matrix[s_wall_data + i, W + 1 + i] = 1.0
 
     o_matrix = torch.zeros(d_head_render, 5)
     for i in range(5):
-        o_matrix[3 + i, i] = 1.0
+        o_matrix[W + 1 + i, i] = 1.0
 
     render_attn = Attn(
         query_in=render_attn_in, key_in=render_attn_in,
