@@ -200,3 +200,140 @@ bivariate computation into a univariate lookup + free linear ops, you
 save layers.  The angle-lookup optimisation saves ~5 layers × N
 segments on the critical path — the single biggest optimisation in the
 renderer.
+
+---
+
+# Observations: attention-based sorting
+
+Notes from building the `sort_digits_v1` through `sort_digits_v4`
+examples and the `torchwright/ops/attention_ops.py` primitive library.
+
+## The bilinear ceiling: why attention can't express "next above prev"
+
+A vanilla attention head computes `softmax(Q·K^T) · V`.  The logit
+`Q[j] · K[i]` is bilinear in the query-side and key-side features.
+Step functions (e.g., "is `score_i > threshold_j`?") mix both sides
+nonlinearly and can't be produced by any polynomial in
+`(query_features, key_features)`.
+
+We verified this by trying every polynomial logit shape we could
+construct — `-(s - prev - δ)²`, `α·s + β·(s - prev)²`, and many
+others.  For every one, the softmax argmax either picks `prev` itself
+(the item we already emitted) or the global max/min, never "smallest
+`s` strictly above `prev`."
+
+**The workaround: move the step function into the residual stream.**
+Three places it can live:
+
+| Location | How | Width cost | Used by |
+|----------|-----|------------|---------|
+| Key-side precomputed | `I(score > d)` for each fixed `d` | N columns per threshold | V1 |
+| Query-side mask vector | Running bitmask, Q·K computes `mask[pos_i]` | N columns per input slot | V4 |
+| Inside attention (non-vanilla) | ReLU between Q·K and softmax | Zero extra width | Not built |
+
+## Unroll, don't self-reference
+
+The compiler (`torchwright/compiler/forward/`) uses Kahn's topological
+sort on the Node DAG.  A self-referential node (value at position `p`
+depends on own value at `p-1` via `attend_to_offset`) creates a cycle.
+The compiler doesn't detect this cleanly — it silently produces an
+incomplete topological order, spins through `max_layers` trying to
+schedule the remaining nodes, and raises a generic "did not converge"
+error.
+
+**Fix: unroll into distinct Nodes**, exactly as `prefix_ops.py` does
+for its Hillis-Steele stages.  V4's mask update is:
+```python
+mask_k = create_literal_value(torch.zeros(max_input))
+for k in range(max_out):
+    selection_onehot = attend_argmin_unmasked(..., mask_vector=mask_k, ...)
+    mask_k = elementwise_max(mask_k, selection_onehot)  # new Node each step
+```
+
+**Width cost of unrolling:** each step's state lives in the residual
+stream simultaneously.  V4 with 10 steps × (10-slot mask + 8-dim
+embed + overhead) fits in D_MODEL = 512.
+
+## The `output_sequence` aliasing bug
+
+`output_sequence` gates slot `k` via `attend_to_offset(is_trigger,
+delta_pos=-k)`.  For `k` near the period of the fastest sine component
+(≈ 2π ≈ 6.28), the attention aliases — it picks the trigger position
+instead of `P - k`, firing the wrong slot.  Confirmed empirically:
+
+```
+k= 0: -1.000 -1.000 +1.000   ← correct
+k= 5: -1.000 -1.000 +1.000   ← ALIASED
+k= 6: -1.000 -1.000 +1.000   ← ALIASED
+k=11: -1.000 -1.000 +1.000   ← ALIASED (≈ 2× period)
+```
+
+**Fix: `_emit_by_slot_index`.**  Compute `steps_since = pos_scalar −
+trigger_pos_scalar` (scalar arithmetic, no aliasing) and gate with
+`compare(steps_since, k ± 0.5)`.  All sort variants use this helper.
+
+## The `digit_to_scaled_scalar` precision trap
+
+`digit_to_scaled_scalar` → `map_to_table` with
+`embedding_step_sharpness = 1.0`.  Embedding norms are ~40 (self-dot
+~1600), so 0.04% softmax leakage (weight 0.9996 on the winner)
+reduces the dot product by ~0.6, eating more than half the 1-unit
+tolerance.  Chaining through `get_prev_value` and a second
+`map_to_table` compounds the error until the scalar drifts.
+
+**Fix (V1):** run a second attention with `value = digit_scalar` so
+the scalar comes out of the softmax directly as a weighted average of
+per-position scalars, staying within 1e-3 of the integer answer.
+
+**Takeaway:** avoid chaining `map_to_table` on softmax-averaged
+vectors.  Use scalar-valued attention outputs instead.
+
+## Score envelope and the causal-mask sentinel
+
+`Attn.compute` masks future positions to -1000.  With the original
+`attention_hardness = 100` query scaling, a score of 5 produces a
+logit of `100 × 8 × (-5) = -4000`, below the sentinel — making the
+softmax pick masked future positions.
+
+**Fix:** the new primitives use `_QUERY_GAIN = 8` (extracted from the
+slowest cosine, which is ≈ 1 for all realistic positions).  Logits
+stay in `[-960, +960]` for `|score| ≤ 120`, safely above -1000.
+Softmax decisiveness per unit score: `exp(8) ≈ 3000` — adequate for
+distinct integer scores.
+
+## Primitives catalog
+
+All in `torchwright/ops/attention_ops.py`.  Each compiles to one
+vanilla attention head.
+
+| Primitive | Intent | Used by |
+|-----------|--------|---------|
+| `attend_argmin` | Argmin of score in causal window | — |
+| `attend_argmax` | Argmax of score | — |
+| `attend_argmin_where` | Argmin restricted by a per-key validity mask | V1, V4 |
+| `attend_argmax_where` | Argmax restricted by validity | — |
+| `attend_argmin_above_integer` | Argmin above a per-query threshold via indicator basis | V1 |
+| `attend_argmin_unmasked` | Argmin excluding positions set in a per-query mask vector | V4 |
+
+## Design-space comparison
+
+| Variant | Attention's role | Handles duplicates | D_MODEL | Max digits |
+|---------|------------------|--------------------|---------|------------|
+| V1 | Discovers next digit above threshold (indicator basis) | No | 384 | 10 |
+| V2 | Only counting via prefix_sum; MLP decides & emits | Yes | 1024 | 5 |
+| V4 | Masked argmin each step (attention does the selection) | Yes | 512 | 10 |
+
+**When to use which pattern:**
+- Pure "attention does the selection" with duplicates → V4 (unrolled mask).
+- Distinct-only, clearest mental model → V1 (indicator basis).
+- Need to understand what MLP-only looks like → V2.
+
+## Follow-ups
+
+- **Delay-1 self-reference compiler support.**  Would let V4 express
+  its mask as one node instead of `MAX_OUT` unrolled copies.
+- **ReLU-in-logit extension to `Attn`.**  Non-vanilla but would
+  eliminate the indicator basis / mask workarounds entirely.
+- **`output_sequence` fix.**  Replace `attend_to_offset` gating with
+  scalar-arithmetic `_emit_by_slot_index` project-wide.
+- **V3 (two-attention hierarchical).**  Planned but not yet built.
