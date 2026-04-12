@@ -592,3 +592,42 @@ vanilla attention head.
 - **`output_sequence` fix.**  Replace `attend_to_offset` gating with
   scalar-arithmetic `_emit_by_slot_index` project-wide.
 - **V3 (two-attention hierarchical).**  Planned but not yet built.
+
+---
+
+## Visibility matching forces d_head >= screen width
+
+The DOOM render attention selects which sorted wall to draw at each
+screen column.  The selection score is a dot product between a column
+one-hot (from the RENDER token) and a visibility mask (from each
+SORTED_WALL token):
+
+```
+score = VIS_GAIN * sum_c(col_onehot[c] * vis_mask[c]) + ...
+```
+
+Since `col_onehot` is a one-hot vector, this just extracts `vis_mask[col]`
+-- but in the attention Q·K framework, that extraction is a bilinear dot
+product that requires **W dimensions** in Q/K space, one per screen column.
+
+With the sorted flag and distance tiebreak, the Q/K width is `W + 1`.
+For the default walkthrough resolution (W=120), that's `d_qk = 121`,
+requiring `d_head >= 128` (next power of 2).  At W=160, `d_head >= 256`.
+
+This is the dominant constraint on d_head in the DOOM graph.  All other
+attention heads (sort, collision) use d_head < 32.  The render attention
+alone forces d_head to scale with screen width.
+
+**Cost implication:** each attention head has 4 parameter matrices of
+size `d × d_head`.  With d=2048 and d_head=128, that's ~1M params per
+head.  The render attention uses one head for Q/K and one or more for
+V/O (which only needs 5 dimensions for wall data passthrough, split
+across heads via the V/O splitting mechanism).
+
+**Possible alternatives (not yet explored):**
+- Hash the column index into a smaller space (e.g., locality-sensitive
+  hashing) — reduces d_qk at the cost of collision risk.
+- Decompose the visibility match into multiple lower-dimensional
+  attention heads (e.g., 4 heads of width 32 covering column groups).
+- Move visibility selection out of attention entirely — use MLP-based
+  dynamic extraction instead, at the cost of more transformer layers.

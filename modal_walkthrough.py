@@ -67,7 +67,6 @@ def generate_transformer(
     fps: int = 10,
     scale: int = 4,
     d: int = 2048,
-    d_head: int = 32,
 ) -> bytes:
     from torchwright.doom.compile import compile_game, step_frame, segments_to_walls
     from torchwright.doom.walkthrough import generate_walkthrough, save_gif
@@ -81,7 +80,7 @@ def generate_transformer(
         config, textures,
         max_walls=max(8, len(walls)),
         max_coord=max_coord,
-        d=d, d_head=d_head,
+        d=d,
         rows_per_patch=rows_per_patch,
         device="cuda",
     )
@@ -153,13 +152,12 @@ def main(
     fps: int = 10,
     scale: int = 4,
     d: int = 2048,
-    d_head: int = 32,
 ):
     # Launch both in parallel
     transformer_call = generate_transformer.spawn(
         scene=scene, width=width, height=height,
         rows_per_patch=rows_per_patch, tex_size=tex_size,
-        frames=frames, fps=fps, scale=scale, d=d, d_head=d_head,
+        frames=frames, fps=fps, scale=scale, d=d,
     )
     reference_call = generate_reference.spawn(
         scene=scene, width=width, height=height,
