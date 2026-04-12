@@ -140,7 +140,7 @@ def _build_selection_attn(
     # to 8, which is both large enough that a unit score delta is
     # decisive (``exp(8) ≈ 3000``) and small enough that our
     # ``|score| ≤ _MAX_SCORE_ABS`` envelope keeps every valid logit above
-    # the ``-1000`` causal-mask sentinel in ``Attn.compute``. Other
+    # the ``CAUSAL_MASK_SENTINEL`` in ``Attn.compute``. Other
     # columns of Q don't matter because ``K`` has only column 0
     # populated; we zero them out for clarity.
     query_matrix = torch.zeros((len(pos_encoding), d_head))
@@ -504,8 +504,8 @@ def attend_argmin_unmasked(
 
     **When every unmasked position is exhausted.** If the mask covers
     every causally-visible position, the best remaining logit is
-    ``−_UNMASKED_PENALTY`` which equals ``-900`` — still above the
-    ``-1000`` causal-mask sentinel, so the attention will return the
+    ``−_UNMASKED_PENALTY`` which equals ``-10000`` — still above the
+    ``CAUSAL_MASK_SENTINEL``, so the attention will return the
     weighted-average of the *least-bad* masked positions rather than
     wandering into "future" positions. Callers that care about this edge
     case should wrap the result in a ``select`` against a sentinel.

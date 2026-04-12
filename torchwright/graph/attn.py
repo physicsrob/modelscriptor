@@ -1,6 +1,13 @@
 import torch
 from torchwright.graph import Node
 
+# Causal mask sentinel: future positions are filled with this value before
+# softmax.  Must be large enough that no valid logit ever falls below it,
+# otherwise the softmax will prefer "hidden" future positions over the
+# real current position.  With _QUERY_GAIN = 80 and |score| up to 120,
+# the worst valid logit is 80 × (−120) = −9600, still far above −1e6.
+CAUSAL_MASK_SENTINEL = -1e6
+
 
 class Attn(Node):
     """Single causal attention head with explicit Q/K/V/O weight matrices.
@@ -68,7 +75,9 @@ class Attn(Node):
         # Apply attention mask
         mask = torch.triu(torch.ones_like(attn_logits), diagonal=1)
         attn_logits = torch.where(
-            mask == 1, -1e6 * torch.ones_like(attn_logits), attn_logits
+            mask == 1,
+            torch.full_like(attn_logits, CAUSAL_MASK_SENTINEL),
+            attn_logits,
         )
 
         attn = torch.softmax(attn_logits, dim=1)
