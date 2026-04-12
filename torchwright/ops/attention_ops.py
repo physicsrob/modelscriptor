@@ -27,17 +27,12 @@ All primitives here follow this template:
   position; ``value_matrix`` and ``output_matrix`` are identity projections
   that copy it through unchanged.
 
-Why not scale the query by ``attention_hardness = 100``. Hardness-scaling
-the query makes logits enormous — on the order of ``±800`` per unit
-score. Those logits collide with the ``-1000`` causal-mask sentinel that
-``Attn.compute`` uses to silence future positions: if any valid logit
-falls below ``-1000``, the softmax starts treating the sentinel as the
-maximum and the attention accidentally picks masked positions. Using a
-per-query gain of ``_QUERY_GAIN = 8`` keeps the minimum valid logit
-comfortably above the sentinel for any ``|score| ≤ _MAX_SCORE_ABS`` while
-still giving ``exp(8) ≈ 3000`` softmax-ratio decisiveness on a unit score
-delta. Soft ties are the price: exact ties are weighted-averaged rather
-than hard-broken, which matches the behaviour of ``get_prev_value``.
+Query gain.  With the causal-mask sentinel at ``-1e6`` in
+``Attn.compute``, ``_QUERY_GAIN = 80`` keeps the worst valid logit at
+``80 × 120 = 9600``, far above ``-1e6``.  A unit score delta produces a
+logit delta of 80 → ``exp(80) ≈ 5.5e34`` softmax weight ratio —
+effectively hard selection for any non-degenerate gap.  Exact ties are
+still weighted-averaged, matching ``get_prev_value``'s behaviour.
 
 Step-function logits (e.g. strict ``>`` comparisons against a runtime
 threshold) are not expressible in bilinear Q·K. The ``_where`` and
@@ -53,51 +48,47 @@ from torchwright.graph.pos_encoding import PosEncoding
 
 # Coefficient applied to the slowest-cosine component of the positional
 # encoding inside the query projection. Chosen so that
+# Coefficient applied to the slowest-cosine component of the positional
+# encoding inside the query projection. Chosen so that
 # ``Q[j, 0] ≈ _QUERY_GAIN`` for every position ``j`` in a realistic
 # sequence length (the slowest cosine is ``cos(j · d[-1]) ≈ 1`` for
-# ``j`` up to a few thousand). With ``_QUERY_GAIN = 8``, a unit score
-# delta produces a logit delta of 8, i.e. ``exp(8) ≈ 3000`` softmax
-# weight ratio — decisive for distinct integer scores — while the worst
-# logit at ``|score| = _MAX_SCORE_ABS`` still sits comfortably above the
-# causal-mask sentinel.
-_QUERY_GAIN = 8.0
+# ``j`` up to a few thousand). With the causal-mask sentinel at -1e6
+# in ``Attn.compute``, gains up to ~8000 are safe for |score| ≤ 120.
+# We use 80 for a comfortable 10× margin: a unit score delta produces
+# a logit delta of 80, i.e. ``exp(80) ≈ 5.5e34`` softmax weight
+# ratio — effectively hard selection for any non-degenerate score gap.
+_QUERY_GAIN = 80.0
 
 # Coefficient on the position-scalar tiebreak in key-space. Must satisfy
 # ``_TIEBREAK_COEFF * n_pos < 1`` so that a unit score difference
 # always dominates the tiebreak. For ``n_pos <= 100`` this gives headroom
 # of one order of magnitude; bump it down if you sort longer sequences
 # with unit-integer scores.
-_TIEBREAK_COEFF = 0.01
+_TIEBREAK_COEFF = 0.001
 
 # "Infinity-substitute" magnitude for the validity penalty in the
 # ``_where`` variants. Must exceed the maximum possible ``|score|`` so
-# validity always dominates score, but must stay well under 125 so the
-# resulting logit (Q[j,0]·K[i,0] ≈ 8·_VALIDITY_LARGE) stays above the
-# causal-mask sentinel of -1000 used inside ``Attn.compute``.
-_VALIDITY_LARGE = 100.0
+# validity always dominates score. With the causal-mask sentinel at
+# -1e6, the old ceiling of 125 no longer applies; 1000 gives a
+# comfortable margin over any realistic score.
+_VALIDITY_LARGE = 1000.0
 
-# Maximum ``|score|`` supported by these primitives without the
-# resulting attention logit colliding with the ``-1000`` causal-mask
-# sentinel in ``Attn.compute``. Logits end up roughly ``8 * score`` under
-# the unit query projection, so keeping scores under ~120 preserves
-# ``min valid logit > -1000`` and the mask correctly zeros future
-# positions. Callers whose scores could exceed this should pre-normalise
-# (e.g. divide by max_score) before passing to these primitives.
+# Maximum ``|score|`` supported by these primitives. With sentinel at
+# -1e6 and ``_QUERY_GAIN = 80``, the worst logit at |score| = 120 is
+# ``80 × (-120) = -9600``, far above -1e6. The old constraint
+# (``gain × score < 1000``) is gone; this ceiling is now just a
+# documentation hint for callers about the tested range.
 _MAX_SCORE_ABS = 120.0
 
 # Penalty (in *logit* space, not key space) applied by
-# ``attend_argmin_unmasked`` to masked positions. Large enough that a
-# masked position with the best score still loses to an unmasked
-# position with the worst score: must exceed
-# ``_QUERY_GAIN * _MAX_SCORE_UNMASKED_ABS``. Needs to be kept small
-# enough that the unmasked positions' logits stay above ``-1000`` — our
-# unmasked min is ``-_QUERY_GAIN * _MAX_SCORE_UNMASKED_ABS`` plus zero
-# penalty, so the same ``_MAX_SCORE_ABS = 120`` ceiling applies.
-_UNMASKED_PENALTY = 900.0
+# ``attend_argmin_unmasked`` to masked positions. Must exceed
+# ``_QUERY_GAIN * _MAX_SCORE_UNMASKED_ABS`` so a masked position with
+# the best score still loses to an unmasked position with the worst
+# score. With gain=80 and max_score=100: 80×100 = 8000, so 10000
+# gives a comfortable margin.
+_UNMASKED_PENALTY = 10000.0
 
-# Maximum ``|score|`` supported by ``attend_argmin_unmasked``. Tighter
-# than the general ``_MAX_SCORE_ABS`` because the penalty machinery
-# needs headroom to decisively beat a low-score masked position.
+# Maximum ``|score|`` supported by ``attend_argmin_unmasked``.
 _MAX_SCORE_UNMASKED_ABS = 100.0
 
 # Bonus applied to "above threshold" positions in
@@ -107,8 +98,8 @@ _MAX_SCORE_UNMASKED_ABS = 100.0
 # Must exceed ``_QUERY_GAIN · (max_score - min_score)`` so a valid
 # position with the worst score still beats any invalid position with
 # the best score. For ``score ∈ [0, 9]`` that gives ``_QUERY_GAIN · 9
-# = 72``; ``_ABOVE_BONUS = 100`` buys a comfortable margin.
-_ABOVE_BONUS = 100.0
+# = 720``; ``_ABOVE_BONUS = 1000`` buys a comfortable margin.
+_ABOVE_BONUS = 1000.0
 
 
 def _assert_value_fits(pos_encoding: PosEncoding, value: Node) -> int:
