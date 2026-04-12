@@ -226,10 +226,10 @@ def _add_scalar_inits(dense_inits: list) -> None:
     )
     dense_inits.append(
         helper.make_tensor(
-            name="_f32_neg1000_s",
+            name="_f32_neg10000_s",
             data_type=TensorProto.FLOAT,
             dims=[],
-            vals=np.array(-1000.0, dtype=np.float32).tobytes(),
+            vals=np.array(-10000.0, dtype=np.float32).tobytes(),
             raw=True,
         )
     )
@@ -323,8 +323,8 @@ def _emit_cached_preamble(nodes: list, seq_input_name: str) -> None:
         ``[past_len : past_len + n_new]``.
       - ``mask_bool_3d``: (1, n_new, past_cache_len + n_new) bool, True
         where a query position must NOT attend to a key position.
-        Applied via ``Where(mask_bool_3d, -1000, logits)`` — this
-        overwrites masked logits (unlike an additive -1000 mask, which
+        Applied via ``Where(mask_bool_3d, -10000, logits)`` — this
+        overwrites masked logits (unlike an additive -10000 mask, which
         is numerically unsafe when the original logits can dominate the
         additive shift).
 
@@ -430,12 +430,12 @@ def _emit_cached_layer_nodes(
     # Attention over the full (past + new) K and V.
     node("Transpose", [f"new_K_{layer_idx}"], [f"{p}_K_T"], perm=[0, 2, 1])
     node("MatMul", [f"{p}_Q", f"{p}_K_T"], [f"{p}_logits"])
-    # Overwrite-mask with -1000 (equivalent to torch's masked_fill).  An
-    # additive -1000 would leave masked positions at "logit - 1000",
+    # Overwrite-mask with -10000 (equivalent to torch's masked_fill).  An
+    # additive -10000 would leave masked positions at "logit - 10000",
     # which is not dominated by real logits when they reach ~800.
     node(
         "Where",
-        ["mask_bool_3d", "_f32_neg1000_s", f"{p}_logits"],
+        ["mask_bool_3d", "_f32_neg10000_s", f"{p}_logits"],
         [f"{p}_logits_masked"],
     )
     node("Softmax", [f"{p}_logits_masked"], [f"{p}_weights"], axis=-1)
