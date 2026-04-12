@@ -201,6 +201,261 @@ save layers.  The angle-lookup optimisation saves ~5 layers × N
 segments on the critical path — the single biggest optimisation in the
 renderer.
 
+## Runtime gather went from "impossible" to "2 MLP sublayers"
+
+The observation above ("Texture mapping requires O(tex_height) MLP
+sublayers, and you can't beat it") was written under one implicit
+assumption: that the IR could not express "read element `k` from a
+runtime vector where `k` is a runtime integer".  Every runtime
+selection had to be phrased as a scatter — loop over all K candidates,
+emit a per-candidate mask via `in_range`, fan out with
+`broadcast_select`, sum the results — which scales as O(K) MLP
+sublayers because each candidate mask is independent work.
+
+Then `dynamic_extract` was added, and the ceiling moved.  Its recipe
+is short: one `in_range(idx, idx + 1, n_entries)` to build a one-hot
+mask, one `broadcast_select` to zero every slot except the selected
+one, one free `Linear` to collapse `n_entries * d_fill` down to
+`d_fill`.  Total cost: **2 MLP sublayers plus one free Linear**,
+regardless of `n_entries`.  The textured fill rewrite turns the
+per-tex-row scatter loop inside-out into a per-screen-row gather:
+
+    for each of rows_per_patch screen rows:
+        tex_idx = linear_bin_index(y, wall_top, wall_bottom, tex_height)
+        color   = dynamic_extract(tex_column_colors, tex_idx, tex_h, 3)
+
+Same math, opposite iteration direction, dramatically fewer ops — and
+fewer failure modes (the scatter approach was quietly wrong when
+`wall_height < tex_height` because the per-band masks overlapped at
+round-off scale).
+
+**The framing to take away**: "K things, pick one" is not a fundamental
+cost ceiling; it's a question of whether the IR has a primitive that
+inverts the scatter into a gather.  Once you have one — either a
+dedicated op like `dynamic_extract` or the transformer's native
+attention — the O(K) cost collapses to O(1).  Any other place in a
+compiled graph that's running a scatter loop over runtime candidates
+is probably a rewrite away from the same collapse.  The first
+observation in this file is no longer a ceiling, just a characteristic
+of the scatter *implementation* of that kind of select.
+
+## The "passing tests" that were hiding a real correctness bug
+
+When the textured fill was rewritten, the new implementation failed
+four previously-green regression tests.  The apparent cause was the
+new rewrite.  The actual cause, discovered after debugging, was that
+**the old implementation was silently wrong** and the old tests only
+passed because their tolerances absorbed the error.
+
+The bug lived in `map_to_table`, used in the texture column lookup
+stage with 2-D keys `(texture_id, col_idx)` mapping to `tex_height * 3`
+RGB values per column.  `map_to_table` scores each key-value unit by
+dot product against the input and fires every unit whose score exceeds
+`key @ key - 1`.  For the input `(texture_id=0, col=7)` and the key set
+`{(0, 0), (0, 1), ..., (0, 7)}`, *every* unit fires with some non-zero
+magnitude and the final `Linear` sum returns a weighted combination of
+several texture columns — not the exact one requested.  The
+`tex_column_colors` node was producing values like `[0.37, 1.97, …]`
+even for the default 8×8 atlas where the answer should be one exact
+column.
+
+The old regression test used `atol=0.2` and `max_boundary_pixels=48` as
+its tolerance.  Both were generous enough to absorb the blended
+lookups.  When the new fill was written with tighter precision, the
+blend became visible and the tests failed — misleadingly pointing at
+the new code rather than the old bug.  Fix: replace `map_to_table` at
+this site with `piecewise_linear` keyed on a flat integer
+`texture_id * tex_w + col`, which returns an exact texture column at
+integer inputs and interpolates cleanly between adjacent columns.
+
+**The lesson worth keeping:**  precision-sensitive tests whose pass
+criterion happens to include the worst-case error of the
+implementation being tested can hide real correctness bugs for a long
+time.  The old test "was green" but was only green because the
+generous tolerance covered the leaky lookup.  Any time you tighten
+tolerance on a passing test and it starts failing, the first hypothesis
+should be "the old test was papering over an error," not "the new code
+regressed."
+
+## Scene complexity couples to model width, quietly
+
+The baked rendering design unrolls per-segment intersection `N` times
+in the graph: each wall gets its own `_segment_intersection` Linear
+nodes with compile-time constants, its own `_segment_distance` MLP
+pipeline, its own contribution to the `reduce_min` tree, and its own
+row in the per-angle lookup.  Most of this is structurally parallel —
+all `N` segments can run in the same layers if residual width
+permits — so the cost story depends on both N and `d`.
+
+A compile-cost sweep at the current default `d=2048`:
+
+| N walls | layers | peak_d |
+|---:|---:|---:|
+|  4 |  51 |  451 |
+|  8 |  57 |  451 |
+| 16 |  67 |  795 |
+| 32 |  90 | 2048 (capped) |
+| 64 | 165 | 2048 (capped) |
+
+And the same walls at `d=6144` (large enough that no config caps):
+
+| N walls | layers | peak_d (true) |
+|---:|---:|---:|
+| 32 | 65 | 1471 |
+| 64 | 77 | 4849 |
+
+Two things jump out:
+
+1. **`peak_d` is flat up to N=8, then grows sharply.**  At small scene
+   size the per-wall work doesn't dominate the residual stream — fixed
+   stages (game logic, `_shared_products`, texture column lookup,
+   column fill) hold the floor at ~450 columns.  Per-wall work starts
+   contributing to peak residual width around N=16 and takes over
+   completely by N=32.
+2. **At `d=2048`, the compiler hits the cap at N=32 and starts adding
+   layers to compensate.**  65 layers at `d=6144` vs 90 at `d=2048`:
+   the extra 25 layers exist purely to sequentialize work that couldn't
+   fit in the narrower residual.  At N=64, it's 77 vs 165 — more than
+   double, entirely due to residual pressure.
+
+**The hidden scaling wall:** at realistic DOOM-scene wall counts
+(`N ≈ 32-64`), the current design silently demands `d ≥ 5000` to avoid
+pathological layer counts, even though smaller scenes at `d=2048`
+compile and run fine.  Nobody ever writes down "this architecture
+requires `d_model` to scale with scene complexity" because it doesn't
+*look* like a requirement until you plot it — per-step graph ops grow
+smoothly, the model still compiles, the tests still pass — and yet
+the per-frame decode cost at large N is dominated by extra layers
+paying rent for residual pressure that wasn't there at small N.
+
+This is the single most compelling reason to reach for runtime wall
+data: moving wall geometry out of the residual stream and into the KV
+cache via attention caps `peak_d` at the single-wall cost
+(`~34-50` columns for the parametric intersection prototype),
+decoupling `d_model` from scene complexity entirely.
+
+## Attention is a runtime gather, and "zero-K" is a load-bearing design pattern
+
+Even before `dynamic_extract` landed, the transformer had a perfectly
+good runtime gather primitive: *attention*.  `softmax(Q·K)` over a
+prefix of N key vectors selects the one whose key best aligns with the
+query, and the value read gets routed through the standard attention
+value projection.  For "pick which of N walls this ray hits", attention
+is a more natural fit than `reduce_min` — `reduce_min` is a binary
+tree of `select` ops with depth `log₂(N)` and some fiddly
+comparator logic; one attention head does the whole thing in a single
+softmax over all `N` walls at once, using Q = ray direction, K = wall
+midpoint direction, V = wall parameters.
+
+The wall-attention prototype (`tests/graph/test_wall_attention.py`)
+hand-builds exactly this.  It packs wall and query tokens into the
+same input sequence with role flags (`is_wall`, `is_query`), hand-
+designs Q/K/V matrices for `Q·K = logit_scale · (cos(ray − wall_angle)
++ wall_bias − dist_scale · wall_dist)`, and verifies the attention
+output concentrates on the correct wall sharply enough (>0.99 weight
+with `logit_scale=200`) to read back that wall's parameters cleanly
+for N up to 32 walls on a circle.
+
+Two patterns from this work are worth writing down:
+
+**Zero-K cross-role isolation.**  In the same rollout you have wall
+positions and query positions.  Causal masking alone would let each
+query attend to *prior queries* — their K vectors would participate
+in the softmax and their V vectors would leak into the gathered
+result.  The fix is elegant: project K from `(wall_cos, wall_sin,
+-dist)` slots that are *exactly zero at query positions*.  A query
+row's K is therefore `(0, 0, 0)`, its Q·K against any other key is
+zero, and the softmax assigns it essentially zero weight.  Project V
+from the same wall slots, so even if some weight leaks onto a query
+row its V is also zero and contributes nothing to the gather.  Causal
+masking handles wall → query direction; zero K handles query → query
+direction; zero V handles the leakage floor.  Three independent
+mechanisms compose cleanly, none of them requiring runtime branching
+or role-conditional ops.
+
+**The zero-logit baseline pitfall.**  There's a subtle failure mode
+that only bites when you hand-design attention (training would learn
+around it).  Causal self-attention at position `k` includes `k` in
+its attention set, and `k` has K=0 (it's a query row), so its logit is
+exactly 0.  If your real wall logits can equal zero — for example,
+because `cos_diff = dist_scale · wall_dist` for some geometry — the
+correct wall *ties* with the V=0 self-row and softmax splits mass
+50/50 between them.  The gathered output is half the correct answer.
+
+The fix is to bias every wall logit strictly positive by routing
+`is_wall · wall_bias` (with `wall_bias` large enough to dominate
+realistic distance terms) into K's distance dimension.  At query
+positions the bias is zero (since `is_wall=0` there); at wall
+positions it adds a constant offset that keeps wall logits above the
+zero-logit self baseline regardless of `cos_diff` or `wall_dist`.
+
+**What to remember:** hand-designing attention requires thinking about
+the logit distribution as an explicit object.  Soft mechanisms that
+training handles implicitly — keeping logit magnitudes apart from
+competing zero baselines, ensuring softmax sharpness is adequate for
+the scene density, handling ties between "correct" and "unused"
+positions — all become explicit constraints on the Q/K matrix design.
+The payoff is that the same attention primitive that replaces
+`reduce_min` for wall selection can be reused anywhere else in the
+graph where you want a runtime gather over a variable-length prefix.
+
+## Algebraic simplification beat primitive substitution, by a lot
+
+One concrete optimisation anecdote worth recording.  When building the
+parametric single-wall intersection prototype (walls-as-tokens
+derisking), the naive translation of `_segment_intersection` with
+runtime wall endpoints cost 233 ops / 10 layers in the compiled graph.
+It had ten `signed_multiply` calls — one per runtime product — because
+every term in the formulas:
+
+    den   = ey · cos - ex · sin
+    num_t = ax · ey - ay · ex + ex · py - ey · px
+    num_u = ax · sin - ay · cos + py · cos - px · sin
+
+needs a product of two runtime scalars once the wall coordinates
+aren't compile-time constants.
+
+The obvious optimisation was to replace `signed_multiply` (~3 MLP
+sublayers each, via the polarization identity) with
+`piecewise_linear_2d` (1 MLP sublayer each, a 2-D grid lookup).  Doing
+that alone would have cut 10 products × 2 layers = 20 layers worth of
+work.  Fine.
+
+But it turns out the much bigger win was **algebraic simplification**.
+Collecting terms:
+
+    num_t = ey · (ax − px) + ex · (py − ay)
+    num_u = (ax − px) · sin + (py − ay) · cos
+
+Both formulas now share the intermediates `dx = ax − px` and
+`dy = py − ay` — both free Linears.  The product count drops from 10
+to 6: two for `den`, two for `num_t` (pos·pos), two for `num_u`
+(pos·trig).  Same math, same precision, fewer operations.
+
+Cost trajectory of the three optimisation steps, measured on the
+compiled graph:
+
+| Change | ops | layers | peak_d |
+|---|---:|---:|---:|
+| Naive, 10 × `signed_multiply` | 233 | 10 | 62 |
+| Algebraic simplification (10 → 6 products) + `piecewise_linear_2d` for pos·trig | 83 | 8 | 34 |
+| + `piecewise_linear_2d` for the two pos·pos products too | **51** | **6** | **34** |
+
+The algebraic simplification step alone cut ops by **150** — from 233
+to 83 — and most of that came from the 10 → 6 product reduction, not
+the primitive swap.  Switching `signed_multiply` to
+`piecewise_linear_2d` got us the rest of the way, from 83 to 51.
+
+**The lesson**: in a transformer-graph IR where each primitive has a
+known cost, the first place to look for optimisations is *not* at the
+primitive level but at the algebra.  Sharing intermediates between
+outputs — finding a common subexpression like `(ax − px)` that serves
+multiple formulas — is free, since free Linears are actually free and
+`Concatenate` over shared residual-stream columns costs nothing.
+Primitive substitution is usually easier to think about but yields
+less.  In the parametric intersection, the algebraic rewrite was worth
+roughly 2× the primitive swap.
+
 ---
 
 # Observations: attention-based sorting

@@ -1,4 +1,17 @@
-"""Compile the DOOM game graph and export it to ONNX.
+"""Compile the DOOM v2 walls-as-tokens game graph and export to ONNX.
+
+The v2 graph receives wall geometry at runtime via wall tokens, so the
+ONNX model is scene-independent.  Collision detection (optional) is
+still baked from segments when ``--collision`` is passed.
+
+Input schema (per position):
+    token_type (8)   — E8 spherical code identifying the token role
+    player_{x,y,angle}, input_* — player state and controls
+    wall_{ax,ay,bx,by,tex_id}, wall_index — wall geometry (WALL tokens)
+    sort_mask (max_walls) — accumulated sort mask (SORTED_WALL tokens)
+    col_idx, patch_idx — screen coordinates (RENDER tokens)
+
+Output schema: token-type-dependent (see game_graph module docstring).
 
 Usage:
     python -m torchwright.doom.to_onnx [--scene box|multi]
@@ -18,7 +31,7 @@ from torchwright.reference_renderer.types import RenderConfig
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compile the DOOM game graph and save it to ONNX",
+        description="Compile the DOOM v2 game graph and save it to ONNX",
     )
     parser.add_argument("--scene", choices=["box", "multi"], default="box")
     parser.add_argument("--wad", type=str, default="doom1.wad",
@@ -28,22 +41,20 @@ def main():
     parser.add_argument("--width", type=int, default=160)
     parser.add_argument("--height", type=int, default=100)
     parser.add_argument("--fov", type=int, default=32)
+    parser.add_argument("--max-walls", type=int, default=8,
+                        help="Maximum number of wall tokens per frame")
     parser.add_argument(
         "--rows-per-patch", type=int, default=10,
-        help="Vertical patch height. Must divide --height. "
-             "Pass --rows-per-patch <height> for the unsharded phase-α path.",
+        help="Vertical patch height. Must divide --height.",
     )
     parser.add_argument(
         "--d", type=int, default=2048,
-        help="Residual stream width. Default 2048 leaves enough headroom "
-             "for the per-row textured-fill chains at the production "
-             "(W=160, H=100, rp=10, tex_size=64) shape; smaller configs "
-             "may compile at d=1024.  Use d=4096 for higher quality.",
+        help="Residual stream width.",
     )
-    parser.add_argument("--d-head", type=int, default=16)
+    parser.add_argument("--d-head", type=int, default=32)
     parser.add_argument(
         "-o", "--output", type=str, default=None,
-        help="Output .onnx path. Default: doom_game_<scene>.onnx",
+        help="Output .onnx path. Default: doom_game_v2_<scene>.onnx",
     )
     args = parser.parse_args()
 
@@ -70,15 +81,20 @@ def main():
         )
         max_coord = 15.0
 
-    print(f"Building game graph (d={args.d})...")
+    print(f"Building game graph (d={args.d}, max_walls={args.max_walls})...")
     output_node, pos_encoding = build_game_graph(
-        segments, config, max_coord,
+        config, textures,
+        max_walls=args.max_walls,
+        max_coord=max_coord,
         move_speed=0.3, turn_speed=4,
-        textures=textures,
         rows_per_patch=args.rows_per_patch,
     )
 
-    max_seq_len = config.screen_width * (config.screen_height // args.rows_per_patch)
+    # Sequence length: START + WALL*N + EOS + SORTED_WALL*N + RENDER*(W*H/rp)
+    rp = args.rows_per_patch
+    n_walls = args.max_walls
+    render_positions = config.screen_width * (config.screen_height // rp)
+    max_seq_len = 1 + n_walls + 1 + n_walls + render_positions
 
     compile_headless_to_onnx(
         output_node=output_node,
@@ -87,9 +103,12 @@ def main():
         d=args.d,
         d_head=args.d_head,
         max_seq_len=max_seq_len,
-        max_layers=200,
+        max_layers=400,
         verbose=True,
-        extra_metadata={"rows_per_patch": args.rows_per_patch},
+        extra_metadata={
+            "rows_per_patch": rp,
+            "max_walls": n_walls,
+        },
     )
 
 

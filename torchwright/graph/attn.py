@@ -68,7 +68,7 @@ class Attn(Node):
         # Apply attention mask
         mask = torch.triu(torch.ones_like(attn_logits), diagonal=1)
         attn_logits = torch.where(
-            mask == 1, -1000 * torch.ones_like(attn_logits), attn_logits
+            mask == 1, -1e6 * torch.ones_like(attn_logits), attn_logits
         )
 
         attn = torch.softmax(attn_logits, dim=1)
