@@ -225,25 +225,10 @@ def main():
     parser.add_argument("--wall-threshold", type=float, default=1.5,
                         help="Distance to wall that triggers a turn")
     parser.add_argument(
-        "--onnx", type=str, default=None,
-        help="Path to a game .onnx produced by torchwright.doom.to_onnx. "
-             "Required for --mode transformer. Scene/width/height/fov "
-             "must match the config used at export.",
-    )
-    parser.add_argument(
-        "--device", choices=["cpu", "gpu"], default="cpu",
-        help="onnxruntime execution device. gpu requires onnxruntime-gpu "
-             "and a working CUDA runtime.",
-    )
-    parser.add_argument(
-        "--cache-lookback", type=int, default=10,
-        help="Trim the KV cache handed to module.step to the most-recent "
-             "N entries (default: 10). Positional encodings stay correct "
-             "because past_len is threaded separately.  Pass a negative "
-             "number to disable trimming.",
+        "--rows-per-patch", type=int, default=10,
+        help="Vertical patch height. Must divide --height.",
     )
     args = parser.parse_args()
-    cache_lookback = args.cache_lookback if args.cache_lookback >= 0 else None
 
     trig_table = generate_trig_table()
     config = RenderConfig(
@@ -269,30 +254,22 @@ def main():
         max_coord = 15.0
 
     if args.mode == "transformer":
-        if args.onnx is None:
-            raise SystemExit(
-                "transformer mode requires --onnx <path>. "
-                "Compile the graph first with "
-                f"`python -m torchwright.doom.to_onnx --scene {args.scene} "
-                f"--width {args.width} --height {args.height} --fov {args.fov} "
-                f"--tex-size {args.tex_size}`."
-            )
-
-        from torchwright.compiler.onnx_load import OnnxHeadlessModule
-        from torchwright.doom.compile import step_frame_compiled
-
-        providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if args.device == "gpu"
-            else ["CPUExecutionProvider"]
+        from torchwright.doom.compile import (
+            compile_game, step_frame, segments_to_walls,
         )
-        print(f"Loading {args.onnx} (providers={providers})...")
-        module = OnnxHeadlessModule(args.onnx, providers=providers)
+
+        walls = segments_to_walls(segments)
+        print(f"Compiling game graph (walls-as-tokens, {len(walls)} walls)...")
+        module = compile_game(
+            config, textures,
+            max_walls=max(8, len(walls)),
+            max_coord=max_coord,
+            d=2048, d_head=32,
+            rows_per_patch=args.rows_per_patch,
+        )
 
         def frame_fn(state, inputs):
-            return step_frame_compiled(
-                module, state, inputs, config, cache_lookback=cache_lookback,
-            )
+            return step_frame(module, state, inputs, walls, config)
     else:
         def frame_fn(state, inputs):
             new_state = update_state(state, inputs, segments, trig_table)

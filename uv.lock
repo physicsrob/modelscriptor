@@ -2296,10 +2296,14 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "onnx" },
-    { name = "onnxruntime-gpu", version = "1.24.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "onnxruntime-gpu", version = "1.24.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pygame" },
     { name = "torch" },
+]
+
+[package.optional-dependencies]
+gpu = [
+    { name = "onnxruntime-gpu", version = "1.24.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "onnxruntime-gpu", version = "1.24.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 
 [package.dev-dependencies]
@@ -2316,10 +2320,11 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "onnx" },
-    { name = "onnxruntime-gpu" },
+    { name = "onnxruntime-gpu", marker = "extra == 'gpu'" },
     { name = "pygame", specifier = ">=2.6.1" },
     { name = "torch" },
 ]
+provides-extras = ["gpu"]
 
 [package.metadata.requires-dev]
 dev = [
