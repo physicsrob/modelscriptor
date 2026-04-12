@@ -54,7 +54,7 @@ def compile_game(
     turn_speed: int = 4,
     d: int = 2048,
     d_head: Optional[int] = None,
-    device: str = "cpu",
+    device: str = "auto",
     verbose: bool = True,
     rows_per_patch: Optional[int] = None,
     d_hidden: Optional[int] = None,
