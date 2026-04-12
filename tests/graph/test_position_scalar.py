@@ -32,17 +32,12 @@ from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 #   640   — old default game graph (W=64, shards_per_col=10)
 #   1600  — new default game graph (W=160, shards_per_col=10)
 #
-# Sizes > 310 exceed the documented accuracy limit for position_scalar.
-# The sin-based approximation breaks down, so those are marked xfail.
 SEQ_LENS = [32, 48, 100, 160, 310, 320, 640, 1600]
-_BEYOND_LIMIT = {320, 640, 1600}
 
 
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
 def test_position_scalar_uncompiled(seq_len):
     """Direct graph.compute() — purely tests the math, not the compiler."""
-    if seq_len in _BEYOND_LIMIT:
-        pytest.xfail(f"seq_len={seq_len} exceeds documented accuracy limit (~310)")
     pos_encoding = PosEncoding(16)
     scalar_node = pos_encoding.get_position_scalar()
     out = scalar_node.compute(n_pos=seq_len, input_values={})
@@ -58,8 +53,6 @@ def test_position_scalar_uncompiled(seq_len):
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
 def test_position_scalar_compiled(seq_len):
     """Compiled transformer — tests the value as downstream ops see it."""
-    if seq_len in _BEYOND_LIMIT:
-        pytest.xfail(f"seq_len={seq_len} exceeds documented accuracy limit (~310)")
     pos_encoding = create_pos_encoding()
     # compile_headless needs at least one input; fold a zero-weighted
     # copy of it into the output so the graph is well-formed without
