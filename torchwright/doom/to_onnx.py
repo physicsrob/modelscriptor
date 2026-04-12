@@ -34,9 +34,11 @@ def main():
              "Pass --rows-per-patch <height> for the unsharded phase-α path.",
     )
     parser.add_argument(
-        "--d", type=int, default=1024,
-        help="Residual stream width. Use a larger value (e.g. 4096) for "
-             "higher quality.",
+        "--d", type=int, default=2048,
+        help="Residual stream width. Default 2048 leaves enough headroom "
+             "for the per-row textured-fill chains at the production "
+             "(W=160, H=100, rp=10, tex_size=64) shape; smaller configs "
+             "may compile at d=1024.  Use d=4096 for higher quality.",
     )
     parser.add_argument("--d-head", type=int, default=16)
     parser.add_argument(

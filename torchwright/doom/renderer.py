@@ -69,35 +69,8 @@ def trig_lookup(ray_angle: Node) -> Tuple[Node, Node]:
 
 
 # ---------------------------------------------------------------------------
-# Wall height from distance (2D lookup)
+# Wall height from distance
 # ---------------------------------------------------------------------------
-
-# Distance breakpoints: dense near 0 where 1/x is steep, sparse far away.
-_DIST_BREAKPOINTS = [
-    0.5,
-    0.75,
-    1.0,
-    1.25,
-    1.5,
-    2.0,
-    2.5,
-    3.0,
-    4.0,
-    5.0,
-    6.0,
-    8.0,
-    10.0,
-    13.0,
-    16.0,
-    20.0,
-    25.0,
-    30.0,
-    35.0,
-    40.0,
-]
-
-# perp_cos breakpoints: covers typical FOV range.
-_COS_BREAKPOINTS = [0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
 
 
 def _wall_height_lookup(
@@ -106,14 +79,43 @@ def _wall_height_lookup(
     config: RenderConfig,
     max_coord: float,
 ) -> Tuple[Node, Node, Node]:
-    """Compute wall_top, wall_bottom, wall_height via a single 2D lookup.
+    """Compute wall_top, wall_bottom, wall_height from the closest hit.
 
-    Replaces the 6-MLP chain (clamp → signed_multiply → clamp →
-    reciprocal → multiply_const → Linear) with 1 MLP sublayer.
+    The math is ``wall_height = H / (closest_dist * perp_cos)``,
+    clamped so the no-hit case (``closest_dist = BIG_DISTANCE``)
+    degenerates to a tiny wall instead of extrapolating wildly.
+
+    Earlier versions used a single ``piecewise_linear_2d`` over
+    ``(closest_dist, perp_cos)`` with sparse breakpoints, collapsing
+    the whole "multiply, clamp, reciprocal, scale" pipeline into one
+    MLP sublayer.  But the function being approximated is ``H/(d*c)``,
+    which has steep gradients near small ``d*c``, and the bilinear
+    interpolant on the sparse grid (~20 × 8 vertices) gave a few
+    percent error in ``wall_height`` for typical wall hits — enough
+    to push the wall band 1-2 screen rows off the reference's
+    location and visibly thin out the wall in the rendered output.
+
+    The reformulation here is the explicit decomposition:
+
+    1. ``perp_dist = signed_multiply(closest_dist, perp_cos)``
+       — both inputs are positive scalars, output bounded above
+       by ``max_dist`` and below by ``min_dist`` after clamping.
+    2. ``inv_perp_dist = 1/perp_dist`` via ``piecewise_linear`` with
+       **geometric** breakpoints (constant relative error per
+       segment, ~1% across the whole range with 48 breakpoints).
+    3. ``wall_height = H * inv_perp_dist`` — free ``Linear``.
+    4. ``wall_top``/``wall_bottom`` — free ``Linear`` from
+       ``wall_height`` (vertically centred wall).
+
+    Cost: ~5 MLP sublayers (signed_multiply ~3 + clamp 1 + reciprocal
+    1) instead of 1 — but called once per screen column, so the
+    total graph depth grows by ~4 sublayers, not by a factor.  See
+    the matching note on :func:`_u_norm_lookup` for the same reasoning.
 
     Args:
         closest_dist: Scalar distance to nearest wall.
-        perp_cos: Fish-eye correction cosine (scalar).
+        perp_cos: Fish-eye correction cosine (scalar) in roughly
+            ``[0.65, 1.0]``.
         config: Render configuration.
         max_coord: Upper bound on coordinate magnitudes.
 
@@ -122,25 +124,51 @@ def _wall_height_lookup(
     """
     H = config.screen_height
     max_dist = 2.0 * max_coord
+    min_dist = 0.5
 
-    # Clamp distance before the 2D lookup so BIG_DISTANCE (no-hit)
-    # maps to a tiny wall height instead of extrapolating wildly.
-    clamped_dist = clamp(closest_dist, 0.5, max_dist)
-
-    def _wall_h(d, c):
-        d_safe = builtins.max(0.5, builtins.min(max_dist, d))
-        perp = builtins.max(0.5, builtins.min(max_dist, d_safe * c))
-        return float(H) / perp
-
-    wall_height = piecewise_linear_2d(
-        clamped_dist,
+    # 1. perp_dist = closest_dist * perp_cos.  Both positive but use
+    #    signed_multiply since we don't have an unsigned version with
+    #    matching API.  Output bounded by max_dist (closest_dist is
+    #    already roughly ≤ max_dist for hits, BIG_DISTANCE for no-hit;
+    #    perp_cos ≤ 1.0 always).
+    perp_dist = signed_multiply(
+        closest_dist,
         perp_cos,
-        _DIST_BREAKPOINTS,
-        _COS_BREAKPOINTS,
-        _wall_h,
-        name="wall_height_2d",
+        max_abs1=BIG_DISTANCE,
+        max_abs2=1.0,
+        max_abs_output=BIG_DISTANCE,
+        step=0.5,
     )
 
+    # 2. Clamp perp_dist to [min_dist, max_dist] so the reciprocal
+    #    lookup stays in its valid range and the no-hit case
+    #    (closest_dist == BIG_DISTANCE) collapses to wall_height =
+    #    H / max_dist (a small wall, not 0).
+    clamped_perp_dist = clamp(perp_dist, min_dist, max_dist)
+
+    # 3. inv_perp_dist via geometric-breakpoint piecewise_linear.
+    #    Geometric spacing gives constant relative error per segment;
+    #    48 breakpoints over [0.5, 40] gives ~1% relative error on
+    #    the reciprocal across the whole range.
+    n_bp = 48
+    ratio = (max_dist / min_dist) ** (1.0 / (n_bp - 1))
+    bps: List[float] = [min_dist * (ratio ** k) for k in range(n_bp)]
+    bps[0] = min_dist
+    bps[-1] = max_dist
+    inv_perp_dist = piecewise_linear(
+        clamped_perp_dist,
+        bps,
+        lambda d: 1.0 / d,
+        name="wall_height_inv_perp_dist",
+    )
+
+    # 4. wall_height = H * inv_perp_dist.  Free Linear.
+    wall_height = multiply_const(inv_perp_dist, float(H))
+
+    # 5. wall_top, wall_bottom from wall_height (free Linears).  The
+    #    wall is always vertically centred at H/2 — see the note in
+    #    _textured_column_fill for why this assumption is currently
+    #    baked in upstream.
     center = float(H) / 2.0
     half_height = multiply_const(wall_height, 0.5)
     wall_top = Linear(
@@ -275,27 +303,65 @@ def _u_norm_lookup(
     tex_w: int,
     max_coord: float,
 ) -> Node:
-    """Compute texture column index via a single 2D lookup.
+    """Compute the integer texture column index ``floor(num_u * tex_w / abs_den)``.
 
-    Replaces the 7-MLP chain (clamp → reciprocal → signed_multiply →
-    clamp → multiply_const → thermometer_floor_div) with 1 MLP sublayer.
+    Earlier versions of this op used :func:`piecewise_linear_2d` over
+    ``(num_u, abs_den)`` with sparse breakpoints, which collapses the
+    whole "divide and floor" pipeline into a single MLP sublayer.  But
+    the function being approximated is a ``tex_w``-step staircase
+    over a 2D domain, and bilinear interpolation between sparse grid
+    vertices cannot resolve every step — for typical wall hits the
+    output landed 1–2 columns off the true value, which manifested
+    visually as a consistent texture-mapping offset across the
+    rendered wall (the "wrong starting point" the demo gif showed).
 
-    Returns a scalar node containing floor(clamp(u/den, 0, 1) * tex_w),
-    i.e. an integer in [0, tex_w-1].
+    The reformulation uses :func:`linear_bin_index`, which is the
+    purpose-built primitive for "continuous coordinate → integer bin
+    over a runtime range":
+
+    * ``num_u`` is the per-segment u-coordinate before normalisation.
+    * ``abs_den`` is the magnitude of the ray-segment denominator
+      (the per-angle scale that ``num_u`` should be divided by).
+    * Bin range is ``[0, abs_den]``, divided into ``tex_w`` bins.
+    * Output is ``floor((num_u - 0) * tex_w / (abs_den - 0))``
+      clamped to ``[0, tex_w - 1]`` — exactly the texture column index.
+
+    Cost: ~5 MLP sublayers (1 reciprocal + ~3 signed_multiply + 1
+    floor_int) instead of 1 — but called once per screen column, so
+    the total graph depth grows by ~4 sublayers, not by a factor.
+
+    Args:
+        winning_adj_num_u: Scalar node — the winning segment's u
+            numerator (sign-normalised so it's non-negative).
+        winning_abs_den: Scalar node — the winning segment's
+            ``|den|`` value (always positive, bounded above by the
+            wall length × ray-direction extreme).
+        tex_w: Texture width in pixels (compile-time).
+        max_coord: World coordinate bound — used to set the
+            reciprocal lookup's range.
+
+    Returns:
+        Scalar node carrying an integer in ``[0, tex_w - 1]``.
     """
+    from torchwright.graph.misc import LiteralValue
 
-    def _tex_col(u, d):
-        d_safe = builtins.max(0.01, builtins.min(2.0 * max_coord, d))
-        u_norm = builtins.max(0.0, builtins.min(1.0 - 1e-4, u / d_safe))
-        return builtins.min(tex_w - 1, builtins.max(0, int(u_norm * tex_w)))
-
-    return piecewise_linear_2d(
+    zero = LiteralValue(torch.tensor([0.0]), name="u_norm_zero")
+    return linear_bin_index(
         winning_adj_num_u,
+        zero,
         winning_abs_den,
-        _U_BREAKPOINTS,
-        _DEN_BREAKPOINTS,
-        lambda u, d: float(_tex_col(u, d)),
-        name="tex_col_2d",
+        n_bins=tex_w,
+        # |abs_den| for box-room geometry sits in roughly
+        # [0.5, 2 * max_coord]: smaller than 0.5 means an extremely
+        # glancing ray (those are unlikely to be the winning segment
+        # via reduce_min anyway), and the upper bound is the longest
+        # wall edge.  Tight bounds → better signed_multiply precision
+        # AND fewer neurons.
+        min_range=0.5,
+        max_range=2.0 * max_coord,
+        n_reciprocal_breakpoints=48,
+        mul_step=0.25,
+        name="u_norm_bin",
     )
 
 
@@ -714,15 +780,23 @@ def _textured_column_fill(
 
     row_rgbs: List[Node] = []
     for y_idx in range(rows_per_patch):
-        # y_abs = patch_row_start + y_idx  (free Linear, y_idx baked in)
-        y_abs = Linear(
+        # y_centre = patch_row_start + y_idx + 0.5  (free Linear, y_idx
+        # and the +0.5 baked into the bias).  The +0.5 makes this the
+        # row's CENTRE, matching the center-sampling rasterisation rule
+        # the wall_masks composite below also uses (via in_range, which
+        # tests centres ``i + 0.5`` against the wall interval).  Without
+        # the offset the texture would be sampled at the row's top edge
+        # while the composite mask would test its centre, leaving a
+        # half-row mismatch between which screen rows look "wall" and
+        # which texture row each one samples.
+        y_centre = Linear(
             patch_row_start,
             torch.tensor([[1.0]]),
-            torch.tensor([float(y_idx)]),
-            name=f"y_abs_row_{y_idx}",
+            torch.tensor([float(y_idx) + 0.5]),
+            name=f"y_centre_row_{y_idx}",
         )
         tex_row_idx = linear_bin_index(
-            y_abs, wall_top, wall_bottom, tex_height,
+            y_centre, wall_top, wall_bottom, tex_height,
             min_range=min_wall_height,
             max_range=max_wall_height,
             n_reciprocal_breakpoints=48,

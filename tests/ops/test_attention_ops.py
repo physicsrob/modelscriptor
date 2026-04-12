@@ -1,0 +1,486 @@
+"""Unit tests for the content-based attention primitives in
+``torchwright.ops.attention_ops``.
+
+These tests run the ``Attn`` node's Python ``compute`` path directly (no
+compiler round-trip) against a small hand-built graph. They verify that
+the Q/K/V matrices produce the selections we expect under the standard
+causal softmax.
+
+The compile-path round-trip is exercised by the sort-variant end-to-end
+tests in ``tests/compile/forward/test_sort_digits.py``.
+
+A few things worth knowing before reading the assertions:
+
+- The primitives use a non-hardness-scaled query projection, so the
+  softmax is decisive only when key-space deltas are at least ~1 unit.
+  Unique integer scores are the supported case; exact ties are softly
+  averaged (the ``get_prev_value`` primitive has the same property). The
+  tests therefore only use unique scores.
+- Scores must be comfortably inside ``|score| <= 120`` so the resulting
+  logit stays above the ``Attn.compute`` causal-mask sentinel of ``-1000``.
+  Where tests exercise "a single valid position beats any other score"
+  they stay below that ceiling.
+"""
+
+import torch
+
+from torchwright.graph import InputNode, PosEncoding
+from torchwright.ops.attention_ops import (
+    attend_argmin,
+    attend_argmax,
+    attend_argmin_where,
+    attend_argmax_where,
+    attend_argmin_above_integer,
+    attend_argmin_unmasked,
+)
+
+
+def _pe() -> PosEncoding:
+    return PosEncoding(d_pos=16)
+
+
+def _run(out_node, n_pos, **inputs):
+    """Call ``compute`` on an attention output with the given input tensors."""
+    return out_node.compute(n_pos=n_pos, input_values=inputs)
+
+
+# ---------------------------------------------------------------------------
+# attend_argmin
+# ---------------------------------------------------------------------------
+
+
+def test_attend_argmin_happy_path():
+    """Unique scores — argmin lands on the single minimum position."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    value = InputNode("value", 4)
+    out = attend_argmin(pe, score, value)
+
+    n_pos = 5
+    # Scores are distinct.
+    score_in = torch.tensor([[5.0], [3.0], [4.0], [2.0], [6.0]])
+    value_in = torch.eye(5, 4)
+    # Expected argmin over each causal prefix: 0, 1, 1, 3, 3.
+    expected = torch.stack(
+        [
+            value_in[0],
+            value_in[1],
+            value_in[1],
+            value_in[3],
+            value_in[3],
+        ]
+    )
+
+    result = _run(out, n_pos, score=score_in, value=value_in)
+    assert result.shape == (n_pos, 4)
+    assert torch.allclose(result, expected, atol=1e-3), f"got {result}"
+
+
+def test_attend_argmin_scalar_value():
+    """Width-1 value — smoke test with small unique scores."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    value = InputNode("value", 1)
+    out = attend_argmin(pe, score, value)
+
+    n_pos = 3
+    score_in = torch.tensor([[2.0], [0.5], [5.0]])
+    value_in = torch.tensor([[10.0], [20.0], [30.0]])
+
+    result = _run(out, n_pos, score=score_in, value=value_in)
+    # pos 0 → value[0]=10. pos 1 → value[1]=20 (min 0.5). pos 2 → value[1]=20.
+    assert abs(result[0].item() - 10.0) < 0.1
+    assert abs(result[1].item() - 20.0) < 0.1
+    assert abs(result[2].item() - 20.0) < 0.1
+
+
+def test_attend_argmin_negative_scores():
+    """argmin works with negative scores too (they're larger in -score space)."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    value = InputNode("value", 3)
+    out = attend_argmin(pe, score, value)
+
+    n_pos = 3
+    # Most negative score = minimum → argmin picks it.
+    score_in = torch.tensor([[-1.0], [-5.0], [-3.0]])
+    value_in = torch.eye(3, 3)
+
+    result = _run(out, n_pos, score=score_in, value=value_in)
+    assert torch.allclose(result[0], value_in[0], atol=1e-3)
+    assert torch.allclose(result[1], value_in[1], atol=1e-3)
+    assert torch.allclose(result[2], value_in[1], atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# attend_argmax
+# ---------------------------------------------------------------------------
+
+
+def test_attend_argmax_happy_path():
+    """Unique scores — argmax lands on the single maximum position."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    value = InputNode("value", 4)
+    out = attend_argmax(pe, score, value)
+
+    n_pos = 5
+    score_in = torch.tensor([[3.0], [1.0], [4.0], [2.0], [5.0]])
+    value_in = torch.eye(5, 4)
+    # argmax over prefixes: 0, 0, 2, 2, 4.
+    expected = torch.stack(
+        [
+            value_in[0],
+            value_in[0],
+            value_in[2],
+            value_in[2],
+            value_in[4],
+        ]
+    )
+
+    result = _run(out, n_pos, score=score_in, value=value_in)
+    assert torch.allclose(result, expected, atol=1e-3), f"got {result}"
+
+
+def test_attend_argmax_dual_of_argmin():
+    """``attend_argmax(score)`` equals ``attend_argmin(-score)``."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    value = InputNode("value", 3)
+    out_max = attend_argmax(pe, score, value)
+
+    # Build an argmin on negated scores by flipping the input.
+    score_in = torch.tensor([[1.0], [5.0], [3.0]])
+    value_in = torch.eye(3, 3)
+
+    result_max = _run(out_max, 3, score=score_in, value=value_in)
+    # Max score 5 is at position 1; argmax picks it from position 1 onwards.
+    assert torch.allclose(result_max[0], value_in[0], atol=1e-3)
+    assert torch.allclose(result_max[1], value_in[1], atol=1e-3)
+    assert torch.allclose(result_max[2], value_in[1], atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# attend_argmin_where
+# ---------------------------------------------------------------------------
+
+
+def test_attend_argmin_where_mask_overrides_score():
+    """A valid high score beats an invalid low score."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    validity = InputNode("validity", 1)
+    value = InputNode("value", 4)
+    out = attend_argmin_where(pe, score, validity, value)
+
+    n_pos = 4
+    # Position 1 has the lowest score (0.1) but is invalid.
+    # Position 2 has score 1.0 and is valid.
+    # Position 3 has score 2.0 and is valid.
+    score_in = torch.tensor([[5.0], [0.1], [1.0], [2.0]])
+    validity_in = torch.tensor([[-1.0], [-1.0], [1.0], [1.0]])
+    value_in = torch.eye(4, 4)
+
+    result = _run(out, n_pos, score=score_in, validity=validity_in, value=value_in)
+    # From pos 2 onwards the only valid minimum is pos 2.
+    assert torch.allclose(result[2], value_in[2], atol=1e-3), f"pos 2: {result[2]}"
+    assert torch.allclose(result[3], value_in[2], atol=1e-3), f"pos 3: {result[3]}"
+
+
+def test_attend_argmin_where_single_valid_wins_any_score():
+    """A single valid position is selected regardless of other scores."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    validity = InputNode("validity", 1)
+    value = InputNode("value", 4)
+    out = attend_argmin_where(pe, score, validity, value)
+
+    n_pos = 4
+    # Only position 1 is valid, and it has a moderate score (kept under
+    # _MAX_SCORE_ABS = 120 so its logit stays above the causal mask).
+    score_in = torch.tensor([[0.0], [50.0], [0.5], [0.2]])
+    validity_in = torch.tensor([[-1.0], [1.0], [-1.0], [-1.0]])
+    value_in = torch.eye(4, 4)
+
+    result = _run(out, n_pos, score=score_in, validity=validity_in, value=value_in)
+    # From pos 1 onwards, the argmin-where must pick pos 1.
+    for p in range(1, n_pos):
+        assert torch.allclose(
+            result[p], value_in[1], atol=1e-3
+        ), f"pos {p}: {result[p]}"
+
+
+def test_attend_argmin_where_advances_with_mask():
+    """As more positions become valid over time, the selection advances."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    validity = InputNode("validity", 1)
+    value = InputNode("value", 4)
+    out = attend_argmin_where(pe, score, validity, value)
+
+    n_pos = 4
+    # Scores: 4, 2, 1, 3. Validity: T, T, F, T.
+    # At pos 0: valid={0}, min=4 → pos 0.
+    # At pos 1: valid={0,1}, min=2 → pos 1.
+    # At pos 2: valid={0,1}, min=2 → pos 1 (pos 2 invalid).
+    # At pos 3: valid={0,1,3}, min=2 → pos 1 (pos 3's score is 3 > 2).
+    score_in = torch.tensor([[4.0], [2.0], [1.0], [3.0]])
+    validity_in = torch.tensor([[1.0], [1.0], [-1.0], [1.0]])
+    value_in = torch.eye(4, 4)
+
+    result = _run(out, n_pos, score=score_in, validity=validity_in, value=value_in)
+    assert torch.allclose(result[0], value_in[0], atol=1e-3)
+    assert torch.allclose(result[1], value_in[1], atol=1e-3)
+    assert torch.allclose(result[2], value_in[1], atol=1e-3)
+    assert torch.allclose(result[3], value_in[1], atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# attend_argmax_where
+# ---------------------------------------------------------------------------
+
+
+def test_attend_argmax_where_mask_overrides_score():
+    """A valid low score beats an invalid high score."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    validity = InputNode("validity", 1)
+    value = InputNode("value", 4)
+    out = attend_argmax_where(pe, score, validity, value)
+
+    n_pos = 4
+    # Invalid high score at pos 1 should be ignored; max among
+    # {pos 0 (1), pos 2 (2), pos 3 (3)} is pos 3.
+    score_in = torch.tensor([[1.0], [99.0], [2.0], [3.0]])
+    validity_in = torch.tensor([[1.0], [-1.0], [1.0], [1.0]])
+    value_in = torch.eye(4, 4)
+
+    result = _run(out, n_pos, score=score_in, validity=validity_in, value=value_in)
+    assert torch.allclose(result[3], value_in[3], atol=1e-3), f"pos 3: {result[3]}"
+
+
+def test_attend_argmax_where_single_valid_wins_any_score():
+    """A single valid position is selected even with a tiny score."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    validity = InputNode("validity", 1)
+    value = InputNode("value", 4)
+    out = attend_argmax_where(pe, score, validity, value)
+
+    n_pos = 4
+    # Only pos 2 is valid; other positions have higher but invalid scores.
+    score_in = torch.tensor([[50.0], [40.0], [0.5], [30.0]])
+    validity_in = torch.tensor([[-1.0], [-1.0], [1.0], [-1.0]])
+    value_in = torch.eye(4, 4)
+
+    result = _run(out, n_pos, score=score_in, validity=validity_in, value=value_in)
+    assert torch.allclose(result[2], value_in[2], atol=1e-3)
+    assert torch.allclose(result[3], value_in[2], atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# attend_argmin_unmasked
+# ---------------------------------------------------------------------------
+
+
+def test_attend_argmin_unmasked_empty_mask_picks_min_score():
+    """With an all-zero mask, this degenerates to a plain argmin."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    mask = InputNode("mask", 4)
+    onehot = InputNode("onehot", 4)
+    value = InputNode("value", 4)
+    out = attend_argmin_unmasked(pe, score, mask, onehot, value)
+
+    n_pos = 4
+    # Scores: min is pos 2 (score 1.0).
+    score_in = torch.tensor([[5.0], [3.0], [1.0], [4.0]])
+    # Each key position is one-hot at its own slot index.
+    onehot_in = torch.eye(4, 4)
+    # Empty mask everywhere.
+    mask_in = torch.zeros(4, 4)
+    # Value payload — tag each input position uniquely.
+    value_in = torch.eye(4, 4) * 2.0
+
+    result = _run(
+        out, n_pos, score=score_in, mask=mask_in, onehot=onehot_in, value=value_in
+    )
+    # Argmin over each prefix: pos 0, pos 1, pos 2, pos 2.
+    assert torch.allclose(result[0], value_in[0], atol=1e-2), f"pos 0: {result[0]}"
+    assert torch.allclose(result[1], value_in[1], atol=1e-2), f"pos 1: {result[1]}"
+    assert torch.allclose(result[2], value_in[2], atol=1e-2), f"pos 2: {result[2]}"
+    assert torch.allclose(result[3], value_in[2], atol=1e-2), f"pos 3: {result[3]}"
+
+
+def test_attend_argmin_unmasked_skips_masked_index():
+    """Masking a specific input slot skips it in favour of the next-best."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    mask = InputNode("mask", 4)
+    onehot = InputNode("onehot", 4)
+    value = InputNode("value", 4)
+    out = attend_argmin_unmasked(pe, score, mask, onehot, value)
+
+    n_pos = 4
+    # Position 2 is the global min, but it's already been "used": its slot
+    # index (2) is set in the mask from position 2 onwards.
+    score_in = torch.tensor([[5.0], [3.0], [1.0], [4.0]])
+    onehot_in = torch.eye(4, 4)
+    # Mask is zero until position 2, then slot 2 is set.
+    mask_in = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    value_in = torch.eye(4, 4) * 2.0
+
+    result = _run(
+        out, n_pos, score=score_in, mask=mask_in, onehot=onehot_in, value=value_in
+    )
+    # At pos 2, slot 2 is masked, so the next-best in {0, 1, 2} is pos 1
+    # (score 3). At pos 3, {0, 1, 3} are unmasked — min score is 3 at pos 1.
+    assert torch.allclose(result[2], value_in[1], atol=1e-2), f"pos 2: {result[2]}"
+    assert torch.allclose(result[3], value_in[1], atol=1e-2), f"pos 3: {result[3]}"
+
+
+# ---------------------------------------------------------------------------
+# attend_argmin_above_integer
+# ---------------------------------------------------------------------------
+
+
+def _build_indicators(scores, thresholds):
+    """Build the key-side I(score_i > t_c) indicator basis in 0/1 form."""
+    out = torch.zeros(len(scores), len(thresholds))
+    for i, s in enumerate(scores):
+        for c, t in enumerate(thresholds):
+            out[i, c] = 1.0 if s > t else 0.0
+    return out
+
+
+def test_attend_argmin_above_integer_picks_smallest_above_threshold():
+    """At each query position, pick the smallest score strictly above the
+    threshold indicated by the one-hot query."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    indicators = InputNode("indicators", 10)
+    threshold_onehot = InputNode("threshold_onehot", 10)
+    value = InputNode("value", 4)
+    out = attend_argmin_above_integer(pe, score, indicators, threshold_onehot, value)
+
+    n_pos = 5
+    scores_list = [4.0, 2.0, 6.0, 1.0, 5.0]  # distinct integer-ish scores
+    score_in = torch.tensor([[s] for s in scores_list])
+    # Thresholds covered: d ∈ {-1, 0, 1, 2, 3, 4, 5, 6, 7, 8} (10 slots).
+    thresholds = list(range(-1, 9))
+    indicators_in = _build_indicators(scores_list, thresholds)
+    value_in = torch.eye(5, 4)
+
+    # At every query position, test threshold = 2 (slot index 3 in
+    # the -1..8 list). Expected: the smallest score > 2 that is in the
+    # causal window.
+    threshold_onehot_in = torch.zeros(n_pos, 10)
+    threshold_onehot_in[:, 3] = 1.0  # select threshold d=2 at every query
+
+    result = _run(
+        out,
+        n_pos,
+        score=score_in,
+        indicators=indicators_in,
+        threshold_onehot=threshold_onehot_in,
+        value=value_in,
+    )
+    # Scores > 2 over each prefix:
+    #   pos 0: {4} → pos 0
+    #   pos 1: {4} → pos 0 (pos 1 has score 2, not strictly above)
+    #   pos 2: {4, 6} → pos 0 (smallest above 2)
+    #   pos 3: {4, 6} → pos 0
+    #   pos 4: {4, 6, 5} → pos 0
+    assert torch.allclose(result[0], value_in[0], atol=1e-2)
+    assert torch.allclose(result[1], value_in[0], atol=1e-2)
+    assert torch.allclose(result[2], value_in[0], atol=1e-2)
+    assert torch.allclose(result[3], value_in[0], atol=1e-2)
+    assert torch.allclose(result[4], value_in[0], atol=1e-2)
+
+
+def test_attend_argmin_above_integer_threshold_varies_per_query():
+    """The one-hot threshold can differ per query position, giving
+    different selections at each."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    indicators = InputNode("indicators", 10)
+    threshold_onehot = InputNode("threshold_onehot", 10)
+    value = InputNode("value", 4)
+    out = attend_argmin_above_integer(pe, score, indicators, threshold_onehot, value)
+
+    n_pos = 4
+    scores_list = [3.0, 1.0, 5.0, 2.0]
+    score_in = torch.tensor([[s] for s in scores_list])
+    thresholds = list(range(-1, 9))
+    indicators_in = _build_indicators(scores_list, thresholds)
+    value_in = torch.eye(4, 4)
+
+    # Row k selects threshold index (2 + k): i.e. d = 1, 2, 3, 4.
+    threshold_onehot_in = torch.zeros(n_pos, 10)
+    threshold_onehot_in[0, 2] = 1.0  # d = 1
+    threshold_onehot_in[1, 3] = 1.0  # d = 2
+    threshold_onehot_in[2, 4] = 1.0  # d = 3
+    threshold_onehot_in[3, 5] = 1.0  # d = 4
+
+    result = _run(
+        out,
+        n_pos,
+        score=score_in,
+        indicators=indicators_in,
+        threshold_onehot=threshold_onehot_in,
+        value=value_in,
+    )
+    # Query 0: threshold 1, causal {3}. Smallest > 1: 3 (pos 0). → value[0]
+    # Query 1: threshold 2, causal {3, 1}. Smallest > 2: 3 (pos 0). → value[0]
+    # Query 2: threshold 3, causal {3, 1, 5}. Smallest > 3: 5 (pos 2). → value[2]
+    # Query 3: threshold 4, causal {3, 1, 5, 2}. Smallest > 4: 5 (pos 2). → value[2]
+    assert torch.allclose(result[0], value_in[0], atol=1e-2), f"q0: {result[0]}"
+    assert torch.allclose(result[1], value_in[0], atol=1e-2), f"q1: {result[1]}"
+    assert torch.allclose(result[2], value_in[2], atol=1e-2), f"q2: {result[2]}"
+    assert torch.allclose(result[3], value_in[2], atol=1e-2), f"q3: {result[3]}"
+
+
+def test_attend_argmin_unmasked_advances_through_all_slots():
+    """Simulate selection sort: each step masks the previous winner."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    mask = InputNode("mask", 4)
+    onehot = InputNode("onehot", 4)
+    value = InputNode("value", 4)
+    out = attend_argmin_unmasked(pe, score, mask, onehot, value)
+
+    n_pos = 4
+    # Scores: 9, 3, 5, 1. Ascending sort order: pos 3 (1), pos 1 (3),
+    # pos 2 (5), pos 0 (9). We feed the mask that "has already been
+    # picked at each step" by hand, so we can check the selection advances.
+    score_in = torch.tensor([[9.0], [3.0], [5.0], [1.0]])
+    onehot_in = torch.eye(4, 4)
+    # At query position 0, nothing picked yet → picks pos 0 (the only option).
+    # At query position 1, mask pos 0 → picks pos 1 (the only other option,
+    # score 3 < 9).
+    # At query position 2, mask pos 0 and pos 1 → picks pos 2 (score 5).
+    # At query position 3, mask pos 0, 1, 2 → picks pos 3 (score 1).
+    mask_in = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 0.0],
+        ]
+    )
+    value_in = torch.eye(4, 4) * 2.0
+
+    result = _run(
+        out, n_pos, score=score_in, mask=mask_in, onehot=onehot_in, value=value_in
+    )
+    assert torch.allclose(result[0], value_in[0], atol=1e-2), f"pos 0: {result[0]}"
+    assert torch.allclose(result[1], value_in[1], atol=1e-2), f"pos 1: {result[1]}"
+    assert torch.allclose(result[2], value_in[2], atol=1e-2), f"pos 2: {result[2]}"
+    assert torch.allclose(result[3], value_in[3], atol=1e-2), f"pos 3: {result[3]}"
