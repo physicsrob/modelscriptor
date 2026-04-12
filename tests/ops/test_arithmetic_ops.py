@@ -279,7 +279,7 @@ def test_max():
 def test_reciprocal():
     """Exact at integer multiples of step in [1, 10]."""
     x = create_input("x", 1)
-    r = reciprocal(x, min_value=1.0, max_value=10.0, step=1.0)
+    r = reciprocal(x, min_value=1.0, max_value=10.0)
     for v in range(1, 11):
         result = r.compute(n_pos=1, input_values={"x": torch.tensor([[float(v)]])})
         expected = 1.0 / v
@@ -291,7 +291,7 @@ def test_reciprocal():
 def test_reciprocal_interpolation():
     """Between grid points the result should be close to 1/x."""
     x = create_input("x", 1)
-    r = reciprocal(x, min_value=1.0, max_value=10.0, step=1.0)
+    r = reciprocal(x, min_value=1.0, max_value=10.0)
     # Halfway between grid points — linear interpolation error is bounded
     for v in [1.5, 2.5, 5.5]:
         result = r.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
@@ -299,6 +299,40 @@ def test_reciprocal_interpolation():
         assert (
             abs(result.item() - exact) < 0.1
         ), f"1/{v} = {exact:.4f}, got {result.item():.4f}"
+
+
+def test_reciprocal_small_min_value():
+    """reciprocal must be accurate even when min_value << 1.
+
+    The game graph calls reciprocal(x, min_value=0.01, max_value=20)
+    and reciprocal(x, min_value=0.1, max_value=20).  With uniform
+    breakpoint spacing (old bug), the first segment [0.01, 1.01]
+    maps [100, 0.99] linearly — giving 51.5 at x=0.5 (true: 2.0)
+    and 1.98 at x=1.0 (true: 1.0).
+    """
+    x = create_input("x", 1)
+
+    # min_value=0.01: used by sort_inv_den and render inv_abs_den
+    r_001 = reciprocal(x, min_value=0.01, max_value=20.0)
+    for v in [0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]:
+        result = r_001.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        expected = 1.0 / v
+        rel_err = abs(result.item() - expected) / expected
+        assert rel_err < 0.05, (
+            f"reciprocal(min=0.01): 1/{v} = {expected:.4f}, "
+            f"got {result.item():.4f} (rel_err={rel_err:.1%})"
+        )
+
+    # min_value=0.1: used by inv_dot_a/b in visibility mask
+    r_01 = reciprocal(x, min_value=0.1, max_value=20.0)
+    for v in [0.1, 0.3, 0.5, 1.0, 2.0, 10.0]:
+        result = r_01.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        expected = 1.0 / v
+        rel_err = abs(result.item() - expected) / expected
+        assert rel_err < 0.05, (
+            f"reciprocal(min=0.1): 1/{v} = {expected:.4f}, "
+            f"got {result.item():.4f} (rel_err={rel_err:.1%})"
+        )
 
 
 def test_floor_int():
