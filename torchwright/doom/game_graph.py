@@ -2,27 +2,31 @@
 
 Token sequence per frame:
 
-    START → WALL×N → EOS → SORTED_WALL×N → RENDER×(W × H/rp)
+    TEX_COL×(num_tex × tex_w) → INPUT → WALL×N → EOS → SORTED_WALL×N → RENDER×(W × H/rp)
 
-Five token types (E8 spherical codes):
+Six token types (E8 spherical codes):
 
-    START (0)        Player state + movement inputs.  Game logic
-                     (angle update, velocity) runs here.
+    TEX_COL (5)      Texture column pixel data.  Each token carries one
+                     column of one texture (tex_h × 3 floats).  RENDER
+                     tokens retrieve the right column via attention.
+    INPUT (0)        Player state + movement inputs.  Controls are fed
+                     only here; an attention head distributes velocity
+                     and trig values to WALL and EOS positions.
     WALL (1)         Wall geometry (ax, ay, bx, by, tex_id).
                      Graph computes distance from player for sort score.
-    EOS (2)          End of prefill.
+    EOS (2)          End of prefill.  Outputs E8_SORTED_WALL type to
+                     seed the autoregressive sort loop.
     SORTED_WALL (3)  Autoregressive sort output.  attend_argmin_unmasked
-                     finds the next closest unmasked wall.
+                     finds the next closest unmasked wall.  The host
+                     feeds each output back as the next input.
     RENDER (4)       Autoregressive render output.  Attention selects
                      the wall for this ray, parametric intersection +
                      full texture pipeline produces pixels.
 
-The host feeds player state at every position (no graph-side
-get_prev_value) and wall indices at WALL positions (no prefix_sum).
-The only cross-position attention in the graph is the sort head
-(attend_argmin_unmasked) and the render head (angular-similarity
-wall selection).  This keeps the critical path short: ~12 layers
-overhead vs the baked renderer at N=4, constant in N.
+Every cross-position data dependency flows through attention:
+INPUT→WALL/EOS (velocity, trig), WALL→EOS (collision), EOS→SORTED
+(resolved state), WALL→SORTED (argmin), SORTED→RENDER (wall for
+column), TEX_COL→RENDER (texture pixels).
 """
 
 import math
@@ -75,17 +79,21 @@ from torchwright.reference_renderer.types import RenderConfig
 # Token types
 # ---------------------------------------------------------------------------
 
-TOKEN_START = 0
+TOKEN_INPUT = 0
 TOKEN_WALL = 1
 TOKEN_EOS = 2
 TOKEN_SORTED_WALL = 3
 TOKEN_RENDER = 4
 
-E8_START = index_to_vector(TOKEN_START)
+E8_INPUT = index_to_vector(TOKEN_INPUT)
 E8_WALL = index_to_vector(TOKEN_WALL)
 E8_EOS = index_to_vector(TOKEN_EOS)
 E8_SORTED_WALL = index_to_vector(TOKEN_SORTED_WALL)
 E8_RENDER = index_to_vector(TOKEN_RENDER)
+
+TOKEN_TEX_COL = 5
+E8_TEX_COL = index_to_vector(TOKEN_TEX_COL)
+TEX_E8_OFFSET = 6  # index_to_vector(6+i) = E8 code for texture i
 
 
 # ---------------------------------------------------------------------------
@@ -313,19 +321,31 @@ def build_game_graph(
     wall_by = create_input("wall_by", 1)
     wall_tex_id = create_input("wall_tex_id", 1)
     wall_index = create_input("wall_index", 1)
-    sort_mask = create_input("sort_mask", max_walls)
+    d_sort_out = 8 + 5 + 2 * max_walls
+    sort_feedback = create_input("sort_feedback", d_sort_out)
+    prev_mask = _extract_from(
+        sort_feedback, d_sort_out, 8 + 5 + max_walls, max_walls, "prev_mask",
+    )
     col_idx = create_input("col_idx", 1)
     patch_idx = create_input("patch_idx", 1)
+    tex_col_input = create_input("tex_col_input", 1)
+    tex_pixels = create_input("tex_pixels", tex_h * 3)
+    texture_id_e8 = create_input("texture_id_e8", 8)
 
     # --- Token type detection ---
-    is_start = equals_vector(token_type, E8_START)
+    is_input = equals_vector(token_type, E8_INPUT)
     is_wall = equals_vector(token_type, E8_WALL)
     is_eos = equals_vector(token_type, E8_EOS)
     is_sorted = equals_vector(token_type, E8_SORTED_WALL)
     is_render = equals_vector(token_type, E8_RENDER)
+    is_tex_col = equals_vector(token_type, E8_TEX_COL)
+
+    # --- TEX_COL: column one-hot for key matching ---
+    tc_p1 = add_const(tex_col_input, 1.0)
+    tc_onehot_01 = bool_to_01(in_range(tex_col_input, tc_p1, tex_w))
 
     # =====================================================================
-    # START: game logic (angle update + velocity, no collision)
+    # INPUT: game logic (angle update + velocity, no collision)
     # =====================================================================
 
     new_angle = _compute_new_angle(
@@ -335,15 +355,31 @@ def build_game_graph(
         new_angle, input_forward, input_backward,
         input_strafe_left, input_strafe_right, move_speed,
     )
+    move_cos, move_sin = trig_lookup(new_angle)
+
+    # --- INPUT attention: distribute controls from INPUT to all positions ---
+    # At INPUT, the graph computes correct new_angle, vel_dx/dy, move_cos/sin
+    # from control inputs.  attend_mean_where averages over validity=is_input
+    # positions — since there's exactly one, it passes through the values.
+    ctrl_attn = attend_mean_where(
+        pos_encoding,
+        validity=is_input,
+        value=Concatenate([vel_dx, vel_dy, move_cos, move_sin, new_angle]),
+    )
+
+    attn_vel_dx   = _extract_from(ctrl_attn, 5, 0, 1, "a_vdx")
+    attn_vel_dy   = _extract_from(ctrl_attn, 5, 1, 1, "a_vdy")
+    attn_move_cos = _extract_from(ctrl_attn, 5, 2, 1, "a_mcos")
+    attn_move_sin = _extract_from(ctrl_attn, 5, 3, 1, "a_msin")
+    attn_new_angle = _extract_from(ctrl_attn, 5, 4, 1, "a_angle")
+
     # =====================================================================
     # WALL: distance score + sort value + collision hit flags
     # =====================================================================
 
-    # Runtime collision: test velocity ray against this wall's geometry.
-    # The host feeds real player inputs at WALL positions so vel_dx/vel_dy
-    # are correct here (same values as at START).
+    # Runtime collision: velocity comes from INPUT attention.
     hit_full, hit_x, hit_y = _build_wall_collision(
-        vel_dx, vel_dy, player_x, player_y,
+        attn_vel_dx, attn_vel_dy, player_x, player_y,
         wall_ax, wall_ay, wall_bx, wall_by, is_wall,
     )
 
@@ -358,18 +394,17 @@ def build_game_graph(
     #   den = ey*cos - ex*sin
     #   num_t = ey*fx + ex*gy
     #   t = num_t / den  (positive = in front)
-    move_cos, move_sin = trig_lookup(new_angle)
     w_ex = subtract(wall_bx, wall_ax)
     w_ey = subtract(wall_by, wall_ay)
     w_fx = subtract(wall_ax, player_x)
     w_gy = subtract(player_y, wall_ay)
 
     sort_ey_cos = piecewise_linear_2d(
-        w_ey, move_cos, _DIFF_BP, _TRIG_BP,
+        w_ey, attn_move_cos, _DIFF_BP, _TRIG_BP,
         lambda a, b: a * b, name="sort_ey_cos",
     )
     sort_ex_sin = piecewise_linear_2d(
-        w_ex, move_sin, _DIFF_BP, _TRIG_BP,
+        w_ex, attn_move_sin, _DIFF_BP, _TRIG_BP,
         lambda a, b: a * b, name="sort_ex_sin",
     )
     sort_den = subtract(sort_ey_cos, sort_ex_sin)
@@ -395,31 +430,31 @@ def build_game_graph(
     #   E = fx*cos_p - gy*sin_p
     #   H_inv_num_t = H / |num_t|        (wall-height scale factor)
     sort_ey_sin = piecewise_linear_2d(
-        w_ey, move_sin, _DIFF_BP, _TRIG_BP,
+        w_ey, attn_move_sin, _DIFF_BP, _TRIG_BP,
         lambda a, b: a * b, name="sort_ey_sin",
     )
     sort_ex_cos = piecewise_linear_2d(
-        w_ex, move_cos, _DIFF_BP, _TRIG_BP,
+        w_ex, attn_move_cos, _DIFF_BP, _TRIG_BP,
         lambda a, b: a * b, name="sort_ex_cos",
     )
     precomp_C = add(sort_ey_sin, sort_ex_cos)
 
     sort_fx_sin = piecewise_linear_2d(
-        w_fx, move_sin, _DIFF_BP, _TRIG_BP,
+        w_fx, attn_move_sin, _DIFF_BP, _TRIG_BP,
         lambda a, b: a * b, name="sort_fx_sin",
     )
     sort_gy_cos = piecewise_linear_2d(
-        w_gy, move_cos, _DIFF_BP, _TRIG_BP,
+        w_gy, attn_move_cos, _DIFF_BP, _TRIG_BP,
         lambda a, b: a * b, name="sort_gy_cos",
     )
     precomp_D = add(sort_fx_sin, sort_gy_cos)
 
     sort_fx_cos = piecewise_linear_2d(
-        w_fx, move_cos, _DIFF_BP, _TRIG_BP,
+        w_fx, attn_move_cos, _DIFF_BP, _TRIG_BP,
         lambda a, b: a * b, name="sort_fx_cos",
     )
     sort_gy_sin = piecewise_linear_2d(
-        w_gy, move_sin, _DIFF_BP, _TRIG_BP,
+        w_gy, attn_move_sin, _DIFF_BP, _TRIG_BP,
         lambda a, b: a * b, name="sort_gy_sin",
     )
     precomp_E = subtract(sort_fx_cos, sort_gy_sin)
@@ -499,10 +534,25 @@ def build_game_graph(
     use_new_x = bool_any_true([negate(any_hit_full), negate(any_hit_x)])
     use_new_y = bool_any_true([negate(any_hit_full), negate(any_hit_y)])
 
-    new_x = add(player_x, vel_dx)
-    new_y = add(player_y, vel_dy)
+    new_x = add(player_x, attn_vel_dx)
+    new_y = add(player_y, attn_vel_dy)
     resolved_x = select(use_new_x, new_x, player_x)
     resolved_y = select(use_new_y, new_y, player_y)
+
+    # --- EOS state attention: distribute resolved state to SORTED ---
+    # SORTED positions read resolved player state from EOS via attention
+    # instead of host-fed inputs.  This lets the sort loop be purely
+    # autoregressive (host just feeds output back as input).
+    is_sorted_01 = bool_to_01(is_sorted)
+    eos_state_attn = attend_mean_where(
+        pos_encoding,
+        validity=is_eos,
+        value=Concatenate([resolved_x, resolved_y, attn_new_angle]),
+    )
+
+    eos_px    = _extract_from(eos_state_attn, 3, 0, 1, "eos_px")
+    eos_py    = _extract_from(eos_state_attn, 3, 1, 1, "eos_py")
+    eos_angle = _extract_from(eos_state_attn, 3, 2, 1, "eos_angle")
 
     # =====================================================================
     # SORTED_WALL: attend_argmin_unmasked
@@ -511,7 +561,7 @@ def build_game_graph(
     selected_sort = attend_argmin_unmasked(
         pos_encoding=pos_encoding,
         score=sort_score,
-        mask_vector=sort_mask,
+        mask_vector=prev_mask,
         position_onehot=position_onehot,
         value=wall_value_for_sort,
     )
@@ -520,6 +570,7 @@ def build_game_graph(
     sel_render = _extract_from(selected_sort, d_sort_val, 5, 5, "sel_render")
     sel_tex_id = _extract_from(sel_wall_data, 5, 4, 1, "sel_tex_id")
     sel_onehot = _extract_from(selected_sort, d_sort_val, 11, max_walls, "sel_onehot")
+    updated_mask = add(prev_mask, sel_onehot)
 
     # Gate sorted values: zero at non-sorted positions
     # Render data: [sort_den, C, D, E, H_inv_num_t, tex_id] = 6 values
@@ -540,10 +591,10 @@ def build_game_graph(
     sel_bx = _extract_from(sel_wall_data, 5, 2, 1, "sel_bx")
     sel_by = _extract_from(sel_wall_data, 5, 3, 1, "sel_by")
 
-    dax = subtract(sel_ax, player_x)
-    day = subtract(sel_ay, player_y)
-    dbx = subtract(sel_bx, player_x)
-    dby = subtract(sel_by, player_y)
+    dax = subtract(sel_ax, eos_px)
+    day = subtract(sel_ay, eos_py)
+    dbx = subtract(sel_bx, eos_px)
+    dby = subtract(sel_by, eos_py)
 
     # Compute column index where each endpoint projects, using the
     # decomposition: cross/dot with the viewing direction gives the
@@ -557,7 +608,7 @@ def build_game_graph(
     # For the FOV, fov_rad = fov * 2*pi/256.  Walls behind the player
     # (dot < 0) get column indices outside [0, W], which in_range
     # correctly excludes.
-    sort_cos, sort_sin = trig_lookup(new_angle)
+    sort_cos, sort_sin = trig_lookup(eos_angle)
 
     cross_a = subtract(
         piecewise_linear_2d(sort_cos, day, _TRIG_BP, _DIFF_BP,
@@ -655,18 +706,26 @@ def build_game_graph(
 
     # --- Render attention: visibility-masked wall selection ---
     # attend_argmax_dot matches the render token's column one-hot against
-    # each sorted wall's visibility mask.  Among visible walls, the
-    # position tiebreak selects the latest (sort is front-to-back, so
-    # we rely on sort order for nearest-wall selection).  cond_gate
-    # zeros key/value at non-SORTED positions (zero-K isolation).
+    # each sorted wall's visibility mask.  An extra bias column ensures
+    # SORTED positions dominate non-SORTED positions regardless of
+    # sequence length (TEX_COL tokens push SORTED far into the sequence,
+    # and the position tiebreak would otherwise penalize them below
+    # early zero-key positions).
     col_p1 = add_const(col_idx, 1.0)
     col_onehot_01 = bool_to_01(in_range(col_idx, col_p1, W))
 
     VIS_GAIN = 500.0
+    SORT_BIAS = 100.0
     render_attn = attend_argmax_dot(
         pos_encoding,
-        query_vector=cond_gate(is_render, col_onehot_01),
-        key_vector=gated_vis_mask,
+        query_vector=Concatenate([
+            cond_gate(is_render, col_onehot_01),
+            bool_to_01(is_render),
+        ]),
+        key_vector=Concatenate([
+            gated_vis_mask,
+            multiply_const(bool_to_01(is_sorted), SORT_BIAS),
+        ]),
         value=gated_render_data,
         match_gain=VIS_GAIN,
     )
@@ -755,22 +814,44 @@ def build_game_graph(
     tex_col_float = multiply_const(u_raw, float(tex_w))
     tex_col_clamped = clamp(tex_col_float, 0.0, float(tex_w) - 0.5)
     tex_col_idx = floor_int(tex_col_clamped, 0, tex_w - 1)
+
+    # --- TEX_COL query data at RENDER positions ---
     num_tex = len(textures)
-    n_keys = num_tex * tex_w
-    flat_key = add(multiply_const(r_wall_tex, float(tex_w)), tex_col_idx)
-
-    def _tex_col_vals(flat_idx):
-        k = int(round(flat_idx))
-        if 0 <= k < n_keys:
-            tid = k // tex_w
-            col = k % tex_w
-            return [float(v) for v in textures[tid][col].flatten()]
-        return [0.0] * (tex_h * 3)
-
-    tex_column_colors = piecewise_linear(
-        flat_key, [float(k) for k in range(n_keys)],
-        _tex_col_vals, name="tex_col_lookup",
+    tex_e8_query = piecewise_linear(
+        r_wall_tex,
+        [float(i) for i in range(num_tex)],
+        lambda tid: [float(v) for v in
+                     index_to_vector(int(round(tid)) + TEX_E8_OFFSET)],
+        name="tex_id_to_e8",
     )
+
+    tex_col_p1 = add_const(tex_col_idx, 1.0)
+    rc_onehot_01 = bool_to_01(in_range(tex_col_idx, tex_col_p1, tex_w))
+
+    # --- TEX_COL attention: match texture ID + column via dot product ---
+    # attend_argmax_dot matches (E8_vector, scaled_column_onehot) between
+    # RENDER queries and TEX_COL keys.  E8 selects the texture (~100 vs
+    # ~-12), scaled column one-hot selects the column (COL_SCALE^2 vs 0).
+    # The column scaling must be large enough that column selectivity
+    # (match_gain * COL_SCALE^2) exceeds the tiebreak range
+    # (match_gain/100 * num_tex * tex_w).  cond_gate zeros key/value at
+    # non-TEX_COL positions (type isolation).
+    # The compiler auto-splits d_v=tex_h*3 across physical heads.
+    COL_SCALE = 10.0
+    TEX_MATCH_GAIN = 1000.0
+    scaled_rc = multiply_const(rc_onehot_01, COL_SCALE)
+    scaled_tc = multiply_const(tc_onehot_01, COL_SCALE)
+    tex_col_attn = attend_argmax_dot(
+        pos_encoding,
+        query_vector=cond_gate(
+            is_render, Concatenate([tex_e8_query, scaled_rc])),
+        key_vector=cond_gate(
+            is_tex_col, Concatenate([texture_id_e8, scaled_tc])),
+        value=cond_gate(is_tex_col, tex_pixels),
+        match_gain=TEX_MATCH_GAIN,
+    )
+
+    tex_column_colors = tex_col_attn
 
     # Column fill
     patch_row_start = multiply_const(patch_idx, float(rp))
@@ -784,11 +865,13 @@ def build_game_graph(
     # Output: gated by token type
     # =====================================================================
 
-    # SORTED_WALL output: type + wall data + onehot
+    # SORTED_WALL output: type + wall data + onehot + updated mask
+    # The host feeds this output back as sort_feedback for the next step.
     sort_output = Concatenate([
         create_literal_value(E8_SORTED_WALL, name="sort_type"),
         sel_wall_data,
         sel_onehot,
+        updated_mask,
     ])
 
     # RENDER output: type + pixels
@@ -797,24 +880,35 @@ def build_game_graph(
         pixels,
     ])
 
-    # START output: type + padding (host ignores START output)
-    start_output = Concatenate([
-        create_literal_value(E8_START, name="start_type"),
-        create_literal_value(torch.zeros(3), name="start_pad"),
+    # INPUT output: type + padding (host ignores INPUT output)
+    input_output = Concatenate([
+        create_literal_value(E8_INPUT, name="input_type"),
+        create_literal_value(torch.zeros(3), name="input_pad"),
     ])
 
-    # EOS output: type + resolved state (collision-resolved position)
+    # EOS output: seeds the sort loop with E8_SORTED_WALL type + resolved
+    # state at offsets 8-10 + zeros for sort mask.  Host reads resolved
+    # state from offsets 8-10, then feeds raw output as sort_feedback.
     eos_output = Concatenate([
-        create_literal_value(E8_EOS, name="eos_type"),
-        resolved_x, resolved_y, new_angle,
+        create_literal_value(E8_SORTED_WALL, name="eos_sort_seed"),
+        resolved_x, resolved_y, attn_new_angle,
+        create_literal_value(
+            torch.zeros(2 + 2 * max_walls), name="eos_sort_pad"),
+    ])
+
+    # TEX_COL output: type + padding (host ignores TEX_COL output)
+    tex_col_output = Concatenate([
+        create_literal_value(E8_TEX_COL, name="tex_col_type"),
+        create_literal_value(torch.zeros(3), name="tc_pad"),
     ])
 
     # Pad all to same width and select
-    d_sort_out = 8 + 5 + max_walls
+    d_sort_out = 8 + 5 + 2 * max_walls
     d_render_out = 8 + rp * 3
-    d_start_out = 8 + 3
-    d_eos_out = 8 + 3
-    d_out = max(d_sort_out, d_render_out, d_start_out, d_eos_out)
+    d_input_out = 8 + 3
+    d_eos_out = d_sort_out  # EOS seeds the sort loop
+    d_tc_out = 8 + 3
+    d_out = max(d_sort_out, d_render_out, d_input_out, d_eos_out, d_tc_out)
 
     def _pad(node, cur_width):
         if cur_width >= d_out:
@@ -824,12 +918,13 @@ def build_game_graph(
 
     sort_padded = _pad(sort_output, d_sort_out)
     render_padded = _pad(render_output, d_render_out)
-    start_padded = _pad(start_output, d_start_out)
+    input_padded = _pad(input_output, d_input_out)
     eos_padded = _pad(eos_output, d_eos_out)
+    tc_padded = _pad(tex_col_output, d_tc_out)
 
-    # Three-level select: render vs sort vs eos vs default
-    inner1 = select(is_eos, eos_padded, start_padded)
-    inner2 = select(is_sorted, sort_padded, inner1)
-    output = select(is_render, render_padded, inner2)
+    inner1 = select(is_eos, eos_padded, input_padded)
+    inner2 = select(is_tex_col, tc_padded, inner1)
+    inner3 = select(is_sorted, sort_padded, inner2)
+    output = select(is_render, render_padded, inner3)
 
     return output, pos_encoding

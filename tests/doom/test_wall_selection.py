@@ -269,7 +269,8 @@ class TestCompiledStructure:
         segs, texs, cfg = box_data
         walls = segments_to_walls(segs)
         state = GameState(x=px, y=py, angle=angle)
-        frame, _ = step_frame(module, state, PlayerInput(), walls, cfg)
+        frame, _ = step_frame(module, state, PlayerInput(), walls, cfg,
+                              textures=texs)
         return frame
 
     def test_wall_height_center_column(self, module, box_data):

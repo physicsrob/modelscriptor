@@ -583,6 +583,28 @@ vanilla attention head.
 - Distinct-only, clearest mental model → V1 (indicator basis).
 - Need to understand what MLP-only looks like → V2.
 
+## Perpendicular distance is precomputable; u-coordinate might be too
+
+For a flat wall segment, the perpendicular distance from the player to
+the wall line is a single scalar independent of ray direction.  The
+current renderer recomputes the full parametric intersection (6
+`piecewise_linear_2d` products) at every RENDER token, then derives
+wall height from the ray distance plus fish-eye correction.  But
+`dist_r * perp_cos` equals the perpendicular distance for any ray
+hitting the same wall line --- so `wall_height = H / perp_dist` can be
+computed from a single precomputed scalar, skipping the per-column
+distance pipeline entirely.  See `distance_optimization_plan.md`.
+
+The u-coordinate (texture column selection) also has a potential
+shortcut: the sort phase already computes `col_a` and `col_b` (the
+screen columns where each wall endpoint projects) for the visibility
+mask.  The u-parameter could be approximated as
+`(col_idx - col_a) / (col_b - col_a)`, eliminating 4 more
+`piecewise_linear_2d` products per RENDER token.  This screen-space
+interpolation is not perspective-correct for walls at oblique angles,
+but for DOOM's vertical-wall geometry the error should be small.
+Worth evaluating empirically as a "fast mode" tradeoff.
+
 ## Follow-ups
 
 - **Delay-1 self-reference compiler support.**  Would let V4 express

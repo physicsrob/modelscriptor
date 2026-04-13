@@ -269,7 +269,8 @@ def main():
         )
 
         def frame_fn(state, inputs):
-            return step_frame(module, state, inputs, walls, config)
+            return step_frame(module, state, inputs, walls, config,
+                              textures=textures)
     else:
         def frame_fn(state, inputs):
             new_state = update_state(state, inputs, segments, trig_table)

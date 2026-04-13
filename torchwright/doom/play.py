@@ -83,13 +83,14 @@ def play(
             config, textures,
             max_walls=max_walls,
             max_coord=max_coord,
-            d=2048, d_head=32,
+            d=2048,
             rows_per_patch=rows_per_patch,
         )
         current_walls = [walls_a]  # mutable container for level-swap
 
         def frame_fn(state, inputs):
-            return step_frame(module, state, inputs, current_walls[0], config)
+            return step_frame(module, state, inputs, current_walls[0], config,
+                              textures=textures)
     else:
         current_walls = [None]
         trig_table = config.trig_table

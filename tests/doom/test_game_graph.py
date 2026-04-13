@@ -83,7 +83,7 @@ class TestGameGraph:
         state = GameState(x=0.0, y=0.0, angle=0, move_speed=0.3, turn_speed=4)
         inputs = PlayerInput()
 
-        frame, new_state = step_frame(module, state, inputs, walls, config)
+        frame, new_state = step_frame(module, state, inputs, walls, config, textures=textures)
         ref = _ref_frame(0.0, 0.0, 0, segs, config, textures)
 
         assert frame.max() > 0.1, "frame appears blank"
@@ -106,14 +106,14 @@ class TestGameGraph:
 
         # Turn right: angle should increase by turn_speed
         inputs = PlayerInput(turn_right=True)
-        frame1, state1 = step_frame(module, state, inputs, walls, config)
+        frame1, state1 = step_frame(module, state, inputs, walls, config, textures=textures)
         assert abs(state1.angle - 4) < 1, (
             f"angle after turn_right: {state1.angle}, expected ~4"
         )
 
         # Turn left from angle 0: should wrap to 252
         inputs = PlayerInput(turn_left=True)
-        frame2, state2 = step_frame(module, state, inputs, walls, config)
+        frame2, state2 = step_frame(module, state, inputs, walls, config, textures=textures)
         assert abs(state2.angle - 252) < 1, (
             f"angle after turn_left: {state2.angle}, expected ~252"
         )
@@ -127,7 +127,7 @@ class TestGameGraph:
 
         inputs = PlayerInput()
         state = GameState(x=0.0, y=0.0, angle=angle, move_speed=0.3, turn_speed=4)
-        frame, _ = step_frame(module, state, inputs, walls, config)
+        frame, _ = step_frame(module, state, inputs, walls, config, textures=textures)
         ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
 
         max_err = np.abs(frame - ref).max()
@@ -145,7 +145,7 @@ class TestGameGraph:
 
         inputs = PlayerInput()
         state = GameState(x=0.0, y=0.0, angle=angle, move_speed=0.3, turn_speed=4)
-        frame, _ = step_frame(module, state, inputs, walls, config)
+        frame, _ = step_frame(module, state, inputs, walls, config, textures=textures)
         ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
 
         max_err = np.abs(frame - ref).max()
@@ -171,7 +171,7 @@ class TestGameGraph:
 
         inputs = PlayerInput()
         state = GameState(x=px, y=py, angle=angle, move_speed=0.3, turn_speed=4)
-        frame, _ = step_frame(module, state, inputs, walls, config)
+        frame, _ = step_frame(module, state, inputs, walls, config, textures=textures)
         ref = _ref_frame(px, py, angle, segs, config, textures)
 
         max_err = np.abs(frame - ref).max()
@@ -194,7 +194,7 @@ class TestGameGraph:
         state = GameState(x=4.0, y=0.0, angle=0, move_speed=0.3, turn_speed=4)
         inputs = PlayerInput(forward=True)
 
-        _, new_state = step_frame(module, state, inputs, walls, config)
+        _, new_state = step_frame(module, state, inputs, walls, config, textures=textures)
         ref_state = update_state(state, inputs, segs, trig)
 
         assert new_state.x == pytest.approx(ref_state.x, abs=0.15)
@@ -208,7 +208,7 @@ class TestGameGraph:
         state = GameState(x=4.5, y=0.0, angle=32, move_speed=0.3, turn_speed=4)
         inputs = PlayerInput(forward=True)
 
-        _, new_state = step_frame(module, state, inputs, walls, config)
+        _, new_state = step_frame(module, state, inputs, walls, config, textures=textures)
         ref_state = update_state(state, inputs, segs, trig)
 
         # X should be blocked (near wall), Y should advance

@@ -99,7 +99,7 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         max_coord=10.0, move_speed=0.3, turn_speed=4,
     )
 
-    from torchwright.doom.game_graph import E8_START
+    from torchwright.doom.game_graph import E8_INPUT
     input_values = {
         "col_idx": torch.tensor([[0.0]]),
         "input_backward": torch.tensor([[0.0]]),
@@ -112,8 +112,11 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         "player_angle": torch.tensor([[0.0]]),
         "player_x": torch.tensor([[0.0]]),
         "player_y": torch.tensor([[0.0]]),
-        "sort_mask": torch.zeros(1, max_walls),
-        "token_type": E8_START.unsqueeze(0),
+        "sort_feedback": torch.zeros(1, 8 + 5 + 2 * max_walls),
+        "tex_col_input": torch.tensor([[0.0]]),
+        "tex_pixels": torch.zeros(1, textures[0].shape[1] * 3),
+        "texture_id_e8": torch.zeros(1, 8),
+        "token_type": E8_INPUT.unsqueeze(0),
         "wall_ax": torch.tensor([[0.0]]),
         "wall_ay": torch.tensor([[0.0]]),
         "wall_bx": torch.tensor([[0.0]]),

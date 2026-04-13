@@ -86,7 +86,8 @@ def generate_transformer(
     )
 
     def frame_fn(state, inputs):
-        return step_frame(module, state, inputs, walls, config)
+        return step_frame(module, state, inputs, walls, config,
+                          textures=textures)
 
     print(f"Generating {frames} transformer frames at {width}x{height}...")
     frame_list = generate_walkthrough(
