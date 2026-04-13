@@ -48,7 +48,7 @@ def _count_layer_params(
     heads_used = 0
     for op in attn_ops:
         if op.op_type == "compute_attn":
-            heads_used += 1
+            heads_used += (op.node.d_v + d_head - 1) // d_head
         elif op.op_type == "compute_linear":
             d_input = len(op.node.inputs[0])
             heads_used += (d_input + d_head - 1) // d_head

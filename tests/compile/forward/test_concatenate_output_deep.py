@@ -42,14 +42,12 @@ def test_concatenate_output_mixed_depth():
         verbose=False,
     )
 
-    # Verify correctness: a=1 > 0.5 so shallow selects a=1; deep = 1/(1*1 * 1)
+    # Verify correctness: a=1 > 0.5 so shallow selects a=1; deep = 1/(1*1 * 1) = 1.0
     inp = torch.tensor([[1.0, 0.0, 1.0, 1.0]])
     result = module(inp)
     assert result.shape == (1, 2)
     assert result[0, 0].item() == pytest.approx(1.0, abs=0.2)  # shallow = a = 1.0
-    assert result[0, 1].item() == pytest.approx(
-        4 / 3, abs=0.2
-    )  # deep: reciprocal interpolates 1.0 between breakpoints 0.5 and 1.5
+    assert result[0, 1].item() == pytest.approx(1.0, abs=0.2)  # deep = 1/1.0 = 1.0
 
 
 # Allow running with pytest

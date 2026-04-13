@@ -1,8 +1,33 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import List, Dict, Optional
 
 import torch
 
 global_node_id = 0
+
+_current_annotation: ContextVar[Optional[str]] = ContextVar(
+    "current_annotation", default=None,
+)
+
+
+@contextmanager
+def annotate(label: str):
+    """Tag all nodes created inside this block with a hierarchical label.
+
+    Nesting builds a ``/``-separated path::
+
+        with annotate("render"):
+            with annotate("texture"):
+                # nodes get annotation = "render/texture"
+    """
+    current = _current_annotation.get()
+    new = f"{current}/{label}" if current else label
+    token = _current_annotation.set(new)
+    try:
+        yield
+    finally:
+        _current_annotation.reset(token)
 
 
 class Node:
@@ -17,12 +42,14 @@ class Node:
         inputs: Upstream nodes whose outputs feed into this node.
         node_id: Auto-incremented unique identifier.
         name: Optional human-readable label (for debugging / repr).
+        annotation: Hierarchical label set by the ``annotate`` context manager.
     """
 
     inputs: List["Node"]
     d_output: int
     node_id: int
     name: str
+    annotation: Optional[str]
 
     def __init__(self, d_output: int, inputs: List["Node"], name: str = ""):
         global global_node_id
@@ -30,6 +57,7 @@ class Node:
         self.inputs = inputs
         self.node_id = global_node_id
         self.name = name
+        self.annotation = _current_annotation.get()
         global_node_id += 1
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:

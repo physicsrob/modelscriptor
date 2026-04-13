@@ -2,9 +2,10 @@
 
 Multi-phase autoregressive rollout:
 
-    Phase 0 — Prefill:  START + WALL×N + EOS  (host-driven)
-    Phase 1 — Sort:     SORTED_WALL×N         (autoregressive, mask feedback)
-    Phase 2 — Render:   RENDER×(W × H/rp)     (autoregressive, pixels out)
+    Phase -1 — Tex:     TEX_COL×(num_tex × tex_w)  (texture column prefill)
+    Phase 0  — Prefill: INPUT + WALL×N + EOS        (host-driven)
+    Phase 1  — Sort:    SORTED_WALL×N               (pure autoregressive)
+    Phase 2  — Render:  RENDER×(W × H/rp)           (autoregressive, pixels out)
 
 The host is a dumb token feeder and pixel stitcher.  It feeds player
 state at every position, wall geometry at WALL positions, the
@@ -24,13 +25,63 @@ from torchwright.doom.game import GameState
 from torchwright.doom.input import PlayerInput
 from torchwright.doom.game_graph import (
     E8_EOS,
+    E8_INPUT,
     E8_RENDER,
     E8_SORTED_WALL,
-    E8_START,
+    E8_TEX_COL,
     E8_WALL,
+    TEX_E8_OFFSET,
     build_game_graph,
 )
+from torchwright.graph.spherical_codes import index_to_vector
 from torchwright.reference_renderer.types import RenderConfig, Segment
+
+
+def print_graph_stats(output_node, pos_encoding=None):
+    """Print a breakdown of graph nodes and params by annotation."""
+    from collections import defaultdict
+    from torchwright.compiler.utils import get_ancestor_nodes
+
+    start = {output_node}
+    if pos_encoding is not None:
+        start.add(pos_encoding)
+    all_nodes = get_ancestor_nodes(start)
+
+    stats = defaultdict(lambda: {"nodes": 0, "params": 0})
+    for node in all_nodes:
+        key = node.annotation or "(none)"
+        stats[key]["nodes"] += 1
+        stats[key]["params"] += node.num_params()
+
+    total_nodes = sum(s["nodes"] for s in stats.values())
+    total_params = sum(s["params"] for s in stats.values())
+
+    # Sort by top-level group, then sub-path
+    rows = sorted(stats.items())
+
+    print(f"\nGraph stats: {total_nodes:,} nodes, {total_params:,} params\n")
+    print(f"  {'Annotation':<35s} {'Nodes':>7s} {'Params':>12s} {'% params':>9s}")
+    print(f"  {'─' * 35} {'─' * 7} {'─' * 12} {'─' * 9}")
+
+    # Group by top-level for subtotals
+    from itertools import groupby
+    def top_level(item):
+        return item[0].split("/")[0]
+
+    for group_key, group_items in groupby(rows, key=top_level):
+        group_list = list(group_items)
+        for key, s in group_list:
+            pct = 100.0 * s["params"] / total_params if total_params else 0
+            print(f"  {key:<35s} {s['nodes']:>7,} {s['params']:>12,} {pct:>8.1f}%")
+        if len(group_list) > 1:
+            gn = sum(s["nodes"] for _, s in group_list)
+            gp = sum(s["params"] for _, s in group_list)
+            gpct = 100.0 * gp / total_params if total_params else 0
+            print(f"  {'  ' + group_key + ' (total)':<35s} {gn:>7,} {gp:>12,} {gpct:>8.1f}%")
+        print()
+
+    print(f"  {'TOTAL':<35s} {total_nodes:>7,} {total_params:>12,} {'100.0%':>9s}")
+    print()
 
 
 def segments_to_walls(segments: List[Segment]) -> List[dict]:
@@ -54,7 +105,7 @@ def compile_game(
     turn_speed: int = 4,
     d: int = 2048,
     d_head: Optional[int] = None,
-    device: str = "cpu",
+    device: str = "auto",
     verbose: bool = True,
     rows_per_patch: Optional[int] = None,
     d_hidden: Optional[int] = None,
@@ -65,21 +116,29 @@ def compile_game(
         move_speed, turn_speed,
         rows_per_patch=rows_per_patch,
     )
-    # The render attention d_head = W + 6 (visibility mask + bias + value
-    # passthrough).  Round up to a power of 2 that divides d.
+    # d_head must be >= max d_qk across all Attn nodes.
+    # Render attention: d_qk = W + 1.  TEX_COL attention: d_qk = 8 + tex_w + 1.
     if d_head is None:
         W = config.screen_width
-        min_d_head = W + 6
+        tex_w = textures[0].shape[0]
+        tex_d_qk = 8 + tex_w + 1
+        render_d_qk = W + 2  # col_onehot(W) + bias(1) + tiebreak(1)
+        min_d_head = max(render_d_qk, tex_d_qk)
         d_head = 1
         while d_head < min_d_head:
             d_head *= 2
         assert d % d_head == 0, f"d={d} not divisible by d_head={d_head}"
     rp = rows_per_patch if rows_per_patch is not None else config.screen_height
+    tex_h = textures[0].shape[1]
     module = compile_headless(
         output_node, pos_encoding,
         d=d, d_head=d_head, max_layers=400,
         device=device, verbose=verbose,
-        extra_metadata={"rows_per_patch": rp, "max_walls": max_walls},
+        extra_metadata={
+            "rows_per_patch": rp,
+            "max_walls": max_walls,
+            "tex_h": tex_h,
+        },
         d_hidden=d_hidden,
     )
     module.eval()
@@ -89,6 +148,7 @@ def compile_game(
 def _build_row(compiled, max_walls, **kwargs):
     """Build a (1, d_input) row for module.step()."""
     device = compiled._net.device
+    tex_h = int(compiled.metadata.get("tex_h", 8))
     defaults = {
         "col_idx": torch.zeros(1, device=device),
         "input_backward": torch.zeros(1, device=device),
@@ -101,7 +161,10 @@ def _build_row(compiled, max_walls, **kwargs):
         "player_angle": torch.zeros(1, device=device),
         "player_x": torch.zeros(1, device=device),
         "player_y": torch.zeros(1, device=device),
-        "sort_mask": torch.zeros(max_walls, device=device),
+        "sort_feedback": torch.zeros(8 + 5 + 3 + 2 * max_walls, device=device),
+        "tex_col_input": torch.zeros(1, device=device),
+        "tex_pixels": torch.zeros(tex_h * 3, device=device),
+        "texture_id_e8": torch.zeros(8, device=device),
         "token_type": torch.zeros(8, device=device),
         "wall_ax": torch.zeros(1, device=device),
         "wall_ay": torch.zeros(1, device=device),
@@ -129,6 +192,7 @@ def step_frame(
     inputs: PlayerInput,
     walls: List[dict],
     config: RenderConfig,
+    textures: List[np.ndarray] = None,
 ) -> Tuple[np.ndarray, GameState]:
     """Run one frame via the multi-phase rollout.
 
@@ -138,33 +202,39 @@ def step_frame(
         inputs: Player inputs for this frame.
         walls: List of wall dicts with keys ax, ay, bx, by, tex_id.
         config: Render configuration.
+        textures: List of texture arrays, each (tex_w, tex_h, 3).
 
     Returns:
         ``(frame, new_state)`` where frame is ``(H, W, 3)`` float32.
 
     Host protocol — the host is a dumb token feeder:
-        1. START + WALL×N — feed real inputs + wall geometry
-        2. EOS — feed real inputs → read (resolved_x, resolved_y, new_angle)
-        3. SORTED_WALL×N — feed resolved state + sort mask feedback
-        4. RENDER×(W×H/rp) — feed resolved state + (col, patch)
+        0. TEX_COL×(num_tex × tex_w) — feed texture column pixel data
+        1. INPUT — feed player state + controls
+        2. WALL×N — feed wall geometry + player position
+        3. EOS — feed player position → read resolved state from output
+        4. SORTED_WALL×N — pure autoregressive: feed prev output back
+        5. RENDER×(W×H/rp) — feed (col, patch) → read pixels
 
-    Collision detection and wall sliding are handled entirely inside
-    the graph (WALL tokens compute per-wall hit flags, EOS aggregates
-    them via attention and resolves the position).
+    Every cross-position dependency flows through attention.  The host
+    never computes on intermediate results — it just forwards outputs
+    back as inputs for the sort phase.
     """
+    assert textures is not None, "textures is required"
     N = len(walls)
     max_walls = int(module.metadata.get("max_walls", 8))
     rp = int(module.metadata.get("rows_per_patch", config.screen_height))
     H = config.screen_height
     W = config.screen_width
     shards_per_col = H // rp
+    num_tex = len(textures)
+    tex_w = textures[0].shape[0]
 
     assert N <= max_walls, f"Too many walls ({N}) for max_walls={max_walls}"
     assert H % rp == 0
 
     past = module.empty_past()
     step = 0
-    total_steps = 1 + N + 1 + N + W * shards_per_col
+    total_steps = num_tex * tex_w + 1 + N + 1 + N + W * shards_per_col
     px, py, angle = float(state.x), float(state.y), float(state.angle)
 
     # Output layout indices
@@ -200,17 +270,30 @@ def step_frame(
 
     t_frame = time.perf_counter()
 
-    # --- Phase 0: Prefill (START + WALL×N + EOS) ---
+    # --- Batched prefill: TEX_COL + INPUT + WALL + EOS in one forward ---
+    # All prefill tokens are causally ordered and don't depend on each
+    # other's outputs, so we process them in a single batched call.
     t0 = time.perf_counter()
+    rows = []
 
-    # START
-    row = _common(token_type=E8_START, **input_kw)
-    out, past = _step(row, past, step)
-    step += 1
+    # TEX_COL × (num_tex × tex_w)
+    for tex_idx in range(num_tex):
+        tex_e8 = index_to_vector(tex_idx + TEX_E8_OFFSET)
+        for col in range(tex_w):
+            pixel_data = textures[tex_idx][col].flatten()
+            rows.append(_common(
+                token_type=E8_TEX_COL,
+                texture_id_e8=tex_e8,
+                tex_col_input=torch.tensor([float(col)]),
+                tex_pixels=torch.tensor(pixel_data, dtype=torch.float32),
+            ))
+
+    # INPUT (controls only here)
+    rows.append(_common(token_type=E8_INPUT, **input_kw))
 
     # WALL × N
     for i, w in enumerate(walls):
-        row = _common(
+        rows.append(_common(
             token_type=E8_WALL,
             wall_ax=torch.tensor([w["ax"]]),
             wall_ay=torch.tensor([w["ay"]]),
@@ -218,37 +301,45 @@ def step_frame(
             wall_by=torch.tensor([w["by"]]),
             wall_tex_id=torch.tensor([w["tex_id"]]),
             wall_index=torch.tensor([float(i)]),
-            **input_kw,
-        )
-        out, past = _step(row, past, step)
-        step += 1
+        ))
 
-    # EOS — graph resolves collision via attention to WALL positions
-    row = _common(token_type=E8_EOS, **input_kw)
-    out, past = _step(row, past, step)
-    step += 1
+    # EOS
+    rows.append(_common(token_type=E8_EOS))
+
+    prefill = torch.cat(rows, dim=0)  # (n_prefill, d_input)
+    with torch.no_grad():
+        out, past = module.step(prefill, past, past_len=0)
+    step = prefill.shape[0]
 
     t_prefill = time.perf_counter() - t0
     print(f"  prefill  {step} steps  kv={_kv_len(past)}  {t_prefill*1000:.0f}ms")
 
-    # Read collision-resolved state from EOS output
-    px = out[0, 8].item()
-    py = out[0, 9].item()
-    new_angle_raw = out[0, 10].item()
+    # Read collision-resolved state from EOS output (last row)
+    eos_out = out[-1:]  # (1, d_output)
+    px = eos_out[0, 8].item()
+    py = eos_out[0, 9].item()
+    new_angle_raw = eos_out[0, 10].item()
     angle = new_angle_raw
 
     # --- Phase 1: Sort ---
+    # Pure autoregressive sort: EOS output seeds the loop, each step's
+    # output feeds back as the next input.  The transformer owns the mask
+    # lifecycle — the host does zero computation on intermediate results.
+    d_sf = 8 + 5 + 3 + 2 * max_walls
+    prev = eos_out[0, :d_sf].detach().clone()  # EOS output seeds sort
     t0 = time.perf_counter()
-    mask = np.zeros(max_walls)
     for k in range(N):
-        row = _common(
-            token_type=E8_SORTED_WALL,
-            sort_mask=torch.tensor(mask, dtype=torch.float32),
+        row = _build_row(
+            module, max_walls,
+            token_type=prev[:8],
+            sort_feedback=prev,
         )
         out, past = _step(row, past, step)
         step += 1
-        raw_sort = out[0].detach().cpu().numpy()
-        # Sort output: [type(8), wall_data(5), sort_rank(1), col_lo(1), col_hi(1), onehot(max_walls)]
+        prev = out[0, :d_sf].detach().clone()
+        raw_sort = prev.cpu().numpy()
+        # Sort output: [type(8), wall_data(5), sort_rank(1), col_lo(1), col_hi(1),
+        #               onehot(max_walls), updated_mask(max_walls)]
         wall_data = raw_sort[8:13]
         s_rank = raw_sort[13]
         s_col_lo = raw_sort[14]
@@ -256,24 +347,21 @@ def step_frame(
         onehot = raw_sort[onehot_sl]
         print(f"  sort[{k}]: wall=[{wall_data[0]:.2f},{wall_data[1]:.2f},{wall_data[2]:.2f},{wall_data[3]:.2f}] "
               f"tex={wall_data[4]:.1f} rank={s_rank:.0f} cols=[{s_col_lo:.1f},{s_col_hi:.1f}) oh_max={np.argmax(onehot)}")
-        mask = np.maximum(mask, np.round(onehot))
 
     t_sort = time.perf_counter() - t0
     print(f"  sort     {N} steps  kv={_kv_len(past)}  {t_sort*1000:.0f}ms")
-
-    # Print sort results for debugging
-    print(f"  sort results: mask={mask.tolist()}")
     print(f"  resolved state: px={px:.3f} py={py:.3f} angle={angle:.3f}")
-    # Re-read the last sort output to see what wall was selected
-    print(f"  last sort out[:20]: {out[0, :20].detach().cpu().numpy().tolist()}")
 
     # --- Phase 2: Render ---
+    # RENDER positions read wall data from SORTED KV and texture data
+    # from TEX_COL KV.  No player state needed — just col/patch indices.
     t0 = time.perf_counter()
     frame = np.zeros((H, W, 3), dtype=np.float32)
     _diag_printed = False
     for col in range(W):
         for shard in range(shards_per_col):
-            row = _common(
+            row = _build_row(
+                module, max_walls,
                 token_type=E8_RENDER,
                 col_idx=torch.tensor([float(col)]),
                 patch_idx=torch.tensor([float(shard)]),
@@ -282,7 +370,6 @@ def step_frame(
             step += 1
             raw_out = out[0].detach().cpu().numpy()
             if not _diag_printed and col == W // 2 and shard == 0:
-                # Dump first 20 output values at center column
                 print(f"  render diag col={col} shard={shard}: "
                       f"out[:20]={raw_out[:20].tolist()}")
                 _diag_printed = True

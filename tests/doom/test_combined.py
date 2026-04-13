@@ -29,6 +29,7 @@ from torchwright.ops.arithmetic_ops import (
     add,
     add_const,
     add_scaled_nodes,
+    bool_to_01,
     compare,
     multiply_const,
     negate,
@@ -42,7 +43,7 @@ from torchwright.ops.arithmetic_ops import (
 from torchwright.ops.arithmetic_ops import max as elementwise_max
 from torchwright.ops.attention_ops import attend_argmin_unmasked
 from torchwright.ops.inout_nodes import create_input, create_literal_value, create_pos_encoding
-from torchwright.ops.logic_ops import bool_all_true, equals_vector
+from torchwright.ops.logic_ops import bool_all_true, cond_gate, equals_vector
 from torchwright.ops.map_select import in_range, select
 
 from torchwright.doom.renderer import (
@@ -199,12 +200,10 @@ def build_combined_graph(
 
     # Gate sorted values: zero at non-sorted positions so render
     # attention's K is (0,0,0) there.
-    zeros_1 = create_literal_value(torch.zeros(1), name="z1")
-    zeros_5 = create_literal_value(torch.zeros(5), name="z5")
-    gated_dx = select(is_sorted, sel_dx, zeros_1)
-    gated_dy = select(is_sorted, sel_dy, zeros_1)
-    gated_dist = select(is_sorted, sel_dist, zeros_1)
-    gated_wall_data = select(is_sorted, sel_wall_data, zeros_5)
+    gated_dx = cond_gate(is_sorted, sel_dx)
+    gated_dy = cond_gate(is_sorted, sel_dy)
+    gated_dist = cond_gate(is_sorted, sel_dist)
+    gated_wall_data = cond_gate(is_sorted, sel_wall_data)
 
     # =====================================================================
     # RENDER POSITIONS: attend to sorted walls, run parametric render
@@ -243,10 +242,10 @@ def build_combined_graph(
     DIST_SCALE = 1.0
 
     # Gate ray_cos/ray_sin: zero at non-render positions
-    gated_ray_cos = select(is_render, ray_cos, zeros_1)
-    gated_ray_sin = select(is_render, ray_sin, zeros_1)
-    is_render_01 = multiply_const(add_const(is_render, 1.0), 0.5)
-    is_sorted_01 = multiply_const(add_const(is_sorted, 1.0), 0.5)
+    gated_ray_cos = cond_gate(is_render, ray_cos)
+    gated_ray_sin = cond_gate(is_render, ray_sin)
+    is_render_01 = bool_to_01(is_render)
+    is_sorted_01 = bool_to_01(is_sorted)
 
     # Build the render attention input: combine query-side and key-side features
     render_attn_in = Concatenate([

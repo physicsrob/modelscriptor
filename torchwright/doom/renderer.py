@@ -11,7 +11,7 @@ import builtins
 import numpy as np
 import torch
 
-from torchwright.graph import Concatenate, Linear, Node
+from torchwright.graph import Concatenate, Linear, Node, annotate
 from torchwright.graph.misc import LiteralValue
 from torchwright.ops.arithmetic_ops import (
     abs,
@@ -19,6 +19,7 @@ from torchwright.ops.arithmetic_ops import (
     add_const,
     clamp,
     compare,
+    floor_int,
     linear_bin_index,
     multiply_const,
     negate,
@@ -747,74 +748,88 @@ def _textured_column_fill(
         patch_row_start = LiteralValue(torch.tensor([0.0]), name="patch_row_start_0")
 
     # --- Base (non-wall) column: floor below wall_bottom, ceiling above ---
-    ceil_node = LiteralValue(torch.tensor(list(config.ceiling_color)), name="ceiling")
-    floor_node = LiteralValue(torch.tensor(list(config.floor_color)), name="floor")
-    wall_top_local = subtract(wall_top, patch_row_start)
-    wall_bottom_local = subtract(wall_bottom, patch_row_start)
-    h_local = Linear(
-        patch_row_start,
-        torch.tensor([[-1.0]]),
-        torch.tensor([float(H)]),
-        name="h_local_bound",
-    )
-    floor_masks = in_range(wall_bottom_local, h_local, rows_per_patch)
-    base = broadcast_select(
-        floor_masks, floor_node, ceil_node, rows_per_patch, 3,
-    )
+    with annotate("base"):
+        ceil_node = LiteralValue(torch.tensor(list(config.ceiling_color)), name="ceiling")
+        floor_node = LiteralValue(torch.tensor(list(config.floor_color)), name="floor")
+        wall_top_local = subtract(wall_top, patch_row_start)
+        wall_bottom_local = subtract(wall_bottom, patch_row_start)
+        h_local = Linear(
+            patch_row_start,
+            torch.tensor([[-1.0]]),
+            torch.tensor([float(H)]),
+            name="h_local_bound",
+        )
+        floor_masks = in_range(wall_bottom_local, h_local, rows_per_patch)
+        base = broadcast_select(
+            floor_masks, floor_node, ceil_node, rows_per_patch, 3,
+        )
 
     # --- Textured wall: per-screen-row texture sampling ---
     #
-    # For each screen row in the patch, compute its full-frame y as
-    # ``patch_row_start + y_idx`` (free Linear, since y_idx is a
-    # compile-time constant), index into the (wall_top, wall_bottom)
-    # range via ``linear_bin_index`` to pick the matching tex row, and
-    # dynamically extract that row's RGB from ``tex_column_colors``.
+    # Each screen row y needs: floor((y - wall_top) * tex_height / wall_height)
     #
-    # ``linear_bin_index`` needs tight (min_range, max_range) bounds on
-    # wall_height to keep its internal signed_multiply precise: loose
-    # bounds inflate absolute error.  ``_wall_height_lookup`` clamps
-    # wall_height to [H/max_dist, 2*H], so we use those as the bounds.
+    # Expanding y = patch_row_start + y_idx + 0.5:
+    #
+    #   bin_f = (patch_row_start - wall_top) * tex_height * inv_range
+    #         + (y_idx + 0.5)               * tex_height * inv_range
+    #           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    #           base_product (SHARED multiply)  per-row offset (FREE Linear)
+    #
+    # This factors the expensive signed_multiply out of the per-row loop:
+    # one shared multiply, then each row is a free Linear + clamp + floor
+    # + dynamic_extract (4 MLP sublayers instead of 8).
     max_dist = 2.0 * max_coord
     min_wall_height = max(float(H) / max_dist, 0.5)
     max_wall_height = 2.0 * float(H)
 
+    # Shared: inv_range and per_row_step
+    range_ = subtract(wall_bottom, wall_top)
+    clamped_range = clamp(range_, min_wall_height, max_wall_height)
+    inv_range = reciprocal(
+        clamped_range, min_value=min_wall_height, max_value=max_wall_height,
+    )
+    per_row_step = multiply_const(inv_range, float(tex_height))
+
+    # Shared: base_product = (patch_row_start - wall_top) * per_row_step
+    base_delta = subtract(patch_row_start, wall_top)
+    max_abs_base_delta = max_wall_height
+    clamped_base_delta = clamp(base_delta, -max_abs_base_delta, max_abs_base_delta)
+    max_abs_step = float(tex_height) / min_wall_height
+    base_product = signed_multiply(
+        clamped_base_delta,
+        per_row_step,
+        max_abs1=max_abs_base_delta,
+        max_abs2=max_abs_step,
+        step=0.5,
+    )
+
     row_rgbs: List[Node] = []
     for y_idx in range(rows_per_patch):
-        # y_centre = patch_row_start + y_idx + 0.5  (free Linear, y_idx
-        # and the +0.5 baked into the bias).  The +0.5 makes this the
-        # row's CENTRE, matching the center-sampling rasterisation rule
-        # the wall_masks composite below also uses (via in_range, which
-        # tests centres ``i + 0.5`` against the wall interval).  Without
-        # the offset the texture would be sampled at the row's top edge
-        # while the composite mask would test its centre, leaving a
-        # half-row mismatch between which screen rows look "wall" and
-        # which texture row each one samples.
-        y_centre = Linear(
-            patch_row_start,
-            torch.tensor([[1.0]]),
-            torch.tensor([float(y_idx) + 0.5]),
-            name=f"y_centre_row_{y_idx}",
-        )
-        tex_row_idx = linear_bin_index(
-            y_centre, wall_top, wall_bottom, tex_height,
-            min_range=min_wall_height,
-            max_range=max_wall_height,
-            n_reciprocal_breakpoints=48,
-            mul_step=0.25,
-            name=f"tex_row_idx_{y_idx}",
-        )
-        row_rgb = dynamic_extract(
-            tex_column_colors, tex_row_idx, tex_height, 3,
-        )
-        row_rgbs.append(row_rgb)
+        with annotate("tex_sample"):
+            # bin_f = base_product + (y_idx + 0.5) * per_row_step
+            # This is a free Linear: 1 × base_product + (y_idx+0.5) × per_row_step
+            bin_f = Linear(
+                Concatenate([base_product, per_row_step]),
+                torch.tensor([[1.0], [float(y_idx) + 0.5]]),
+                name=f"bin_f_row_{y_idx}",
+            )
+            clamped_bin_f = clamp(bin_f, 0.0, float(tex_height) - 0.5)
+            tex_row_idx = floor_int(
+                clamped_bin_f, min_value=0, max_value=tex_height - 1,
+            )
+            row_rgb = dynamic_extract(
+                tex_column_colors, tex_row_idx, tex_height, 3,
+            )
+            row_rgbs.append(row_rgb)
 
     textured_wall = Concatenate(row_rgbs)
 
     # --- Composite: wall region gets textured_wall, rest keeps base ---
-    wall_masks = in_range(wall_top_local, wall_bottom_local, rows_per_patch)
-    return broadcast_select(
-        wall_masks, textured_wall, base, rows_per_patch, 3,
-    )
+    with annotate("composite"):
+        wall_masks = in_range(wall_top_local, wall_bottom_local, rows_per_patch)
+        return broadcast_select(
+            wall_masks, textured_wall, base, rows_per_patch, 3,
+        )
 
 
 # ---------------------------------------------------------------------------

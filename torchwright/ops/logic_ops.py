@@ -1,11 +1,11 @@
 from typing import List
 
-from torchwright.graph import Node, Add
+from torchwright.graph import Node, Add, Concatenate
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 import torch
 
-from torchwright.ops.arithmetic_ops import relu, sum_nodes, compare
+from torchwright.ops.arithmetic_ops import sum_nodes, compare
 from torchwright.ops.const import (
     step_sharpness,
     embedding_step_sharpness,
@@ -157,21 +157,36 @@ def cond_gate(cond: Node, inp: Node) -> Node:
     Returns:
         Node: Output node after applying the gate based on condition.
     """
-    # Strategy:
-    # Add offset if cond is true, -offset if cond is false
-    # Rectify
-    # Add -offset if cond is true, 0 if cond is false
-    x = cond_add_vector(
-        cond=cond,
-        inp=inp,
-        true_vector=torch.tensor([big_offset] * len(inp)),
-        false_vector=torch.tensor([-big_offset] * len(inp)),
+    assert len(cond) == 1
+
+    d = len(inp)
+    # Fused single L->ReLU->L reading [cond, inp]:
+    #   unit_a[j] = ReLU( big_offset * cond + inp[j])  -- alive when cond=+1
+    #   unit_b[j] = ReLU(-big_offset * cond)            -- alive when cond=-1
+    #   out[j]    = unit_a[j] + unit_b[j] - big_offset
+    #
+    # cond=+1: out = inp,  cond=-1: out = 0
+    d_hidden = 2 * d
+    input_proj = torch.zeros(d_hidden, 1 + d)
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, d)
+    output_bias = torch.full((d,), -big_offset)
+
+    for j in range(d):
+        a = j
+        b = d + j
+        input_proj[a, 0] = big_offset
+        input_proj[a, 1 + j] = 1.0
+        input_proj[b, 0] = -big_offset
+        output_proj[a, j] = 1.0
+        output_proj[b, j] = 1.0
+
+    x = Concatenate([cond, inp])
+    return linear_relu_linear(
+        input_node=x,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=output_bias,
+        name="cond_gate",
     )
-    x = relu(x)
-    x = cond_add_vector(
-        cond=cond,
-        inp=x,
-        true_vector=torch.tensor([-big_offset] * len(inp)),
-        false_vector=torch.zeros(len(inp)),
-    )
-    return x

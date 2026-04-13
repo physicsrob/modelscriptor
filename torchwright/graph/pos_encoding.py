@@ -24,19 +24,39 @@ class PosEncoding(Node):
     def compute(self, n_pos: int, input_values: dict):
         return self.get_pos_encoding(n_pos)
 
-    def get_position_scalar(self) -> "Linear":
-        """Approximate position index as a 1D scalar node.
+    def get_position_scalar(self, max_pos: int = 2048) -> Node:
+        """Recover position index as a 1D scalar node.
 
         Extracts the slowest-frequency sin component of the positional
-        encoding and scales it back to position space.  The result equals
-        ``pos`` to within 0.5 for positions 0-310 (d_pos=16).
+        encoding and applies ``asin`` (via piecewise-linear) to invert
+        it back to position space.  Accurate to within 0.5 for
+        positions 0 through ``max_pos``.
         """
         from torchwright.graph.linear import Linear
+        from torchwright.ops.arithmetic_ops import piecewise_linear
 
         freq = math.exp((self.d_pos - 2) * -(math.log(10000.0) / self.d_pos))
+
+        # Extract the slowest sin component (raw, no scaling)
         weight = torch.zeros(self.d_pos, 1)
-        weight[self.d_pos - 2, 0] = 1.0 / freq
-        return Linear(self, weight, name="position_scalar")
+        weight[self.d_pos - 2, 0] = 1.0
+        sin_val = Linear(self, weight, name="position_sin")
+
+        # asin correction: pos = asin(sin(pos * freq)) / freq
+        # Quadratic spacing: dense at the top where asin curves,
+        # sparse near zero where sin(x) ≈ x is already accurate.
+        max_sin = math.sin(max_pos * freq) * 1.05  # slight margin
+        n_bp = 18
+        bps = [
+            max_sin * (1.0 - ((n_bp - 1 - k) / (n_bp - 1)) ** 2)
+            for k in range(n_bp)
+        ]
+
+        return piecewise_linear(
+            sin_val, bps,
+            lambda x: math.asin(max(-1.0, min(1.0, x))) / freq,
+            name="position_scalar",
+        )
 
     def attend_to_offset(self, value: Node, delta_pos=-1) -> Node:
         if delta_pos == 0:

@@ -94,6 +94,22 @@ def multiply_const(inp: Node, scalar: float) -> Node:
     return Linear(inp, scalar * torch.eye(d), name="multiply_const")
 
 
+def bool_to_01(inp: Node) -> Node:
+    """Map a ±1 boolean node to 0/1.
+
+    Converts the torchwright boolean convention (+1 = true, −1 = false)
+    to a 0/1 scale (1 = true, 0 = false).  This is a free operation
+    (no MLP sublayers — two linear transforms).
+
+    Args:
+        inp (Node): Boolean node with values in {-1, +1}.
+
+    Returns:
+        Node: Node with values in {0, 1}.
+    """
+    return multiply_const(add_const(inp, 1.0), 0.5)
+
+
 def add_scaled_nodes(scale1: float, inp1: Node, scale2: float, inp2: Node) -> Node:
     """
     Computes the linear combination of two nodes using specified coefficients.
@@ -624,6 +640,10 @@ def piecewise_linear_2d(
 
     # Build L -> ReLU -> L weight matrices
     d_hidden = len(active) if active else 1
+    assert d_hidden <= d_max, (
+        f"piecewise_linear_2d needs {d_hidden} neurons but d_max={d_max}. "
+        f"Use coarser breakpoints or raise d_max."
+    )
     input_proj = torch.zeros(d_hidden, 2)
     input_bias = torch.zeros(d_hidden)
     output_proj = torch.zeros(d_hidden, 1)
@@ -649,6 +669,96 @@ def piecewise_linear_2d(
         base_weight = torch.tensor([[base_sx], [base_sy]])
         base_linear = Linear(inp, base_weight, name=f"{name}_base")
         return Add(base_linear, result)
+    return result
+
+
+def multiply_2d(
+    inp1: Node,
+    inp2: Node,
+    max_abs1: float,
+    max_abs2: float,
+    step1: float = 1.0,
+    step2: float = 1.0,
+    breakpoints1: Optional[List[float]] = None,
+    breakpoints2: Optional[List[float]] = None,
+    min1: Optional[float] = None,
+    min2: Optional[float] = None,
+    max_abs_output: Optional[float] = None,
+    d_max: int = 1024,
+    name: str = "multiply_2d",
+) -> Node:
+    """Multiply two signed scalars via a 2D piecewise-linear lookup.
+
+    Computes ``inp1 * inp2`` in a **single MLP sublayer** by tabulating
+    the product on a 2D grid and delegating to :func:`piecewise_linear_2d`.
+    This trades MLP width for depth: ``signed_multiply`` uses ~3 MLP
+    sublayers but few neurons; ``multiply_2d`` uses 1 sublayer but
+    ~2*n1*n2 neurons (non-uniform grids) or ~3*(n1+n2) neurons (uniform).
+
+    **When to prefer over** ``signed_multiply``:
+
+    * The pipeline is depth-bound (most layers have spare MLP slots).
+    * Input ranges are moderate — the grid precision ``step1 * step2 / 4``
+      must be acceptable for the downstream consumer.  Feeding the output
+      into ``floor_int`` requires ``step1 * step2 < 2`` to avoid bin errors.
+    * You need one multiplication per layer rather than a 3-layer chain.
+
+    **Breakpoint generation.** When ``breakpoints1`` / ``breakpoints2`` are
+    not provided, uniform spacing from ``min1`` to ``max_abs1`` (and
+    similarly for axis 2) at ``step`` intervals is used.  ``min1`` defaults
+    to ``-max_abs1``; setting ``min1=0`` halves the breakpoints for
+    inputs known to be non-negative (e.g. ``inv_range``).  Custom
+    breakpoints (like the non-uniform ``_DIFF_BP`` used elsewhere in the
+    renderer) can be passed directly.
+
+    Args:
+        inp1: 1D scalar node.
+        inp2: 1D scalar node.
+        max_abs1: Upper bound on ``|inp1|``.
+        max_abs2: Upper bound on ``|inp2|``.
+        step1: Grid spacing for auto-generated breakpoints on axis 1.
+        step2: Grid spacing for auto-generated breakpoints on axis 2.
+        breakpoints1: Explicit breakpoints for axis 1.  Overrides
+            ``max_abs1`` / ``step1`` / ``min1``.
+        breakpoints2: Explicit breakpoints for axis 2.  Overrides
+            ``max_abs2`` / ``step2`` / ``min2``.
+        min1: Lower bound for auto-generated axis-1 breakpoints.
+            Defaults to ``-max_abs1``.
+        min2: Lower bound for auto-generated axis-2 breakpoints.
+            Defaults to ``-max_abs2``.
+        max_abs_output: If set, clamp the product to
+            ``[-max_abs_output, max_abs_output]`` via an extra
+            :func:`clamp` node (1 additional MLP sublayer).
+        d_max: Maximum neurons in the underlying MLP sublayer.
+        name: Node name for debugging.
+
+    Returns:
+        1D scalar node containing ``inp1 * inp2`` (optionally clamped).
+    """
+    assert len(inp1) == 1, "inp1 must be a 1D scalar node"
+    assert len(inp2) == 1, "inp2 must be a 1D scalar node"
+
+    # --- Build breakpoints ---
+    if breakpoints1 is None:
+        lo1 = -max_abs1 if min1 is None else min1
+        n1 = builtins.max(int(round((max_abs1 - lo1) / step1)) + 1, 2)
+        breakpoints1 = [lo1 + i * step1 for i in range(n1)]
+        breakpoints1[-1] = max_abs1  # pin endpoint
+    if breakpoints2 is None:
+        lo2 = -max_abs2 if min2 is None else min2
+        n2 = builtins.max(int(round((max_abs2 - lo2) / step2)) + 1, 2)
+        breakpoints2 = [lo2 + i * step2 for i in range(n2)]
+        breakpoints2[-1] = max_abs2  # pin endpoint
+
+    result = piecewise_linear_2d(
+        inp1, inp2, breakpoints1, breakpoints2,
+        lambda a, b: a * b,
+        d_max=d_max, name=name,
+    )
+
+    if max_abs_output is not None:
+        result = clamp(result, -max_abs_output, max_abs_output)
+
     return result
 
 
@@ -813,6 +923,7 @@ def linear_bin_index(
     n_reciprocal_breakpoints: int = 32,
     mul_step: float = 0.5,
     name: str = "linear_bin_index",
+    inv_range: Optional[Node] = None,
 ) -> Node:
     """Map a continuous coordinate onto an integer bin index.
 
@@ -858,8 +969,18 @@ def linear_bin_index(
     dominated by the ``signed_multiply``.  The primitive is designed
     for "call once per query"; if a caller needs many bin indices over
     the same ``(x_min, x_max)`` with different ``x`` values, the cheap
-    path is to hoist ``inv_range`` out and do the per-query arithmetic
-    as a free ``Linear`` — see the textured wall fill for an example.
+    path is to hoist ``inv_range`` out and pass it via the ``inv_range``
+    parameter, saving 2 MLP sublayers per call::
+
+        # Hoist the shared computation:
+        range_ = subtract(x_max, x_min)
+        clamped = clamp(range_, min_range, max_range)
+        inv = reciprocal(clamped, min_value=min_range, max_value=max_range)
+
+        for y_idx in range(rows_per_patch):
+            idx = linear_bin_index(y, x_min, x_max, n_bins,
+                                   min_range=min_range, max_range=max_range,
+                                   inv_range=inv)
 
     Args:
         x: Scalar node — continuous coordinate to bin.
@@ -867,19 +988,32 @@ def linear_bin_index(
         x_max: Scalar node — upper edge.  Must satisfy
             ``x_max - x_min >= min_range`` for correct output; smaller
             ranges are clamped to ``min_range`` before the reciprocal.
+            Ignored (but still required for API stability) when
+            ``inv_range`` is provided.
         n_bins: Number of discrete bins (compile-time).  Output is an
             integer in ``[0, n_bins - 1]``.
         min_range: Smallest representable value of ``x_max - x_min``.
             Smaller values need more reciprocal breakpoints to stay
-            accurate.
+            accurate.  Also sets the ``signed_multiply`` bound
+            ``max_abs2 = 1/min_range``, so it is required even when
+            ``inv_range`` is provided.
         max_range: Largest representable value of ``x_max - x_min``.
+            Also sets the ``signed_multiply`` bound ``max_abs1 = max_range``
+            and the delta clamp, so it is required even when ``inv_range``
+            is provided.
         n_reciprocal_breakpoints: Number of geometrically-spaced
             breakpoints used by the internal ``1/range`` lookup.  More
             breakpoints → tighter relative error on the reciprocal;
             typically ``log(max_range/min_range) / log(1 + tolerance)``.
             Default 32 gives ≲1% relative error over a 400× range.
+            Ignored when ``inv_range`` is provided.
         mul_step: Grid spacing passed to the internal ``signed_multiply``
             for the ``delta × inv_range`` product.
+        inv_range: Pre-computed ``1 / clamp(x_max - x_min, min_range,
+            max_range)`` node.  When provided, steps 1-3 above are
+            skipped and this node is used directly in the multiplication.
+            The caller is responsible for computing this with adequate
+            precision (see the hoisting example above).
 
     Returns:
         Scalar node carrying an integer in ``[0, n_bins - 1]``.
@@ -891,35 +1025,40 @@ def linear_bin_index(
     assert 0 < min_range < max_range, (
         "need 0 < min_range < max_range for the reciprocal lookup"
     )
-    assert n_reciprocal_breakpoints >= 2, (
-        "need at least 2 breakpoints for the geometric reciprocal lookup"
-    )
 
-    # 1. range and its clamp.
-    range_ = subtract(x_max, x_min)
-    clamped_range = clamp(range_, min_range, max_range)
+    if inv_range is not None:
+        # Caller pre-computed 1/clamped_range — skip steps 1-3.
+        assert len(inv_range) == 1, "inv_range must be a 1D scalar node"
+    else:
+        assert n_reciprocal_breakpoints >= 2, (
+            "need at least 2 breakpoints for the geometric reciprocal lookup"
+        )
 
-    # 2. 1/range via a geometric breakpoint lookup.  Geometric spacing
-    #    gives constant relative error per segment: error_rel ≈ (r-1)²/4
-    #    where r is the per-step ratio.  For 32 breakpoints over a
-    #    400× range, r ≈ 1.22 and error_rel ≈ 1.2%.
-    ratio = (max_range / min_range) ** (1.0 / (n_reciprocal_breakpoints - 1))
-    bps: List[float] = [min_range * (ratio ** k) for k in range(n_reciprocal_breakpoints)]
-    # Pin the endpoints so float rounding can't drift them.
-    bps[0] = min_range
-    bps[-1] = max_range
-    # The breakpoints must be strictly ascending — trivially true for
-    # geometric spacing but assert in case min_range == max_range sneaks
-    # through numerically.
-    assert all(bps[i] < bps[i + 1] for i in range(len(bps) - 1)), (
-        "geometric breakpoints collapsed — check min_range/max_range"
-    )
-    inv_range = piecewise_linear(
-        clamped_range,
-        bps,
-        lambda r: 1.0 / r,
-        name=f"{name}_inv_range",
-    )
+        # 1. range and its clamp.
+        range_ = subtract(x_max, x_min)
+        clamped_range = clamp(range_, min_range, max_range)
+
+        # 2. 1/range via a geometric breakpoint lookup.  Geometric spacing
+        #    gives constant relative error per segment: error_rel ≈ (r-1)²/4
+        #    where r is the per-step ratio.  For 32 breakpoints over a
+        #    400× range, r ≈ 1.22 and error_rel ≈ 1.2%.
+        ratio = (max_range / min_range) ** (1.0 / (n_reciprocal_breakpoints - 1))
+        bps: List[float] = [min_range * (ratio ** k) for k in range(n_reciprocal_breakpoints)]
+        # Pin the endpoints so float rounding can't drift them.
+        bps[0] = min_range
+        bps[-1] = max_range
+        # The breakpoints must be strictly ascending — trivially true for
+        # geometric spacing but assert in case min_range == max_range sneaks
+        # through numerically.
+        assert all(bps[i] < bps[i + 1] for i in range(len(bps) - 1)), (
+            "geometric breakpoints collapsed — check min_range/max_range"
+        )
+        inv_range = piecewise_linear(
+            clamped_range,
+            bps,
+            lambda r: 1.0 / r,
+            name=f"{name}_inv_range",
+        )
 
     # 3. delta and its clamp.  Pre-clamping keeps the multiplication
     #    inputs inside the declared bounds even under adversarial
@@ -993,14 +1132,18 @@ def reciprocal(
 ) -> Node:
     """Compute 1/x via piecewise-linear interpolation.
 
-    Exact when x is a multiple of ``step``.  Between grid points the
-    result is linearly interpolated.
+    Uses **geometric** breakpoint spacing so that relative interpolation
+    error is roughly constant across the entire ``[min_value, max_value]``
+    range.  ``step`` controls breakpoint density: the number of
+    breakpoints is ``(max_value - min_value) / step``, with a floor
+    of 32 to guarantee reasonable accuracy.
 
     Args:
         inp: 1D scalar node with value in [min_value, max_value].
         min_value: Lower bound on input (must be > 0).
         max_value: Upper bound on input.
-        step: Grid spacing.
+        step: Controls breakpoint density.  Smaller step = more
+            breakpoints = higher accuracy.
         d_max: Maximum neurons per MLP sublayer.
 
     Returns:
@@ -1010,11 +1153,11 @@ def reciprocal(
     assert min_value > 0, "min_value must be positive"
     assert max_value > min_value, "max_value must exceed min_value"
 
-    breakpoints = []
-    x = min_value
-    while x <= max_value + step / 2.0:
-        breakpoints.append(x)
-        x += step
+    n_breakpoints = builtins.max(int((max_value - min_value) / step) + 1, 32)
+    ratio = (max_value / min_value) ** (1.0 / (n_breakpoints - 1))
+    breakpoints = [min_value * (ratio ** k) for k in range(n_breakpoints)]
+    breakpoints[0] = min_value
+    breakpoints[-1] = max_value
 
     return piecewise_linear(
         inp, breakpoints, lambda x: 1.0 / x, d_max=d_max, name="reciprocal"

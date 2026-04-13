@@ -31,7 +31,8 @@ from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 #   320   — just above the documented limit
 #   640   — old default game graph (W=64, shards_per_col=10)
 #   1600  — new default game graph (W=160, shards_per_col=10)
-SEQ_LENS = [32, 48, 100, 160, 310, 320, 640, 1600]
+#
+SEQ_LENS = [32, 48, 100, 160, 310, 320, 640, 1600, 2048]
 
 
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
@@ -46,6 +47,21 @@ def test_position_scalar_uncompiled(seq_len):
     assert max_err < 0.5, (
         f"position_scalar max error {max_err:.3f} at seq_len={seq_len} "
         f"(must be < 0.5 for thermometer ops fed by it to remain correct)"
+    )
+
+
+def test_position_scalar_exhaustive():
+    """Every position 0-2047 must be accurate to within 0.5."""
+    pos_encoding = PosEncoding(16)
+    scalar_node = pos_encoding.get_position_scalar()
+    out = scalar_node.compute(n_pos=2048, input_values={}).squeeze(-1)
+    expected = torch.arange(2048, dtype=out.dtype)
+    errors = (out - expected).abs()
+    max_err = errors.max().item()
+    worst_pos = errors.argmax().item()
+    assert max_err < 0.5, (
+        f"position_scalar max error {max_err:.3f} at pos={worst_pos} "
+        f"(got {out[worst_pos].item():.3f}, expected {worst_pos})"
     )
 
 

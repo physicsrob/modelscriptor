@@ -22,6 +22,25 @@ from torchwright.reference_renderer.types import RenderConfig, Segment
 TRIG = generate_trig_table()
 
 
+def _test_textures(tex_size=8):
+    """High-contrast solid-color textures for compiled tests.
+
+    Every texel is far from both ceiling (0.2, 0.2, 0.2) and floor
+    (0.4, 0.4, 0.4), so _wall_band never misclassifies wall pixels.
+    """
+    colors = [
+        (0.9, 0.1, 0.1),  # east: red
+        (0.1, 0.9, 0.1),  # west: green
+        (0.1, 0.1, 0.9),  # north: blue
+        (0.9, 0.9, 0.1),  # south: yellow
+    ]
+    textures = []
+    for r, g, b in colors:
+        tex = np.full((tex_size, tex_size, 3), [r, g, b], dtype=np.float64)
+        textures.append(tex)
+    return textures
+
+
 def _config(W=32, H=24, fov=8):
     return RenderConfig(
         screen_width=W,
@@ -163,7 +182,8 @@ class TestReferenceStructure:
 
     @pytest.fixture(scope="class")
     def box_data(self):
-        segs, texs = box_room_textured(size=10.0, wad_path="doom1.wad", tex_size=8)
+        segs, _ = box_room_textured(size=10.0, wad_path="doom1.wad", tex_size=8)
+        texs = _test_textures(tex_size=8)
         cfg = _config(W=32, H=24, fov=8)
         return segs, texs, cfg
 
@@ -231,7 +251,8 @@ class TestCompiledStructure:
 
     @pytest.fixture(scope="class")
     def box_data(self):
-        segs, texs = box_room_textured(size=10.0, wad_path="doom1.wad", tex_size=8)
+        segs, _ = box_room_textured(size=10.0, wad_path="doom1.wad", tex_size=8)
+        texs = _test_textures(tex_size=8)
         cfg = _config(W=32, H=24, fov=8)
         return segs, texs, cfg
 
@@ -248,7 +269,8 @@ class TestCompiledStructure:
         segs, texs, cfg = box_data
         walls = segments_to_walls(segs)
         state = GameState(x=px, y=py, angle=angle)
-        frame, _ = step_frame(module, state, PlayerInput(), walls, cfg)
+        frame, _ = step_frame(module, state, PlayerInput(), walls, cfg,
+                              textures=texs)
         return frame
 
     def test_wall_height_center_column(self, module, box_data):

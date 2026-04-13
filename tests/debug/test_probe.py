@@ -99,7 +99,7 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         max_coord=10.0, move_speed=0.3, turn_speed=4,
     )
 
-    from torchwright.doom.game_graph import E8_START
+    from torchwright.doom.game_graph import E8_INPUT
     input_values = {
         "col_idx": torch.tensor([[0.0]]),
         "input_backward": torch.tensor([[0.0]]),
@@ -112,8 +112,11 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         "player_angle": torch.tensor([[0.0]]),
         "player_x": torch.tensor([[0.0]]),
         "player_y": torch.tensor([[0.0]]),
-        "sort_mask": torch.zeros(1, max_walls),
-        "token_type": E8_START.unsqueeze(0),
+        "sort_feedback": torch.zeros(1, 8 + 5 + 2 * max_walls),
+        "tex_col_input": torch.tensor([[0.0]]),
+        "tex_pixels": torch.zeros(1, textures[0].shape[1] * 3),
+        "texture_id_e8": torch.zeros(1, 8),
+        "token_type": E8_INPUT.unsqueeze(0),
         "wall_ax": torch.tensor([[0.0]]),
         "wall_ay": torch.tensor([[0.0]]),
         "wall_bx": torch.tensor([[0.0]]),
@@ -123,13 +126,14 @@ def test_probe_clean_on_v2_box_room(tiny_config):
     }
 
     # The v2 graph has large intermediate values in square_signed and
-    # signed_multiply chains (10^4–10^5 range), so absolute errors up
-    # to ~60 are normal fp32 rounding.  atol=100 still catches real
-    # compilation bugs (missing layers, swapped inputs) which show as
-    # errors of 1000+.
+    # signed_multiply chains (10^4–10^5 range).  The central ray sort
+    # adds more chained multiplications, pushing fp32 accumulation
+    # errors up to ~325 on values of ~10^4 (~3% relative).  atol=500
+    # still catches real compilation bugs (missing layers, swapped
+    # inputs) which show as errors of 1000+.
     report = probe_graph(
         output_node, pos_encoding, input_values, n_pos=1,
-        d=2048, d_head=32, verbose=False, atol=100.0,
+        d=2048, d_head=32, verbose=False, atol=500.0,
     )
 
     assert report.nodes_checked, (

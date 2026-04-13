@@ -119,7 +119,13 @@ def _allocate_head(attn):
 
 
 def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
-    """Copy an Attn node's Q/K/V/O matrices into one head."""
+    """Copy an Attn node's Q/K/V/O matrices into attention heads.
+
+    When the node's d_v exceeds the layer's d_head, V/O are split across
+    multiple heads that share duplicated Q/K matrices.  This is correct
+    because V/O is applied after softmax (purely linear):
+    sum_i(weights @ V_i @ O_i) == weights @ V @ O.
+    """
     node = op.node
     assert isinstance(node, Attn)
 
@@ -129,19 +135,33 @@ def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
     v_idx = rmap.resolve_indices(value_in)
     o_idx = op.target_cols
 
-    # Pad node matrices to layer d_head if needed
-    node_d_head = node.d_head
     layer_d_head = attn.d_head
 
-    q_mat = F.pad(node.query_matrix, (0, layer_d_head - node_d_head))
-    k_mat = F.pad(node.key_matrix, (0, layer_d_head - node_d_head))
-    v_mat = F.pad(node.value_matrix, (0, layer_d_head - node_d_head))
-    o_mat = F.pad(node.output_matrix, (0, 0, 0, layer_d_head - node_d_head))
-
-    head = _allocate_head(attn)
-    _scatter_attn_head(
-        attn, head, q_idx, k_idx, v_idx, o_idx, q_mat, k_mat, v_mat, o_mat, layer_d_head
+    assert layer_d_head >= node.d_qk, (
+        f"d_head={layer_d_head} is too small for Attn node "
+        f"'{node.name}' which needs d_qk={node.d_qk} for Q/K. "
+        f"Use d_head>={node.d_qk} or let compile_game auto-size it."
     )
+
+    # Q/K are shared across all V/O chunk heads, padded to layer d_head
+    q_mat = F.pad(node.query_matrix, (0, layer_d_head - node.d_qk))
+    k_mat = F.pad(node.key_matrix, (0, layer_d_head - node.d_qk))
+
+    # Split V/O across ceil(d_v / layer_d_head) heads
+    n_vo_heads = (node.d_v + layer_d_head - 1) // layer_d_head
+    for chunk_idx in range(n_vo_heads):
+        v_start = chunk_idx * layer_d_head
+        v_end = min(v_start + layer_d_head, node.d_v)
+        chunk_size = v_end - v_start
+
+        v_chunk = F.pad(node.value_matrix[:, v_start:v_end], (0, layer_d_head - chunk_size))
+        o_chunk = F.pad(node.output_matrix[v_start:v_end, :], (0, 0, 0, layer_d_head - chunk_size))
+
+        head = _allocate_head(attn)
+        _scatter_attn_head(
+            attn, head, q_idx, k_idx, v_idx, o_idx,
+            q_mat, k_mat, v_chunk, o_chunk, layer_d_head,
+        )
 
 
 def _current_pos_attn_matrices(pos_encoding, d_head):

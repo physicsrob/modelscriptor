@@ -28,10 +28,12 @@ from torchwright.graph import InputNode, PosEncoding
 from torchwright.ops.attention_ops import (
     attend_argmin,
     attend_argmax,
+    attend_argmax_dot,
     attend_argmin_where,
     attend_argmax_where,
     attend_argmin_above_integer,
     attend_argmin_unmasked,
+    attend_mean_where,
 )
 
 
@@ -484,3 +486,217 @@ def test_attend_argmin_unmasked_advances_through_all_slots():
     assert torch.allclose(result[1], value_in[1], atol=1e-2), f"pos 1: {result[1]}"
     assert torch.allclose(result[2], value_in[2], atol=1e-2), f"pos 2: {result[2]}"
     assert torch.allclose(result[3], value_in[3], atol=1e-2), f"pos 3: {result[3]}"
+
+
+# ---------------------------------------------------------------------------
+# attend_mean_where
+# ---------------------------------------------------------------------------
+
+
+def test_attend_mean_where_averages_valid_positions():
+    """Mean of value across valid positions, ignoring invalid ones."""
+    pe = _pe()
+    validity = InputNode("validity", 1)
+    value = InputNode("value", 3)
+    out = attend_mean_where(pe, validity, value)
+
+    n_pos = 5
+    # Positions 0, 1, 3 are valid; 2, 4 are invalid.
+    validity_in = torch.tensor([[1.0], [1.0], [-1.0], [1.0], [-1.0]])
+    value_in = torch.tensor([
+        [2.0, 0.0, 0.0],
+        [0.0, 4.0, 0.0],
+        [99.0, 99.0, 99.0],  # invalid — should be ignored
+        [0.0, 0.0, 6.0],
+        [99.0, 99.0, 99.0],  # invalid
+    ])
+
+    result = _run(out, n_pos, validity=validity_in, value=value_in)
+
+    # At pos 3: causal window = {0, 1, 2, 3}. Valid = {0, 1, 3}.
+    # Mean = (2+0+0)/3, (0+4+0)/3, (0+0+6)/3 = (0.667, 1.333, 2.0)
+    expected_3 = torch.tensor([2.0 / 3, 4.0 / 3, 6.0 / 3])
+    assert torch.allclose(result[3], expected_3, atol=1e-2), f"pos 3: {result[3]}"
+
+
+def test_attend_mean_where_single_valid():
+    """With one valid position, the mean is that position's value."""
+    pe = _pe()
+    validity = InputNode("validity", 1)
+    value = InputNode("value", 2)
+    out = attend_mean_where(pe, validity, value)
+
+    n_pos = 3
+    validity_in = torch.tensor([[-1.0], [1.0], [-1.0]])
+    value_in = torch.tensor([[0.0, 0.0], [7.0, 3.0], [0.0, 0.0]])
+
+    result = _run(out, n_pos, validity=validity_in, value=value_in)
+    # At pos 1 and pos 2, only pos 1 is valid.
+    assert torch.allclose(result[1], torch.tensor([7.0, 3.0]), atol=1e-2)
+    assert torch.allclose(result[2], torch.tensor([7.0, 3.0]), atol=1e-2)
+
+
+def test_attend_mean_where_wide_value():
+    """Value wider than d_pos — exercises the no-width-constraint path."""
+    pe = _pe()  # d_pos = 16
+    validity = InputNode("validity", 1)
+    value = InputNode("value", 32)  # wider than d_pos
+    out = attend_mean_where(pe, validity, value)
+
+    n_pos = 3
+    validity_in = torch.tensor([[1.0], [1.0], [-1.0]])
+    v0 = torch.arange(32).float().unsqueeze(0)
+    v1 = (torch.arange(32).float() * 2).unsqueeze(0)
+    value_in = torch.cat([v0, v1, torch.zeros(1, 32)], dim=0)
+
+    result = _run(out, n_pos, validity=validity_in, value=value_in)
+    # At pos 1: mean of v0 and v1
+    expected = (v0 + v1).squeeze(0) / 2
+    assert torch.allclose(result[1], expected, atol=1e-2), f"pos 1: {result[1]}"
+
+
+def test_attend_mean_where_all_valid_uniform():
+    """With all positions valid, result is the running cumulative mean."""
+    pe = _pe()
+    validity = InputNode("validity", 1)
+    value = InputNode("value", 1)
+    out = attend_mean_where(pe, validity, value)
+
+    n_pos = 4
+    validity_in = torch.ones(n_pos, 1)
+    value_in = torch.tensor([[4.0], [8.0], [12.0], [16.0]])
+
+    result = _run(out, n_pos, validity=validity_in, value=value_in)
+    # pos 0: mean(4) = 4
+    # pos 1: mean(4, 8) = 6
+    # pos 2: mean(4, 8, 12) = 8
+    # pos 3: mean(4, 8, 12, 16) = 10
+    assert abs(result[0].item() - 4.0) < 0.1
+    assert abs(result[1].item() - 6.0) < 0.1
+    assert abs(result[2].item() - 8.0) < 0.1
+    assert abs(result[3].item() - 10.0) < 0.1
+
+
+# ---------------------------------------------------------------------------
+# attend_argmax_dot
+# ---------------------------------------------------------------------------
+
+
+def test_attend_argmax_dot_selects_best_match():
+    """Selects the key position whose key_vector best matches query_vector."""
+    pe = _pe()
+    query_vector = InputNode("qv", 4)
+    key_vector = InputNode("kv", 4)
+    value = InputNode("value", 2)
+    out = attend_argmax_dot(pe, query_vector, key_vector, value)
+
+    n_pos = 4
+    # Query: one-hot selecting column 2 (0/1 convention)
+    qv_in = torch.tensor([
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ])
+    # Key: ±1 masks. Pos 0: col 2 = -1 (not matching).
+    # Pos 1: col 2 = +1 (matching). Pos 2: col 2 = +1 (matching).
+    # Pos 3: col 2 = -1 (not matching).
+    kv_in = torch.tensor([
+        [-1.0, 1.0, -1.0, 1.0],   # col 2 = -1
+        [1.0, -1.0, 1.0, -1.0],   # col 2 = +1
+        [-1.0, 1.0, 1.0, -1.0],   # col 2 = +1
+        [1.0, -1.0, -1.0, 1.0],   # col 2 = -1
+    ])
+    value_in = torch.tensor([
+        [10.0, 0.0],
+        [20.0, 1.0],
+        [30.0, 2.0],
+        [40.0, 3.0],
+    ])
+
+    result = _run(out, n_pos, qv=qv_in, kv=kv_in, value=value_in)
+
+    # pos 0: only pos 0 visible, col 2 = -1 → forced to pick it
+    assert torch.allclose(result[0], value_in[0], atol=1e-2)
+    # pos 1: pos 1 has col 2 = +1, pos 0 has -1 → picks pos 1
+    assert torch.allclose(result[1], value_in[1], atol=1e-2)
+    # pos 2: pos 1 and 2 both have col 2 = +1 (tied dot product);
+    # result is a soft average of value_in[1] and value_in[2] with
+    # slight tiebreak preference toward earliest.  Just verify it's
+    # between the two matching values and far from the non-matching one.
+    assert result[2, 0].item() > 19.0  # well above value_in[0]=10
+    assert result[2, 0].item() < 31.0  # bounded by value_in[2]=30
+    # pos 3: pos 1 and 2 match (col 2 = +1), pos 3 doesn't → soft avg of 1,2
+    assert result[3, 0].item() > 19.0
+    assert result[3, 0].item() < 31.0
+
+
+def test_attend_argmax_dot_zero_key_isolation():
+    """Zero key_vector (from cond_gate) produces dot product 0, losing to
+    any matching position."""
+    pe = _pe()
+    query_vector = InputNode("qv", 3)
+    key_vector = InputNode("kv", 3)
+    value = InputNode("value", 2)
+    out = attend_argmax_dot(pe, query_vector, key_vector, value)
+
+    n_pos = 3
+    # Query: one-hot column 0
+    qv_in = torch.tensor([
+        [1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+    ])
+    # Key: pos 0 is gated to zero (non-participating), pos 1 matches,
+    # pos 2 doesn't match.
+    kv_in = torch.tensor([
+        [0.0, 0.0, 0.0],     # gated zero (dot product = 0)
+        [1.0, -1.0, -1.0],   # col 0 = +1 (dot product = +1)
+        [-1.0, 1.0, 1.0],    # col 0 = -1 (dot product = -1)
+    ])
+    value_in = torch.tensor([
+        [0.0, 0.0],   # gated zero value
+        [5.0, 5.0],
+        [9.0, 9.0],
+    ])
+
+    result = _run(out, n_pos, qv=qv_in, kv=kv_in, value=value_in)
+    # At pos 2: pos 1 (dot=+200) beats pos 0 (dot=0) and pos 2 (dot=-200)
+    assert torch.allclose(result[2], value_in[1], atol=1e-2), f"pos 2: {result[2]}"
+
+
+def test_attend_argmax_dot_different_queries_per_position():
+    """Different query positions can select different matches."""
+    pe = _pe()
+    query_vector = InputNode("qv", 3)
+    key_vector = InputNode("kv", 3)
+    value = InputNode("value", 1)
+    out = attend_argmax_dot(pe, query_vector, key_vector, value)
+
+    n_pos = 4
+    # Key positions 0-2 each have a different column set to +1.
+    # Position 3 queries column 0.
+    kv_in = torch.tensor([
+        [1.0, -1.0, -1.0],   # "visible at col 0"
+        [-1.0, 1.0, -1.0],   # "visible at col 1"
+        [-1.0, -1.0, 1.0],   # "visible at col 2"
+        [0.0, 0.0, 0.0],     # gated (non-participating)
+    ])
+    # Queries: each position queries a different column.
+    qv_in = torch.tensor([
+        [1.0, 0.0, 0.0],   # query col 0
+        [0.0, 1.0, 0.0],   # query col 1
+        [0.0, 0.0, 1.0],   # query col 2
+        [1.0, 0.0, 0.0],   # query col 0 again
+    ])
+    value_in = torch.tensor([[10.0], [20.0], [30.0], [0.0]])
+
+    result = _run(out, n_pos, qv=qv_in, kv=kv_in, value=value_in)
+    # pos 0 queries col 0 → pos 0 (only option)
+    assert abs(result[0].item() - 10.0) < 0.5
+    # pos 1 queries col 1 → pos 1 (col 1 = +1)
+    assert abs(result[1].item() - 20.0) < 0.5
+    # pos 2 queries col 2 → pos 2 (col 2 = +1)
+    assert abs(result[2].item() - 30.0) < 0.5
+    # pos 3 queries col 0 → pos 0 (col 0 = +1, among {0,1,2,3})
+    assert abs(result[3].item() - 10.0) < 0.5
