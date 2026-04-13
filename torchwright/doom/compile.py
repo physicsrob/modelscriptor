@@ -37,6 +37,53 @@ from torchwright.graph.spherical_codes import index_to_vector
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
 
+def print_graph_stats(output_node, pos_encoding=None):
+    """Print a breakdown of graph nodes and params by annotation."""
+    from collections import defaultdict
+    from torchwright.compiler.utils import get_ancestor_nodes
+
+    start = {output_node}
+    if pos_encoding is not None:
+        start.add(pos_encoding)
+    all_nodes = get_ancestor_nodes(start)
+
+    stats = defaultdict(lambda: {"nodes": 0, "params": 0})
+    for node in all_nodes:
+        key = node.annotation or "(none)"
+        stats[key]["nodes"] += 1
+        stats[key]["params"] += node.num_params()
+
+    total_nodes = sum(s["nodes"] for s in stats.values())
+    total_params = sum(s["params"] for s in stats.values())
+
+    # Sort by top-level group, then sub-path
+    rows = sorted(stats.items())
+
+    print(f"\nGraph stats: {total_nodes:,} nodes, {total_params:,} params\n")
+    print(f"  {'Annotation':<35s} {'Nodes':>7s} {'Params':>12s} {'% params':>9s}")
+    print(f"  {'─' * 35} {'─' * 7} {'─' * 12} {'─' * 9}")
+
+    # Group by top-level for subtotals
+    from itertools import groupby
+    def top_level(item):
+        return item[0].split("/")[0]
+
+    for group_key, group_items in groupby(rows, key=top_level):
+        group_list = list(group_items)
+        for key, s in group_list:
+            pct = 100.0 * s["params"] / total_params if total_params else 0
+            print(f"  {key:<35s} {s['nodes']:>7,} {s['params']:>12,} {pct:>8.1f}%")
+        if len(group_list) > 1:
+            gn = sum(s["nodes"] for _, s in group_list)
+            gp = sum(s["params"] for _, s in group_list)
+            gpct = 100.0 * gp / total_params if total_params else 0
+            print(f"  {'  ' + group_key + ' (total)':<35s} {gn:>7,} {gp:>12,} {gpct:>8.1f}%")
+        print()
+
+    print(f"  {'TOTAL':<35s} {total_nodes:>7,} {total_params:>12,} {'100.0%':>9s}")
+    print()
+
+
 def segments_to_walls(segments: List[Segment]) -> List[dict]:
     """Convert Segment objects to the wall dict format expected by step_frame."""
     return [
