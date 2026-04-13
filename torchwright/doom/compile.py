@@ -169,7 +169,7 @@ def step_frame(
 
     # Output layout indices
     pixel_sl = slice(8, 8 + rp * 3)
-    onehot_sl = slice(8 + 5, 8 + 5 + max_walls)
+    onehot_sl = slice(8 + 5 + 3, 8 + 5 + 3 + max_walls)
 
     # Player input tensors (reused at START, WALL, and EOS positions
     # so the graph computes velocity consistently at all three)
@@ -248,13 +248,14 @@ def step_frame(
         out, past = _step(row, past, step)
         step += 1
         raw_sort = out[0].detach().cpu().numpy()
-        # Sort output: [type(8), wall_data(5), onehot(max_walls)]
+        # Sort output: [type(8), wall_data(5), sort_rank(1), col_lo(1), col_hi(1), onehot(max_walls)]
         wall_data = raw_sort[8:13]
+        s_rank = raw_sort[13]
+        s_col_lo = raw_sort[14]
+        s_col_hi = raw_sort[15]
         onehot = raw_sort[onehot_sl]
-        # Also read the sel_dist from the sort value (position 7 = 8+5+2 = offset 15 in raw output)
-        # Actually, onehot_sl starts at 8+5 = 13, so dist would be at position... let me print more context
         print(f"  sort[{k}]: wall=[{wall_data[0]:.2f},{wall_data[1]:.2f},{wall_data[2]:.2f},{wall_data[3]:.2f}] "
-              f"tex={wall_data[4]:.1f} oh_max={np.argmax(onehot)} raw[13:16]={raw_sort[13:16].tolist()}")
+              f"tex={wall_data[4]:.1f} rank={s_rank:.0f} cols=[{s_col_lo:.1f},{s_col_hi:.1f}) oh_max={np.argmax(onehot)}")
         mask = np.maximum(mask, np.round(onehot))
 
     t_sort = time.perf_counter() - t0

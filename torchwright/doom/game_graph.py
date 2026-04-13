@@ -498,6 +498,12 @@ def build_game_graph(
         value=wall_value_for_sort,
     )
 
+    # Sort rank: number of walls already selected (= sum of mask entries).
+    # At step k the mask has k bits set, so sort_rank = k.
+    sort_rank = Linear(
+        sort_mask, torch.ones(max_walls, 1), name="sort_rank",
+    )
+
     sel_wall_data = _extract_from(selected_sort, d_sort_val, 0, 5, "sel_wall_data")
     sel_dx = _extract_from(selected_sort, d_sort_val, 5, 1, "sel_dx")
     sel_dy = _extract_from(selected_sort, d_sort_val, 6, 1, "sel_dy")
@@ -812,10 +818,13 @@ def build_game_graph(
     # Output: gated by token type
     # =====================================================================
 
-    # SORTED_WALL output: type + wall data + onehot
+    # SORTED_WALL output: type + wall data + sort_rank + col_lo + col_hi + onehot
     sort_output = Concatenate([
         create_literal_value(E8_SORTED_WALL, name="sort_type"),
         sel_wall_data,
+        sort_rank,
+        vis_lo,
+        vis_hi,
         sel_onehot,
     ])
 
@@ -838,7 +847,7 @@ def build_game_graph(
     ])
 
     # Pad all to same width and select
-    d_sort_out = 8 + 5 + max_walls
+    d_sort_out = 8 + 5 + 3 + max_walls
     d_render_out = 8 + rp * 3
     d_start_out = 8 + 3
     d_eos_out = 8 + 3
