@@ -61,7 +61,7 @@ def generate_transformer(
     scene: str = "box",
     width: int = 120,
     height: int = 100,
-    rows_per_patch: int = 10,
+    chunk_size: int = 20,
     tex_size: int = 64,
     frames: int = 10,
     fps: int = 10,
@@ -81,7 +81,7 @@ def generate_transformer(
         max_walls=max(8, len(walls)),
         max_coord=max_coord,
         d=d,
-        rows_per_patch=rows_per_patch,
+        chunk_size=chunk_size,
         device="cuda",
     )
 
@@ -147,7 +147,7 @@ def main(
     scene: str = "box",
     width: int = 120,
     height: int = 100,
-    rows_per_patch: int = 10,
+    chunk_size: int = 20,
     tex_size: int = 64,
     frames: int = 10,
     fps: int = 10,
@@ -157,7 +157,7 @@ def main(
     # Launch both in parallel
     transformer_call = generate_transformer.spawn(
         scene=scene, width=width, height=height,
-        rows_per_patch=rows_per_patch, tex_size=tex_size,
+        chunk_size=chunk_size, tex_size=tex_size,
         frames=frames, fps=fps, scale=scale, d=d,
     )
     reference_call = generate_reference.spawn(

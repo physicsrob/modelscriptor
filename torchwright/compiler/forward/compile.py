@@ -80,6 +80,7 @@ def forward_compile(
     on_layer_compiled: Optional[Callable[[int, TransformerLayer], None]] = None,
     d_hidden: Optional[int] = None,
     on_node_scheduled: Optional[Callable[[Node, int], None]] = None,
+    trim_heads: bool = True,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -288,6 +289,10 @@ def forward_compile(
     else:
         ra.assign(out_state, output_node, residual_map.get_indices(output_node))
     net.residual_assignment = ra
+
+    if trim_heads:
+        for layer in net.layers:
+            layer.attn.attn.trim_unused_heads()
 
     if device == "auto":
         net.to(get_device(verbose=verbose))

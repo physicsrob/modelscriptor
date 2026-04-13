@@ -2,7 +2,7 @@
 
 Token sequence per frame:
 
-    TEX_COL×(num_tex × tex_w) → INPUT → WALL×N → EOS → SORTED_WALL×N → RENDER×(W × H/rp)
+    TEX_COL×(num_tex × tex_w) → INPUT → WALL×N → EOS → SORTED_WALL×N → RENDER×(dynamic)
 
 Six token types (E8 spherical codes):
 
@@ -66,7 +66,7 @@ from torchwright.ops.attention_ops import (
     attend_mean_where,
 )
 from torchwright.ops.inout_nodes import create_input, create_literal_value, create_pos_encoding
-from torchwright.ops.logic_ops import bool_all_true, bool_any_true, cond_gate, equals_vector
+from torchwright.ops.logic_ops import bool_all_true, bool_any_true, bool_not, cond_gate, equals_vector
 from torchwright.ops.map_select import in_range, select
 
 from torchwright.doom.renderer import (
@@ -287,7 +287,7 @@ def build_game_graph(
     max_coord: float = 20.0,
     move_speed: float = 0.3,
     turn_speed: int = 4,
-    rows_per_patch: Optional[int] = None,
+    chunk_size: int = 20,
 ) -> Tuple[Node, PosEncoding]:
     """Build the walls-as-tokens game graph.
 
@@ -301,7 +301,7 @@ def build_game_graph(
     W = config.screen_width
     fov = config.fov_columns
     tex_w, tex_h = textures[0].shape[0], textures[0].shape[1]
-    rp = rows_per_patch if rows_per_patch is not None else H
+    cs = chunk_size
 
     pos_encoding = create_pos_encoding()
 
@@ -322,13 +322,21 @@ def build_game_graph(
     wall_by = create_input("wall_by", 1)
     wall_tex_id = create_input("wall_tex_id", 1)
     wall_index = create_input("wall_index", 1)
-    d_sort_out = 8 + 5 + 2 * max_walls
+    d_sort_out = 8 + 5 + 3 + 2 * max_walls
     sort_feedback = create_input("sort_feedback", d_sort_out)
     prev_mask = _extract_from(
-        sort_feedback, d_sort_out, 8 + 5 + max_walls, max_walls, "prev_mask",
+        sort_feedback, d_sort_out, 8 + 5 + 3 + max_walls, max_walls, "prev_mask",
     )
-    col_idx = create_input("col_idx", 1)
-    patch_idx = create_input("patch_idx", 1)
+    d_render_fb = max_walls + 3
+    render_feedback = create_input("render_feedback", d_render_fb)
+    render_mask = _extract_from(render_feedback, d_render_fb, 0, max_walls, "render_mask")
+    render_col = _extract_from(render_feedback, d_render_fb, max_walls, 1, "render_col")
+    render_is_new_wall = _extract_from(
+        render_feedback, d_render_fb, max_walls + 1, 1, "render_is_new_wall",
+    )
+    render_chunk_start = _extract_from(
+        render_feedback, d_render_fb, max_walls + 2, 1, "render_chunk_start",
+    )
     tex_col_input = create_input("tex_col_input", 1)
     tex_pixels = create_input("tex_pixels", tex_h * 3)
     texture_id_e8 = create_input("texture_id_e8", 8)
@@ -580,6 +588,17 @@ def build_game_graph(
             value=wall_value_for_sort,
         )
 
+        # Sort rank: number of walls already selected (= sum of mask entries).
+        # At step k the mask has k bits set, so sort_rank = k.
+        sort_rank = Linear(
+            prev_mask, torch.ones(max_walls, 1), name="sort_rank",
+        )
+
+        # One-hot encoding of sort_rank for render-phase wall selection
+        sort_rank_p1 = add_const(sort_rank, 1.0)
+        sr_onehot_bool = in_range(sort_rank, sort_rank_p1, max_walls)
+        sort_rank_onehot = add_scaled_nodes(0.5, sr_onehot_bool, 0.5, ones_oh)
+
         sel_wall_data = _extract_from(selected_sort, d_sort_val, 0, 5, "sel_wall_data")
         sel_render = _extract_from(selected_sort, d_sort_val, 5, 5, "sel_render")
         sel_tex_id = _extract_from(sel_wall_data, 5, 4, 1, "sel_tex_id")
@@ -684,44 +703,57 @@ def build_game_graph(
         vis_lo = select(a_lt_b, col_a_c, col_b_c)
         vis_hi = select(a_lt_b, col_b_c, col_a_c)
 
-        vis_mask = in_range(vis_lo, vis_hi, W)
-        gated_vis_mask = cond_gate(is_sorted, vis_mask)
-
     # =====================================================================
-    # RENDER: visibility-masked wall selection + parametric intersection
+    # RENDER: autoregressive wall-column render with chunked pixel output
     # =====================================================================
 
     with annotate("render/wall_attention"):
-        # Per-column angle offset from player's forward direction
-        col_times_fov = multiply_const(col_idx, float(fov))
-        ao_raw = thermometer_floor_div(col_times_fov, W, fov * (W - 1))
-        angle_offset = add_const(ao_raw, float(-(fov // 2)))
+        # Build score + position_onehot for attend_argmin_unmasked
+        render_sentinel = create_literal_value(
+            torch.tensor([99.0]), name="render_sentinel",
+        )
+        render_score = select(is_sorted, sort_rank, render_sentinel)
+        z_mw = create_literal_value(
+            torch.zeros(max_walls), name="z_mw",
+        )
+        render_position_onehot = select(is_sorted, sort_rank_onehot, z_mw)
 
-        col_p1 = add_const(col_idx, 1.0)
-        col_onehot_01 = bool_to_01(in_range(col_idx, col_p1, W))
+        # Value: render data + col bounds + onehot for mask update
+        render_value = Concatenate([
+            gated_render_data,   # 6: [sort_den, C, D, E, H_inv, tex_id]
+            vis_lo,              # 1: col_lo
+            vis_hi,              # 1: col_hi
+            sort_rank_onehot,    # max_walls: for mask update
+        ])
+        render_value_gated = cond_gate(is_sorted, render_value)
 
-        VIS_GAIN = 500.0
-        SORT_BIAS = 100.0
-        render_attn = attend_argmax_dot(
-            pos_encoding,
-            query_vector=Concatenate([
-                cond_gate(is_render, col_onehot_01),
-                bool_to_01(is_render),
-            ]),
-            key_vector=Concatenate([
-                gated_vis_mask,
-                multiply_const(bool_to_01(is_sorted), SORT_BIAS),
-            ]),
-            value=gated_render_data,
-            match_gain=VIS_GAIN,
+        selected_render = attend_argmin_unmasked(
+            pos_encoding=pos_encoding,
+            score=render_score,
+            mask_vector=render_mask,
+            position_onehot=render_position_onehot,
+            value=render_value_gated,
         )
 
-        r_sort_den    = _extract_from(render_attn, 6, 0, 1, "r_sort_den")
-        r_C           = _extract_from(render_attn, 6, 1, 1, "r_C")
-        r_D           = _extract_from(render_attn, 6, 2, 1, "r_D")
-        r_E           = _extract_from(render_attn, 6, 3, 1, "r_E")
-        r_H_inv_num_t = _extract_from(render_attn, 6, 4, 1, "r_H_inv")
-        r_wall_tex    = _extract_from(render_attn, 6, 5, 1, "r_tex")
+        d_rv = 8 + max_walls
+        r_sort_den    = _extract_from(selected_render, d_rv, 0, 1, "r_sort_den")
+        r_C           = _extract_from(selected_render, d_rv, 1, 1, "r_C")
+        r_D           = _extract_from(selected_render, d_rv, 2, 1, "r_D")
+        r_E           = _extract_from(selected_render, d_rv, 3, 1, "r_E")
+        r_H_inv_num_t = _extract_from(selected_render, d_rv, 4, 1, "r_H_inv")
+        r_wall_tex    = _extract_from(selected_render, d_rv, 5, 1, "r_tex")
+        r_col_lo      = _extract_from(selected_render, d_rv, 6, 1, "r_col_lo")
+        r_col_hi      = _extract_from(selected_render, d_rv, 7, 1, "r_col_hi")
+        r_onehot      = _extract_from(selected_render, d_rv, 8, max_walls, "r_onehot")
+
+    with annotate("render/state_machine"):
+        # Active column: new wall → use col_lo from attention; else feedback col
+        active_col = select(render_is_new_wall, r_col_lo, render_col)
+
+        # Per-column angle offset from player's forward direction
+        col_times_fov = multiply_const(active_col, float(fov))
+        ao_raw = thermometer_floor_div(col_times_fov, W, fov * (W - 1))
+        angle_offset = add_const(ao_raw, float(-(fov // 2)))
 
     # --- Wall height from precomputed values ---
     with annotate("render/wall_height"):
@@ -819,32 +851,94 @@ def build_game_graph(
 
         tex_column_colors = tex_col_attn
 
-    # Column fill
+    # Column fill — chunk-based
     with annotate("render/column_fill"):
-        patch_row_start = multiply_const(patch_idx, float(rp))
+        vis_top_render = clamp(wall_top, 0.0, float(H))
+        vis_bottom_render = clamp(wall_bottom, 0.0, float(H))
+
+        # New column detection (chunk_start < -0.5 = sentinel)
+        neg_half = create_literal_value(torch.tensor([-0.5]), name="neg_half")
+        is_new_col = compare(subtract(neg_half, render_chunk_start), 0.0)
+        active_start = select(is_new_col, vis_top_render, render_chunk_start)
+
+        chunk_length = clamp(
+            subtract(vis_bottom_render, active_start), 0.0, float(cs),
+        )
+
         pixels = _textured_column_fill(
             wall_top, wall_bottom, wall_height,
             tex_column_colors, tex_h, config, max_coord=max_coord,
-            patch_row_start=patch_row_start, rows_per_patch=rp,
+            patch_row_start=active_start, rows_per_patch=cs,
         )
+
+    # State transitions (3-way: more chunks / advance col / advance wall)
+    with annotate("render/state_transitions"):
+        next_chunk_start_val = add_const(active_start, float(cs))
+        has_more_chunks = compare(
+            subtract(vis_bottom_render, next_chunk_start_val), 0.5,
+        )
+
+        col_p1 = add_const(active_col, 1.0)
+        not_more_chunks = bool_not(has_more_chunks)
+        has_more_cols = compare(subtract(r_col_hi, col_p1), 0.5)
+        advance_col = bool_all_true([not_more_chunks, has_more_cols])
+        advance_wall = bool_all_true([not_more_chunks, bool_not(has_more_cols)])
+
+        # Mask update
+        mask_with_new = add(render_mask, r_onehot)
+        next_render_mask = select(advance_wall, mask_with_new, render_mask)
+
+        # Done detection
+        mask_sum = Linear(
+            mask_with_new, torch.ones(max_walls, 1), name="render_mask_sum",
+        )
+        all_walls_done = compare(mask_sum, max_walls - 0.5)
+        done_flag = bool_all_true([advance_wall, all_walls_done])
+
+        # Next feedback fields
+        zero_col = create_literal_value(torch.tensor([0.0]), name="zero_col")
+        next_col_output = select(
+            has_more_chunks, active_col,
+            select(advance_col, col_p1, zero_col),
+        )
+        chunk_sentinel = create_literal_value(
+            torch.tensor([-1.0]), name="chunk_sentinel",
+        )
+        next_chunk = select(has_more_chunks, next_chunk_start_val, chunk_sentinel)
+        pos_one = create_literal_value(torch.tensor([1.0]), name="pos_one")
+        neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one")
+        next_is_new_wall = select(advance_wall, pos_one, neg_one)
+
+        next_feedback = Concatenate([
+            next_render_mask, next_col_output, next_is_new_wall, next_chunk,
+        ])
 
     # =====================================================================
     # Output: gated by token type
     # =====================================================================
     with annotate("output"):
 
-        # SORTED_WALL output: type + wall data + onehot + updated mask
+        # SORTED_WALL output: type + wall data + sort_rank + col_lo + col_hi
+        #                     + onehot + updated mask
         sort_output = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="sort_type"),
             sel_wall_data,
+            sort_rank,
+            vis_lo,
+            vis_hi,
             sel_onehot,
             updated_mask,
         ])
 
-        # RENDER output: type + pixels
+        # RENDER output: type + col + start_y + length + done + pixels + feedback
         render_output = Concatenate([
             create_literal_value(E8_RENDER, name="render_type"),
+            active_col,
+            active_start,
+            chunk_length,
+            done_flag,
             pixels,
+            next_feedback,
         ])
 
         # INPUT output: type + padding (host ignores INPUT output)
@@ -859,7 +953,7 @@ def build_game_graph(
             create_literal_value(E8_SORTED_WALL, name="eos_sort_seed"),
             resolved_x, resolved_y, attn_new_angle,
             create_literal_value(
-                torch.zeros(2 + 2 * max_walls), name="eos_sort_pad"),
+                torch.zeros(2 + 3 + 2 * max_walls), name="eos_sort_pad"),
         ])
 
         # TEX_COL output: type + padding (host ignores TEX_COL output)
@@ -869,8 +963,8 @@ def build_game_graph(
         ])
 
         # Pad all to same width and select
-        d_sort_out = 8 + 5 + 2 * max_walls
-        d_render_out = 8 + rp * 3
+        d_sort_out = 8 + 5 + 3 + 2 * max_walls
+        d_render_out = 12 + cs * 3 + max_walls + 3
         d_input_out = 8 + 3
         d_eos_out = d_sort_out  # EOS seeds the sort loop
         d_tc_out = 8 + 3

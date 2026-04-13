@@ -43,7 +43,7 @@ def play(
     scale: int = 8,
     mode: str = "transformer",
     textures=None,
-    rows_per_patch: int = 10,
+    chunk_size: int = 20,
 ) -> None:
     """Run an interactive game loop with pygame display.
 
@@ -84,7 +84,7 @@ def play(
             max_walls=max_walls,
             max_coord=max_coord,
             d=2048,
-            rows_per_patch=rows_per_patch,
+            chunk_size=chunk_size,
         )
         current_walls = [walls_a]  # mutable container for level-swap
 
@@ -180,8 +180,8 @@ def main():
     parser.add_argument("--fov", type=int, default=32)
     parser.add_argument("--scale", type=int, default=8)
     parser.add_argument(
-        "--rows-per-patch", type=int, default=10,
-        help="Vertical patch height. Must divide --height.",
+        "--chunk-size", type=int, default=20,
+        help="Render chunk height (pixels per render token).",
     )
     args = parser.parse_args()
 
@@ -210,7 +210,7 @@ def main():
 
     play(segments, config, start_x, start_y, start_angle,
          max_coord=max_coord, scale=args.scale, mode=args.mode,
-         textures=textures, rows_per_patch=args.rows_per_patch)
+         textures=textures, chunk_size=args.chunk_size)
 
 
 if __name__ == "__main__":
