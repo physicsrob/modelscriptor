@@ -1,4 +1,4 @@
-"""Sweep rows_per_patch values and report compile-time stats.
+"""Sweep chunk_size values and report compile-time stats.
 
 Builds + compiles the DOOM game graph at several patch heights and
 prints a table showing:
@@ -218,7 +218,7 @@ def _profile_one(
     textures,
     config: RenderConfig,
     max_coord: float,
-    rows_per_patch: int,
+    chunk_size: int,
     d: int,
     d_head: int,
 ) -> dict:
@@ -227,7 +227,7 @@ def _profile_one(
         max_walls=max(8, len(segments)),
         max_coord=max_coord,
         move_speed=0.3, turn_speed=4,
-        rows_per_patch=rows_per_patch,
+        chunk_size=chunk_size,
     )
 
     buf = io.StringIO()
@@ -271,7 +271,7 @@ def _profile_one(
     peak_d = max(max(r[3], r[4]) for r in layer_rows)
     compile_time = sum(r[5] for r in layer_rows) / 1000.0
 
-    total_positions = config.screen_width * (config.screen_height // rows_per_patch)
+    total_positions = config.screen_width * (config.screen_height // chunk_size)
     cost = _cost_model(
         peak_d=peak_d,
         n_layers=n_layers,
@@ -280,8 +280,8 @@ def _profile_one(
     )
 
     return {
-        "rp": rows_per_patch,
-        "shards": config.screen_height // rows_per_patch,
+        "rp": chunk_size,
+        "shards": config.screen_height // chunk_size,
         "positions": total_positions,
         "layers": n_layers,
         "peak_d": peak_d,
@@ -337,7 +337,7 @@ def _print_table(rows: List[dict]) -> None:
 
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Profile compile stats across rows_per_patch values",
+        description="Profile compile stats across chunk_size values",
     )
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--height", type=int, default=200)
@@ -364,10 +364,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     H = args.height
-    rps = args.rows_per_patch or _divisors(H)
+    rps = args.chunk_size or _divisors(H)
     for rp in rps:
         if H % rp != 0:
-            parser.error(f"rows_per_patch={rp} does not divide --height={H}")
+            parser.error(f"chunk_size={rp} does not divide --height={H}")
 
     trig_table = generate_trig_table()
     config = RenderConfig(
@@ -406,7 +406,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         try:
             row = _profile_one(
                 segments, textures, config, max_coord,
-                rows_per_patch=rp,
+                chunk_size=rp,
                 d=args.d,
                 d_head=args.d_head,
             )

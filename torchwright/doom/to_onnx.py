@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--max-walls", type=int, default=8,
                         help="Maximum number of wall tokens per frame")
     parser.add_argument(
-        "--rows-per-patch", type=int, default=10,
+        "--chunk-size", type=int, default=20,
         help="Vertical patch height. Must divide --height.",
     )
     parser.add_argument(
@@ -87,14 +87,15 @@ def main():
         max_walls=args.max_walls,
         max_coord=max_coord,
         move_speed=0.3, turn_speed=4,
-        rows_per_patch=args.rows_per_patch,
+        chunk_size=args.chunk_size,
     )
 
-    # Sequence length: START + WALL*N + EOS + SORTED_WALL*N + RENDER*(W*H/rp)
-    rp = args.rows_per_patch
+    # Sequence length: TEX_COL + INPUT + WALL*N + EOS + SORTED_WALL*N + RENDER (dynamic)
+    cs = args.chunk_size
     n_walls = args.max_walls
-    render_positions = config.screen_width * (config.screen_height // rp)
-    max_seq_len = 1 + n_walls + 1 + n_walls + render_positions
+    # Upper bound on render tokens: each wall covers W columns, each column ceil(H/cs) chunks
+    max_render = n_walls * config.screen_width * ((config.screen_height + cs - 1) // cs)
+    max_seq_len = 1 + n_walls + 1 + n_walls + max_render
 
     compile_headless_to_onnx(
         output_node=output_node,
@@ -106,7 +107,7 @@ def main():
         max_layers=400,
         verbose=True,
         extra_metadata={
-            "rows_per_patch": rp,
+            "chunk_size": cs,
             "max_walls": n_walls,
         },
     )

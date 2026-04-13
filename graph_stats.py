@@ -2,8 +2,8 @@
 
 Usage (via Makefile):
     make graph-stats
-    make graph-stats ARGS="--rows-per-patch 25"
-    make graph-stats ARGS="--scene multi --rows-per-patch 100"
+    make graph-stats ARGS="--chunk-size 25"
+    make graph-stats ARGS="--scene multi --chunk-size 100"
     make graph-stats ARGS="--d 4096 --d-head 128"
 
 Three levels of parameter accounting:
@@ -161,7 +161,7 @@ def main():
     parser.add_argument("--scene", default="box", choices=["box", "multi"])
     parser.add_argument("--width", type=int, default=120)
     parser.add_argument("--height", type=int, default=100)
-    parser.add_argument("--rows-per-patch", type=int, default=10)
+    parser.add_argument("--chunk-size", type=int, default=20)
     parser.add_argument("--tex-size", type=int, default=64)
     parser.add_argument("--max-walls", type=int, default=None)
     parser.add_argument("--d", type=int, default=2048,
@@ -188,11 +188,12 @@ def main():
     # Compute d_head the same way compile_game does
     d = args.d
     if args.d_head is None:
-        W = args.width
         tex_w = textures[0].shape[0]
-        tex_d_qk = 8 + tex_w + 1
-        render_d_qk = W + 2
-        min_d_head = max(render_d_qk, tex_d_qk)
+        d_sort_val = 11 + max_walls
+        sort_d = 1 + max_walls + d_sort_val
+        render_d = 1 + max_walls + 8 + max_walls
+        tex_d = 8 + tex_w + 1
+        min_d_head = max(sort_d, render_d, tex_d)
         d_head = 1
         while d_head < min_d_head:
             d_head *= 2
@@ -211,14 +212,14 @@ def main():
     )
 
     print(f"Building graph: {args.scene} scene, {args.width}x{args.height}, "
-          f"rows_per_patch={args.rows_per_patch}, {len(textures)} textures, "
+          f"chunk_size={args.chunk_size}, {len(textures)} textures, "
           f"max_walls={max_walls}")
     print(f"Transformer config: d={d}, d_head={d_head}, d_hidden={d_hidden}, "
           f"n_heads={d // d_head}")
 
     output, pos = build_game_graph(
         config, textures, max_walls=max_walls, max_coord=max_coord,
-        rows_per_patch=args.rows_per_patch,
+        chunk_size=args.chunk_size,
     )
 
     all_nodes = get_ancestor_nodes({output, pos})
