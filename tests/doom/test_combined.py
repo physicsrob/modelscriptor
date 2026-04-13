@@ -29,6 +29,7 @@ from torchwright.ops.arithmetic_ops import (
     add,
     add_const,
     add_scaled_nodes,
+    bool_to_01,
     compare,
     multiply_const,
     negate,
@@ -243,8 +244,8 @@ def build_combined_graph(
     # Gate ray_cos/ray_sin: zero at non-render positions
     gated_ray_cos = cond_gate(is_render, ray_cos)
     gated_ray_sin = cond_gate(is_render, ray_sin)
-    is_render_01 = multiply_const(add_const(is_render, 1.0), 0.5)
-    is_sorted_01 = multiply_const(add_const(is_sorted, 1.0), 0.5)
+    is_render_01 = bool_to_01(is_render)
+    is_sorted_01 = bool_to_01(is_sorted)
 
     # Build the render attention input: combine query-side and key-side features
     render_attn_in = Concatenate([

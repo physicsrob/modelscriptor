@@ -670,16 +670,19 @@ def attend_argmax_dot(
 
     At each query position, the attention returns ``value`` at the
     causal-window position whose ``key_vector`` has the highest dot
-    product with ``query_vector``.  Ties break toward the latest
-    (most recent) position.
+    product with ``query_vector``.  Ties break toward the earliest
+    (first) position — "first match wins."
 
     The logit at key position ``i`` seen from query position ``j`` is
 
         match_gain · (query_vector_j · key_vector_i)
-        + _QUERY_GAIN · _TIEBREAK_COEFF · pos_scalar_i
+        − (match_gain / 100) · pos_scalar_i
 
-    The match and tiebreak terms occupy separate ``d_qk`` columns, so
-    ``match_gain`` is independent of ``_QUERY_GAIN``.
+    The tiebreak coefficient is derived from ``match_gain`` so the
+    caller controls both match strength and tiebreak hardness through
+    one parameter.  Logit per position = ``match_gain / 100``.
+    Match dominates tiebreak for sequences up to 200 positions.
+    Increase ``match_gain`` for harder selection over longer sequences.
 
     **Type isolation.**  This primitive does not include a validity
     parameter.  Callers should use
@@ -719,7 +722,7 @@ def attend_argmax_dot(
 
     # d_qk layout:
     #   cols 0..W-1:  match dimensions (query_vector · key_vector)
-    #   col  W:       position tiebreak (latest wins)
+    #   col  W:       position tiebreak (earliest wins)
     d_qk = W + 1
 
     position_scalar = pos_encoding.get_position_scalar()
@@ -736,12 +739,19 @@ def attend_argmax_dot(
 
     # --- Key ---
     # Columns 0..W-1: key_vector[c] (identity)
-    # Column W: _TIEBREAK_COEFF * position_scalar (latest wins)
+    # Column W: -tiebreak * position_scalar (earliest wins).
+    # The tiebreak is derived from match_gain so the caller controls
+    # both match and tiebreak strength through one parameter.
+    # Logit per position = match_gain / _DOT_TB_DIVISOR.
+    # Match dominates tiebreak when span < 2 * _DOT_TB_DIVISOR (= 200).
+    # Increase match_gain for harder selection over longer sequences.
+    _DOT_TB_DIVISOR = 100.0
+    dot_tiebreak = match_gain / (_QUERY_GAIN * _DOT_TB_DIVISOR)
     key_in = Concatenate([pos_encoding, key_vector, position_scalar])
     key_matrix = torch.zeros((len(key_in), d_qk))
     for c in range(W):
         key_matrix[d_pos + c, c] = 1.0
-    key_matrix[d_pos + W, W] = _TIEBREAK_COEFF
+    key_matrix[d_pos + W, W] = -dot_tiebreak
 
     # --- Value / Output: identity pass-through ---
     value_matrix = torch.eye(d_v)

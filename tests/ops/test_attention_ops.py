@@ -603,7 +603,7 @@ def test_attend_argmax_dot_selects_best_match():
     assert torch.allclose(result[1], value_in[1], atol=1e-2)
     # pos 2: pos 1 and 2 both have col 2 = +1 (tied dot product);
     # result is a soft average of value_in[1] and value_in[2] with
-    # slight tiebreak preference toward latest.  Just verify it's
+    # slight tiebreak preference toward earliest.  Just verify it's
     # between the two matching values and far from the non-matching one.
     assert result[2, 0].item() > 19.0  # well above value_in[0]=10
     assert result[2, 0].item() < 31.0  # bounded by value_in[2]=30

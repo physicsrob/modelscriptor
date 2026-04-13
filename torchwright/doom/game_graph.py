@@ -31,7 +31,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 
-from torchwright.graph import Attn, Concatenate, Linear, Node
+from torchwright.graph import Concatenate, Linear, Node
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.spherical_codes import index_to_vector
@@ -40,6 +40,7 @@ from torchwright.ops.arithmetic_ops import (
     add,
     add_const,
     add_scaled_nodes,
+    bool_to_01,
     clamp,
     compare,
     floor_int,
@@ -54,7 +55,11 @@ from torchwright.ops.arithmetic_ops import (
     subtract,
     thermometer_floor_div,
 )
-from torchwright.ops.attention_ops import attend_argmin_unmasked
+from torchwright.ops.attention_ops import (
+    attend_argmax_dot,
+    attend_argmin_unmasked,
+    attend_mean_where,
+)
 from torchwright.ops.inout_nodes import create_input, create_literal_value, create_pos_encoding
 from torchwright.ops.logic_ops import bool_all_true, bool_any_true, cond_gate, equals_vector
 from torchwright.ops.map_select import in_range, select
@@ -471,54 +476,18 @@ def build_game_graph(
     # =====================================================================
 
     # Remap hit flags from {-1, +1} to {0, 1} for clean averaging
-    hit_full_01 = multiply_const(add_const(hit_full, 1.0), 0.5)
-    hit_x_01 = multiply_const(add_const(hit_x, 1.0), 0.5)
-    hit_y_01 = multiply_const(add_const(hit_y, 1.0), 0.5)
+    hit_full_01 = bool_to_01(hit_full)
+    hit_x_01 = bool_to_01(hit_x)
+    hit_y_01 = bool_to_01(hit_y)
 
-    is_eos_01 = multiply_const(add_const(is_eos, 1.0), 0.5)
-    is_wall_01 = multiply_const(add_const(is_wall, 1.0), 0.5)
-
-    resolve_attn_in = Concatenate([
+    # Average hit flags across WALL positions.  If any wall was hit,
+    # the mean is >= 1/max_walls = 0.125 >> threshold of 0.05.
+    resolve_attn = attend_mean_where(
         pos_encoding,
-        is_eos_01, is_wall_01,
-        hit_full_01, hit_x_01, hit_y_01,
-    ])
-
-    d_pe_r = len(pos_encoding)
-    s_eos_01 = d_pe_r
-    s_wall_01 = d_pe_r + 1
-    s_hf = d_pe_r + 2
-    s_hx = d_pe_r + 3
-    s_hy = d_pe_r + 4
-
-    RESOLVE_GAIN = 80.0
-    d_head_resolve = 1 + 3
-
-    q_resolve = torch.zeros(len(resolve_attn_in), d_head_resolve)
-    q_resolve[s_eos_01, 0] = RESOLVE_GAIN
-
-    k_resolve = torch.zeros(len(resolve_attn_in), d_head_resolve)
-    k_resolve[s_wall_01, 0] = 1.0
-
-    v_resolve = torch.zeros(len(resolve_attn_in), d_head_resolve)
-    v_resolve[s_hf, 1] = 1.0
-    v_resolve[s_hx, 2] = 1.0
-    v_resolve[s_hy, 3] = 1.0
-
-    o_resolve = torch.zeros(d_head_resolve, 3)
-    o_resolve[1, 0] = 1.0
-    o_resolve[2, 1] = 1.0
-    o_resolve[3, 2] = 1.0
-
-    resolve_attn = Attn(
-        query_in=resolve_attn_in, key_in=resolve_attn_in,
-        value_in=resolve_attn_in,
-        query_matrix=q_resolve, key_matrix=k_resolve,
-        value_matrix=v_resolve, output_matrix=o_resolve,
+        validity=is_wall,
+        value=Concatenate([hit_full_01, hit_x_01, hit_y_01]),
     )
 
-    # Threshold averaged flags: any value > 0 means at least one wall hit.
-    # Worst case (1 hit out of max_walls=8) → avg = 0.125 >> 0.05.
     avg_hf = _extract_from(resolve_attn, 3, 0, 1, "avg_hf")
     avg_hx = _extract_from(resolve_attn, 3, 1, 1, "avg_hx")
     avg_hy = _extract_from(resolve_attn, 3, 2, 1, "avg_hy")
@@ -550,13 +519,11 @@ def build_game_graph(
     sel_wall_data = _extract_from(selected_sort, d_sort_val, 0, 5, "sel_wall_data")
     sel_render = _extract_from(selected_sort, d_sort_val, 5, 5, "sel_render")
     sel_tex_id = _extract_from(sel_wall_data, 5, 4, 1, "sel_tex_id")
-    sel_dist = _extract_from(selected_sort, d_sort_val, 10, 1, "sel_dist")
     sel_onehot = _extract_from(selected_sort, d_sort_val, 11, max_walls, "sel_onehot")
 
     # Gate sorted values: zero at non-sorted positions
     # Render data: [sort_den, C, D, E, H_inv_num_t, tex_id] = 6 values
     gated_render_data = cond_gate(is_sorted, Concatenate([sel_render, sel_tex_id]))
-    gated_dist = cond_gate(is_sorted, sel_dist)
 
     # --- Visibility mask: column range where this wall is visible ---
     # Compute atan2 of each wall endpoint relative to the player, then
@@ -677,8 +644,6 @@ def build_game_graph(
     vis_mask = in_range(vis_lo, vis_hi, W)
     gated_vis_mask = cond_gate(is_sorted, vis_mask)
 
-    is_sorted_01 = multiply_const(add_const(is_sorted, 1.0), 0.5)
-
     # =====================================================================
     # RENDER: visibility-masked wall selection + parametric intersection
     # =====================================================================
@@ -689,86 +654,29 @@ def build_game_graph(
     angle_offset = add_const(ao_raw, float(-(fov // 2)))
 
     # --- Render attention: visibility-masked wall selection ---
-    # The attention score is dominated by the dot product of the render
-    # token's column one-hot with the sorted wall's visibility mask.
-    # Among visible walls, earlier sort order (lower position) wins.
-    #
-    # Query (at RENDER): col_onehot (W) + is_render (1)
-    # Key (at SORTED_WALL): vis_mask (W) + is_sorted (1)
-    # Value (at SORTED_WALL): render_data (6)
-
-    # Column one-hot: +1 at col_idx, -1 elsewhere → map to 0/1
+    # attend_argmax_dot matches the render token's column one-hot against
+    # each sorted wall's visibility mask.  Among visible walls, the
+    # position tiebreak selects the latest (sort is front-to-back, so
+    # we rely on sort order for nearest-wall selection).  cond_gate
+    # zeros key/value at non-SORTED positions (zero-K isolation).
     col_p1 = add_const(col_idx, 1.0)
-    col_onehot = in_range(col_idx, col_p1, W)
-    col_onehot_01 = multiply_const(add_const(col_onehot, 1.0), 0.5)
-    gated_col_onehot = cond_gate(is_render, col_onehot_01)
-    is_render_01 = multiply_const(add_const(is_render, 1.0), 0.5)
+    col_onehot_01 = bool_to_01(in_range(col_idx, col_p1, W))
 
-    # Render attention: visibility-masked nearest-wall selection.
-    #
-    # Score = VIS_GAIN * vis_mask[col]            — visible (+1) vs hidden (-1)
-    #       + VIS_GAIN * SORTED_BIAS * is_sorted  — bonus for sorted tokens
-    #       - VIS_GAIN * DIST_SCALE * dist         — prefer closer walls
-    #
-    # The visibility match (±1) dominates: a 2*VIS_GAIN swing between
-    # visible and hidden walls.  Among visible walls, the distance
-    # tiebreak selects the nearest.
-    VIS_GAIN = 200.0
-    SORTED_BIAS = 100.0
-    DIST_SCALE = 5.0
-
-    n_render_vals = 6  # sort_den, C, D, E, H_inv_num_t, tex_id
-    render_attn_in = Concatenate([
+    VIS_GAIN = 500.0
+    render_attn = attend_argmax_dot(
         pos_encoding,
-        gated_col_onehot, is_render_01,
-        gated_vis_mask, is_sorted_01, gated_dist,
-        gated_render_data,
-    ])
-
-    d_pe = len(pos_encoding)
-    s_col_oh = d_pe
-    s_is_render = d_pe + W
-    s_vis_mask = d_pe + W + 1
-    s_is_sorted = d_pe + 2 * W + 1
-    s_dist = d_pe + 2 * W + 2
-    s_render_data = d_pe + 2 * W + 3
-
-    # Q/K dimension for visibility dot product; V/O dimension for values
-    d_qk = W + 1
-    d_v = n_render_vals
-
-    q_matrix = torch.zeros(len(render_attn_in), d_qk)
-    for c in range(W):
-        q_matrix[s_col_oh + c, c] = VIS_GAIN
-    q_matrix[s_is_render, W] = VIS_GAIN
-
-    k_matrix = torch.zeros(len(render_attn_in), d_qk)
-    for c in range(W):
-        k_matrix[s_vis_mask + c, c] = 1.0
-    k_matrix[s_is_sorted, W] = SORTED_BIAS
-    k_matrix[s_dist, W] = -DIST_SCALE
-
-    v_matrix = torch.zeros(len(render_attn_in), d_v)
-    for i in range(n_render_vals):
-        v_matrix[s_render_data + i, i] = 1.0
-
-    o_matrix = torch.zeros(d_v, n_render_vals)
-    for i in range(n_render_vals):
-        o_matrix[i, i] = 1.0
-
-    render_attn = Attn(
-        query_in=render_attn_in, key_in=render_attn_in,
-        value_in=render_attn_in,
-        query_matrix=q_matrix, key_matrix=k_matrix,
-        value_matrix=v_matrix, output_matrix=o_matrix,
+        query_vector=cond_gate(is_render, col_onehot_01),
+        key_vector=gated_vis_mask,
+        value=gated_render_data,
+        match_gain=VIS_GAIN,
     )
 
-    r_sort_den    = _extract_from(render_attn, n_render_vals, 0, 1, "r_sort_den")
-    r_C           = _extract_from(render_attn, n_render_vals, 1, 1, "r_C")
-    r_D           = _extract_from(render_attn, n_render_vals, 2, 1, "r_D")
-    r_E           = _extract_from(render_attn, n_render_vals, 3, 1, "r_E")
-    r_H_inv_num_t = _extract_from(render_attn, n_render_vals, 4, 1, "r_H_inv")
-    r_wall_tex    = _extract_from(render_attn, n_render_vals, 5, 1, "r_tex")
+    r_sort_den    = _extract_from(render_attn, 6, 0, 1, "r_sort_den")
+    r_C           = _extract_from(render_attn, 6, 1, 1, "r_C")
+    r_D           = _extract_from(render_attn, 6, 2, 1, "r_D")
+    r_E           = _extract_from(render_attn, 6, 3, 1, "r_E")
+    r_H_inv_num_t = _extract_from(render_attn, 6, 4, 1, "r_H_inv")
+    r_wall_tex    = _extract_from(render_attn, 6, 5, 1, "r_tex")
 
     # --- Wall height from precomputed values ---
     # den/cos(o) = sort_den - C·tan(o)
