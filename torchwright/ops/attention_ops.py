@@ -613,13 +613,15 @@ def attend_mean_where(
     must ensure at least one valid position exists within the causal
     window at every query position whose output is consumed.
 
-    Compile cost: exactly one vanilla attention head.  ``d_qk = 1``,
-    ``d_v = len(value)``.
+    Compile cost: one attention head (auto-split across multiple
+    physical heads by the compiler when ``d_v > d_head``).
+    ``d_qk = 1``, ``d_v = len(value)``.
 
     Args:
         pos_encoding: The graph's positional encoding node.
         validity: 1D boolean node (+1 valid, −1 invalid).
-        value: Node to average.  ``len(value) <= pos_encoding.d_pos``.
+        value: Node to average.  No width constraint — the compiler
+            splits wide V/O across multiple physical heads.
 
     Returns:
         Attn node of width ``len(value)`` equal to the uniform mean of
@@ -630,13 +632,13 @@ def attend_mean_where(
         instead of averaging.
     """
     assert len(validity) == 1, "attend_mean_where expects a 1D boolean validity"
-    d_head = _assert_value_fits(pos_encoding, value)
 
     # d_qk = 1: the only scoring column carries the validity bonus.
     # Q reads from the slowest cosine of pos_encoding (stable ≈ 1).
     # K reads only validity.  No tiebreak → all valid positions get
     # the same logit → uniform softmax weights → exact mean.
     d_qk = 1
+    d_v = len(value)
 
     query_matrix = torch.zeros((len(pos_encoding), d_qk))
     query_matrix[-1, 0] = _QUERY_GAIN
@@ -645,8 +647,8 @@ def attend_mean_where(
     key_matrix = torch.zeros((len(key_in), d_qk))
     key_matrix[-1, 0] = _VALIDITY_LARGE
 
-    value_matrix = torch.eye(len(value), d_head)
-    output_matrix = torch.eye(d_head, len(value))
+    value_matrix = torch.eye(d_v)
+    output_matrix = torch.eye(d_v)
 
     return Attn(
         query_in=pos_encoding,
@@ -692,8 +694,9 @@ def attend_argmax_dot(
     ``match_gain`` for any matching position — providing effective type
     isolation without a separate validity signal.
 
-    Compile cost: exactly one vanilla attention head.  ``d_qk =
-    len(query_vector) + 1``, ``d_v = len(value)``.
+    Compile cost: one attention head (auto-split across multiple
+    physical heads by the compiler when ``d_v > d_head``).
+    ``d_qk = len(query_vector) + 1``, ``d_v = len(value)``.
 
     Args:
         pos_encoding: The graph's positional encoding node.
@@ -702,7 +705,9 @@ def attend_argmax_dot(
         key_vector: Width-``W`` node at each key position (e.g. a
             visibility mask in ±1).  Must have the same width as
             ``query_vector``.
-        value: Node to read at the winning position.
+        value: Node to read at the winning position.  No width
+            constraint — the compiler splits wide V/O across
+            multiple physical heads.
         match_gain: Coefficient applied to the dot-product term.
 
     Returns:

@@ -536,6 +536,25 @@ def test_attend_mean_where_single_valid():
     assert torch.allclose(result[2], torch.tensor([7.0, 3.0]), atol=1e-2)
 
 
+def test_attend_mean_where_wide_value():
+    """Value wider than d_pos — exercises the no-width-constraint path."""
+    pe = _pe()  # d_pos = 16
+    validity = InputNode("validity", 1)
+    value = InputNode("value", 32)  # wider than d_pos
+    out = attend_mean_where(pe, validity, value)
+
+    n_pos = 3
+    validity_in = torch.tensor([[1.0], [1.0], [-1.0]])
+    v0 = torch.arange(32).float().unsqueeze(0)
+    v1 = (torch.arange(32).float() * 2).unsqueeze(0)
+    value_in = torch.cat([v0, v1, torch.zeros(1, 32)], dim=0)
+
+    result = _run(out, n_pos, validity=validity_in, value=value_in)
+    # At pos 1: mean of v0 and v1
+    expected = (v0 + v1).squeeze(0) / 2
+    assert torch.allclose(result[1], expected, atol=1e-2), f"pos 1: {result[1]}"
+
+
 def test_attend_mean_where_all_valid_uniform():
     """With all positions valid, result is the running cumulative mean."""
     pe = _pe()
