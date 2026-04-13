@@ -56,7 +56,7 @@ def _config(width, height):
     )
 
 
-@app.function(gpu="A100", cpu=8, timeout=1800)
+@app.function(gpu="a100-80gb", cpu=8, timeout=1800)
 def generate_transformer(
     scene: str = "box",
     width: int = 120,

@@ -52,7 +52,7 @@ SHARDS = [
 
 # ── Remote function ───────────────────────────────────────────────
 
-@app.function(gpu="A100", cpu=8, memory=32768, timeout=1800)
+@app.function(gpu="a100-80gb", cpu=8, memory=32768, timeout=1800)
 def run_pytest(pytest_args: str, extra_args: str = "") -> int:
     t0 = time.time()
     cmd = [
