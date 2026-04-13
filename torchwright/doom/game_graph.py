@@ -42,6 +42,7 @@ from torchwright.ops.arithmetic_ops import (
     add_scaled_nodes,
     clamp,
     compare,
+    floor_int,
     mod_const,
     multiply_const,
     negate,
@@ -60,7 +61,6 @@ from torchwright.ops.map_select import in_range, select
 
 from torchwright.doom.renderer import (
     _textured_column_fill,
-    _u_norm_lookup,
     trig_lookup,
 )
 from torchwright.reference_renderer.types import RenderConfig
@@ -693,10 +693,6 @@ def build_game_graph(
     ao_raw = thermometer_floor_div(col_times_fov, W, fov * (W - 1))
     angle_offset = add_const(ao_raw, float(-(fov // 2)))
 
-    perp_shifted = add_const(angle_offset, 256.0)
-    perp_angle = mod_const(perp_shifted, 256, 256 + fov)
-    perp_cos, perp_sin = trig_lookup(perp_angle)
-
     # --- Render attention: visibility-masked wall selection ---
     # The attention score is dominated by the dot product of the render
     # token's column one-hot with the sorted wall's visibility mask.
@@ -833,33 +829,29 @@ def build_game_graph(
         torch.tensor([center]), name="wall_bottom",
     )
 
-    # --- Texture u-coordinate from rotated offsets ---
-    # den = den_over_cos × perp_cos (recover actual denominator magnitude)
-    # num_u = D·perp_cos + E·perp_sin  (rotated offset formula)
-    sign_den = compare(den_over_cos, 0.0)
-
-    # perp_cos/perp_sin breakpoints — narrower range than full trig
-    _PERP_COS_BP = [0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
-    _PERP_SIN_BP = [-0.5, -0.35, -0.25, -0.15, -0.08, 0, 0.08, 0.15, 0.25, 0.35, 0.5]
-
-    abs_den = piecewise_linear_2d(
-        abs_den_over_cos, perp_cos, doc_bp, _PERP_COS_BP,
-        lambda a, b: a * b, name="abs_den",
+    # --- Texture u-coordinate via tan(offset) ---
+    # The ratio adj_num_u / abs_den simplifies to a pure function of tan(o):
+    #   u = (D + E·tan_o) / (A - C·tan_o) = |nuc| / |doc|
+    # where nuc = D + E·tan_o (numerator/cos) and doc = A - C·tan_o
+    # (denominator/cos).  Both perp_cos and perp_sin cancel out,
+    # so we don't need the per-column trig lookup at all.
+    E_tan = piecewise_linear_2d(
+        r_E, tan_o, _DIFF_BP, tan_val_bp,
+        lambda a, b: a * b, name="E_tan_o",
     )
+    num_u_over_cos = add(r_D, E_tan)
+    abs_nuc = abs(num_u_over_cos)
 
-    D_cos = piecewise_linear_2d(
-        r_D, perp_cos, _DIFF_BP, _PERP_COS_BP,
-        lambda a, b: a * b, name="D_cos",
+    # u = |nuc| / |doc|, scaled to [0, tex_w] then floored
+    u_raw = piecewise_linear_2d(
+        abs_nuc, abs_den_over_cos,
+        doc_bp, doc_bp,
+        lambda n, d: n / d if d > 0.01 else 0.0,
+        name="u_ratio",
     )
-    E_sin = piecewise_linear_2d(
-        r_E, perp_sin, _DIFF_BP, _PERP_SIN_BP,
-        lambda a, b: a * b, name="E_sin",
-    )
-    num_u = add(D_cos, E_sin)
-    adj_num_u = select(sign_den, num_u, negate(num_u))
-
-    # Texture column
-    tex_col_idx = _u_norm_lookup(adj_num_u, abs_den, tex_w, max_coord)
+    tex_col_float = multiply_const(u_raw, float(tex_w))
+    tex_col_clamped = clamp(tex_col_float, 0.0, float(tex_w) - 0.5)
+    tex_col_idx = floor_int(tex_col_clamped, 0, tex_w - 1)
     num_tex = len(textures)
     n_keys = num_tex * tex_w
     flat_key = add(multiply_const(r_wall_tex, float(tex_w)), tex_col_idx)

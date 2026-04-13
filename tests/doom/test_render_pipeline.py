@@ -5,8 +5,9 @@ player's angular frame at sort time. The standalone subgraph computes
 sort_den, C, D, E, H_inv_num_t from raw inputs, then feeds them through
 the same wall-height and u-coordinate pipeline used in game_graph.py.
 
-Outputs intermediate values so we can see exactly where precision
-loss occurs.
+The u-coordinate uses the tan(offset) formulation:
+    u = |D + E·tan(o)| / |A - C·tan(o)|
+which eliminates the need for perp_cos/perp_sin entirely.
 """
 
 import builtins
@@ -19,7 +20,6 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.doom.renderer import (
     _textured_column_fill,
-    _u_norm_lookup,
     trig_lookup,
 )
 from torchwright.graph import Concatenate, Linear
@@ -29,6 +29,7 @@ from torchwright.ops.arithmetic_ops import (
     add_const,
     clamp,
     compare,
+    floor_int,
     multiply_const,
     negate,
     piecewise_linear,
@@ -47,8 +48,6 @@ _DIFF_BP = [
     0, 0.5, 1, 2, 3, 5, 7, 10, 15, 20, 30, 40,
 ]
 _TRIG_BP = [-1, -0.9, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 0.9, 1]
-_PERP_COS_BP = [0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
-_PERP_SIN_BP = [-0.5, -0.35, -0.25, -0.15, -0.08, 0, 0.08, 0.15, 0.25, 0.35, 0.5]
 MAX_COORD = 10.0
 W, H, FOV = 32, 24, 8
 
@@ -92,18 +91,28 @@ def _wall_band(column, tol=0.05):
     return int(indices[0]), int(indices[-1]) + 1
 
 
-def _build_precomp_graph(pos):
-    """Build precomputed-value render subgraph (matches game_graph.py).
+# Shared breakpoints for the render pipeline
+_HALF_FOV = FOV // 2
+_MAX_TAN = math.tan(_HALF_FOV * 2.0 * math.pi / 256.0) * 1.1
+_TAN_BP = [float(i) for i in range(-_HALF_FOV, _HALF_FOV + 1)]
+_TAN_VAL_BP = [-_MAX_TAN + i * (2 * _MAX_TAN / 10) for i in range(11)]
+_DOC_MAX = 2.5 * MAX_COORD
+_DOC_BP = [_DOC_MAX * i / 15 for i in range(16)]
 
-    Inputs: wall_ax, wall_ay, wall_bx, wall_by, player_x, player_y,
-            player_cos (cos of player angle), player_sin (sin of player angle),
-            angle_offset (per-column offset from center in angle units)
+_MAX_H_INV = float(H) / 0.3
+_H_INV_N = 16
+_H_INV_RATIO = (_MAX_H_INV / 0.01) ** (1.0 / (_H_INV_N - 1))
+_HEIGHT_INV_BP = [0.01 * (_H_INV_RATIO ** k) for k in range(_H_INV_N)]
+_HEIGHT_INV_BP[0] = 0.0
+_HEIGHT_INV_BP[-1] = _MAX_H_INV
 
-    Returns (output_node, config) where output_node concatenates
-    intermediates + wall_height + wall_top + wall_bottom.
+
+def _build_sort_precomp(pos):
+    """Build sort-time precomputation from raw wall + player data.
+
+    Returns (precomp_dict, pos) where precomp_dict has all precomputed
+    nodes and input nodes needed for rendering.
     """
-    config = _config()
-
     wall_ax = create_input("wall_ax", 1)
     wall_ay = create_input("wall_ay", 1)
     wall_bx = create_input("wall_bx", 1)
@@ -114,7 +123,6 @@ def _build_precomp_graph(pos):
     player_sin = create_input("player_sin", 1)
     angle_offset = create_input("angle_offset", 1)
 
-    # --- Sort-time precomputation (from raw wall + player data) ---
     ex = subtract(wall_bx, wall_ax)
     ey = subtract(wall_by, wall_ay)
     fx = subtract(wall_ax, player_x)
@@ -154,37 +162,43 @@ def _build_precomp_graph(pos):
                                max_value=2.0 * MAX_COORD * MAX_COORD, step=1.0)
     H_inv_num_t = multiply_const(inv_abs_num_t, float(H))
 
-    # --- Render-time pipeline (from precomputed values + angle offset) ---
-    half_fov = FOV // 2
-    tan_bp = [float(i) for i in range(-half_fov, half_fov + 1)]
+    return {
+        "sort_den": sort_den, "C": C_val, "D": D_val, "E": E_val,
+        "H_inv_num_t": H_inv_num_t, "num_t": num_t,
+        "angle_offset": angle_offset,
+    }, pos
+
+
+def _build_render_pipeline(p):
+    """Build the render-time pipeline from precomputed values.
+
+    Takes dict p from _build_sort_precomp.  Returns
+    (wall_height, wall_top, wall_bottom, tex_col_idx, abs_doc, abs_nuc, doc).
+    """
     tan_o = piecewise_linear(
-        angle_offset, tan_bp,
+        p["angle_offset"], _TAN_BP,
         lambda x: math.tan(x * 2.0 * math.pi / 256.0),
         name="tan_offset",
     )
 
-    max_tan = math.tan(half_fov * 2.0 * math.pi / 256.0) * 1.1
-    tan_val_bp = [-max_tan + i * (2 * max_tan / 10) for i in range(11)]
     C_tan = piecewise_linear_2d(
-        C_val, tan_o, _DIFF_BP, tan_val_bp,
+        p["C"], tan_o, _DIFF_BP, _TAN_VAL_BP,
         lambda a, b: a * b, name="C_tan_o",
     )
-    den_over_cos = subtract(sort_den, C_tan)
-    abs_den_over_cos = node_abs(den_over_cos)
+    E_tan = piecewise_linear_2d(
+        p["E"], tan_o, _DIFF_BP, _TAN_VAL_BP,
+        lambda a, b: a * b, name="E_tan_o",
+    )
 
-    max_h_inv = float(H) / 0.3
-    h_inv_n = 16
-    h_inv_ratio = (max_h_inv / 0.01) ** (1.0 / (h_inv_n - 1))
-    height_inv_bp = [0.01 * (h_inv_ratio ** k) for k in range(h_inv_n)]
-    height_inv_bp[0] = 0.0
-    height_inv_bp[-1] = max_h_inv
+    doc = subtract(p["sort_den"], C_tan)
+    nuc = add(p["D"], E_tan)
+    abs_doc = node_abs(doc)
+    abs_nuc = node_abs(nuc)
 
-    doc_max = 2.5 * MAX_COORD
-    doc_bp = [doc_max * i / 15 for i in range(16)]
-
+    # Wall height
     wall_height_raw = piecewise_linear_2d(
-        H_inv_num_t, abs_den_over_cos,
-        height_inv_bp, doc_bp,
+        p["H_inv_num_t"], abs_doc,
+        _HEIGHT_INV_BP, _DOC_BP,
         lambda a, b: a * b, name="wall_height_raw",
     )
     wall_height = clamp(wall_height_raw, 0.0, float(H))
@@ -200,24 +214,19 @@ def _build_precomp_graph(pos):
         torch.tensor([center]), name="wall_bottom",
     )
 
-    # Output: intermediates + final height
-    output = Concatenate([
-        sort_den, C_val, num_t,             # 3: precomputed values
-        den_over_cos, abs_den_over_cos,     # 2: per-column intermediates
-        H_inv_num_t,                        # 1: height scale
-        wall_top, wall_bottom,              # 2: screen positions
-        wall_height,                        # 1: height
-    ])
-    return output, pos
+    # Texture u-coordinate: u = |nuc| / |doc|
+    u_raw = piecewise_linear_2d(
+        abs_nuc, abs_doc, _DOC_BP, _DOC_BP,
+        lambda n, d: n / d if d > 0.01 else 0.0,
+        name="u_ratio",
+    )
+
+    return wall_height, wall_top, wall_bottom, u_raw, abs_doc, abs_nuc, doc
 
 
 def _precomp_inputs(wall_ax, wall_ay, wall_bx, wall_by,
                     player_x, player_y, player_angle_deg, angle_offset):
-    """Build input tensor for the precomputed-value test graph.
-
-    player_angle_deg: player facing angle in degrees (0=east, 90=north).
-    angle_offset: per-column offset in angle units (256 = full circle).
-    """
+    """Build input tensor for the precomputed-value test graph."""
     pa_rad = player_angle_deg * 2.0 * math.pi / 256.0
     p_cos = math.cos(pa_rad)
     p_sin = math.sin(pa_rad)
@@ -230,17 +239,26 @@ def _precomp_inputs(wall_ax, wall_ay, wall_bx, wall_by,
 
 
 # ---------------------------------------------------------------------------
-# Test: Intermediates — wall height from precomputed values
+# Test: Intermediates — wall height + u-coordinate from precomputed values
 # ---------------------------------------------------------------------------
 
 
 class TestRenderIntermediate:
-    """Compile precomputed-value wall height, check intermediates."""
+    """Compile precomputed-value wall height + u, check intermediates."""
 
     @pytest.fixture(scope="class")
     def module(self):
         pos = create_pos_encoding()
-        output, pos = _build_precomp_graph(pos)
+        p, pos = _build_sort_precomp(pos)
+        wh, wt, wb, u_raw, abs_doc, abs_nuc, doc = _build_render_pipeline(p)
+
+        output = Concatenate([
+            p["sort_den"], p["C"], p["num_t"],  # 3: precomputed values
+            doc, abs_doc,                        # 2: per-column intermediates
+            p["H_inv_num_t"],                    # 1: height scale
+            wt, wb, wh,                          # 3: wall geometry
+            u_raw,                               # 1: texture u-coordinate
+        ])
         return compile_headless(output, pos, d=2048, d_head=32,
                                 max_layers=100, verbose=False)
 
@@ -256,23 +274,26 @@ class TestRenderIntermediate:
             "sort_den": out[0].item(),
             "C": out[1].item(),
             "num_t": out[2].item(),
-            "den_over_cos": out[3].item(),
-            "abs_den_over_cos": out[4].item(),
+            "doc": out[3].item(),
+            "abs_doc": out[4].item(),
             "H_inv_num_t": out[5].item(),
             "wall_top": out[6].item(),
             "wall_bottom": out[7].item(),
             "wall_height": out[8].item(),
+            "u_raw": out[9].item(),
         }
 
     def test_center_dist5(self, module):
-        """Player at (0,0) facing east, east wall at x=5: height≈4.8."""
+        """Player at (0,0) facing east, east wall at x=5: height~4.8."""
         r = self._run(module,
                       wall_ax=5, wall_ay=-5, wall_bx=5, wall_by=5,
                       player_x=0, player_y=0, player_angle_deg=0)
         print(f"  center dist5: {r}")
-        # Expected: z_depth=5, wall_height = 24/5 = 4.8
         assert builtins.abs(r["wall_height"] - 4.8) < 1.5, \
             f"wall_height should be ~4.8, got {r['wall_height']:.3f}"
+        # u should be 0.5 (center of wall) for center ray
+        assert builtins.abs(r["u_raw"] - 0.5) < 0.15, \
+            f"u_raw should be ~0.5 at center, got {r['u_raw']:.3f}"
 
     def test_near_dist2(self, module):
         """Player at (3,0) facing east, east wall: dist=2, height=12."""
@@ -280,7 +301,6 @@ class TestRenderIntermediate:
                       wall_ax=5, wall_ay=-5, wall_bx=5, wall_by=5,
                       player_x=3, player_y=0, player_angle_deg=0)
         print(f"  near dist2: {r}")
-        # Expected: z_depth=2, wall_height = 24/2 = 12
         assert builtins.abs(r["wall_height"] - 12.0) < 2.0, \
             f"wall_height should be ~12, got {r['wall_height']:.3f}"
         assert builtins.abs(r["wall_top"] - 6.0) < 2.0, \
@@ -298,19 +318,19 @@ class TestRenderIntermediate:
             f"wall should fill screen, got {r['wall_height']:.1f}"
 
     def test_oblique_wall(self, module):
-        """Player at (0,0) facing east, oblique wall: height varies per column."""
-        # Wall from (3, -1) to (5, 1) — not perpendicular to view.
-        # Center ray (offset=0): hits at some point, z_depth depends on geometry.
-        # This tests that the precomputed pipeline handles oblique walls correctly.
+        """Player at (0,0) facing east, oblique wall (3,-1)→(5,1)."""
         r = self._run(module,
                       wall_ax=3, wall_ay=-1, wall_bx=5, wall_by=1,
                       player_x=0, player_y=0, player_angle_deg=0)
         print(f"  oblique wall: {r}")
-        # Wall is close-ish (3-5 units away), should produce visible height
         assert r["wall_height"] > 2.0, \
             f"oblique wall should be visible, got {r['wall_height']:.1f}"
         assert r["wall_height"] < H, \
             f"oblique wall shouldn't fill screen, got {r['wall_height']:.1f}"
+        # u_raw is the unclamped ratio |nuc|/|doc|; may exceed 1 for
+        # columns that see the wall's extended line beyond its endpoints
+        assert r["u_raw"] >= 0.0, \
+            f"u_raw should be non-negative, got {r['u_raw']:.3f}"
 
 
 # ---------------------------------------------------------------------------
@@ -330,124 +350,15 @@ class TestRenderPixels:
         n_keys = num_tex * tex_w
 
         pos = create_pos_encoding()
-
-        wall_ax = create_input("wall_ax", 1)
-        wall_ay = create_input("wall_ay", 1)
-        wall_bx = create_input("wall_bx", 1)
-        wall_by = create_input("wall_by", 1)
+        p, pos = _build_sort_precomp(pos)
         wall_tex = create_input("wall_tex", 1)
-        player_x = create_input("player_x", 1)
-        player_y = create_input("player_y", 1)
-        player_cos = create_input("player_cos", 1)
-        player_sin = create_input("player_sin", 1)
-        angle_offset = create_input("angle_offset", 1)
-        perp_cos = create_input("perp_cos", 1)
-        perp_sin = create_input("perp_sin", 1)
 
-        # Sort-time precomputation
-        ex = subtract(wall_bx, wall_ax)
-        ey = subtract(wall_by, wall_ay)
-        fx = subtract(wall_ax, player_x)
-        gy = subtract(player_y, wall_ay)
+        wh, wt, wb, u_raw, _, _, _ = _build_render_pipeline(p)
 
-        ey_cos_p = piecewise_linear_2d(ey, player_cos, _DIFF_BP, _TRIG_BP,
-                                       lambda a, b: a * b, name="ey_cos_p")
-        ex_sin_p = piecewise_linear_2d(ex, player_sin, _DIFF_BP, _TRIG_BP,
-                                       lambda a, b: a * b, name="ex_sin_p")
-        sort_den = subtract(ey_cos_p, ex_sin_p)
-
-        ey_sin_p = piecewise_linear_2d(ey, player_sin, _DIFF_BP, _TRIG_BP,
-                                       lambda a, b: a * b, name="ey_sin_p")
-        ex_cos_p = piecewise_linear_2d(ex, player_cos, _DIFF_BP, _TRIG_BP,
-                                       lambda a, b: a * b, name="ex_cos_p")
-        C_val = add(ey_sin_p, ex_cos_p)
-
-        fx_sin_p = piecewise_linear_2d(fx, player_sin, _DIFF_BP, _TRIG_BP,
-                                       lambda a, b: a * b, name="fx_sin_p")
-        gy_cos_p = piecewise_linear_2d(gy, player_cos, _DIFF_BP, _TRIG_BP,
-                                       lambda a, b: a * b, name="gy_cos_p")
-        D_val = add(fx_sin_p, gy_cos_p)
-
-        fx_cos_p = piecewise_linear_2d(fx, player_cos, _DIFF_BP, _TRIG_BP,
-                                       lambda a, b: a * b, name="fx_cos_p")
-        gy_sin_p = piecewise_linear_2d(gy, player_sin, _DIFF_BP, _TRIG_BP,
-                                       lambda a, b: a * b, name="gy_sin_p")
-        E_val = subtract(fx_cos_p, gy_sin_p)
-
-        ey_fx = piecewise_linear_2d(ey, fx, _DIFF_BP, _DIFF_BP,
-                                    lambda a, b: a * b, name="ey_fx")
-        ex_gy = piecewise_linear_2d(ex, gy, _DIFF_BP, _DIFF_BP,
-                                    lambda a, b: a * b, name="ex_gy")
-        num_t = add(ey_fx, ex_gy)
-        abs_num_t = node_abs(num_t)
-        inv_abs_num_t = reciprocal(abs_num_t, min_value=0.3,
-                                   max_value=2.0 * MAX_COORD * MAX_COORD,
-                                   step=1.0)
-        H_inv_num_t = multiply_const(inv_abs_num_t, float(H))
-
-        # Render-time: wall height
-        half_fov = FOV // 2
-        tan_bp = [float(i) for i in range(-half_fov, half_fov + 1)]
-        tan_o = piecewise_linear(
-            angle_offset, tan_bp,
-            lambda x: math.tan(x * 2.0 * math.pi / 256.0),
-            name="tan_offset",
-        )
-        max_tan = math.tan(half_fov * 2.0 * math.pi / 256.0) * 1.1
-        tan_val_bp = [-max_tan + i * (2 * max_tan / 10) for i in range(11)]
-        C_tan = piecewise_linear_2d(
-            C_val, tan_o, _DIFF_BP, tan_val_bp,
-            lambda a, b: a * b, name="C_tan_o",
-        )
-        den_over_cos = subtract(sort_den, C_tan)
-        abs_den_over_cos = node_abs(den_over_cos)
-
-        max_h_inv = float(H) / 0.3
-        h_inv_n = 16
-        h_inv_ratio = (max_h_inv / 0.01) ** (1.0 / (h_inv_n - 1))
-        height_inv_bp = [0.01 * (h_inv_ratio ** k) for k in range(h_inv_n)]
-        height_inv_bp[0] = 0.0
-        height_inv_bp[-1] = max_h_inv
-
-        doc_max = 2.5 * MAX_COORD
-        doc_bp = [doc_max * i / 15 for i in range(16)]
-
-        wall_height_raw = piecewise_linear_2d(
-            H_inv_num_t, abs_den_over_cos,
-            height_inv_bp, doc_bp,
-            lambda a, b: a * b, name="wall_height_raw",
-        )
-        wall_height = clamp(wall_height_raw, 0.0, float(H))
-
-        center = float(H) / 2.0
-        half_height = multiply_const(wall_height, 0.5)
-        wall_top = Linear(
-            half_height, torch.tensor([[-1.0]]),
-            torch.tensor([center]), name="wall_top",
-        )
-        wall_bottom = Linear(
-            half_height, torch.tensor([[1.0]]),
-            torch.tensor([center]), name="wall_bottom",
-        )
-
-        # Render-time: u-coordinate
-        sign_den = compare(den_over_cos, 0.0)
-        abs_den = piecewise_linear_2d(
-            abs_den_over_cos, perp_cos, doc_bp, _PERP_COS_BP,
-            lambda a, b: a * b, name="abs_den",
-        )
-        D_cos = piecewise_linear_2d(
-            D_val, perp_cos, _DIFF_BP, _PERP_COS_BP,
-            lambda a, b: a * b, name="D_cos",
-        )
-        E_sin = piecewise_linear_2d(
-            E_val, perp_sin, _DIFF_BP, _PERP_SIN_BP,
-            lambda a, b: a * b, name="E_sin",
-        )
-        num_u = add(D_cos, E_sin)
-        adj_num_u = select(sign_den, num_u, negate(num_u))
-
-        tex_col_idx = _u_norm_lookup(adj_num_u, abs_den, tex_w, MAX_COORD)
+        # Texture column from u_raw
+        tex_col_float = multiply_const(u_raw, float(tex_w))
+        tex_col_clamped = clamp(tex_col_float, 0.0, float(tex_w) - 0.5)
+        tex_col_idx = floor_int(tex_col_clamped, 0, tex_w - 1)
 
         def _tex_col_vals(flat_idx):
             k = int(round(flat_idx))
@@ -464,11 +375,11 @@ class TestRenderPixels:
         )
 
         pixels = _textured_column_fill(
-            wall_top, wall_bottom, wall_height,
+            wt, wb, wh,
             tex_column_colors, tex_h, config, max_coord=MAX_COORD,
         )
 
-        output = Concatenate([wall_height, wall_top, wall_bottom, pixels])
+        output = Concatenate([wh, wt, wb, pixels])
         module = compile_headless(output, pos, d=2048, d_head=32,
                                   max_layers=200, verbose=False)
         return module, texs
@@ -478,14 +389,10 @@ class TestRenderPixels:
         pa_rad = player_angle_deg * 2.0 * math.pi / 256.0
         p_cos = math.cos(pa_rad)
         p_sin = math.sin(pa_rad)
-        ao_rad = angle_offset * 2.0 * math.pi / 256.0
-        pc = math.cos(ao_rad)
-        ps = math.sin(ao_rad)
-        # Alphabetical: angle_offset, perp_cos, perp_sin, player_cos, player_sin,
-        #               player_x, player_y, wall_ax, wall_ay, wall_bx, wall_by, wall_tex
+        # Alphabetical: angle_offset, player_cos, player_sin, player_x, player_y,
+        #               wall_ax, wall_ay, wall_bx, wall_by, wall_tex
         inputs = torch.tensor([[
-            angle_offset, pc, ps, p_cos, p_sin,
-            player_x, player_y,
+            angle_offset, p_cos, p_sin, player_x, player_y,
             wall_ax, wall_ay, wall_bx, wall_by, wall_tex,
         ]])
         with torch.no_grad():
