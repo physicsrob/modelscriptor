@@ -85,16 +85,18 @@ TOKEN_WALL = 1
 TOKEN_EOS = 2
 TOKEN_SORTED_WALL = 3
 TOKEN_RENDER = 4
+TOKEN_THINKING = 6
 
 E8_INPUT = index_to_vector(TOKEN_INPUT)
 E8_WALL = index_to_vector(TOKEN_WALL)
 E8_EOS = index_to_vector(TOKEN_EOS)
 E8_SORTED_WALL = index_to_vector(TOKEN_SORTED_WALL)
 E8_RENDER = index_to_vector(TOKEN_RENDER)
+E8_THINKING = index_to_vector(TOKEN_THINKING)
 
 TOKEN_TEX_COL = 5
 E8_TEX_COL = index_to_vector(TOKEN_TEX_COL)
-TEX_E8_OFFSET = 6  # index_to_vector(6+i) = E8 code for texture i
+TEX_E8_OFFSET = 7  # index_to_vector(7+i) = E8 code for texture i
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +329,7 @@ def build_game_graph(
     prev_mask = _extract_from(
         sort_feedback, d_sort_out, 8 + 5 + 3 + max_walls, max_walls, "prev_mask",
     )
-    d_render_fb = max_walls + 3
+    d_render_fb = 2 * max_walls + 11
     render_feedback = create_input("render_feedback", d_render_fb)
     render_mask = _extract_from(render_feedback, d_render_fb, 0, max_walls, "render_mask")
     render_col = _extract_from(render_feedback, d_render_fb, max_walls, 1, "render_col")
@@ -337,6 +339,16 @@ def build_game_graph(
     render_chunk_start = _extract_from(
         render_feedback, d_render_fb, max_walls + 2, 1, "render_chunk_start",
     )
+    # Wall data fields (populated by THINKING, forwarded by RENDER)
+    fb_sort_den = _extract_from(render_feedback, d_render_fb, max_walls + 3, 1, "fb_sort_den")
+    fb_C        = _extract_from(render_feedback, d_render_fb, max_walls + 4, 1, "fb_C")
+    fb_D        = _extract_from(render_feedback, d_render_fb, max_walls + 5, 1, "fb_D")
+    fb_E        = _extract_from(render_feedback, d_render_fb, max_walls + 6, 1, "fb_E")
+    fb_H_inv    = _extract_from(render_feedback, d_render_fb, max_walls + 7, 1, "fb_H_inv")
+    fb_tex_id   = _extract_from(render_feedback, d_render_fb, max_walls + 8, 1, "fb_tex_id")
+    fb_col_lo   = _extract_from(render_feedback, d_render_fb, max_walls + 9, 1, "fb_col_lo")
+    fb_col_hi   = _extract_from(render_feedback, d_render_fb, max_walls + 10, 1, "fb_col_hi")
+    fb_onehot   = _extract_from(render_feedback, d_render_fb, max_walls + 11, max_walls, "fb_onehot")
     tex_col_input = create_input("tex_col_input", 1)
     tex_pixels = create_input("tex_pixels", tex_h * 3)
     texture_id_e8 = create_input("texture_id_e8", 8)
@@ -348,6 +360,7 @@ def build_game_graph(
         is_eos = equals_vector(token_type, E8_EOS)
         is_sorted = equals_vector(token_type, E8_SORTED_WALL)
         is_render = equals_vector(token_type, E8_RENDER)
+        is_thinking = equals_vector(token_type, E8_THINKING)
         is_tex_col = equals_vector(token_type, E8_TEX_COL)
 
     # --- TEX_COL: column one-hot for key matching ---
@@ -704,10 +717,10 @@ def build_game_graph(
         vis_hi = select(a_lt_b, col_b_c, col_a_c)
 
     # =====================================================================
-    # RENDER: autoregressive wall-column render with chunked pixel output
+    # THINKING: wall selection via attend_argmin_unmasked (one per wall)
     # =====================================================================
 
-    with annotate("render/wall_attention"):
+    with annotate("thinking/wall_attention"):
         # Build score + position_onehot for attend_argmin_unmasked
         render_sentinel = create_literal_value(
             torch.tensor([99.0]), name="render_sentinel",
@@ -736,26 +749,31 @@ def build_game_graph(
         )
 
         d_rv = 8 + max_walls
-        r_sort_den    = _extract_from(selected_render, d_rv, 0, 1, "r_sort_den")
-        r_C           = _extract_from(selected_render, d_rv, 1, 1, "r_C")
-        r_D           = _extract_from(selected_render, d_rv, 2, 1, "r_D")
-        r_E           = _extract_from(selected_render, d_rv, 3, 1, "r_E")
-        r_H_inv_num_t = _extract_from(selected_render, d_rv, 4, 1, "r_H_inv")
-        r_wall_tex    = _extract_from(selected_render, d_rv, 5, 1, "r_tex")
-        r_col_lo      = _extract_from(selected_render, d_rv, 6, 1, "r_col_lo")
-        r_col_hi      = _extract_from(selected_render, d_rv, 7, 1, "r_col_hi")
-        r_onehot      = _extract_from(selected_render, d_rv, 8, max_walls, "r_onehot")
+        t_sort_den = _extract_from(selected_render, d_rv, 0, 1, "t_sort_den")
+        t_C        = _extract_from(selected_render, d_rv, 1, 1, "t_C")
+        t_D        = _extract_from(selected_render, d_rv, 2, 1, "t_D")
+        t_E        = _extract_from(selected_render, d_rv, 3, 1, "t_E")
+        t_H_inv    = _extract_from(selected_render, d_rv, 4, 1, "t_H_inv")
+        t_tex_id   = _extract_from(selected_render, d_rv, 5, 1, "t_tex_id")
+        t_col_lo   = _extract_from(selected_render, d_rv, 6, 1, "t_col_lo")
+        t_col_hi   = _extract_from(selected_render, d_rv, 7, 1, "t_col_hi")
+        t_onehot   = _extract_from(selected_render, d_rv, 8, max_walls, "t_onehot")
+
+    # =====================================================================
+    # RENDER: column iteration + pixel rendering (reads wall data from
+    # feedback, populated by THINKING and forwarded by prior RENDER tokens)
+    # =====================================================================
 
     with annotate("render/state_machine"):
-        # Active column: new wall → use col_lo from attention; else feedback col
-        active_col = select(render_is_new_wall, r_col_lo, render_col)
+        # Active column: new wall → use col_lo from feedback; else feedback col
+        active_col = select(render_is_new_wall, fb_col_lo, render_col)
 
         # Per-column angle offset from player's forward direction
         col_times_fov = multiply_const(active_col, float(fov))
         ao_raw = thermometer_floor_div(col_times_fov, W, fov * (W - 1))
         angle_offset = add_const(ao_raw, float(-(fov // 2)))
 
-    # --- Wall height from precomputed values ---
+    # --- Wall height from feedback wall data (available at layer 0) ---
     with annotate("render/wall_height"):
         half_fov = fov // 2
         tan_bp = [float(i) for i in range(-half_fov, half_fov + 1)]
@@ -768,10 +786,10 @@ def build_game_graph(
         max_tan = math.tan(half_fov * 2.0 * math.pi / 256.0) * 1.1
         tan_val_bp = [-max_tan + i * (2 * max_tan / 10) for i in range(11)]
         C_tan = piecewise_linear_2d(
-            r_C, tan_o, _DIFF_BP, tan_val_bp,
+            fb_C, tan_o, _DIFF_BP, tan_val_bp,
             lambda a, b: a * b, name="C_tan_o",
         )
-        den_over_cos = subtract(r_sort_den, C_tan)
+        den_over_cos = subtract(fb_sort_den, C_tan)
         abs_den_over_cos = abs(den_over_cos)
 
         max_h_inv = float(H) / 0.3
@@ -785,7 +803,7 @@ def build_game_graph(
         doc_bp = [doc_max * i / 15 for i in range(16)]
 
         wall_height_raw = piecewise_linear_2d(
-            r_H_inv_num_t, abs_den_over_cos,
+            fb_H_inv, abs_den_over_cos,
             height_inv_bp, doc_bp,
             lambda a, b: a * b, name="wall_height_raw",
         )
@@ -805,10 +823,10 @@ def build_game_graph(
     # --- Texture u-coordinate via tan(offset) ---
     with annotate("render/tex_coord"):
         E_tan = piecewise_linear_2d(
-            r_E, tan_o, _DIFF_BP, tan_val_bp,
+            fb_E, tan_o, _DIFF_BP, tan_val_bp,
             lambda a, b: a * b, name="E_tan_o",
         )
-        num_u_over_cos = add(r_D, E_tan)
+        num_u_over_cos = add(fb_D, E_tan)
         abs_nuc = abs(num_u_over_cos)
 
         u_raw = piecewise_linear_2d(
@@ -825,7 +843,7 @@ def build_game_graph(
     with annotate("render/tex_attention"):
         num_tex = len(textures)
         tex_e8_query = piecewise_linear(
-            r_wall_tex,
+            fb_tex_id,
             [float(i) for i in range(num_tex)],
             lambda tid: [float(v) for v in
                          index_to_vector(int(round(tid)) + TEX_E8_OFFSET)],
@@ -880,12 +898,12 @@ def build_game_graph(
 
         col_p1 = add_const(active_col, 1.0)
         not_more_chunks = bool_not(has_more_chunks)
-        has_more_cols = compare(subtract(r_col_hi, col_p1), 0.5)
+        has_more_cols = compare(subtract(fb_col_hi, col_p1), 0.5)
         advance_col = bool_all_true([not_more_chunks, has_more_cols])
         advance_wall = bool_all_true([not_more_chunks, bool_not(has_more_cols)])
 
         # Mask update
-        mask_with_new = add(render_mask, r_onehot)
+        mask_with_new = add(render_mask, fb_onehot)
         next_render_mask = select(advance_wall, mask_with_new, render_mask)
 
         # Done detection
@@ -895,7 +913,7 @@ def build_game_graph(
         all_walls_done = compare(mask_sum, max_walls - 0.5)
         done_flag = bool_all_true([advance_wall, all_walls_done])
 
-        # Next feedback fields
+        # Next feedback fields — iteration state
         zero_col = create_literal_value(torch.tensor([0.0]), name="zero_col")
         next_col_output = select(
             has_more_chunks, active_col,
@@ -909,18 +927,45 @@ def build_game_graph(
         neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one")
         next_is_new_wall = select(advance_wall, pos_one, neg_one)
 
-        next_feedback = Concatenate([
+        # Next token type: THINKING for new wall, RENDER to continue
+        next_type = select(advance_wall,
+                           create_literal_value(E8_THINKING, name="type_thinking"),
+                           create_literal_value(E8_RENDER, name="type_render"))
+
+        # Full render feedback: iteration state + forwarded wall data
+        next_render_feedback = Concatenate([
             next_render_mask, next_col_output, next_is_new_wall, next_chunk,
+            fb_sort_den, fb_C, fb_D, fb_E, fb_H_inv, fb_tex_id,
+            fb_col_lo, fb_col_hi, fb_onehot,
         ])
 
     # =====================================================================
-    # Output: gated by token type
+    # Output: autoregressive state at input offsets + pixel overflow
+    #
+    # The first d_input values of the output match the flat input layout
+    # (alphabetical field order).  The host feeds output[:d_input] directly
+    # as the next input — no remapping needed.  Pixel data and render
+    # metadata live in an overflow region after d_input.
+    #
+    # To minimize residual stream pressure, we build per-FIELD selects
+    # rather than per-TOKEN-TYPE full-width outputs.
     # =====================================================================
     with annotate("output"):
 
-        # SORTED_WALL output: type + wall data + sort_rank + col_lo + col_hi
-        #                     + onehot + updated mask
-        sort_output = Concatenate([
+        # --- Per-field output values (select by token type) ---
+
+        # THINKING render_feedback: wall data from wall_attention
+        thinking_render_fb = Concatenate([
+            render_mask,  # forwarded (not updated yet)
+            t_col_lo,     # first column of this wall
+            pos_one,      # is_new_wall = +1
+            chunk_sentinel,  # chunk_start = -1
+            t_sort_den, t_C, t_D, t_E, t_H_inv, t_tex_id,
+            t_col_lo, t_col_hi, t_onehot,
+        ])
+
+        # SORTED_WALL sort_feedback
+        sort_feedback_out = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="sort_type"),
             sel_wall_data,
             sort_rank,
@@ -930,61 +975,74 @@ def build_game_graph(
             updated_mask,
         ])
 
-        # RENDER output: type + col + start_y + length + done + pixels + feedback
-        render_output = Concatenate([
-            create_literal_value(E8_RENDER, name="render_type"),
-            active_col,
-            active_start,
-            chunk_length,
-            done_flag,
-            pixels,
-            next_feedback,
-        ])
-
-        # INPUT output: type + padding (host ignores INPUT output)
-        input_output = Concatenate([
-            create_literal_value(E8_INPUT, name="input_type"),
-            create_literal_value(torch.zeros(3), name="input_pad"),
-        ])
-
-        # EOS output: seeds the sort loop with E8_SORTED_WALL type + resolved
-        # state at offsets 8-10 + zeros for sort mask.
-        eos_output = Concatenate([
+        # EOS sort_feedback (seeds sort loop)
+        eos_sort_seed = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="eos_sort_seed"),
             resolved_x, resolved_y, attn_new_angle,
             create_literal_value(
                 torch.zeros(2 + 3 + 2 * max_walls), name="eos_sort_pad"),
         ])
 
-        # TEX_COL output: type + padding (host ignores TEX_COL output)
-        tex_col_output = Concatenate([
-            create_literal_value(E8_TEX_COL, name="tex_col_type"),
-            create_literal_value(torch.zeros(3), name="tc_pad"),
+        # token_type field: what the NEXT token should be
+        zero_8 = create_literal_value(torch.zeros(8), name="zero_8")
+        out_token_type = select(is_thinking,
+            create_literal_value(E8_RENDER, name="thinking_next_type"),
+            select(is_render, next_type,
+                select(is_sorted,
+                    create_literal_value(E8_SORTED_WALL, name="sort_next_type"),
+                    select(is_eos,
+                        create_literal_value(E8_SORTED_WALL, name="eos_next_type"),
+                        zero_8))))
+
+        # render_feedback field
+        zero_rf = create_literal_value(torch.zeros(d_render_fb), name="zero_rf")
+        out_render_fb = select(is_thinking, thinking_render_fb,
+                          select(is_render, next_render_feedback,
+                            zero_rf))
+
+        # sort_feedback field
+        zero_sf = create_literal_value(torch.zeros(d_sort_out), name="zero_sf")
+        out_sort_fb = select(is_sorted, sort_feedback_out,
+                        select(is_eos, eos_sort_seed,
+                          zero_sf))
+
+        # Build output at input offsets: the first d_input values match the
+        # flat input layout (alphabetical).  The host feeds output[:d_input]
+        # directly as the next input.  Pixels + metadata overflow after d_input.
+        #
+        # Active fields in alphabetical order:
+        #   render_feedback (rf), sort_feedback (sf), token_type (tt)
+        # Everything else is zero.  Adjacent zero fields are merged into
+        # gap-fill nodes to minimize residual stream pressure.
+
+        # Compact output: [token_type(8), sort_feedback(d_sort_out),
+        #                  render_feedback(d_render_fb),
+        #                  pixels(cs*3), col(1), start(1), length(1), done(1)]
+        #
+        # The host maps these three fields to their input offsets via
+        # _out_to_input (three slice copies).
+
+        zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
+        zero_pixels = create_literal_value(torch.zeros(cs * 3), name="zero_pixels")
+
+        out_pixels = select(is_render, pixels, zero_pixels)
+        out_col = select(is_render, active_col, zero_1)
+        out_start = select(is_render, active_start, zero_1)
+        out_length = select(is_render, chunk_length, zero_1)
+        out_done = select(is_render, done_flag, zero_1)
+
+        output = Concatenate([
+            out_token_type,     # 8
+            out_sort_fb,        # d_sort_out
+            out_render_fb,      # d_render_fb
+            out_pixels,         # cs * 3
+            out_col,            # 1
+            out_start,          # 1
+            out_length,         # 1
+            out_done,           # 1
         ])
 
-        # Pad all to same width and select
-        d_sort_out = 8 + 5 + 3 + 2 * max_walls
-        d_render_out = 12 + cs * 3 + max_walls + 3
-        d_input_out = 8 + 3
-        d_eos_out = d_sort_out  # EOS seeds the sort loop
-        d_tc_out = 8 + 3
-        d_out = max(d_sort_out, d_render_out, d_input_out, d_eos_out, d_tc_out)
-
-        def _pad(node, cur_width):
-            if cur_width >= d_out:
-                return node
-            return Concatenate([node, create_literal_value(
-                torch.zeros(d_out - cur_width), name="pad")])
-
-        sort_padded = _pad(sort_output, d_sort_out)
-        render_padded = _pad(render_output, d_render_out)
-        input_padded = _pad(input_output, d_input_out)
-        eos_padded = _pad(eos_output, d_eos_out)
-        tc_padded = _pad(tex_col_output, d_tc_out)
-
-        inner1 = select(is_eos, eos_padded, input_padded)
-        inner2 = select(is_tex_col, tc_padded, inner1)
-        inner3 = select(is_sorted, sort_padded, inner2)
-        output = select(is_render, render_padded, inner3)
+    # Expose compact output layout for the host protocol
+    output.d_state = 8 + d_sort_out + d_render_fb
 
     return output, pos_encoding

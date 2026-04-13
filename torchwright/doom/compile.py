@@ -30,6 +30,7 @@ from torchwright.doom.game_graph import (
     E8_RENDER,
     E8_SORTED_WALL,
     E8_TEX_COL,
+    E8_THINKING,
     E8_WALL,
     TEX_E8_OFFSET,
     build_game_graph,
@@ -160,7 +161,7 @@ def _build_row(compiled, max_walls, **kwargs):
     device = compiled._net.device
     tex_h = int(compiled.metadata.get("tex_h", 8))
     max_walls_meta = int(compiled.metadata.get("max_walls", 8))
-    d_render_fb = max_walls_meta + 3
+    d_render_fb = 2 * max_walls_meta + 11
     defaults = {
         "input_backward": torch.zeros(1, device=device),
         "input_forward": torch.zeros(1, device=device),
@@ -223,13 +224,14 @@ def step_frame(
         1. INPUT — feed player state + controls
         2. WALL×N — feed wall geometry + player position
         3. EOS — feed player position → read resolved state from output
-        4. SORTED_WALL×N — pure autoregressive: feed prev output back
-        5. RENDER×(dynamic) — autoregressive: feed render_feedback,
-           read (col, start_y, length, done, pixels, next_feedback),
-           bitblit pixels to framebuffer with skip-filled compositing
+        4. SORTED_WALL×N — pure autoregressive: output IS next input
+        5. THINKING/RENDER×(dynamic) — autoregressive: output IS next
+           input.  THINKING selects wall, RENDER renders pixels.  Host
+           reads pixels from overflow region, bitblits to framebuffer.
 
-    Every cross-position dependency flows through attention.  The host
-    copies feedback and bitblits pixels — no computation on game state.
+    For autoregressive phases (sort + render), the output tensor's first
+    d_input values are laid out at input field offsets.  The host feeds
+    ``output[:d_input]`` directly as the next input — no remapping.
     """
     assert textures is not None, "textures is required"
     N = len(walls)
@@ -246,17 +248,30 @@ def step_frame(
     step = 0
     px, py, angle = float(state.x), float(state.y), float(state.angle)
 
-    # Output layout indices for sort phase
-    onehot_sl = slice(8 + 5 + 3, 8 + 5 + 3 + max_walls)
+    # Compute layout from compiled module
+    d_input = max(s + w for _, s, w in module._input_specs)
+    d_sort_out = 8 + 5 + 3 + 2 * max_walls
+    d_render_fb = 2 * max_walls + 11
+    d_state = 8 + d_sort_out + d_render_fb
+    device = module._net.device
 
-    # Output layout indices for render phase
-    d_rfb = max_walls + 3
-    _R_COL = 8
-    _R_START = 9
-    _R_LEN = 10
-    _R_DONE = 11
-    _R_PIX = 12
-    _R_FB = 12 + cs * 3
+    # Input field offsets (alphabetical)
+    _offsets = {name: (start, width) for name, start, width in module._input_specs}
+    sf_off, sf_w = _offsets["sort_feedback"]
+    rf_off, rf_w = _offsets["render_feedback"]
+    tt_off, tt_w = _offsets["token_type"]
+
+    # Compact output layout:
+    # [token_type(8), sort_feedback(d_sort_out), render_feedback(d_render_fb),
+    #  pixels(cs*3), col(1), start(1), length(1), done(1)]
+    _O_TT = 0
+    _O_SF = 8
+    _O_RF = 8 + d_sort_out
+    _O_PIX = d_state
+    _O_COL = d_state + cs * 3
+    _O_START = d_state + cs * 3 + 1
+    _O_LEN = d_state + cs * 3 + 2
+    _O_DONE = d_state + cs * 3 + 3
 
     # Player input tensors (reused at START, WALL, and EOS positions
     # so the graph computes velocity consistently at all three)
@@ -331,37 +346,37 @@ def step_frame(
     t_prefill = time.perf_counter() - t0
     print(f"  prefill  {step} steps  kv={_kv_len(past)}  {t_prefill*1000:.0f}ms")
 
-    # Read collision-resolved state from EOS output (last row)
+    # Read collision-resolved state from EOS output (last row).
+    # EOS compact output: [token_type(8), sort_feedback(d_sort_out), ...]
+    # sort_feedback starts with E8_SORTED_WALL(8), then resolved x,y,angle.
     eos_out = out[-1:]  # (1, d_output)
-    px = eos_out[0, 8].item()
-    py = eos_out[0, 9].item()
-    new_angle_raw = eos_out[0, 10].item()
+    px = eos_out[0, _O_SF + 8].item()
+    py = eos_out[0, _O_SF + 9].item()
+    new_angle_raw = eos_out[0, _O_SF + 10].item()
     angle = new_angle_raw
 
+    def _out_to_input(raw_out):
+        """Map compact output fields to flat input tensor."""
+        row = torch.zeros(1, d_input, device=device)
+        row[0, tt_off:tt_off + 8] = raw_out[0, _O_TT:_O_TT + 8]
+        row[0, sf_off:sf_off + d_sort_out] = raw_out[0, _O_SF:_O_SF + d_sort_out]
+        row[0, rf_off:rf_off + d_render_fb] = raw_out[0, _O_RF:_O_RF + d_render_fb]
+        return row
+
     # --- Phase 1: Sort ---
-    # Pure autoregressive sort: EOS output seeds the loop, each step's
-    # output feeds back as the next input.  The transformer owns the mask
-    # lifecycle — the host does zero computation on intermediate results.
-    d_sf = 8 + 5 + 3 + 2 * max_walls
-    prev = eos_out[0, :d_sf].detach().clone()  # EOS output seeds sort
+    prev = _out_to_input(eos_out)
     t0 = time.perf_counter()
     for k in range(N):
-        row = _build_row(
-            module, max_walls,
-            token_type=prev[:8],
-            sort_feedback=prev,
-        )
-        out, past = _step(row, past, step)
+        out, past = _step(prev, past, step)
         step += 1
-        prev = out[0, :d_sf].detach().clone()
-        raw_sort = prev.cpu().numpy()
-        # Sort output: [type(8), wall_data(5), sort_rank(1), col_lo(1), col_hi(1),
-        #               onehot(max_walls), updated_mask(max_walls)]
-        wall_data = raw_sort[8:13]
-        s_rank = raw_sort[13]
-        s_col_lo = raw_sort[14]
-        s_col_hi = raw_sort[15]
-        onehot = raw_sort[onehot_sl]
+        prev = _out_to_input(out)
+        # Diagnostics: read sort_feedback from compact output
+        raw_sf = out[0, _O_SF:_O_SF + d_sort_out].cpu().numpy()
+        wall_data = raw_sf[8:13]
+        s_rank = raw_sf[13]
+        s_col_lo = raw_sf[14]
+        s_col_hi = raw_sf[15]
+        onehot = raw_sf[16:16 + max_walls]
         print(f"  sort[{k}]: wall=[{wall_data[0]:.2f},{wall_data[1]:.2f},{wall_data[2]:.2f},{wall_data[3]:.2f}] "
               f"tex={wall_data[4]:.1f} rank={s_rank:.0f} cols=[{s_col_lo:.1f},{s_col_hi:.1f}) oh_max={np.argmax(onehot)}")
 
@@ -369,39 +384,38 @@ def step_frame(
     print(f"  sort     {N} steps  kv={_kv_len(past)}  {t_sort*1000:.0f}ms")
     print(f"  resolved state: px={px:.3f} py={py:.3f} angle={angle:.3f}")
 
-    # --- Phase 2: Render (autoregressive) ---
-    # Each RENDER token emits one chunk of one column of one wall.
-    # The host bitblits pixels and copies feedback to the next input.
+    # --- Phase 2: Render (THINKING + RENDER interleaved) ---
+    # THINKING tokens select a wall.  RENDER tokens render pixels.
+    # The graph decides the next token type in the output.
     t0 = time.perf_counter()
     frame = np.full((H, W, 3), -1.0, dtype=np.float32)
     filled = np.zeros((H, W), dtype=bool)
 
-    # Seed feedback: new_wall=+1, chunk_start=-1 (sentinel)
-    render_fb = np.zeros(d_rfb)
-    render_fb[max_walls + 1] = 1.0   # is_new_wall = +1
-    render_fb[max_walls + 2] = -1.0  # chunk_start = sentinel
+    # Seed: E8_THINKING + render_feedback with is_new_wall=+1, chunk_start=-1
+    prev = _out_to_input(torch.zeros(1, d_state + cs * 3 + 4, device=device))
+    prev[0, tt_off:tt_off + 8] = E8_THINKING.to(device)
+    seed_rf = torch.zeros(d_render_fb, device=device)
+    seed_rf[max_walls + 1] = 1.0   # is_new_wall = +1
+    seed_rf[max_walls + 2] = -1.0  # chunk_start = sentinel
+    prev[0, rf_off:rf_off + d_render_fb] = seed_rf
 
-    max_render_steps = N * W * (H // cs + 1) + 10
+    max_render_steps = N * W * (H // cs + 1) + N + 10
     render_steps = 0
 
     for k in range(max_render_steps):
-        row = _build_row(
-            module, max_walls,
-            token_type=E8_RENDER,
-            render_feedback=torch.tensor(render_fb, dtype=torch.float32),
-        )
-        out, past = _step(row, past, step)
+        out, past = _step(prev, past, step)
         step += 1
         render_steps += 1
         raw = out[0].detach().cpu().numpy()
 
-        col = int(round(raw[_R_COL]))
-        start_y = int(round(raw[_R_START]))
-        length = int(round(raw[_R_LEN]))
-        done = raw[_R_DONE]
-        pix = raw[_R_PIX:_R_PIX + cs * 3].reshape(cs, 3)
+        # Pixels and metadata from compact output
+        col = int(round(raw[_O_COL]))
+        start_y = int(round(raw[_O_START]))
+        length = int(round(raw[_O_LEN]))
+        done = raw[_O_DONE]
+        pix = raw[_O_PIX:_O_PIX + cs * 3].reshape(cs, 3)
 
-        # Bitblit with skip-filled
+        # Bitblit with skip-filled (length=0 for THINKING tokens → no-op)
         for row_idx in range(length):
             y = start_y + row_idx
             if 0 <= y < H and 0 <= col < W and not filled[y, col]:
@@ -411,10 +425,12 @@ def step_frame(
         if done > 0.0:
             break
 
-        render_fb = raw[_R_FB:_R_FB + d_rfb]
+        # Map compact output to input layout
+        prev = _out_to_input(out)
 
-        # Host-side termination: all N walls processed (mask has N bits set)
-        n_masked = int(np.sum(np.round(render_fb[:max_walls]).clip(0, 1)))
+        # Host-side termination: check render_mask from render_feedback
+        mask_vals = out[0, _O_RF:_O_RF + max_walls].cpu().numpy()
+        n_masked = int(np.sum(np.round(mask_vals).clip(0, 1)))
         if n_masked >= N:
             break
 
