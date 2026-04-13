@@ -35,7 +35,7 @@ class _Model:
     session: "object"  # onnxruntime.InferenceSession
     vocab: _Vocab
     n_layers: int
-    n_heads: int
+    per_layer_n_heads: List[int]
     d_head: int
 
 
@@ -61,17 +61,19 @@ def generate(
     session = model.session
     vocab = model.vocab
     n_layers = model.n_layers
-    n_heads = model.n_heads
+    per_layer_n_heads = model.per_layer_n_heads
     d_head = model.d_head
 
     tokens = [bos_token] + list(input_text)
     token_ids = np.array([vocab.token_to_id(t) for t in tokens], dtype=np.int64)
 
     past_K = [
-        np.zeros((n_heads, 0, d_head), dtype=np.float32) for _ in range(n_layers)
+        np.zeros((per_layer_n_heads[i], 0, d_head), dtype=np.float32)
+        for i in range(n_layers)
     ]
     past_V = [
-        np.zeros((n_heads, 0, d_head), dtype=np.float32) for _ in range(n_layers)
+        np.zeros((per_layer_n_heads[i], 0, d_head), dtype=np.float32)
+        for i in range(n_layers)
     ]
     past_len = 0
 
@@ -131,15 +133,16 @@ def _load(onnx_path: str) -> _Model:
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
     assert n_layers > 0, "ONNX model has no past_K_* inputs — expected cached export"
-    shape0 = inputs["past_K_0"].shape  # [n_heads, 'n_past', d_head]
-    n_heads = int(shape0[0])
-    d_head = int(shape0[2])
+    per_layer_n_heads = [
+        int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)
+    ]
+    d_head = int(inputs["past_K_0"].shape[2])
 
     return _Model(
         session=session,
         vocab=vocab,
         n_layers=n_layers,
-        n_heads=n_heads,
+        per_layer_n_heads=per_layer_n_heads,
         d_head=d_head,
     )
 
