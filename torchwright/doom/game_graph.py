@@ -40,6 +40,7 @@ from torchwright.ops.arithmetic_ops import (
     add,
     add_const,
     add_scaled_nodes,
+    clamp,
     compare,
     mod_const,
     multiply_const,
@@ -60,7 +61,6 @@ from torchwright.ops.map_select import in_range, select
 from torchwright.doom.renderer import (
     _textured_column_fill,
     _u_norm_lookup,
-    _wall_height_lookup,
     trig_lookup,
 )
 from torchwright.reference_renderer.types import RenderConfig
@@ -342,11 +342,6 @@ def build_game_graph(
         wall_ax, wall_ay, wall_bx, wall_by, is_wall,
     )
 
-    mid_x = multiply_const(add(wall_ax, wall_bx), 0.5)
-    mid_y = multiply_const(add(wall_ay, wall_by), 0.5)
-    w_dx = subtract(mid_x, player_x)
-    w_dy = subtract(mid_y, player_y)
-
     # --- Central ray intersection distance for sort score ---
     # Compute intersection of the central ray (player's viewing direction)
     # with this wall segment's extended line.  This gives front-to-back
@@ -384,6 +379,54 @@ def build_game_graph(
     )
     sort_num_t = add(sort_ey_fx, sort_ex_gy)
 
+    # --- Precomputed render values (column-independent) ---
+    # Rotate wall edge and player-to-A offset into the player's angular
+    # frame so the render phase only needs per-column angle offsets
+    # (perp_cos, perp_sin) instead of full ray angles (ray_cos, ray_sin).
+    #
+    #   sort_den = ey*cos_p - ex*sin_p   (already computed above)
+    #   C = ey*sin_p + ex*cos_p
+    #   D = fx*sin_p + gy*cos_p
+    #   E = fx*cos_p - gy*sin_p
+    #   H_inv_num_t = H / |num_t|        (wall-height scale factor)
+    sort_ey_sin = piecewise_linear_2d(
+        w_ey, move_sin, _DIFF_BP, _TRIG_BP,
+        lambda a, b: a * b, name="sort_ey_sin",
+    )
+    sort_ex_cos = piecewise_linear_2d(
+        w_ex, move_cos, _DIFF_BP, _TRIG_BP,
+        lambda a, b: a * b, name="sort_ex_cos",
+    )
+    precomp_C = add(sort_ey_sin, sort_ex_cos)
+
+    sort_fx_sin = piecewise_linear_2d(
+        w_fx, move_sin, _DIFF_BP, _TRIG_BP,
+        lambda a, b: a * b, name="sort_fx_sin",
+    )
+    sort_gy_cos = piecewise_linear_2d(
+        w_gy, move_cos, _DIFF_BP, _TRIG_BP,
+        lambda a, b: a * b, name="sort_gy_cos",
+    )
+    precomp_D = add(sort_fx_sin, sort_gy_cos)
+
+    sort_fx_cos = piecewise_linear_2d(
+        w_fx, move_cos, _DIFF_BP, _TRIG_BP,
+        lambda a, b: a * b, name="sort_fx_cos",
+    )
+    sort_gy_sin = piecewise_linear_2d(
+        w_gy, move_sin, _DIFF_BP, _TRIG_BP,
+        lambda a, b: a * b, name="sort_gy_sin",
+    )
+    precomp_E = subtract(sort_fx_cos, sort_gy_sin)
+
+    abs_num_t = abs(sort_num_t)
+    inv_abs_num_t = reciprocal(
+        abs_num_t, min_value=0.3,
+        max_value=2.0 * max_coord * max_coord, step=1.0,
+    )
+    precomp_H_inv = multiply_const(inv_abs_num_t, float(H))
+
+    # --- Central ray distance for sort score ---
     sort_sign_den = compare(sort_den, 0.0)
     sort_abs_den = abs(sort_den)
     sort_adj_num_t = select(sort_sign_den, sort_num_t, negate(sort_num_t))
@@ -410,13 +453,18 @@ def build_game_graph(
     ones_oh = create_literal_value(torch.ones(max_walls), name="ones_oh")
     position_onehot = add_scaled_nodes(0.5, onehot_bool, 0.5, ones_oh)
 
-    # Pack wall value: geometry + angular info + onehot
+    # Pack wall value: geometry + precomputed render data + onehot
+    # Indices 0-4: ax,ay,bx,by,tex_id (vis mask needs 0-3)
+    # Indices 5-9: sort_den, C, D, E, H_inv_num_t (render pipeline)
+    # Index 10: center_ray_dist (render attention distance tiebreak)
+    # Indices 11+: position_onehot (sort mask)
     wall_value_for_sort = Concatenate([
         wall_ax, wall_ay, wall_bx, wall_by, wall_tex_id,
-        w_dx, w_dy, center_ray_dist,
+        sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv,
+        center_ray_dist,
         position_onehot,
     ])
-    d_sort_val = 8 + max_walls
+    d_sort_val = 11 + max_walls
 
     # =====================================================================
     # EOS: attend to WALL positions, aggregate collision, resolve position
@@ -500,16 +548,19 @@ def build_game_graph(
     )
 
     sel_wall_data = _extract_from(selected_sort, d_sort_val, 0, 5, "sel_wall_data")
-    sel_dx = _extract_from(selected_sort, d_sort_val, 5, 1, "sel_dx")
-    sel_dy = _extract_from(selected_sort, d_sort_val, 6, 1, "sel_dy")
-    sel_dist = _extract_from(selected_sort, d_sort_val, 7, 1, "sel_dist")
-    sel_onehot = _extract_from(selected_sort, d_sort_val, 8, max_walls, "sel_onehot")
+    sel_render = _extract_from(selected_sort, d_sort_val, 5, 5, "sel_render")
+    sel_tex_id = _extract_from(sel_wall_data, 5, 4, 1, "sel_tex_id")
+    sel_dist = _extract_from(selected_sort, d_sort_val, 10, 1, "sel_dist")
+    sel_onehot = _extract_from(selected_sort, d_sort_val, 11, max_walls, "sel_onehot")
 
     # Gate sorted values: zero at non-sorted positions
+    # Render data: [sort_den, C, D, E, H_inv_num_t, tex_id] = 6 values
     zeros_1 = create_literal_value(torch.zeros(1), name="z1")
-    zeros_5 = create_literal_value(torch.zeros(5), name="z5")
+    zeros_6 = create_literal_value(torch.zeros(6), name="z6")
     zeros_W = create_literal_value(torch.zeros(W), name="z_W")
-    gated_wall_data = select(is_sorted, sel_wall_data, zeros_5)
+    gated_render_data = select(
+        is_sorted, Concatenate([sel_render, sel_tex_id]), zeros_6,
+    )
     gated_dist = select(is_sorted, sel_dist, zeros_1)
 
     # --- Visibility mask: column range where this wall is visible ---
@@ -621,7 +672,6 @@ def build_game_graph(
 
     # min/max of col_a, col_b for in_range.
     # Clamp to [-2, W+2] because in_range overflows with distant bounds.
-    from torchwright.ops.arithmetic_ops import clamp
     col_a_c = clamp(col_a, -2.0, float(W + 2))
     col_b_c = clamp(col_b, -2.0, float(W + 2))
 
@@ -638,18 +688,14 @@ def build_game_graph(
     # RENDER: visibility-masked wall selection + parametric intersection
     # =====================================================================
 
-    # Ray angle from col_idx + player_angle
+    # Per-column angle offset from player's forward direction
     col_times_fov = multiply_const(col_idx, float(fov))
     ao_raw = thermometer_floor_div(col_times_fov, W, fov * (W - 1))
     angle_offset = add_const(ao_raw, float(-(fov // 2)))
-    ray_angle_raw = add(player_angle, angle_offset)
-    ray_angle_shifted = add_const(ray_angle_raw, 256.0)
-    ray_angle = mod_const(ray_angle_shifted, 256, 512 + fov)
-    ray_cos, ray_sin = trig_lookup(ray_angle)
 
     perp_shifted = add_const(angle_offset, 256.0)
     perp_angle = mod_const(perp_shifted, 256, 256 + fov)
-    perp_cos, _perp_sin = trig_lookup(perp_angle)
+    perp_cos, perp_sin = trig_lookup(perp_angle)
 
     # --- Render attention: visibility-masked wall selection ---
     # The attention score is dominated by the dot product of the render
@@ -658,7 +704,7 @@ def build_game_graph(
     #
     # Query (at RENDER): col_onehot (W) + is_render (1)
     # Key (at SORTED_WALL): vis_mask (W) + is_sorted (1)
-    # Value (at SORTED_WALL): wall_data (5)
+    # Value (at SORTED_WALL): render_data (6)
 
     # Column one-hot: +1 at col_idx, -1 elsewhere → map to 0/1
     col_p1 = add_const(col_idx, 1.0)
@@ -680,11 +726,12 @@ def build_game_graph(
     SORTED_BIAS = 100.0
     DIST_SCALE = 5.0
 
+    n_render_vals = 6  # sort_den, C, D, E, H_inv_num_t, tex_id
     render_attn_in = Concatenate([
         pos_encoding,
         gated_col_onehot, is_render_01,
         gated_vis_mask, is_sorted_01, gated_dist,
-        gated_wall_data,
+        gated_render_data,
     ])
 
     d_pe = len(pos_encoding)
@@ -693,28 +740,30 @@ def build_game_graph(
     s_vis_mask = d_pe + W + 1
     s_is_sorted = d_pe + 2 * W + 1
     s_dist = d_pe + 2 * W + 2
-    s_wall_data = d_pe + 2 * W + 3
+    s_render_data = d_pe + 2 * W + 3
 
-    d_head_render = W + 1 + 5
+    # Q/K dimension for visibility dot product; V/O dimension for values
+    d_qk = W + 1
+    d_v = n_render_vals
 
-    q_matrix = torch.zeros(len(render_attn_in), d_head_render)
+    q_matrix = torch.zeros(len(render_attn_in), d_qk)
     for c in range(W):
         q_matrix[s_col_oh + c, c] = VIS_GAIN
     q_matrix[s_is_render, W] = VIS_GAIN
 
-    k_matrix = torch.zeros(len(render_attn_in), d_head_render)
+    k_matrix = torch.zeros(len(render_attn_in), d_qk)
     for c in range(W):
         k_matrix[s_vis_mask + c, c] = 1.0
     k_matrix[s_is_sorted, W] = SORTED_BIAS
     k_matrix[s_dist, W] = -DIST_SCALE
 
-    v_matrix = torch.zeros(len(render_attn_in), d_head_render)
-    for i in range(5):
-        v_matrix[s_wall_data + i, W + 1 + i] = 1.0
+    v_matrix = torch.zeros(len(render_attn_in), d_v)
+    for i in range(n_render_vals):
+        v_matrix[s_render_data + i, i] = 1.0
 
-    o_matrix = torch.zeros(d_head_render, 5)
-    for i in range(5):
-        o_matrix[W + 1 + i, i] = 1.0
+    o_matrix = torch.zeros(d_v, n_render_vals)
+    for i in range(n_render_vals):
+        o_matrix[i, i] = 1.0
 
     render_attn = Attn(
         query_in=render_attn_in, key_in=render_attn_in,
@@ -723,59 +772,91 @@ def build_game_graph(
         value_matrix=v_matrix, output_matrix=o_matrix,
     )
 
-    r_wall_ax = _extract_from(render_attn, 5, 0, 1, "r_ax")
-    r_wall_ay = _extract_from(render_attn, 5, 1, 1, "r_ay")
-    r_wall_bx = _extract_from(render_attn, 5, 2, 1, "r_bx")
-    r_wall_by = _extract_from(render_attn, 5, 3, 1, "r_by")
-    r_wall_tex = _extract_from(render_attn, 5, 4, 1, "r_tex")
+    r_sort_den    = _extract_from(render_attn, n_render_vals, 0, 1, "r_sort_den")
+    r_C           = _extract_from(render_attn, n_render_vals, 1, 1, "r_C")
+    r_D           = _extract_from(render_attn, n_render_vals, 2, 1, "r_D")
+    r_E           = _extract_from(render_attn, n_render_vals, 3, 1, "r_E")
+    r_H_inv_num_t = _extract_from(render_attn, n_render_vals, 4, 1, "r_H_inv")
+    r_wall_tex    = _extract_from(render_attn, n_render_vals, 5, 1, "r_tex")
 
-    # --- Parametric intersection ---
-    ex = subtract(r_wall_bx, r_wall_ax)
-    ey = subtract(r_wall_by, r_wall_ay)
-    dx_r = subtract(r_wall_ax, player_x)
-    dy_r = subtract(player_y, r_wall_ay)
+    # --- Wall height from precomputed values ---
+    # den/cos(o) = sort_den - C·tan(o)
+    # wall_height = (H/|num_t|) · |den/cos(o)|
+    #
+    # This replaces the full parametric intersection → dist_r →
+    # dist_r*perp_cos → reciprocal → scale chain with a single
+    # tan lookup + two 2D products.
+    half_fov = fov // 2
+    tan_bp = [float(i) for i in range(-half_fov, half_fov + 1)]
+    tan_o = piecewise_linear(
+        angle_offset, tan_bp,
+        lambda x: math.tan(x * 2.0 * math.pi / 256.0),
+        name="tan_offset",
+    )
 
-    ey_cos = piecewise_linear_2d(ey, ray_cos, _DIFF_BP, _TRIG_BP, lambda a,b: a*b, name="r_ey_cos")
-    ex_sin = piecewise_linear_2d(ex, ray_sin, _DIFF_BP, _TRIG_BP, lambda a,b: a*b, name="r_ex_sin")
-    den = subtract(ey_cos, ex_sin)
+    # C · tan(offset): product of wall-frame value × per-column tangent
+    max_tan = math.tan(half_fov * 2.0 * math.pi / 256.0) * 1.1
+    tan_val_bp = [-max_tan + i * (2 * max_tan / 10) for i in range(11)]
+    C_tan = piecewise_linear_2d(
+        r_C, tan_o, _DIFF_BP, tan_val_bp,
+        lambda a, b: a * b, name="C_tan_o",
+    )
+    den_over_cos = subtract(r_sort_den, C_tan)
+    abs_den_over_cos = abs(den_over_cos)
 
-    ey_dx = piecewise_linear_2d(ey, dx_r, _DIFF_BP, _DIFF_BP, lambda a,b: a*b, name="r_ey_dx")
-    ex_dy = piecewise_linear_2d(ex, dy_r, _DIFF_BP, _DIFF_BP, lambda a,b: a*b, name="r_ex_dy")
-    num_t = add(ey_dx, ex_dy)
+    # Wall height = H_inv_num_t × |den/cos(o)|, clamped to [0, H]
+    max_h_inv = float(H) / 0.3  # matches reciprocal min_value in sort phase
+    h_inv_n = 16
+    h_inv_ratio = (max_h_inv / 0.01) ** (1.0 / (h_inv_n - 1))
+    height_inv_bp = [0.01 * (h_inv_ratio ** k) for k in range(h_inv_n)]
+    height_inv_bp[0] = 0.0
+    height_inv_bp[-1] = max_h_inv
 
-    dx_sin = piecewise_linear_2d(dx_r, ray_sin, _DIFF_BP, _TRIG_BP, lambda a,b: a*b, name="r_dx_sin")
-    dy_cos = piecewise_linear_2d(dy_r, ray_cos, _DIFF_BP, _TRIG_BP, lambda a,b: a*b, name="r_dy_cos")
-    num_u = add(dx_sin, dy_cos)
+    doc_max = 2.5 * max_coord  # |den/cos| bounded by ~2×wall_length/cos
+    doc_bp = [doc_max * i / 15 for i in range(16)]
 
-    # Den → angle data
-    sign_den = compare(den, 0.0)
-    abs_den = abs(den)
-    inv_abs_den = reciprocal(abs_den, min_value=0.01, max_value=2.0 * max_coord)
-    signed_inv_den = select(sign_den, inv_abs_den, negate(inv_abs_den))
+    wall_height_raw = piecewise_linear_2d(
+        r_H_inv_num_t, abs_den_over_cos,
+        height_inv_bp, doc_bp,
+        lambda a, b: a * b, name="wall_height_raw",
+    )
+    wall_height = clamp(wall_height_raw, 0.0, float(H))
 
-    # Distance + validity
-    adj_num_t = select(sign_den, num_t, negate(num_t))
+    center = float(H) / 2.0
+    half_height = multiply_const(wall_height, 0.5)
+    wall_top = Linear(
+        half_height, torch.tensor([[-1.0]]),
+        torch.tensor([center]), name="wall_top",
+    )
+    wall_bottom = Linear(
+        half_height, torch.tensor([[1.0]]),
+        torch.tensor([center]), name="wall_bottom",
+    )
+
+    # --- Texture u-coordinate from rotated offsets ---
+    # den = den_over_cos × perp_cos (recover actual denominator magnitude)
+    # num_u = D·perp_cos + E·perp_sin  (rotated offset formula)
+    sign_den = compare(den_over_cos, 0.0)
+
+    # perp_cos/perp_sin breakpoints — narrower range than full trig
+    _PERP_COS_BP = [0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
+    _PERP_SIN_BP = [-0.5, -0.35, -0.25, -0.15, -0.08, 0, 0.08, 0.15, 0.25, 0.35, 0.5]
+
+    abs_den = piecewise_linear_2d(
+        abs_den_over_cos, perp_cos, doc_bp, _PERP_COS_BP,
+        lambda a, b: a * b, name="abs_den",
+    )
+
+    D_cos = piecewise_linear_2d(
+        r_D, perp_cos, _DIFF_BP, _PERP_COS_BP,
+        lambda a, b: a * b, name="D_cos",
+    )
+    E_sin = piecewise_linear_2d(
+        r_E, perp_sin, _DIFF_BP, _PERP_SIN_BP,
+        lambda a, b: a * b, name="E_sin",
+    )
+    num_u = add(D_cos, E_sin)
     adj_num_u = select(sign_den, num_u, negate(num_u))
-    is_den_nz = compare(abs_den, 0.05)
-    is_t_pos = compare(adj_num_t, 0.05)
-    is_u_ge0 = compare(adj_num_u, -0.05)
-    u_minus_den = subtract(abs_den, adj_num_u)
-    is_u_le_den = compare(u_minus_den, -0.05)
-    abs_inv = select(sign_den, signed_inv_den, negate(signed_inv_den))
-    dist_r = signed_multiply(
-        adj_num_t, abs_inv,
-        max_abs1=2.0 * max_coord * max_coord,
-        max_abs2=1.0 / 0.01,
-        step=1.0, max_abs_output=BIG_DISTANCE,
-    )
-    is_valid = bool_all_true([is_den_nz, is_t_pos, is_u_ge0, is_u_le_den])
-    big = create_literal_value(torch.tensor([BIG_DISTANCE]), name="big")
-    dist_r = select(is_valid, dist_r, big)
-
-    # Wall height
-    wall_top, wall_bottom, wall_height = _wall_height_lookup(
-        dist_r, perp_cos, config, max_coord,
-    )
 
     # Texture column
     tex_col_idx = _u_norm_lookup(adj_num_u, abs_den, tex_w, max_coord)
