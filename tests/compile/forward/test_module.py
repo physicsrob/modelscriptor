@@ -40,19 +40,22 @@ def _build_1digit():
     return output_node, pos_encoding, embedding
 
 
-def _empty_past_feeds(n_layers: int, n_heads: int, d_head: int) -> dict:
+def _empty_past_feeds(per_layer_n_heads: list, d_head: int) -> dict:
     feeds = {"past_len": np.array(0, dtype=np.int64)}
-    for i in range(n_layers):
-        feeds[f"past_K_{i}"] = np.zeros((n_heads, 0, d_head), dtype=np.float32)
-        feeds[f"past_V_{i}"] = np.zeros((n_heads, 0, d_head), dtype=np.float32)
+    for i, nh in enumerate(per_layer_n_heads):
+        feeds[f"past_K_{i}"] = np.zeros((nh, 0, d_head), dtype=np.float32)
+        feeds[f"past_V_{i}"] = np.zeros((nh, 0, d_head), dtype=np.float32)
     return feeds
 
 
 def _discover_meta(session):
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
-    shape0 = inputs["past_K_0"].shape
-    return n_layers, int(shape0[0]), int(shape0[2])
+    per_layer_n_heads = [
+        int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)
+    ]
+    d_head = int(inputs["past_K_0"].shape[2])
+    return n_layers, per_layer_n_heads, d_head
 
 
 def _reference_logits(output_node, pos_encoding, embedding, tokens):
@@ -98,13 +101,13 @@ def test_token_onnx_prefill_matches_compute():
         )
 
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, n_heads, d_head = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
         token_ids = np.array(
             [embedding.tokenizer.get_token_id(t) for t in tokens],
             dtype=np.int64,
         )
         feeds = {"token_ids": token_ids}
-        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
         onnx_logits = session.run(["logits"], feeds)[0]
 
         assert np.allclose(ref_logits, onnx_logits, atol=1e-4), (
@@ -134,17 +137,17 @@ def test_token_onnx_decode_step_matches_full_prefill():
         )
 
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, n_heads, d_head = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
         out_names = ["logits"]
         for i in range(n_layers):
             out_names += [f"new_K_{i}", f"new_V_{i}"]
 
         feeds = {"token_ids": token_ids}
-        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
         full_logits = session.run(["logits"], feeds)[0]
 
         feeds = {"token_ids": token_ids[:-1]}
-        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
         outputs = session.run(out_names, feeds)
         past_K = [outputs[1 + 2 * i] for i in range(n_layers)]
         past_V = [outputs[1 + 2 * i + 1] for i in range(n_layers)]
@@ -247,5 +250,6 @@ def test_token_onnx_sidecar_schema_and_metadata():
 
         model = _load(onnx_path)
         assert model.n_layers > 0
-        assert model.n_heads == D // D_HEAD
+        assert len(model.per_layer_n_heads) == model.n_layers
+        assert all(nh <= D // D_HEAD for nh in model.per_layer_n_heads)
         assert model.d_head == D_HEAD
