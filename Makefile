@@ -37,6 +37,10 @@ test:
 test-logs:
 	@tail -f $(LOGFILE)
 
+.PHONY: graph-stats
+graph-stats:
+	uv run python graph_stats.py $(ARGS)
+
 .PHONY: walkthrough
 walkthrough:
 	uv run modal run modal_walkthrough.py $(ARGS)
