@@ -33,6 +33,7 @@ from itertools import groupby
 
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.utils import get_ancestor_nodes
+from torchwright.doom.compile import compute_min_d_head
 from torchwright.doom.game_graph import build_game_graph
 from torchwright.graph import Add, Attn, Node
 from torchwright.graph.linear import Linear
@@ -244,11 +245,7 @@ def main():
     d = args.d
     if args.d_head is None:
         tex_w = textures[0].shape[0]
-        d_sort_val = 11 + max_walls
-        sort_d = 1 + max_walls + d_sort_val
-        render_d = 1 + max_walls + 8 + max_walls
-        tex_d = 8 + tex_w + 1
-        min_d_head = max(sort_d, render_d, tex_d)
+        min_d_head = compute_min_d_head(max_walls, tex_w)
         d_head = 1
         while d_head < min_d_head:
             d_head *= 2

@@ -45,7 +45,7 @@ def main():
                         help="Maximum number of wall tokens per frame")
     parser.add_argument(
         "--chunk-size", type=int, default=20,
-        help="Vertical patch height. Must divide --height.",
+        help="Render chunk height (pixels per render token).",
     )
     parser.add_argument(
         "--d", type=int, default=2048,
@@ -93,9 +93,12 @@ def main():
     # Sequence length: TEX_COL + INPUT + WALL*N + EOS + SORTED_WALL*N + RENDER (dynamic)
     cs = args.chunk_size
     n_walls = args.max_walls
+    num_tex = len(textures)
+    tex_w = textures[0].shape[0]
+    n_tex_col = num_tex * tex_w
     # Upper bound on render tokens: each wall covers W columns, each column ceil(H/cs) chunks
     max_render = n_walls * config.screen_width * ((config.screen_height + cs - 1) // cs)
-    max_seq_len = 1 + n_walls + 1 + n_walls + max_render
+    max_seq_len = n_tex_col + 1 + n_walls + 1 + n_walls + max_render
 
     compile_headless_to_onnx(
         output_node=output_node,

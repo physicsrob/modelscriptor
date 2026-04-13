@@ -271,7 +271,13 @@ def _profile_one(
     peak_d = max(max(r[3], r[4]) for r in layer_rows)
     compile_time = sum(r[5] for r in layer_rows) / 1000.0
 
-    total_positions = config.screen_width * (config.screen_height // chunk_size)
+    # Render is autoregressive — step count is dynamic at runtime.
+    # For cost modeling, estimate max render steps (N_walls * W * ceil(H/cs)).
+    W = config.screen_width
+    H = config.screen_height
+    max_walls_est = max(8, len(segments))
+    max_render_steps = max_walls_est * W * ((H + chunk_size - 1) // chunk_size)
+    total_positions = max_render_steps
     cost = _cost_model(
         peak_d=peak_d,
         n_layers=n_layers,
@@ -280,8 +286,8 @@ def _profile_one(
     )
 
     return {
-        "rp": chunk_size,
-        "shards": config.screen_height // chunk_size,
+        "cs": chunk_size,
+        "chunks_per_col": (H + chunk_size - 1) // chunk_size,
         "positions": total_positions,
         "layers": n_layers,
         "peak_d": peak_d,
@@ -310,7 +316,7 @@ def _print_table(rows: List[dict]) -> None:
         f"  frame_s    = max(mem_s, compute_s)  — always mem_s on H100 at batch=1\n"
     )
     header = (
-        f"{'rp':>4}  {'shards':>6}  {'positions':>9}  "
+        f"{'cs':>4}  {'ch/col':>6}  {'positions':>9}  "
         f"{'peak_d':>7}  {'d_ship':>7}  {'dense_GB':>9}  "
         f"{'weight_s':>9}  {'kv_s':>8}  "
         f"{'compute_s':>10}  {'frame_s':>8}"
@@ -320,14 +326,14 @@ def _print_table(rows: List[dict]) -> None:
     for r in rows:
         if r.get("error"):
             print(
-                f"{r['rp']:>4}  {r['shards']:>6}  {r['positions']:>9}  "
+                f"{r['cs']:>4}  {r['chunks_per_col']:>6}  {r['positions']:>9}  "
                 f"{'—':>7}  {'—':>7}  {'—':>9}  "
                 f"{'—':>9}  {'—':>8}  {'—':>10}  {'—':>8}   ({r['error']})"
             )
             continue
         frame_s = max(r["compute_s"], r["mem_s"])
         print(
-            f"{r['rp']:>4}  {r['shards']:>6}  {r['positions']:>9}  "
+            f"{r['cs']:>4}  {r['chunks_per_col']:>6}  {r['positions']:>9}  "
             f"{r['peak_d']:>7}  {r['d_ship']:>7}  "
             f"{r['dense_gb']:>8.2f}G  "
             f"{r['weight_s']:>8.2f}s  {r['kv_s']:>7.2f}s  "
@@ -412,9 +418,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             # the sweep succeeds, which is the whole point of finding
             # the minimum-viable rp.
             results.append({
-                "rp": rp,
-                "shards": H // rp,
-                "positions": args.width * (H // rp),
+                "cs": rp,
+                "chunks_per_col": (H + rp - 1) // rp,
+                "positions": max(8, len(segments)) * args.width * ((H + rp - 1) // rp),
                 "layers": None,
                 "peak_d": None,
                 "layer_params": None,

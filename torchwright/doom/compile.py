@@ -97,6 +97,21 @@ def segments_to_walls(segments: List[Segment]) -> List[dict]:
     ]
 
 
+def compute_min_d_head(max_walls: int, tex_w: int) -> int:
+    """Minimum d_head required by the game graph's attention heads.
+
+    Three attention patterns drive the requirement:
+    - Sort (attend_argmin_unmasked): 1 + max_walls + (11 + max_walls)
+    - Render (attend_argmin_unmasked): 1 + max_walls + (8 + max_walls)
+    - TEX_COL (attend_argmax_dot): 8 + tex_w + 1
+    """
+    d_sort_val = 11 + max_walls
+    sort_d = 1 + max_walls + d_sort_val
+    render_d = 1 + max_walls + 8 + max_walls
+    tex_d = 8 + tex_w + 1
+    return max(sort_d, render_d, tex_d)
+
+
 def compile_game(
     config: RenderConfig,
     textures: List[np.ndarray],
@@ -117,17 +132,9 @@ def compile_game(
         move_speed, turn_speed,
         chunk_size=chunk_size,
     )
-    # d_head must be >= max d_qk across all Attn nodes.
-    # Sort attention (attend_argmin_unmasked): d_head = 1 + max_walls + d_sort_val
-    # Render attention (attend_argmin_unmasked): d_head = 1 + max_walls + (8 + max_walls)
-    # TEX_COL attention (attend_argmax_dot): d_qk = 8 + tex_w + 1
     if d_head is None:
         tex_w = textures[0].shape[0]
-        d_sort_val = 11 + max_walls
-        sort_d = 1 + max_walls + d_sort_val
-        render_d = 1 + max_walls + 8 + max_walls
-        tex_d = 8 + tex_w + 1
-        min_d_head = max(sort_d, render_d, tex_d)
+        min_d_head = compute_min_d_head(max_walls, tex_w)
         d_head = 1
         while d_head < min_d_head:
             d_head *= 2
