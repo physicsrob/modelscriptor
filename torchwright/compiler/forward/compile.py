@@ -79,6 +79,7 @@ def forward_compile(
     device: Optional[str] = "auto",
     on_layer_compiled: Optional[Callable[[int, TransformerLayer], None]] = None,
     d_hidden: Optional[int] = None,
+    on_node_scheduled: Optional[Callable[[Node, int], None]] = None,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -172,6 +173,7 @@ def forward_compile(
         if output_node in computed:
             break
 
+        prev_computed = set(computed) if on_node_scheduled else None
         occupied_before = d - residual_map.get_free_count()
 
         t_layer_start = time.perf_counter()
@@ -198,6 +200,10 @@ def forward_compile(
             if isinstance(node, Concatenate) and node not in computed:
                 if all(leaf in computed for leaf in flatten_concat_nodes([node])):
                     computed.add(node)
+
+        if on_node_scheduled is not None:
+            for node in computed - prev_computed:
+                on_node_scheduled(node, i)
 
         layer_params = _count_layer_params(attn_ops, mlp_ops, d, d_head)
         total_params += layer_params

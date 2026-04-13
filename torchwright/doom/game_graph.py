@@ -49,6 +49,7 @@ from torchwright.ops.arithmetic_ops import (
     compare,
     floor_int,
     mod_const,
+    multiply_2d,
     multiply_const,
     negate,
     piecewise_linear,
@@ -647,50 +648,56 @@ def build_game_graph(
                                 lambda a, b: a * b, name="sin_dby_b"),
         )
 
-        dot_a_sign = compare(dot_a, 0.0)
-        dot_a_abs = abs(dot_a)
-        dot_a_clamped = select(
-            compare(dot_a_abs, 0.1),
-            dot_a_abs,
-            create_literal_value(torch.tensor([0.1]), name="dot_min"),
-        )
-        inv_dot_a = reciprocal(dot_a_clamped, min_value=0.1, max_value=2.0 * max_coord)
-        signed_inv_dot_a = select(dot_a_sign, inv_dot_a, negate(inv_dot_a))
-        tan_a = signed_multiply(cross_a, signed_inv_dot_a,
-                                max_abs1=max_coord, max_abs2=1.0 / 0.1,
-                                step=0.5, max_abs_output=20.0)
+        # Tangent computation: cross/dot → column index.
+        #
+        # Optimized pipeline (6 sequential MLP sublayers per endpoint,
+        # down from 10):
+        #   abs(dot) → clamp(0.1,20) → reciprocal → multiply_2d(cross,inv)
+        #   → atan_clamped → select(sign, col, W-col)
+        #
+        # Key changes vs the original:
+        # - clamp(abs) replaces compare+select (1 sublayer vs 2)
+        # - multiply_2d replaces signed_multiply (1 sublayer vs 3)
+        # - atan bakes in column clamping (1 sublayer vs 2)
+        # - sign handling moved after atan so compare(dot,0) runs
+        #   in parallel with the main chain
 
-        dot_b_sign = compare(dot_b, 0.0)
-        dot_b_abs = abs(dot_b)
-        dot_b_clamped = select(
-            compare(dot_b_abs, 0.1),
-            dot_b_abs,
-            create_literal_value(torch.tensor([0.1]), name="dot_min_b"),
-        )
-        inv_dot_b = reciprocal(dot_b_clamped, min_value=0.1, max_value=2.0 * max_coord)
-        signed_inv_dot_b = select(dot_b_sign, inv_dot_b, negate(inv_dot_b))
-        tan_b = signed_multiply(cross_b, signed_inv_dot_b,
-                                max_abs1=max_coord, max_abs2=1.0 / 0.1,
-                                step=0.5, max_abs_output=20.0)
-
-        _ATAN_BP = [-20, -10, -5, -3, -2, -1.5, -1, -0.75, -0.5, -0.25,
-                    0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 10, 20]
+        _ATAN_BP = [-100, -20, -10, -5, -3, -2, -1.5, -1, -0.75, -0.5,
+                    -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 10,
+                    20, 100]
         fov_rad = float(fov) * math.pi / 128.0
         col_from_tan_scale = float(W) / fov_rad
+        half_W = float(W) / 2.0
+        col_lo, col_hi = -2.0, float(W + 2)
 
-        col_a = piecewise_linear(
-            tan_a, _ATAN_BP,
-            lambda t: math.atan(t) * col_from_tan_scale + W / 2.0,
-            name="col_a",
-        )
-        col_b = piecewise_linear(
-            tan_b, _ATAN_BP,
-            lambda t: math.atan(t) * col_from_tan_scale + W / 2.0,
-            name="col_b",
-        )
+        def _atan_clamped(t):
+            return max(col_lo, min(col_hi, math.atan(t) * col_from_tan_scale + half_W))
 
-        col_a_c = clamp(col_a, -2.0, float(W + 2))
-        col_b_c = clamp(col_b, -2.0, float(W + 2))
+        max_inv = 1.0 / 0.1  # = 10
+
+        # --- Endpoint A ---
+        dot_a_sign = compare(dot_a, 0.0)           # parallel with chain below
+        dot_a_clamped = clamp(abs(dot_a), 0.1, 2.0 * max_coord)
+        inv_dot_a = reciprocal(dot_a_clamped, min_value=0.1, max_value=2.0 * max_coord)
+        tan_a = multiply_2d(cross_a, inv_dot_a,
+                            max_abs1=max_coord, max_abs2=max_inv,
+                            step1=0.5, step2=0.5, min2=0.0)
+        col_a_pos = piecewise_linear(tan_a, _ATAN_BP, _atan_clamped, name="col_a")
+        col_a_neg = Linear(col_a_pos, torch.tensor([[-1.0]]),
+                           torch.tensor([float(W)]), name="col_a_neg")
+        col_a_c = select(dot_a_sign, col_a_pos, col_a_neg)
+
+        # --- Endpoint B ---
+        dot_b_sign = compare(dot_b, 0.0)
+        dot_b_clamped = clamp(abs(dot_b), 0.1, 2.0 * max_coord)
+        inv_dot_b = reciprocal(dot_b_clamped, min_value=0.1, max_value=2.0 * max_coord)
+        tan_b = multiply_2d(cross_b, inv_dot_b,
+                            max_abs1=max_coord, max_abs2=max_inv,
+                            step1=0.5, step2=0.5, min2=0.0)
+        col_b_pos = piecewise_linear(tan_b, _ATAN_BP, _atan_clamped, name="col_b")
+        col_b_neg = Linear(col_b_pos, torch.tensor([[-1.0]]),
+                           torch.tensor([float(W)]), name="col_b_neg")
+        col_b_c = select(dot_b_sign, col_b_pos, col_b_neg)
 
         a_lt_b = compare(subtract(col_b_c, col_a_c), 0.0)
         vis_lo = select(a_lt_b, col_a_c, col_b_c)
