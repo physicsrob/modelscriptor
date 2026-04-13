@@ -19,11 +19,14 @@ import pytest
 import torch
 
 from torchwright.debug.probe import probe_graph, reference_eval
+from torchwright.graph import Concatenate
 from torchwright.ops import (
     create_input,
     dynamic_extract,
     linear_bin_index,
+    reciprocal,
 )
+from torchwright.ops.arithmetic_ops import clamp, subtract
 
 
 # ---------------------------------------------------------------------------
@@ -383,3 +386,153 @@ def test_linear_bin_index_into_dynamic_extract():
         d=2048, d_head=16, verbose=False, atol=0.5,
     )
     assert report.first_divergent is None, report.format_short()
+
+
+# ---------------------------------------------------------------------------
+# linear_bin_index with hoisted inv_range
+# ---------------------------------------------------------------------------
+
+
+def _build_linear_bin_index_hoisted(
+    n_bins: int,
+    min_range: float,
+    max_range: float,
+    n_reciprocal_breakpoints: int = 48,
+    mul_step: float = 0.25,
+):
+    """Build a linear_bin_index graph with externally-hoisted inv_range.
+
+    Returns the same output as ``_build_linear_bin_index_graph`` but
+    computes ``inv_range`` outside of ``linear_bin_index`` and passes
+    it in via the ``inv_range`` parameter.
+    """
+    x = create_input("x", 1)
+    x_min = create_input("x_min", 1)
+    x_max = create_input("x_max", 1)
+
+    # Hoist: compute inv_range once
+    range_ = subtract(x_max, x_min)
+    clamped_range = clamp(range_, min_range, max_range)
+    inv = reciprocal(clamped_range, min_value=min_range, max_value=max_range)
+
+    out = linear_bin_index(
+        x, x_min, x_max, n_bins,
+        min_range=min_range,
+        max_range=max_range,
+        mul_step=mul_step,
+        inv_range=inv,
+    )
+    return out
+
+
+@pytest.mark.parametrize(
+    "n_bins,x_min_val,x_max_val",
+    [
+        (4, 0.0, 10.0),
+        (8, 0.0, 10.0),
+        (16, 0.0, 10.0),
+        (64, 0.0, 10.0),
+        (16, -5.0, 5.0),
+        (16, 0.0, 1.5),
+        (16, 0.0, 100.0),
+    ],
+)
+def test_linear_bin_index_with_inv_range(n_bins, x_min_val, x_max_val):
+    """Hoisted inv_range produces the same bin indices as the original.
+
+    Mirrors ``test_linear_bin_index_centers_and_out_of_range`` but
+    builds the graph with externally-computed ``inv_range``.
+    """
+    min_r, max_r = _bounds_for(x_min_val, x_max_val)
+    out_node = _build_linear_bin_index_hoisted(n_bins, min_r, max_r)
+
+    x, x_min, x_max = _sweep_inputs(x_min_val, x_max_val, n_bins)
+    inputs = {"x": x, "x_min": x_min, "x_max": x_max}
+    n_pos = x.shape[0]
+
+    cache = reference_eval(out_node, inputs, n_pos)
+    oracle = cache[out_node].flatten()
+    expected_mid = torch.arange(n_bins, dtype=torch.float32)
+    expected = torch.cat([
+        torch.tensor([0.0]),
+        expected_mid,
+        torch.tensor([n_bins - 1.0]),
+    ])
+    assert torch.allclose(oracle, expected, atol=0.05), (
+        f"hoisted oracle disagrees with expected bins "
+        f"(n_bins={n_bins}, range=[{x_min_val}, {x_max_val}])\n"
+        f"  oracle:   {oracle.tolist()}\n  expected: {expected.tolist()}"
+    )
+
+
+def test_linear_bin_index_shared_inv_range_multi_x():
+    """Multiple x values sharing one inv_range node all produce correct bins.
+
+    This is the exact pattern the textured wall fill needs: one shared
+    ``inv_range`` node, multiple ``linear_bin_index`` calls with
+    different ``x`` values.
+    """
+    n_bins = 16
+    x_min_val, x_max_val = 0.0, 16.0
+    min_r, max_r = _bounds_for(x_min_val, x_max_val)
+
+    x_min = create_input("x_min", 1)
+    x_max = create_input("x_max", 1)
+
+    # Hoist inv_range — shared across all calls
+    range_ = subtract(x_max, x_min)
+    clamped_range = clamp(range_, min_r, max_r)
+    inv = reciprocal(clamped_range, min_value=min_r, max_value=max_r)
+
+    # Build multiple bin indices from separate x inputs
+    x_nodes = [create_input(f"x{i}", 1) for i in range(4)]
+    bin_nodes = []
+    for x in x_nodes:
+        idx = linear_bin_index(
+            x, x_min, x_max, n_bins,
+            min_range=min_r, max_range=max_r,
+            mul_step=0.25, inv_range=inv,
+        )
+        bin_nodes.append(idx)
+
+    # Concatenate for a single output node
+    out = Concatenate(bin_nodes)
+
+    # Sweep: each x input gets a different bin center
+    bin_width = (x_max_val - x_min_val) / n_bins
+    x_vals = [x_min_val + (k + 0.5) * bin_width for k in [0, 5, 10, 15]]
+    n_pos = 1
+    inputs = {
+        "x_min": torch.tensor([[x_min_val]]),
+        "x_max": torch.tensor([[x_max_val]]),
+    }
+    for i, v in enumerate(x_vals):
+        inputs[f"x{i}"] = torch.tensor([[v]])
+
+    cache = reference_eval(out, inputs, n_pos)
+    oracle = cache[out].flatten()
+    expected = torch.tensor([0.0, 5.0, 10.0, 15.0])
+    assert torch.allclose(oracle, expected, atol=0.05), (
+        f"shared inv_range multi-x: oracle={oracle.tolist()}, "
+        f"expected={expected.tolist()}"
+    )
+
+
+def test_linear_bin_index_inv_range_probe():
+    """Probe test: hoisted inv_range compiles correctly."""
+    n_bins = 8
+    x_min_val, x_max_val = 0.0, 8.0
+    min_r, max_r = _bounds_for(x_min_val, x_max_val)
+    out_node = _build_linear_bin_index_hoisted(n_bins, min_r, max_r)
+
+    x, x_min, x_max = _sweep_inputs(x_min_val, x_max_val, n_bins)
+    inputs = {"x": x, "x_min": x_min, "x_max": x_max}
+    n_pos = x.shape[0]
+
+    report = probe_graph(
+        out_node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
+        d=2048, d_head=16, verbose=False, atol=0.5,
+    )
+    assert report.first_divergent is None, (
+        f"probe divergence on hoisted inv_range:\n{report.format_short()}"
+    )
