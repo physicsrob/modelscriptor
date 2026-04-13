@@ -19,6 +19,7 @@ from torchwright.ops.arithmetic_ops import (
     add_const,
     clamp,
     compare,
+    floor_int,
     linear_bin_index,
     multiply_const,
     negate,
@@ -764,26 +765,57 @@ def _textured_column_fill(
         )
 
     # --- Textured wall: per-screen-row texture sampling ---
+    #
+    # Each screen row y needs: floor((y - wall_top) * tex_height / wall_height)
+    #
+    # Expanding y = patch_row_start + y_idx + 0.5:
+    #
+    #   bin_f = (patch_row_start - wall_top) * tex_height * inv_range
+    #         + (y_idx + 0.5)               * tex_height * inv_range
+    #           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    #           base_product (SHARED multiply)  per-row offset (FREE Linear)
+    #
+    # This factors the expensive signed_multiply out of the per-row loop:
+    # one shared multiply, then each row is a free Linear + clamp + floor
+    # + dynamic_extract (4 MLP sublayers instead of 8).
     max_dist = 2.0 * max_coord
     min_wall_height = max(float(H) / max_dist, 0.5)
     max_wall_height = 2.0 * float(H)
 
+    # Shared: inv_range and per_row_step
+    range_ = subtract(wall_bottom, wall_top)
+    clamped_range = clamp(range_, min_wall_height, max_wall_height)
+    inv_range = reciprocal(
+        clamped_range, min_value=min_wall_height, max_value=max_wall_height,
+    )
+    per_row_step = multiply_const(inv_range, float(tex_height))
+
+    # Shared: base_product = (patch_row_start - wall_top) * per_row_step
+    base_delta = subtract(patch_row_start, wall_top)
+    max_abs_base_delta = max_wall_height
+    clamped_base_delta = clamp(base_delta, -max_abs_base_delta, max_abs_base_delta)
+    max_abs_step = float(tex_height) / min_wall_height
+    base_product = signed_multiply(
+        clamped_base_delta,
+        per_row_step,
+        max_abs1=max_abs_base_delta,
+        max_abs2=max_abs_step,
+        step=0.5,
+    )
+
     row_rgbs: List[Node] = []
     for y_idx in range(rows_per_patch):
         with annotate("tex_sample"):
-            y_centre = Linear(
-                patch_row_start,
-                torch.tensor([[1.0]]),
-                torch.tensor([float(y_idx) + 0.5]),
-                name=f"y_centre_row_{y_idx}",
+            # bin_f = base_product + (y_idx + 0.5) * per_row_step
+            # This is a free Linear: 1 × base_product + (y_idx+0.5) × per_row_step
+            bin_f = Linear(
+                Concatenate([base_product, per_row_step]),
+                torch.tensor([[1.0], [float(y_idx) + 0.5]]),
+                name=f"bin_f_row_{y_idx}",
             )
-            tex_row_idx = linear_bin_index(
-                y_centre, wall_top, wall_bottom, tex_height,
-                min_range=min_wall_height,
-                max_range=max_wall_height,
-                n_reciprocal_breakpoints=48,
-                mul_step=0.25,
-                name=f"tex_row_idx_{y_idx}",
+            clamped_bin_f = clamp(bin_f, 0.0, float(tex_height) - 0.5)
+            tex_row_idx = floor_int(
+                clamped_bin_f, min_value=0, max_value=tex_height - 1,
             )
             row_rgb = dynamic_extract(
                 tex_column_colors, tex_row_idx, tex_height, 3,

@@ -228,6 +228,8 @@ def main():
         "--rows-per-patch", type=int, default=10,
         help="Vertical patch height. Must divide --height.",
     )
+    parser.add_argument("--d", type=int, default=2048,
+                        help="Residual stream width (d_model).")
     args = parser.parse_args()
 
     trig_table = generate_trig_table()
@@ -264,7 +266,7 @@ def main():
             config, textures,
             max_walls=max(8, len(walls)),
             max_coord=max_coord,
-            d=2048,
+            d=args.d,
             rows_per_patch=args.rows_per_patch,
         )
 
