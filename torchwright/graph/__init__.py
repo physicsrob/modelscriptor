@@ -1,4 +1,4 @@
-from .node import Node
+from .node import Node, annotate
 
 from .attn import Attn
 from .embedding import Embedding
