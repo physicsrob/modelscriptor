@@ -25,15 +25,26 @@ Three levels of parameter accounting:
     The ratio graph/allocated is the density within the "used" portion.
     The ratio allocated/total is the layer utilization reported by the
     compiler (the "params used" percentage).
+
+Critical path analysis:
+
+    The critical path is the longest chain of sequential dependencies in the
+    graph. This determines the minimum number of layers needed. Optimizations
+    that shorten the critical path directly reduce layer count.
+
+    Contiguous chains of the same annotation on the critical path are often
+    the best optimization targets - they represent a single logical operation
+    that might be restructurable.
 """
 
 import argparse
-from collections import defaultdict
+from collections import defaultdict, deque
 from itertools import groupby
+from typing import Dict, List, Set, Tuple
 
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.doom.game_graph import build_game_graph
-from torchwright.graph import Attn, Node
+from torchwright.graph import Attn, Node, Concatenate
 from torchwright.graph.linear import Linear
 from torchwright.graph.relu import ReLU
 from torchwright.reference_renderer.scenes import (
@@ -153,6 +164,285 @@ def _print_summary(total_graph, total_alloc, n_layers, layer_capacity):
     print()
 
 
+# ── Critical Path Analysis ───────────────────────────────────────────
+
+
+class CriticalPathAnalyzer:
+    """Analyzes critical paths through the computation graph.
+
+    The critical path is the longest chain of sequential dependencies.
+    This determines the minimum number of transformer layers needed.
+    """
+
+    def __init__(self, output_nodes: Set[Node], all_nodes: Set[Node]):
+        self._output_nodes = output_nodes
+        self._all_nodes = all_nodes
+
+        # Build forward edges: node -> set of consumers
+        self._consumers: Dict[Node, Set[Node]] = defaultdict(set)
+        for node in all_nodes:
+            for inp in node.inputs:
+                if inp in all_nodes:
+                    self._consumers[inp].add(node)
+
+        # Distance from each node to nearest output (0 for outputs)
+        self._dist_to_output: Dict[Node, int] = {}
+        self._compute_distances()
+
+        # The maximum distance = critical path length
+        self._max_depth = max(self._dist_to_output.values()) if self._dist_to_output else 0
+
+    def _compute_distances(self):
+        """BFS from outputs backward to compute distance to output for each node."""
+        # Start from output nodes
+        queue = deque()
+        for node in self._output_nodes:
+            self._dist_to_output[node] = 0
+            queue.append(node)
+
+        # BFS backward through inputs
+        while queue:
+            node = queue.popleft()
+            dist = self._dist_to_output[node]
+            for inp in node.inputs:
+                if inp in self._all_nodes and inp not in self._dist_to_output:
+                    self._dist_to_output[inp] = dist + 1
+                    queue.append(inp)
+
+    def get_max_depth(self) -> int:
+        """The length of the critical path (longest input-to-output chain)."""
+        return self._max_depth
+
+    def get_depth_histogram(self) -> Dict[int, int]:
+        """Count of nodes at each depth level."""
+        hist: Dict[int, int] = defaultdict(int)
+        for dist in self._dist_to_output.values():
+            hist[dist] += 1
+        return dict(hist)
+
+    def get_critical_path_nodes(self) -> Set[Node]:
+        """All nodes that lie on some critical path."""
+        # A node is on a critical path if its depth equals the max depth
+        # and there's a path of decreasing depth to an output
+        critical: Set[Node] = set()
+        for node, dist in self._dist_to_output.items():
+            if dist == self._max_depth:
+                # This is a critical path start, trace forward
+                self._trace_critical_path_forward(node, critical)
+        return critical
+
+    def _trace_critical_path_forward(self, node: Node, critical: Set[Node]):
+        """Trace from a critical path start to output, marking all nodes."""
+        critical.add(node)
+        dist = self._dist_to_output[node]
+        if dist == 0:
+            return
+        # Find a consumer with dist = current dist - 1
+        for consumer in self._consumers.get(node, set()):
+            if self._dist_to_output.get(consumer, -1) == dist - 1:
+                self._trace_critical_path_forward(consumer, critical)
+                break  # Only need one path
+
+    def trace_critical_paths(self, max_paths: int = 5) -> List[List[Node]]:
+        """Trace up to max_paths distinct critical paths.
+
+        Returns list of paths, each path is a list of nodes from input to output.
+        """
+        # Find all critical path starts (nodes at max depth)
+        starts = [n for n, d in self._dist_to_output.items() if d == self._max_depth]
+
+        paths: List[List[Node]] = []
+        seen_path_signatures: Set[Tuple[Tuple[str, str | None], ...]] = set()
+
+        for start in starts:
+            if len(paths) >= max_paths:
+                break
+            path = self._trace_one_path(start)
+            # Use annotation signature to deduplicate similar paths
+            sig = tuple((n.node_type(), n.annotation) for n in path)
+            if sig not in seen_path_signatures:
+                seen_path_signatures.add(sig)
+                paths.append(path)
+
+        return paths
+
+    def _trace_one_path(self, start: Node) -> List[Node]:
+        """Trace one critical path from start to output."""
+        path = [start]
+        node = start
+        while True:
+            dist = self._dist_to_output[node]
+            if dist == 0:
+                break
+            # Find a consumer with dist - 1 (prefer staying on annotation)
+            candidates = [
+                c for c in self._consumers.get(node, set())
+                if self._dist_to_output.get(c, -1) == dist - 1
+            ]
+            if not candidates:
+                break
+            # Prefer same annotation for cleaner traces
+            same_ann = [c for c in candidates if c.annotation == node.annotation]
+            next_node = same_ann[0] if same_ann else candidates[0]
+            path.append(next_node)
+            node = next_node
+        return path
+
+    def get_annotation_critical_contribution(self) -> Dict[str, int]:
+        """Count how many critical path nodes have each annotation."""
+        critical = self.get_critical_path_nodes()
+        counts: Dict[str, int] = defaultdict(int)
+        for node in critical:
+            ann = node.annotation or "(none)"
+            counts[ann] += 1
+        return dict(counts)
+
+    def find_contiguous_chains(self, path: List[Node]) -> List[Tuple[str, int, int, List[Node]]]:
+        """Find contiguous runs of the same annotation in a path.
+
+        Returns list of (annotation, start_idx, length, nodes).
+        Sorted by length descending.
+        """
+        if not path:
+            return []
+
+        chains = []
+        i = 0
+        while i < len(path):
+            ann = path[i].annotation or "(none)"
+            start = i
+            while i < len(path) and (path[i].annotation or "(none)") == ann:
+                i += 1
+            length = i - start
+            chains.append((ann, start, length, path[start:i]))
+
+        # Sort by length descending
+        chains.sort(key=lambda x: -x[2])
+        return chains
+
+
+def _count_real_ops(nodes: List[Node]) -> int:
+    """Count nodes that consume layer capacity (exclude Concatenate)."""
+    return sum(1 for n in nodes if not isinstance(n, Concatenate))
+
+
+def _real_ops_type_summary(nodes: List[Node]) -> str:
+    """Summarize real op types (excluding Concatenate)."""
+    real = [n for n in nodes if not isinstance(n, Concatenate)]
+    if not real:
+        return "(none)"
+
+    condensed = []
+    for t, group in groupby(n.node_type() for n in real):
+        count = len(list(group))
+        if count > 1:
+            condensed.append(f"{t}×{count}")
+        else:
+            condensed.append(t)
+
+    if len(condensed) > 6:
+        return " → ".join(condensed[:3]) + " → ... → " + " → ".join(condensed[-2:])
+    return " → ".join(condensed)
+
+
+def _print_critical_path_analysis(all_nodes: Set[Node], output_nodes: Set[Node]):
+    """Print critical path analysis."""
+    analyzer = CriticalPathAnalyzer(output_nodes, all_nodes)
+
+    max_depth = analyzer.get_max_depth()
+    print(f"\n{'─' * 72}")
+    print(f"  CRITICAL PATH ANALYSIS")
+    print(f"{'─' * 72}")
+    print(f"\n  Critical path length: {max_depth} sequential ops")
+    print(f"  (This determines the minimum transformer layers needed)")
+
+    # Trace paths first so we can use them for the optimization targets
+    paths = analyzer.trace_critical_paths(max_paths=3)
+
+    # Depth histogram (condensed)
+    hist = analyzer.get_depth_histogram()
+    depths = sorted(hist.keys())
+    if depths:
+        # Show a condensed sparkline-style histogram
+        max_count = max(hist.values())
+        bars = []
+        for d in range(0, max(depths) + 1, max(1, len(depths) // 20)):
+            # Average count in this bucket
+            bucket = [hist.get(i, 0) for i in range(d, min(d + max(1, len(depths) // 20), max(depths) + 1))]
+            avg = sum(bucket) / len(bucket) if bucket else 0
+            level = int(8 * avg / max_count) if max_count > 0 else 0
+            bars.append("▁▂▃▄▅▆▇█"[min(level, 7)])
+        print(f"\n  Depth distribution: [{''.join(bars)}] 0→{max(depths)}")
+
+    # Show one representative critical path breakdown
+    if paths:
+        path = paths[0]
+        real_ops = _count_real_ops(path)
+        print(f"\n  One critical path: {real_ops} real ops (excluding Concatenate)")
+
+        # Break down by annotation for this path
+        chains = analyzer.find_contiguous_chains(path)
+        print(f"\n  {'Annotation':<35s} {'Ops':>8s} {'%':>8s}")
+        print(f"  {'─' * 35} {'─' * 8} {'─' * 8}")
+
+        for ann, start, length, nodes in sorted(chains, key=lambda x: -_count_real_ops(x[3])):
+            real_count = _count_real_ops(nodes)
+            if real_count > 0:
+                pct = 100.0 * real_count / real_ops if real_ops else 0
+                print(f"  {ann:<35s} {real_count:>8d} {pct:>7.1f}%")
+
+    # Optimization targets - find the longest contiguous chains across all paths
+    print(f"\n  {'─' * 68}")
+    print(f"  OPTIMIZATION TARGETS (longest contiguous chains)")
+    print(f"  {'─' * 68}")
+    print(f"  Contiguous chains of the same annotation are often single logical")
+    print(f"  operations that could potentially be restructured for parallelism.")
+
+    all_chains = []
+    for path in paths:
+        chains = analyzer.find_contiguous_chains(path)
+        for ann, start, length, nodes in chains:
+            real_count = _count_real_ops(nodes)
+            if real_count >= 3:  # Only show chains with 3+ real ops
+                all_chains.append((ann, real_count, nodes))
+
+    # Deduplicate and sort by real op count
+    seen = set()
+    unique_chains = []
+    for ann, real_count, nodes in sorted(all_chains, key=lambda x: -x[1]):
+        key = (ann, real_count, tuple(n.node_type() for n in nodes))
+        if key not in seen:
+            seen.add(key)
+            unique_chains.append((ann, real_count, nodes))
+
+    if unique_chains:
+        print(f"\n  {'Annotation':<30s} {'Ops':>6s}  {'Pattern':<30s}")
+        print(f"  {'─' * 30} {'─' * 6}  {'─' * 30}")
+        for ann, real_count, nodes in unique_chains[:10]:  # Top 10
+            pattern = _real_ops_type_summary(nodes)
+            if len(pattern) > 30:
+                pattern = pattern[:27] + "..."
+            print(f"  {ann:<30s} {real_count:>6d}  {pattern:<30s}")
+    else:
+        print(f"\n  No contiguous chains with 3+ ops found.")
+
+    # Detailed path trace (optional, show first path only)
+    if paths:
+        print(f"\n  Example critical path trace:")
+        path = paths[0]
+        real_ops_count = _count_real_ops(path)
+        print(f"  ({len(path)} nodes, {real_ops_count} real ops)")
+
+        chains = analyzer.find_contiguous_chains(path)
+        print()
+        for ann, start, length, nodes in sorted(chains, key=lambda x: x[1]):
+            real_count = _count_real_ops(nodes)
+            pattern = _real_ops_type_summary(nodes)
+            print(f"    [{ann}] {real_count} ops: {pattern}")
+
+    print()
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 
@@ -234,6 +524,9 @@ def main():
     n_layers_est = max(1, -(-total_alloc // layer_capacity))  # ceil division
 
     _print_summary(total_graph, total_alloc, n_layers_est, layer_capacity)
+
+    # Critical path analysis
+    _print_critical_path_analysis(all_nodes, {output, pos})
 
 
 if __name__ == "__main__":
