@@ -135,6 +135,53 @@ class TestGameGraph:
             f"angle={angle}: max pixel error {max_err:.3f} exceeds 0.5"
         )
 
+    @pytest.mark.parametrize("angle", [20, 45, 100, 160, 210])
+    def test_renders_oblique_angle(self, module, box_room, angle):
+        """Render from oblique angles where walls are not perpendicular
+        to the view direction.  Wall heights should vary per column
+        (closer side taller, farther side shorter).
+        """
+        config, textures, walls, segs, trig = box_room
+
+        inputs = PlayerInput()
+        state = GameState(x=0.0, y=0.0, angle=angle, move_speed=0.3, turn_speed=4)
+        frame, _ = step_frame(module, state, inputs, walls, config)
+        ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
+
+        max_err = np.abs(frame - ref).max()
+        mean_err = np.abs(frame - ref).mean()
+        print(f"\n  oblique angle={angle}: max_err={max_err:.3f}, mean_err={mean_err:.3f}")
+        assert max_err < 0.65, (
+            f"angle={angle}: max pixel error {max_err:.3f} exceeds 0.5"
+        )
+
+    @pytest.mark.parametrize("px,py,angle", [
+        (3.0, 2.0, 20),    # near corner, looking diagonally
+        (-2.0, 3.0, 240),  # off-center, looking at wall at steep angle
+        (1.0, -3.0, 50),   # off-center, oblique to two walls
+    ])
+    def test_renders_off_center_oblique(self, module, box_room, px, py, angle):
+        """Render from off-center positions at oblique angles.
+
+        This exercises the full precomputed pipeline with walls at
+        varying distances and angles across the screen — the near
+        side of a wall should be taller than the far side.
+        """
+        config, textures, walls, segs, trig = box_room
+
+        inputs = PlayerInput()
+        state = GameState(x=px, y=py, angle=angle, move_speed=0.3, turn_speed=4)
+        frame, _ = step_frame(module, state, inputs, walls, config)
+        ref = _ref_frame(px, py, angle, segs, config, textures)
+
+        max_err = np.abs(frame - ref).max()
+        mean_err = np.abs(frame - ref).mean()
+        print(f"\n  off-center ({px},{py}) angle={angle}: "
+              f"max_err={max_err:.3f}, mean_err={mean_err:.3f}")
+        assert max_err < 0.65, (
+            f"({px},{py}) angle={angle}: max pixel error {max_err:.3f} exceeds 0.5"
+        )
+
     # ── Collision detection tests ──────────────────────────────────
 
     def test_collision_blocks_wall(self, module, box_room):
