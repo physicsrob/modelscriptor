@@ -79,7 +79,7 @@ def forward_compile(
     device: Optional[str] = "auto",
     on_layer_compiled: Optional[Callable[[int, TransformerLayer], None]] = None,
     d_hidden: Optional[int] = None,
-    trim_heads: bool = True,
+    on_node_scheduled: Optional[Callable[[Node, int], None]] = None,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -95,9 +95,6 @@ def forward_compile(
         d_hidden: MLP hidden width per layer (the per-layer pool of
             ``L1->ReLU->L2`` neurons).  Independent of ``d``; defaults
             to ``d`` for backwards compatibility.
-        trim_heads: Remove unused attention heads after compilation.
-            Reduces attention compute and KV cache size proportionally.
-            Disable for debugging or head-level inspection.
         on_layer_compiled: Optional streaming hook, called with
             ``(layer_index, layer)`` after each layer's weights are fully
             written.  The callback may extract weight tensors and then
@@ -176,6 +173,7 @@ def forward_compile(
         if output_node in computed:
             break
 
+        prev_computed = set(computed) if on_node_scheduled else None
         occupied_before = d - residual_map.get_free_count()
 
         t_layer_start = time.perf_counter()
@@ -186,8 +184,6 @@ def forward_compile(
         )
         t_attn_start = time.perf_counter()
         write_attn_sublayer(layer, attn_ops, residual_map, pos_encoding)
-        if trim_heads:
-            layer.attn.attn.trim_unused_heads()
         t_mlp_start = time.perf_counter()
         write_mlp_sublayer(layer, mlp_ops, residual_map, set(biased_linears))
         t_layer_end = time.perf_counter()
@@ -205,6 +201,10 @@ def forward_compile(
                 if all(leaf in computed for leaf in flatten_concat_nodes([node])):
                     computed.add(node)
 
+        if on_node_scheduled is not None:
+            for node in computed - prev_computed:
+                on_node_scheduled(node, i)
+
         layer_params = _count_layer_params(attn_ops, mlp_ops, d, d_head)
         total_params += layer_params
         occupied_after = d - residual_map.get_free_count()
@@ -214,14 +214,11 @@ def forward_compile(
             pct_params = 100 * layer_params / layer_capacity if layer_capacity else 0
             pct_before = 100 * occupied_before // d
             pct_after = 100 * occupied_after // d
-            trimmed_heads = layer.attn.attn.n_heads
-            max_heads = d // d_head
             print(
                 f"  {i:<8} {n_ops:>5} ops  "
                 f"{layer_params:>9,}/{layer_capacity:,} ({pct_params:>4.1f}%)  "
                 f"{occupied_before:>6}/{d} ({pct_before:>2}%)  "
                 f"{occupied_after:>6}/{d} ({pct_after:>2}%)  "
-                f"heads {trimmed_heads}/{max_heads}  "
                 f"{layer_time*1000:>7.1f}ms "
                 f"(alloc {alloc_time*1000:.0f} sch {schedule_time*1000:.0f} "
                 f"attn {attn_time*1000:.0f} mlp {mlp_time*1000:.0f})",
