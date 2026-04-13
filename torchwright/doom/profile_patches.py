@@ -346,11 +346,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--scene", choices=["box", "multi"], default="box")
     parser.add_argument("--wad", type=str, default="doom1.wad")
     parser.add_argument(
-        "--rows-per-patch",
+        "--chunk-size",
         type=int,
         nargs="+",
         default=None,
-        help="Patch heights to profile. Must divide --height. "
+        help="Chunk sizes to profile. "
              "Default: all divisors of --height (descending).",
     )
     parser.add_argument(
@@ -365,9 +365,6 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     H = args.height
     rps = args.chunk_size or _divisors(H)
-    for rp in rps:
-        if H % rp != 0:
-            parser.error(f"chunk_size={rp} does not divide --height={H}")
 
     trig_table = generate_trig_table()
     config = RenderConfig(
