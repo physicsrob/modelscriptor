@@ -2,6 +2,7 @@ import torch
 from torchwright import ops
 from torchwright.ops.arithmetic_ops import (
     add_const,
+    bool_to_01,
     clamp,
     relu_add,
     compare,
@@ -20,6 +21,26 @@ from torchwright.ops.arithmetic_ops import (
     reduce_max,
 )
 from torchwright.ops.inout_nodes import create_input
+
+
+def test_bool_to_01():
+    x = create_input("x", 1)
+    out = bool_to_01(x)
+    for x_val, expected in [(-1.0, 0.0), (1.0, 1.0)]:
+        result = out.compute(
+            n_pos=1, input_values={"x": torch.tensor([[x_val]])}
+        )
+        assert result.item() == expected
+
+
+def test_bool_to_01_wide():
+    x = create_input("x", 3)
+    out = bool_to_01(x)
+    result = out.compute(
+        n_pos=1,
+        input_values={"x": torch.tensor([[1.0, -1.0, 1.0]])},
+    )
+    assert result.tolist() == [[1.0, 0.0, 1.0]]
 
 
 def test_add_const():

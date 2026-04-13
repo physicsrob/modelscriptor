@@ -628,3 +628,48 @@ def test_compile_split_vo_different_inputs():
         input_values={"qk": torch.randn(4, 6), "v": torch.randn(4, 8)},
         max_layers=10,
     )
+
+
+def test_compile_attend_mean_where():
+    """attend_mean_where — uniform mean over valid positions."""
+    from torchwright.ops.attention_ops import attend_mean_where
+
+    pos = create_pos_encoding()
+    validity = create_input("validity", 1)
+    value = create_input("value", 3)
+    out = attend_mean_where(pos, validity, value)
+
+    n_pos = 5
+    _verify(
+        out,
+        n_pos=n_pos,
+        input_values={
+            "validity": torch.tensor([[1.0], [1.0], [-1.0], [1.0], [-1.0]]),
+            "value": torch.randn(n_pos, 3),
+        },
+        pos_encoding=pos,
+    )
+
+
+def test_compile_attend_argmax_dot():
+    """attend_argmax_dot — vector dot-product matching in attention."""
+    from torchwright.ops.attention_ops import attend_argmax_dot
+    from torchwright.ops.logic_ops import cond_gate
+
+    pos = create_pos_encoding()
+    qv = create_input("qv", 4)
+    kv = create_input("kv", 4)
+    value = create_input("value", 3)
+    out = attend_argmax_dot(pos, qv, kv, value, match_gain=200.0)
+
+    n_pos = 5
+    _verify(
+        out,
+        n_pos=n_pos,
+        input_values={
+            "qv": torch.randn(n_pos, 4),
+            "kv": torch.randn(n_pos, 4),
+            "value": torch.randn(n_pos, 3),
+        },
+        pos_encoding=pos,
+    )

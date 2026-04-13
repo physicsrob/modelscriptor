@@ -586,3 +586,173 @@ def attend_argmin_unmasked(
         value_matrix=value_matrix,
         output_matrix=output_matrix,
     )
+
+
+def attend_mean_where(
+    pos_encoding: PosEncoding,
+    validity: Node,
+    value: Node,
+) -> Node:
+    """Uniform mean of ``value`` across positions where ``validity`` is true.
+
+    At each query position, the attention returns the uniform average of
+    ``value`` over all causally-visible positions where ``validity`` is
+    +1.  Invalid positions (``validity`` = −1) receive a large negative
+    logit penalty and contribute negligibly to the output.
+
+    All valid positions share the same logit (no score term, no position
+    tiebreak), so softmax assigns them equal weight — producing an exact
+    mean rather than a weighted combination.
+
+    A typical use is reduce-any: map boolean flags to 0/1 with
+    :func:`~torchwright.ops.arithmetic_ops.bool_to_01`, average them
+    with this primitive, and threshold the result.
+
+    **When no position is valid.** The softmax still runs and produces a
+    weighted average over all positions — effectively garbage.  Callers
+    must ensure at least one valid position exists within the causal
+    window at every query position whose output is consumed.
+
+    Compile cost: exactly one vanilla attention head.  ``d_qk = 1``,
+    ``d_v = len(value)``.
+
+    Args:
+        pos_encoding: The graph's positional encoding node.
+        validity: 1D boolean node (+1 valid, −1 invalid).
+        value: Node to average.  ``len(value) <= pos_encoding.d_pos``.
+
+    Returns:
+        Attn node of width ``len(value)`` equal to the uniform mean of
+        ``value`` across valid key positions in the causal window.
+
+    See also:
+        :func:`attend_argmin_where` — selects one position (min score)
+        instead of averaging.
+    """
+    assert len(validity) == 1, "attend_mean_where expects a 1D boolean validity"
+    d_head = _assert_value_fits(pos_encoding, value)
+
+    # d_qk = 1: the only scoring column carries the validity bonus.
+    # Q reads from the slowest cosine of pos_encoding (stable ≈ 1).
+    # K reads only validity.  No tiebreak → all valid positions get
+    # the same logit → uniform softmax weights → exact mean.
+    d_qk = 1
+
+    query_matrix = torch.zeros((len(pos_encoding), d_qk))
+    query_matrix[-1, 0] = _QUERY_GAIN
+
+    key_in = Concatenate([pos_encoding, validity])
+    key_matrix = torch.zeros((len(key_in), d_qk))
+    key_matrix[-1, 0] = _VALIDITY_LARGE
+
+    value_matrix = torch.eye(len(value), d_head)
+    output_matrix = torch.eye(d_head, len(value))
+
+    return Attn(
+        query_in=pos_encoding,
+        key_in=key_in,
+        value_in=value,
+        query_matrix=query_matrix,
+        key_matrix=key_matrix,
+        value_matrix=value_matrix,
+        output_matrix=output_matrix,
+    )
+
+
+def attend_argmax_dot(
+    pos_encoding: PosEncoding,
+    query_vector: Node,
+    key_vector: Node,
+    value: Node,
+    match_gain: float = 200.0,
+) -> Node:
+    """Argmax of a vector dot-product score.
+
+    At each query position, the attention returns ``value`` at the
+    causal-window position whose ``key_vector`` has the highest dot
+    product with ``query_vector``.  Ties break toward the latest
+    (most recent) position.
+
+    The logit at key position ``i`` seen from query position ``j`` is
+
+        match_gain · (query_vector_j · key_vector_i)
+        + _QUERY_GAIN · _TIEBREAK_COEFF · pos_scalar_i
+
+    The match and tiebreak terms occupy separate ``d_qk`` columns, so
+    ``match_gain`` is independent of ``_QUERY_GAIN``.
+
+    **Type isolation.**  This primitive does not include a validity
+    parameter.  Callers should use
+    :func:`~torchwright.ops.logic_ops.cond_gate` to zero out
+    ``key_vector`` and ``value`` at non-participating positions.  A
+    zero ``key_vector`` produces a dot product of 0, well below
+    ``match_gain`` for any matching position — providing effective type
+    isolation without a separate validity signal.
+
+    Compile cost: exactly one vanilla attention head.  ``d_qk =
+    len(query_vector) + 1``, ``d_v = len(value)``.
+
+    Args:
+        pos_encoding: The graph's positional encoding node.
+        query_vector: Width-``W`` node at each query position (e.g. a
+            column one-hot mapped to 0/1 via ``bool_to_01``).
+        key_vector: Width-``W`` node at each key position (e.g. a
+            visibility mask in ±1).  Must have the same width as
+            ``query_vector``.
+        value: Node to read at the winning position.
+        match_gain: Coefficient applied to the dot-product term.
+
+    Returns:
+        Attn node of width ``len(value)`` equal to ``value`` at the
+        best-matching key position within the causal window.
+
+    See also:
+        :func:`attend_argmax_where` — scalar-score variant with
+        explicit validity.
+    """
+    assert len(query_vector) == len(key_vector), (
+        "query_vector and key_vector must have the same width "
+        f"(got {len(query_vector)} and {len(key_vector)})"
+    )
+    W = len(query_vector)
+    d_v = len(value)
+
+    # d_qk layout:
+    #   cols 0..W-1:  match dimensions (query_vector · key_vector)
+    #   col  W:       position tiebreak (latest wins)
+    d_qk = W + 1
+
+    position_scalar = pos_encoding.get_position_scalar()
+
+    # --- Query ---
+    # Columns 0..W-1: match_gain * query_vector[c]
+    # Column W: _QUERY_GAIN from the slowest cosine of pos_encoding
+    query_in = Concatenate([pos_encoding, query_vector])
+    query_matrix = torch.zeros((len(query_in), d_qk))
+    d_pos = pos_encoding.d_pos
+    for c in range(W):
+        query_matrix[d_pos + c, c] = match_gain
+    query_matrix[d_pos - 1, W] = _QUERY_GAIN
+
+    # --- Key ---
+    # Columns 0..W-1: key_vector[c] (identity)
+    # Column W: _TIEBREAK_COEFF * position_scalar (latest wins)
+    key_in = Concatenate([pos_encoding, key_vector, position_scalar])
+    key_matrix = torch.zeros((len(key_in), d_qk))
+    for c in range(W):
+        key_matrix[d_pos + c, c] = 1.0
+    key_matrix[d_pos + W, W] = _TIEBREAK_COEFF
+
+    # --- Value / Output: identity pass-through ---
+    value_matrix = torch.eye(d_v)
+    output_matrix = torch.eye(d_v)
+
+    return Attn(
+        query_in=query_in,
+        key_in=key_in,
+        value_in=value,
+        query_matrix=query_matrix,
+        key_matrix=key_matrix,
+        value_matrix=value_matrix,
+        output_matrix=output_matrix,
+    )

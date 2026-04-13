@@ -56,7 +56,7 @@ from torchwright.ops.arithmetic_ops import (
 )
 from torchwright.ops.attention_ops import attend_argmin_unmasked
 from torchwright.ops.inout_nodes import create_input, create_literal_value, create_pos_encoding
-from torchwright.ops.logic_ops import bool_all_true, bool_any_true, equals_vector
+from torchwright.ops.logic_ops import bool_all_true, bool_any_true, cond_gate, equals_vector
 from torchwright.ops.map_select import in_range, select
 
 from torchwright.doom.renderer import (
@@ -555,13 +555,8 @@ def build_game_graph(
 
     # Gate sorted values: zero at non-sorted positions
     # Render data: [sort_den, C, D, E, H_inv_num_t, tex_id] = 6 values
-    zeros_1 = create_literal_value(torch.zeros(1), name="z1")
-    zeros_6 = create_literal_value(torch.zeros(6), name="z6")
-    zeros_W = create_literal_value(torch.zeros(W), name="z_W")
-    gated_render_data = select(
-        is_sorted, Concatenate([sel_render, sel_tex_id]), zeros_6,
-    )
-    gated_dist = select(is_sorted, sel_dist, zeros_1)
+    gated_render_data = cond_gate(is_sorted, Concatenate([sel_render, sel_tex_id]))
+    gated_dist = cond_gate(is_sorted, sel_dist)
 
     # --- Visibility mask: column range where this wall is visible ---
     # Compute atan2 of each wall endpoint relative to the player, then
@@ -680,7 +675,7 @@ def build_game_graph(
     vis_hi = select(a_lt_b, col_b_c, col_a_c)
 
     vis_mask = in_range(vis_lo, vis_hi, W)
-    gated_vis_mask = select(is_sorted, vis_mask, zeros_W)
+    gated_vis_mask = cond_gate(is_sorted, vis_mask)
 
     is_sorted_01 = multiply_const(add_const(is_sorted, 1.0), 0.5)
 
@@ -706,7 +701,7 @@ def build_game_graph(
     col_p1 = add_const(col_idx, 1.0)
     col_onehot = in_range(col_idx, col_p1, W)
     col_onehot_01 = multiply_const(add_const(col_onehot, 1.0), 0.5)
-    gated_col_onehot = select(is_render, col_onehot_01, zeros_W)
+    gated_col_onehot = cond_gate(is_render, col_onehot_01)
     is_render_01 = multiply_const(add_const(is_render, 1.0), 0.5)
 
     # Render attention: visibility-masked nearest-wall selection.

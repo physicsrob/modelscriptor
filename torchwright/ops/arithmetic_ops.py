@@ -94,6 +94,22 @@ def multiply_const(inp: Node, scalar: float) -> Node:
     return Linear(inp, scalar * torch.eye(d), name="multiply_const")
 
 
+def bool_to_01(inp: Node) -> Node:
+    """Map a ±1 boolean node to 0/1.
+
+    Converts the torchwright boolean convention (+1 = true, −1 = false)
+    to a 0/1 scale (1 = true, 0 = false).  This is a free operation
+    (no MLP sublayers — two linear transforms).
+
+    Args:
+        inp (Node): Boolean node with values in {-1, +1}.
+
+    Returns:
+        Node: Node with values in {0, 1}.
+    """
+    return multiply_const(add_const(inp, 1.0), 0.5)
+
+
 def add_scaled_nodes(scale1: float, inp1: Node, scale2: float, inp2: Node) -> Node:
     """
     Computes the linear combination of two nodes using specified coefficients.

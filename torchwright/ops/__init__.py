@@ -4,6 +4,7 @@ from torchwright.ops.arithmetic_ops import (
     add_const,
     add_scaled_nodes,
     abs,
+    bool_to_01,
     ceil_int,
     compare,
     concat,
