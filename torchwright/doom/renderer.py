@@ -640,9 +640,6 @@ def _column_fill(
     H = config.screen_height
     if rows_per_patch is None:
         rows_per_patch = H
-    assert H % rows_per_patch == 0, (
-        f"screen_height {H} must be divisible by rows_per_patch {rows_per_patch}"
-    )
     if patch_row_start is None:
         patch_row_start = LiteralValue(torch.tensor([0.0]), name="patch_row_start_0")
 
@@ -741,9 +738,6 @@ def _textured_column_fill(
     H = config.screen_height
     if rows_per_patch is None:
         rows_per_patch = H
-    assert H % rows_per_patch == 0, (
-        f"screen_height {H} must be divisible by rows_per_patch {rows_per_patch}"
-    )
     if patch_row_start is None:
         patch_row_start = LiteralValue(torch.tensor([0.0]), name="patch_row_start_0")
 

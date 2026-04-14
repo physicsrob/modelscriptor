@@ -2,8 +2,8 @@
 
 Usage (via Makefile):
     make graph-stats
-    make graph-stats ARGS="--rows-per-patch 25"
-    make graph-stats ARGS="--scene multi --rows-per-patch 100"
+    make graph-stats ARGS="--chunk-size 25"
+    make graph-stats ARGS="--scene multi --chunk-size 100"
     make graph-stats ARGS="--d 4096 --d-head 128"
 
 Three levels of parameter accounting:
@@ -42,9 +42,11 @@ from collections import defaultdict, deque
 from itertools import groupby
 from typing import Dict, List, Set, Tuple
 
+from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.utils import get_ancestor_nodes
+from torchwright.doom.compile import compute_min_d_head
 from torchwright.doom.game_graph import build_game_graph
-from torchwright.graph import Attn, Node, Concatenate
+from torchwright.graph import Add, Attn, Concatenate, Node
 from torchwright.graph.linear import Linear
 from torchwright.graph.relu import ReLU
 from torchwright.reference_renderer.scenes import (
@@ -91,28 +93,79 @@ def _estimate_allocated_params(node: Node, d: int, d_head: int) -> int:
     return 0
 
 
-def _collect_stats(all_nodes, d, d_head):
+def _collect_stats(all_nodes, d, d_head, node_to_layer=None):
     """Collect per-annotation stats from a set of graph nodes."""
-    stats = defaultdict(lambda: {"nodes": 0, "graph_params": 0, "alloc_params": 0})
+    # Build consumer map so we can detect LRL chain membership
+    consumers = defaultdict(set)
+    for node in all_nodes:
+        for inp in node.inputs:
+            consumers[inp.node_id].add(node)
+
+    # Linears that are part of Linear→ReLU→Linear chains (compiled as MLP,
+    # not attention).  Linear1 feeds a ReLU; Linear2 reads from a ReLU.
+    lrl_linears: set = set()
+    for node in all_nodes:
+        if isinstance(node, ReLU):
+            if node.inputs and isinstance(node.inputs[0], Linear):
+                lrl_linears.add(node.inputs[0].node_id)
+            for consumer in consumers.get(node.node_id, set()):
+                if isinstance(consumer, Linear):
+                    lrl_linears.add(consumer.node_id)
+
+    stats = defaultdict(lambda: {
+        "nodes": 0, "graph_params": 0, "alloc_params": 0,
+        "neurons": 0, "heads": 0, "layers": set(),
+    })
     for node in all_nodes:
         key = node.annotation or "(none)"
         stats[key]["nodes"] += 1
         stats[key]["graph_params"] += node.num_params()
         stats[key]["alloc_params"] += _estimate_allocated_params(node, d, d_head)
+
+        if isinstance(node, ReLU):
+            # ReLU width = hidden dimension of the LRL chain
+            stats[key]["neurons"] += len(node)
+        elif isinstance(node, Attn):
+            stats[key]["heads"] += (node.d_v + d_head - 1) // d_head
+        elif isinstance(node, Add):
+            # Add compiled as attention head(s)
+            stats[key]["heads"] += (len(node) + d_head - 1) // d_head
+        elif isinstance(node, Linear) and node.node_id not in lrl_linears:
+            # Standalone Linear (not part of LRL) → compiled as attention
+            d_input = len(node.inputs[0])
+            stats[key]["heads"] += (d_input + d_head - 1) // d_head
+
+        if node_to_layer and node.node_id in node_to_layer:
+            stats[key]["layers"].add(node_to_layer[node.node_id])
+
     return stats
 
 
-def _print_table(stats):
+def _fmt_layers(layer_set):
+    """Format a set of layer indices as 'min-max (count)' or '—'."""
+    if not layer_set:
+        return "—"
+    lo, hi = min(layer_set), max(layer_set)
+    n = len(layer_set)
+    return f"{lo:>3}-{hi:<3} ({n:>2})"
+
+
+def _print_table(stats, has_layers=False):
     """Print the annotation breakdown table with subtotals."""
     total_nodes = sum(s["nodes"] for s in stats.values())
     total_graph = sum(s["graph_params"] for s in stats.values())
     total_alloc = sum(s["alloc_params"] for s in stats.values())
+    total_neurons = sum(s["neurons"] for s in stats.values())
+    total_heads = sum(s["heads"] for s in stats.values())
 
     rows = sorted(stats.items())
 
+    layer_hdr = f"{'Layers':>14s} " if has_layers else ""
+    layer_sep = f"{'─' * 14} " if has_layers else ""
     print(f"\n  {'Annotation':<35s} {'Nodes':>7s} "
-          f"{'Graph params':>14s} {'Alloc params':>14s} {'Density':>8s}")
-    print(f"  {'─' * 35} {'─' * 7} {'─' * 14} {'─' * 14} {'─' * 8}")
+          f"{'Neurons':>9s} {'Heads':>7s} {layer_hdr}"
+          f"{'Graph params':>14s} {'Alloc params':>14s}")
+    print(f"  {'─' * 35} {'─' * 7} {'─' * 9} {'─' * 7} {layer_sep}{'─' * 14} {'─' * 14}")
 
     def top_level(item):
         return item[0].split("/")[0]
@@ -120,25 +173,28 @@ def _print_table(stats):
     for group_key, group_items in groupby(rows, key=top_level):
         group_list = list(group_items)
         for key, s in group_list:
-            density = (100.0 * s["graph_params"] / s["alloc_params"]
-                       if s["alloc_params"] else 0)
-            density_str = f"{density:.1f}%" if s["alloc_params"] else "—"
+            layer_col = f"{_fmt_layers(s['layers']):>14s} " if has_layers else ""
             print(f"  {key:<35s} {s['nodes']:>7,} "
-                  f"{s['graph_params']:>14,} {s['alloc_params']:>14,} "
-                  f"{density_str:>8s}")
+                  f"{s['neurons']:>9,} {s['heads']:>7,} {layer_col}"
+                  f"{s['graph_params']:>14,} {s['alloc_params']:>14,}")
         if len(group_list) > 1:
             gn = sum(s["nodes"] for _, s in group_list)
+            gneu = sum(s["neurons"] for _, s in group_list)
+            gh = sum(s["heads"] for _, s in group_list)
             gg = sum(s["graph_params"] for _, s in group_list)
             ga = sum(s["alloc_params"] for _, s in group_list)
-            density = 100.0 * gg / ga if ga else 0
-            density_str = f"{density:.1f}%" if ga else "—"
+            gl = set().union(*(s["layers"] for _, s in group_list))
+            layer_col = f"{_fmt_layers(gl):>14s} " if has_layers else ""
             print(f"  {'  ' + group_key + ' (total)':<35s} {gn:>7,} "
-                  f"{gg:>14,} {ga:>14,} {density_str:>8s}")
+                  f"{gneu:>9,} {gh:>7,} {layer_col}"
+                  f"{gg:>14,} {ga:>14,}")
         print()
 
-    density = 100.0 * total_graph / total_alloc if total_alloc else 0
+    all_layers = set().union(*(s["layers"] for s in stats.values()))
+    layer_col = f"{_fmt_layers(all_layers):>14s} " if has_layers else ""
     print(f"  {'TOTAL':<35s} {total_nodes:>7,} "
-          f"{total_graph:>14,} {total_alloc:>14,} {density:>7.1f}%")
+          f"{total_neurons:>9,} {total_heads:>7,} {layer_col}"
+          f"{total_graph:>14,} {total_alloc:>14,}")
 
     return total_nodes, total_graph, total_alloc
 
@@ -451,7 +507,7 @@ def main():
     parser.add_argument("--scene", default="box", choices=["box", "multi"])
     parser.add_argument("--width", type=int, default=120)
     parser.add_argument("--height", type=int, default=100)
-    parser.add_argument("--rows-per-patch", type=int, default=10)
+    parser.add_argument("--chunk-size", type=int, default=20)
     parser.add_argument("--tex-size", type=int, default=64)
     parser.add_argument("--max-walls", type=int, default=None)
     parser.add_argument("--d", type=int, default=2048,
@@ -478,11 +534,8 @@ def main():
     # Compute d_head the same way compile_game does
     d = args.d
     if args.d_head is None:
-        W = args.width
         tex_w = textures[0].shape[0]
-        tex_d_qk = 8 + tex_w + 1
-        render_d_qk = W + 2
-        min_d_head = max(render_d_qk, tex_d_qk)
+        min_d_head = compute_min_d_head(max_walls, tex_w)
         d_head = 1
         while d_head < min_d_head:
             d_head *= 2
@@ -501,29 +554,40 @@ def main():
     )
 
     print(f"Building graph: {args.scene} scene, {args.width}x{args.height}, "
-          f"rows_per_patch={args.rows_per_patch}, {len(textures)} textures, "
+          f"chunk_size={args.chunk_size}, {len(textures)} textures, "
           f"max_walls={max_walls}")
     print(f"Transformer config: d={d}, d_head={d_head}, d_hidden={d_hidden}, "
           f"n_heads={d // d_head}")
 
     output, pos = build_game_graph(
         config, textures, max_walls=max_walls, max_coord=max_coord,
-        rows_per_patch=args.rows_per_patch,
+        chunk_size=args.chunk_size,
     )
 
     all_nodes = get_ancestor_nodes({output, pos})
-    stats = _collect_stats(all_nodes, d, d_head)
 
-    print(f"\nGraph: {len(all_nodes):,} nodes")
-    total_nodes, total_graph, total_alloc = _print_table(stats)
+    # Compile to get actual layer assignments
+    print("Compiling...")
+    node_to_layer: dict = {}
+    def _track(node, layer_idx):
+        node_to_layer[node.node_id] = layer_idx
 
-    # Estimate layer count: total allocated / layer capacity, rounded up.
-    # This is a rough estimate — the actual compiler may use more or fewer
-    # layers depending on scheduling constraints.
+    forward_compile(
+        d, d_head, output, pos,
+        verbose=False, max_layers=400,
+        d_hidden=d_hidden if d_hidden != 4 * d else None,
+        device=None,
+        on_node_scheduled=_track,
+    )
+    n_layers = max(node_to_layer.values()) + 1 if node_to_layer else 0
+
+    stats = _collect_stats(all_nodes, d, d_head, node_to_layer)
+
+    print(f"\nGraph: {len(all_nodes):,} nodes, compiled to {n_layers} layers")
+    total_nodes, total_graph, total_alloc = _print_table(stats, has_layers=True)
+
     layer_capacity = 4 * d * d + 2 * d * d_hidden + d_hidden + d
-    n_layers_est = max(1, -(-total_alloc // layer_capacity))  # ceil division
-
-    _print_summary(total_graph, total_alloc, n_layers_est, layer_capacity)
+    _print_summary(total_graph, total_alloc, n_layers, layer_capacity)
 
     # Critical path analysis
     _print_critical_path_analysis(all_nodes, {output, pos})

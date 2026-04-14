@@ -22,10 +22,15 @@ from torchwright.graph.relu import ReLU
 @dataclass
 class AttnHeadOp:
     op_type: Literal[
-        "compute_attn", "compute_linear", "compute_add", "cancel", "add_into"
+        "compute_attn", "compute_linear", "compute_add", "cancel", "add_into",
+        "delta_transfer"
     ]
     node: Node
     target_cols: List[int]
+    # For delta_transfer: source columns (where the output value is)
+    source_cols: List[int] = None
+    # For delta_transfer: subtract columns (same as target for overlay)
+    subtract_cols: List[int] = None
 
 
 @dataclass
@@ -61,6 +66,8 @@ def write_attn_sublayer(
             _write_compute_add(attn, op, residual_map, pos_encoding)
         elif op.op_type == "add_into":
             _write_add_into(attn, op, residual_map, pos_encoding)
+        elif op.op_type == "delta_transfer":
+            _write_delta_transfer(attn, op, residual_map, pos_encoding)
         else:
             raise ValueError(f"Unknown attn op_type: {op.op_type}")
 
@@ -358,6 +365,92 @@ def _write_add_into(
 
         v_mat = torch.eye(chunk_size, d_head)
         o_mat = torch.eye(d_head, chunk_size)
+
+        head = _allocate_head(attn)
+        _scatter_attn_head(
+            attn,
+            head,
+            pe_idx,
+            pe_idx,
+            v_chunk_idx,
+            o_chunk_idx,
+            q_mat,
+            k_mat,
+            v_mat,
+            o_mat,
+            d_head,
+        )
+
+
+def _write_delta_transfer(
+    attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
+):
+    """Transfer (source - subtract) to target columns via attention.
+
+    This operation computes: target_cols += (source_cols - subtract_cols)
+
+    After the skip connection, if target_cols originally held the same value
+    as subtract_cols (i.e., the input value), then:
+        result = original + (source - subtract)
+               = subtract + (source - subtract)
+               = source
+
+    This enables overlaid I/O where the output replaces the input in-place.
+
+    Uses two groups of attention heads:
+    - Group 1: Copy source_cols to target_cols with +1 coefficient
+    - Group 2: Copy subtract_cols to target_cols with -1 coefficient
+
+    Net effect: target_cols += source - subtract
+    """
+    assert op.source_cols is not None, "delta_transfer requires source_cols"
+    assert op.subtract_cols is not None, "delta_transfer requires subtract_cols"
+
+    d_head = attn.d_head
+    d_width = len(op.target_cols)
+
+    assert len(op.source_cols) == d_width
+    assert len(op.subtract_cols) == d_width
+
+    pe_idx = rmap.get_indices(pos_encoding)
+    q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
+
+    # Group 1: +1 coefficient (copy source to target)
+    for start in range(0, d_width, d_head):
+        end = min(start + d_head, d_width)
+        chunk_size = end - start
+
+        v_chunk_idx = op.source_cols[start:end]
+        o_chunk_idx = op.target_cols[start:end]
+
+        v_mat = torch.eye(chunk_size, d_head)
+        o_mat = torch.eye(d_head, chunk_size)  # +1 coefficient
+
+        head = _allocate_head(attn)
+        _scatter_attn_head(
+            attn,
+            head,
+            pe_idx,
+            pe_idx,
+            v_chunk_idx,
+            o_chunk_idx,
+            q_mat,
+            k_mat,
+            v_mat,
+            o_mat,
+            d_head,
+        )
+
+    # Group 2: -1 coefficient (subtract subtract_cols from target)
+    for start in range(0, d_width, d_head):
+        end = min(start + d_head, d_width)
+        chunk_size = end - start
+
+        v_chunk_idx = op.subtract_cols[start:end]
+        o_chunk_idx = op.target_cols[start:end]
+
+        v_mat = torch.eye(chunk_size, d_head)
+        o_mat = -torch.eye(d_head, chunk_size)  # -1 coefficient
 
         head = _allocate_head(attn)
         _scatter_attn_head(

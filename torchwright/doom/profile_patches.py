@@ -1,4 +1,4 @@
-"""Sweep rows_per_patch values and report compile-time stats.
+"""Sweep chunk_size values and report compile-time stats.
 
 Builds + compiles the DOOM game graph at several patch heights and
 prints a table showing:
@@ -218,7 +218,7 @@ def _profile_one(
     textures,
     config: RenderConfig,
     max_coord: float,
-    rows_per_patch: int,
+    chunk_size: int,
     d: int,
     d_head: int,
 ) -> dict:
@@ -227,7 +227,7 @@ def _profile_one(
         max_walls=max(8, len(segments)),
         max_coord=max_coord,
         move_speed=0.3, turn_speed=4,
-        rows_per_patch=rows_per_patch,
+        chunk_size=chunk_size,
     )
 
     buf = io.StringIO()
@@ -271,7 +271,13 @@ def _profile_one(
     peak_d = max(max(r[3], r[4]) for r in layer_rows)
     compile_time = sum(r[5] for r in layer_rows) / 1000.0
 
-    total_positions = config.screen_width * (config.screen_height // rows_per_patch)
+    # Render is autoregressive — step count is dynamic at runtime.
+    # For cost modeling, estimate max render steps (N_walls * W * ceil(H/cs)).
+    W = config.screen_width
+    H = config.screen_height
+    max_walls_est = max(8, len(segments))
+    max_render_steps = max_walls_est * W * ((H + chunk_size - 1) // chunk_size)
+    total_positions = max_render_steps
     cost = _cost_model(
         peak_d=peak_d,
         n_layers=n_layers,
@@ -280,8 +286,8 @@ def _profile_one(
     )
 
     return {
-        "rp": rows_per_patch,
-        "shards": config.screen_height // rows_per_patch,
+        "cs": chunk_size,
+        "chunks_per_col": (H + chunk_size - 1) // chunk_size,
         "positions": total_positions,
         "layers": n_layers,
         "peak_d": peak_d,
@@ -310,7 +316,7 @@ def _print_table(rows: List[dict]) -> None:
         f"  frame_s    = max(mem_s, compute_s)  — always mem_s on H100 at batch=1\n"
     )
     header = (
-        f"{'rp':>4}  {'shards':>6}  {'positions':>9}  "
+        f"{'cs':>4}  {'ch/col':>6}  {'positions':>9}  "
         f"{'peak_d':>7}  {'d_ship':>7}  {'dense_GB':>9}  "
         f"{'weight_s':>9}  {'kv_s':>8}  "
         f"{'compute_s':>10}  {'frame_s':>8}"
@@ -320,14 +326,14 @@ def _print_table(rows: List[dict]) -> None:
     for r in rows:
         if r.get("error"):
             print(
-                f"{r['rp']:>4}  {r['shards']:>6}  {r['positions']:>9}  "
+                f"{r['cs']:>4}  {r['chunks_per_col']:>6}  {r['positions']:>9}  "
                 f"{'—':>7}  {'—':>7}  {'—':>9}  "
                 f"{'—':>9}  {'—':>8}  {'—':>10}  {'—':>8}   ({r['error']})"
             )
             continue
         frame_s = max(r["compute_s"], r["mem_s"])
         print(
-            f"{r['rp']:>4}  {r['shards']:>6}  {r['positions']:>9}  "
+            f"{r['cs']:>4}  {r['chunks_per_col']:>6}  {r['positions']:>9}  "
             f"{r['peak_d']:>7}  {r['d_ship']:>7}  "
             f"{r['dense_gb']:>8.2f}G  "
             f"{r['weight_s']:>8.2f}s  {r['kv_s']:>7.2f}s  "
@@ -337,7 +343,7 @@ def _print_table(rows: List[dict]) -> None:
 
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Profile compile stats across rows_per_patch values",
+        description="Profile compile stats across chunk_size values",
     )
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--height", type=int, default=200)
@@ -346,11 +352,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--scene", choices=["box", "multi"], default="box")
     parser.add_argument("--wad", type=str, default="doom1.wad")
     parser.add_argument(
-        "--rows-per-patch",
+        "--chunk-size",
         type=int,
         nargs="+",
         default=None,
-        help="Patch heights to profile. Must divide --height. "
+        help="Chunk sizes to profile. "
              "Default: all divisors of --height (descending).",
     )
     parser.add_argument(
@@ -364,10 +370,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     H = args.height
-    rps = args.rows_per_patch or _divisors(H)
-    for rp in rps:
-        if H % rp != 0:
-            parser.error(f"rows_per_patch={rp} does not divide --height={H}")
+    rps = args.chunk_size or _divisors(H)
 
     trig_table = generate_trig_table()
     config = RenderConfig(
@@ -406,7 +409,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         try:
             row = _profile_one(
                 segments, textures, config, max_coord,
-                rows_per_patch=rp,
+                chunk_size=rp,
                 d=args.d,
                 d_head=args.d_head,
             )
@@ -415,9 +418,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             # the sweep succeeds, which is the whole point of finding
             # the minimum-viable rp.
             results.append({
-                "rp": rp,
-                "shards": H // rp,
-                "positions": args.width * (H // rp),
+                "cs": rp,
+                "chunks_per_col": (H + rp - 1) // rp,
+                "positions": max(8, len(segments)) * args.width * ((H + rp - 1) // rp),
                 "layers": None,
                 "peak_d": None,
                 "layer_params": None,
