@@ -15,6 +15,9 @@ from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.scheduler import LayerScheduler
+from torchwright.compiler.forward.sibling_clusters import (
+    SiblingClusterAnalyzer,
+)
 from torchwright.compiler.forward.weight_writer import (
     AttnHeadOp,
     MLPOp,
@@ -82,6 +85,10 @@ def forward_compile(
     on_node_scheduled: Optional[Callable[[Node, int], None]] = None,
     trim_heads: bool = True,
     overlays: Optional[dict] = None,
+    admission_control: bool = False,
+    admission_budget_fraction: float = 0.4,
+    admission_min_chains: int = 4,
+    admission_min_peak_width: int = 32,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -133,7 +140,30 @@ def forward_compile(
     for node in input_nodes:
         residual_map.allocate(node)
     computed = set(input_nodes)
-    scheduler = LayerScheduler(graph, d, d_head, pos_encoding, d_hidden=d_hidden)
+
+    # Static sibling-cluster analysis for admission control.  When
+    # disabled or no clusters are found, the scheduler behaves exactly
+    # as it did before admission control was added.
+    clusters = None
+    if admission_control:
+        cluster_analyzer = SiblingClusterAnalyzer(
+            graph,
+            min_chains=admission_min_chains,
+            min_peak_width=admission_min_peak_width,
+        )
+        clusters = cluster_analyzer.analyze()
+        if verbose and not clusters.is_empty():
+            print(
+                f"  Admission control: {len(clusters.clusters)} cluster(s), "
+                f"{sum(len(c.chains) for c in clusters.clusters.values())} "
+                f"total chains"
+            )
+
+    scheduler = LayerScheduler(
+        graph, d, d_head, pos_encoding, d_hidden=d_hidden,
+        clusters=clusters,
+        admission_budget_fraction=admission_budget_fraction,
+    )
 
     # Save input indices before scheduling (scheduling may free/reassign them)
     input_indices: dict[Node, list[int]] = {

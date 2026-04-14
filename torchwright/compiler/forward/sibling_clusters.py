@@ -1,0 +1,340 @@
+"""Static detection of "sibling clusters" for scheduler admission control.
+
+A sibling cluster is a graph pattern where ``N ≥ min_chains`` parallel
+chains all feed a common N-way join (typically a ``Concatenate``).  Each
+chain has wide intermediate nodes (``≥ min_peak_width``) that persist
+until the chain's terminal node is placed.  If the scheduler admits too
+many sibling chains concurrently, their intermediates saturate the
+residual stream and force a long low-productivity "plateau" — see the
+optimization_guide §7 for background.
+
+This module runs once before scheduling and produces a
+:class:`SiblingClusters` descriptor that the :class:`LayerScheduler`
+consults to gate admission of new chains.
+
+Detection rules
+---------------
+
+For each candidate join node J (currently: ``Concatenate`` with
+``≥ min_chains`` inputs):
+
+    1. Compute, per input branch, the "backward-reachable" set of
+       non-``Concatenate`` nodes (traversing ``Concatenate`` inputs
+       transparently since they're never placed in the residual stream).
+    2. The branch-exclusive set = backward-reachable nodes that aren't
+       shared with any other branch of J.
+    3. Prune nodes whose direct consumers escape the exclusive set
+       (i.e., have any consumer outside ``exclusive ∪ {J}``,
+       modulo ``Concatenate`` transparency).
+    4. Skip MLP-chain-internal ReLU nodes when computing peak width —
+       their hidden slots are MLP-sublayer scratch, not residual
+       columns.
+    5. Accept the cluster iff ≥ ``min_chains`` branches survive and
+       the maximum branch peak-width ≥ ``min_peak_width``.
+
+Limitations
+-----------
+
+- Only ``Concatenate`` joins are detected.  Multi-input ``Add`` or
+  concat-fed ``Linear`` joins can be added later.
+- Exclusivity is strict: a node shared between two branches (even
+  indirectly) is excluded from both.  This misses valid clusters with
+  diamond dependencies but avoids mis-attributing shared work.
+- Peak width is a static max-over-nodes; it doesn't account for the
+  fact that some intermediates may be freed before the chain's peak
+  is reached.  Conservative = admission is slightly more aggressive
+  than optimal.
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
+
+from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+from torchwright.graph import Concatenate, Linear, Node
+from torchwright.graph.relu import ReLU
+
+
+@dataclass
+class ChainInfo:
+    """One parallel branch of a sibling cluster.
+
+    ``nodes`` is the set of branch-exclusive non-``Concatenate`` nodes.
+    ``terminal`` is the (non-``Concatenate``) node that feeds the join
+    directly — scheduling its placement marks the branch "completed"
+    and frees an in-flight slot.  ``peak_width`` is the max
+    residual-relevant width over ``nodes``.
+    """
+
+    chain_id: int
+    nodes: Set[Node]
+    terminal: Node
+    peak_width: int
+
+
+@dataclass
+class ClusterInfo:
+    cluster_id: int
+    join: Node
+    chains: List[ChainInfo]
+    peak_chain_width: int
+
+
+@dataclass
+class SiblingClusters:
+    """Analysis output consumed by the scheduler.
+
+    ``node_to_chain`` maps each branch-exclusive node to its
+    ``(cluster_id, chain_id)`` so the scheduler can look up in O(1)
+    whether a candidate node belongs to a gated cluster.
+
+    ``terminal_to_chain`` maps a branch's terminal node to its
+    ``(cluster_id, chain_id)`` so the scheduler can detect "branch
+    completed" transitions as terminals are scheduled.
+    """
+
+    clusters: Dict[int, ClusterInfo] = field(default_factory=dict)
+    node_to_chain: Dict[Node, Tuple[int, int]] = field(default_factory=dict)
+    terminal_to_chain: Dict[Node, Tuple[int, int]] = field(default_factory=dict)
+
+    def is_empty(self) -> bool:
+        return not self.clusters
+
+
+class SiblingClusterAnalyzer:
+    """Detects sibling clusters in a graph.
+
+    Parameters
+    ----------
+    graph
+        A :class:`GraphAnalyzer` over the target graph.
+    min_chains
+        Minimum number of parallel branches required to register a
+        cluster.  Default 4 — captures unrolled loops without firing on
+        small (2–3 way) joins that don't benefit from batching.
+    min_peak_width
+        Minimum per-branch peak intermediate width.  Default 32 —
+        excludes scalar-only branches where admission gating would
+        over-serialize with no pressure benefit.
+    """
+
+    def __init__(
+        self,
+        graph: GraphAnalyzer,
+        min_chains: int = 4,
+        min_peak_width: int = 32,
+    ):
+        self.graph = graph
+        self.min_chains = min_chains
+        self.min_peak_width = min_peak_width
+
+    def analyze(self) -> SiblingClusters:
+        result = SiblingClusters()
+        next_id = 0
+
+        for join in self._find_joins():
+            cluster = self._try_build_cluster(join, next_id)
+            if cluster is None:
+                continue
+            result.clusters[cluster.cluster_id] = cluster
+            for chain in cluster.chains:
+                key = (cluster.cluster_id, chain.chain_id)
+                for node in chain.nodes:
+                    # If a node ends up in multiple clusters (possible
+                    # if graph has unusual topology), first assignment
+                    # wins.  This is rare and the alternative
+                    # (double-counting) would over-gate.
+                    result.node_to_chain.setdefault(node, key)
+                result.terminal_to_chain.setdefault(chain.terminal, key)
+            next_id += 1
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Join discovery
+    # ------------------------------------------------------------------
+
+    def _find_joins(self):
+        for node in self.graph.get_all_nodes():
+            if isinstance(node, Concatenate) and len(node.inputs) >= self.min_chains:
+                yield node
+
+    # ------------------------------------------------------------------
+    # Per-join cluster construction
+    # ------------------------------------------------------------------
+
+    def _try_build_cluster(
+        self, join: Node, cluster_id: int
+    ) -> Optional[ClusterInfo]:
+        inputs = list(join.inputs)
+
+        # Step 1: per-input backward-reachable set (Concatenate-transparent).
+        per_input_reachable: List[Set[Node]] = [
+            self._backward_reachable(inp) for inp in inputs
+        ]
+
+        # Step 2: per-input exclusive set = reachable_i \ union_{j≠i} reachable_j.
+        chains: List[ChainInfo] = []
+        union_others_cache = self._union_others(per_input_reachable)
+        for idx, inp in enumerate(inputs):
+            exclusive = per_input_reachable[idx] - union_others_cache[idx]
+            # Filter out input nodes — they're always live and not
+            # candidates for admission gating.
+            exclusive = {n for n in exclusive if not self.graph.is_input_node(n)}
+            if not exclusive:
+                continue
+
+            # Step 3: prune nodes with external consumers.
+            exclusive = self._prune_external_consumers(exclusive, join)
+            if not exclusive:
+                continue
+
+            # Step 4: compute peak width, skipping MLP-chain-internal ReLUs.
+            widths = [
+                len(n) for n in exclusive if not self._is_chain_internal_relu(n)
+            ]
+            if not widths:
+                continue
+            peak = max(widths)
+
+            # Terminal = the branch's direct input to the join.  If inp
+            # is a Concatenate (nested Concatenate-into-Concatenate),
+            # fall back to the widest exclusive node — the scheduler
+            # can handle either.
+            terminal = inp if inp in exclusive else max(exclusive, key=len)
+
+            chains.append(
+                ChainInfo(
+                    chain_id=len(chains),
+                    nodes=exclusive,
+                    terminal=terminal,
+                    peak_width=peak,
+                )
+            )
+
+        # Step 5: cluster acceptance.
+        if len(chains) < self.min_chains:
+            return None
+        peak_chain_width = max(c.peak_width for c in chains)
+        if peak_chain_width < self.min_peak_width:
+            return None
+
+        return ClusterInfo(
+            cluster_id=cluster_id,
+            join=join,
+            chains=chains,
+            peak_chain_width=peak_chain_width,
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _backward_reachable(self, start: Node) -> Set[Node]:
+        """All non-Concatenate nodes reachable backward from ``start``.
+
+        Concatenates are transparent: walked through but not included
+        in the result.  The start node itself is included (unless it's
+        a Concatenate, in which case its children are).
+        """
+        result: Set[Node] = set()
+        visited: Set[Node] = set()
+        stack: List[Node] = [start]
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            if not isinstance(cur, Concatenate):
+                result.add(cur)
+            for inp in cur.inputs:
+                stack.append(inp)
+        return result
+
+    def _union_others(
+        self, per_input_reachable: List[Set[Node]]
+    ) -> List[Set[Node]]:
+        """For each index i, return the union of all other reachable sets."""
+        out: List[Set[Node]] = []
+        for i, _ in enumerate(per_input_reachable):
+            u: Set[Node] = set()
+            for j, s_j in enumerate(per_input_reachable):
+                if j != i:
+                    u |= s_j
+            out.append(u)
+        return out
+
+    def _prune_external_consumers(
+        self, exclusive: Set[Node], join: Node
+    ) -> Set[Node]:
+        """Iteratively drop nodes with consumers outside ``exclusive ∪ {join}``.
+
+        Concatenates on the consumer side are walked through: a node n
+        whose immediate consumer is a Concatenate C is fine iff all of
+        C's downstream non-Concatenate consumers are in the exclusive
+        set or are the join.
+        """
+        valid_downstream_cache: Dict[Node, bool] = {}
+
+        def is_valid(node: Node, within: Set[Node]) -> bool:
+            if node is join:
+                return True
+            if node in within:
+                return True
+            if not isinstance(node, Concatenate):
+                return False
+            if node in valid_downstream_cache:
+                return valid_downstream_cache[node]
+            # Tentatively mark True to break cycles (DAG: won't happen,
+            # but defensive).  We'll finalize after checking.
+            valid_downstream_cache[node] = True
+            ok = all(is_valid(c, within) for c in self.graph.get_consumers(node))
+            valid_downstream_cache[node] = ok
+            return ok
+
+        # Pruning can invalidate the cache, so clear it each iteration.
+        while True:
+            valid_downstream_cache.clear()
+            to_remove: Set[Node] = set()
+            for n in exclusive:
+                for c in self.graph.get_consumers(n):
+                    if not is_valid(c, exclusive):
+                        to_remove.add(n)
+                        break
+            if not to_remove:
+                break
+            exclusive -= to_remove
+        return exclusive
+
+    def _is_chain_internal_relu(self, node: Node) -> bool:
+        """True if ``node`` is a ReLU that will be absorbed into an MLP chain.
+
+        Mirrors the scheduler's :meth:`LayerScheduler._detect_chains`
+        acceptance criteria so widths are computed consistently.
+        """
+        if not isinstance(node, ReLU):
+            return False
+        if not node.inputs or not isinstance(node.inputs[0], Linear):
+            return False
+        effective = self._effective_consumers(node)
+        if len(effective) != 1:
+            return False
+        (cons,) = effective
+        if not isinstance(cons, Linear):
+            return False
+        return cons.inputs[0] is node
+
+    def _effective_consumers(self, node: Node) -> Set[Node]:
+        """Consumers of ``node``, walking through ``Concatenate``."""
+        result: Set[Node] = set()
+        stack = list(self.graph.get_consumers(node))
+        seen: Set[Node] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if isinstance(cur, Concatenate):
+                stack.extend(self.graph.get_consumers(cur))
+            else:
+                result.add(cur)
+        return result
