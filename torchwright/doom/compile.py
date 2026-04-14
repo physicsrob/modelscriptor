@@ -126,13 +126,36 @@ def compile_game(
     verbose: bool = True,
     chunk_size: int = 20,
     d_hidden: Optional[int] = None,
+    optimize: bool = True,
 ):
-    """Compile the game graph to a HeadlessTransformerModule."""
+    """Compile the game graph to a HeadlessTransformerModule.
+
+    Args:
+        optimize: Run graph optimization passes (Linear fusion) before
+            compilation. Fuses consecutive Linear nodes to reduce layers.
+    """
     graph_io, pos_encoding = build_game_graph(
         config, textures, max_walls, max_coord,
         move_speed, turn_speed,
         chunk_size=chunk_size,
     )
+
+    # Run graph optimizations (Linear fusion)
+    if optimize:
+        from torchwright.graph.optimize import fuse_consecutive_linears
+        # Collect all output nodes from both overlaid and overflow outputs
+        output_nodes = set(graph_io.overlaid_outputs.values())
+        output_nodes.update(graph_io.overflow_outputs.values())
+        output_nodes.add(pos_encoding)
+        total_fused = 0
+        while True:
+            fused = fuse_consecutive_linears(output_nodes, verbose=False)
+            if fused == 0:
+                break
+            total_fused += fused
+        if verbose and total_fused > 0:
+            print(f"Optimized: fused {total_fused} Linear pairs")
+
     if d_head is None:
         tex_w = textures[0].shape[0]
         min_d_head = compute_min_d_head(max_walls, tex_w)
