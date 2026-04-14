@@ -30,6 +30,7 @@ from dataclasses import dataclass
 import torch
 
 from torchwright.graph import Concatenate, Linear, Node, annotate
+from torchwright.graph.asserts import assert_distinct_across, assert_picked_from
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import (
     abs,
@@ -78,8 +79,11 @@ class SortedInputs:
     eos_py: Node
     eos_angle: Node
 
-    # Token-type flag (1.0 at SORTED_WALL positions).
+    # Token-type flags.  ``is_wall`` is consumed only by the attention
+    # assertions (keys-validity) — the argmin itself already ignores
+    # non-WALL positions via their sentinel scores.
     is_sorted: Node
+    is_wall: Node
 
     pos_encoding: PosEncoding
 
@@ -155,13 +159,39 @@ def build_sorted(
 
 
 def _argmin_and_derive(inputs: SortedInputs, max_walls: int):
-    """Pick the nearest unmasked wall + derive sort_rank + gate render data."""
+    """Pick the nearest unmasked wall + derive sort_rank + gate render data.
+
+    Two invariants are asserted around the argmin:
+
+    * ``sort_score`` values at WALL positions must be pairwise distinct
+      (``assert_distinct_across``) — tied ranks would make the softmax
+      blend walls.  This is the angle-192 class of bug; the check fires
+      at reference-eval time before the attention runs.
+    * The attention output must match exactly one ``sort_value`` row
+      from a valid (WALL) position (``assert_picked_from``).  Reference
+      math's exact softmax always picks; this assertion is for the
+      compile-side probe, where the piecewise-linear softmax can blend
+      near-ties.
+    """
+    # Pre-attention: scores at WALL positions must be pairwise distinct.
+    checked_score = assert_distinct_across(
+        inputs.sort_score, inputs.is_wall, margin=0.5,
+    )
+
     selected_sort = attend_argmin_unmasked(
         pos_encoding=inputs.pos_encoding,
-        score=inputs.sort_score,
+        score=checked_score,
         mask_vector=inputs.prev_mask,
         position_onehot=inputs.position_onehot,
         value=inputs.sort_value,
+    )
+
+    # Post-attention: result must match exactly one value row from a
+    # WALL position (within atol).  This rarely fires at reference eval
+    # but catches compile-side softmax blending via
+    # ``check_asserts_on_compiled``.
+    selected_sort = assert_picked_from(
+        selected_sort, inputs.sort_value, inputs.is_wall, atol=1e-2,
     )
     unpacked = unpack_wall_payload(selected_sort, max_walls)
     sel_wall_data = unpacked.wall_data

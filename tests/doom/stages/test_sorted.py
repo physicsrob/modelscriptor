@@ -58,6 +58,7 @@ def sorted_module():
     eos_py = create_input("eos_py", 1)
     eos_angle = create_input("eos_angle", 1)
     is_sorted = create_input("is_sorted", 1)
+    is_wall = create_input("is_wall", 1)
 
     out = build_sorted(
         SortedInputs(
@@ -69,6 +70,7 @@ def sorted_module():
             eos_py=eos_py,
             eos_angle=eos_angle,
             is_sorted=is_sorted,
+            is_wall=is_wall,
             pos_encoding=pos,
         ),
         config=_tiny_config(),
@@ -139,6 +141,7 @@ def test_argmin_picks_lowest_unmasked(sorted_module, scores, prev_mask, expected
             "prev_mask": prev_mask,
             "eos_px": 0.0, "eos_py": 0.0, "eos_angle": 0.0,
             "is_sorted": 0.0,
+            "is_wall": 1.0,
         })
     # One SORTED position reads the argmin.
     sorted_row = {
@@ -148,6 +151,7 @@ def test_argmin_picks_lowest_unmasked(sorted_module, scores, prev_mask, expected
         "prev_mask": prev_mask,
         "eos_px": 0.0, "eos_py": 0.0, "eos_angle": 0.0,
         "is_sorted": 1.0,
+        "is_wall": 0.0,
     }
     inputs = _pack(sorted_module, wall_rows + [sorted_row])
     with torch.no_grad():
@@ -179,6 +183,7 @@ def test_updated_mask_adds_selected_wall(sorted_module):
             "prev_mask": prev_mask,
             "eos_px": 0.0, "eos_py": 0.0, "eos_angle": 0.0,
             "is_sorted": 0.0,
+            "is_wall": 1.0,
         })
     sorted_row = {
         "sort_score": 99.0,
@@ -187,6 +192,7 @@ def test_updated_mask_adds_selected_wall(sorted_module):
         "prev_mask": prev_mask,
         "eos_px": 0.0, "eos_py": 0.0, "eos_angle": 0.0,
         "is_sorted": 1.0,
+        "is_wall": 0.0,
     }
     inputs = _pack(sorted_module, wall_rows + [sorted_row])
     with torch.no_grad():
@@ -202,3 +208,33 @@ def test_updated_mask_adds_selected_wall(sorted_module):
     assert updated_mask[1] > 0.75, f"bit 1 previously picked, got {updated_mask[1]:+.2f}"
     assert updated_mask[2] < 0.75, f"bit 2 should stay unmasked, got {updated_mask[2]:+.2f}"
     assert updated_mask[3] < 0.75, f"bit 3 should stay unmasked, got {updated_mask[3]:+.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Annotation checks — the inline Asserts in _argmin_and_derive
+# ---------------------------------------------------------------------------
+
+
+def test_tied_wall_scores_raise_at_reference_eval():
+    """Two WALL positions with equal sort_score should fire assert_distinct_across.
+
+    Builds a tiny subgraph that only reaches the ``assert_distinct_across``
+    wrapper — compiled end-to-end compilation is expensive and the assert
+    fires at reference-eval time anyway.  We run ``reference_eval``
+    directly on the asserted score node and expect an AssertionError
+    whose message names the offending rows.
+    """
+    from torchwright.debug.probe import reference_eval
+    from torchwright.graph.asserts import assert_distinct_across
+
+    sort_score = create_input("sort_score", 1)
+    is_wall = create_input("is_wall", 1)
+    checked = assert_distinct_across(sort_score, is_wall, margin=0.5)
+
+    # Two WALL rows with tied scores (1.0 and 1.1, margin 0.5 → tie).
+    input_values = {
+        "sort_score": torch.tensor([[1.0], [1.1], [99.0]]),
+        "is_wall":    torch.tensor([[1.0], [1.0], [0.0]]),
+    }
+    with pytest.raises(AssertionError, match=r"valid-subset rows"):
+        reference_eval(checked, input_values, n_pos=3)

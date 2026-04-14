@@ -211,6 +211,35 @@ class TestBspIntegration:
         ):
             assert required in input_names, f"missing input: {required}"
 
+    def test_module_metadata_includes_asserts(self, module) -> None:
+        """Assert nodes survive through compile_game and reach module.metadata.
+
+        The SORTED stage annotations (``assert_distinct_across`` +
+        ``assert_picked_from``) should register at least two Asserts,
+        plus the pre-existing ``assert_strictly_less`` at the sentinel
+        ordering — so we expect ≥ 3 entries.  This documents the
+        compiled module's invariant surface without trying to evaluate
+        each predicate against the compiled residual stream (the per-
+        step input reconstruction is non-trivial and out of scope for
+        this test).
+        """
+        from torchwright.graph.misc import Assert
+
+        asserts = module.metadata.get("asserts", [])
+        assert isinstance(asserts, list), (
+            f"expected 'asserts' metadata entry to be a list, got {type(asserts)}"
+        )
+        assert all(isinstance(a, Assert) for a in asserts), (
+            "'asserts' metadata must contain Assert nodes"
+        )
+        assert len(asserts) >= 3, (
+            f"expected ≥3 annotated invariants after compile_game; "
+            f"got {len(asserts)}.  Check that the SORTED stage's "
+            f"assert_distinct_across and assert_picked_from annotations "
+            f"survived through compile — and that collect_asserts is "
+            f"invoked before compile_headless strips them."
+        )
+
     def test_renders_box_room_via_subset(self, module, subset) -> None:
         """Using a real BSP-aware MapSubset, the compiled graph renders
         a plausible frame of the 4-wall box room."""
