@@ -25,6 +25,7 @@ from dataclasses import dataclass
 import torch
 
 from torchwright.graph import Node, annotate
+from torchwright.graph.asserts import assert_strictly_less
 from torchwright.ops.arithmetic_ops import (
     abs,
     add,
@@ -408,9 +409,17 @@ def _compute_bsp_rank(
     )
 
     # Non-wall positions get a strictly higher sentinel so they never
-    # tie with wall_index=0's tiebroken sentinel.
+    # tie with wall_index=0's tiebroken sentinel.  The ordering
+    # ``bsp_sentinel < nonwall_sentinel`` is load-bearing — if it flips,
+    # the SORTED argmin softmax-averages non-wall positions with
+    # unrenderable walls (cf. commit da101c4 in main).  Asserted with a
+    # 0.5 margin so the invariant can't silently drift under compiled
+    # noise.
     nonwall_sentinel = create_literal_value(
         torch.tensor([99.9]), name="nonwall_sentinel",
+    )
+    nonwall_sentinel = assert_strictly_less(
+        bsp_sentinel, nonwall_sentinel, margin=0.5,
     )
     return select(inputs.is_wall, bsp_rank_tiebroken, nonwall_sentinel)
 
