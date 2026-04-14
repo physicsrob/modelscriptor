@@ -256,22 +256,21 @@ def main():
         max_coord = 15.0
 
     if args.mode == "transformer":
-        from torchwright.doom.compile import (
-            compile_game, step_frame, segments_to_walls,
-        )
+        from torchwright.doom.compile import compile_game, step_frame
+        from torchwright.doom.map_subset import build_scene_subset
 
-        walls = segments_to_walls(segments)
-        print(f"Compiling game graph (walls-as-tokens, {len(walls)} walls)...")
+        print(f"Compiling game graph (walls-as-tokens, {len(segments)} walls)...")
         module = compile_game(
             config, textures,
-            max_walls=max(8, len(walls)),
+            max_walls=max(8, len(segments)),
             max_coord=max_coord,
             d=args.d,
             chunk_size=args.chunk_size,
         )
+        subset = build_scene_subset(segments, textures)
 
         def frame_fn(state, inputs):
-            return step_frame(module, state, inputs, walls, config,
+            return step_frame(module, state, inputs, subset, config,
                               textures=textures)
     else:
         def frame_fn(state, inputs):

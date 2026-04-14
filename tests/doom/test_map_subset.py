@@ -14,11 +14,17 @@ import pytest
 from torchwright.doom.map_subset import (
     BspNodeSubset,
     MapSubset,
+    _build_balanced_bsp,
     bsp_traversal_order,
+    build_scene_subset,
     load_map_subset,
     side_P,
 )
 from torchwright.doom.wad import WADReader
+from torchwright.reference_renderer.scenes import (
+    box_room_textured, multi_room_textured,
+)
+from torchwright.reference_renderer.types import Segment
 
 
 # E1M1's canonical player spawn (Doomguy, THING type 1).  We don't
@@ -511,3 +517,151 @@ def test_synthetic_box_rank_matches_traversal() -> None:
             f"at ({px}, {py}): got {computed}, expected {reference}\n"
             f"ranks: {ranks}"
         )
+
+
+# ---------------------------------------------------------------------------
+# build_scene_subset — axis-aligned balanced BSP for hand-authored scenes
+# ---------------------------------------------------------------------------
+
+
+def _traverse_scene_tree(root, px: float, py: float) -> List[int]:
+    """Front-to-back DFS of an in-memory ``_BspTreeNode`` tree.
+
+    Returns seg indices in DOOM traversal order: at each internal node
+    visit the player-side subtree first, then the other side.  This is
+    the ground-truth comparator for rank-based sorting on a scene.
+    """
+    out: List[int] = []
+
+    def visit(node) -> None:
+        if node.is_leaf:
+            out.append(node.seg_idx)
+            return
+        raw = node.plane.nx * px + node.plane.ny * py + node.plane.d
+        if raw > 0:
+            visit(node.front)
+            visit(node.back)
+        else:
+            visit(node.back)
+            visit(node.front)
+
+    visit(root)
+    return out
+
+
+def _rank_order_scene(subset: MapSubset, px: float, py: float) -> List[int]:
+    """Sort segs by rank at (px, py); return seg indices in rank order."""
+    M = subset.seg_bsp_coeffs.shape[1]
+    side_P_vec = np.zeros(M, dtype=np.float64)
+    for i, plane in enumerate(subset.bsp_nodes):
+        side_P_vec[i] = float(side_P(plane, px, py))
+    ranks = subset.seg_bsp_coeffs @ side_P_vec + subset.seg_bsp_consts
+    seg_idx_arr = np.arange(len(subset.segments))
+    order = np.lexsort((seg_idx_arr, ranks))
+    return [int(i) for i in order]
+
+
+def test_build_scene_subset_nonempty() -> None:
+    """box_room scene builds a non-empty subset with real BSP nodes."""
+    segments, textures = box_room_textured(
+        wad_path="doom1.wad", tex_size=8,
+    )
+    subset = build_scene_subset(segments, textures)
+    assert len(subset.segments) == len(segments)
+    assert len(subset.bsp_nodes) == len(segments) - 1  # balanced BSP
+    assert subset.original_seg_indices == list(range(len(segments)))
+
+
+def test_build_scene_subset_coeffs_shape() -> None:
+    """Coefficient matrix has shape (N, max_bsp_nodes); exactly N-1
+    columns contain nonzero entries; the rest are pure zero padding."""
+    segments, textures = box_room_textured(
+        wad_path="doom1.wad", tex_size=8,
+    )
+    subset = build_scene_subset(segments, textures, max_bsp_nodes=16)
+    N = len(segments)
+    assert subset.seg_bsp_coeffs.shape == (N, 16)
+    real_nodes = len(subset.bsp_nodes)
+    assert real_nodes == N - 1
+    # Columns >= real_nodes are padding → all zeros
+    padding = subset.seg_bsp_coeffs[:, real_nodes:]
+    assert np.all(padding == 0.0)
+
+
+def test_build_scene_subset_rank_matches_python_traversal() -> None:
+    """Rank-sorted segs match a direct DFS of the built BSP tree.
+
+    This is the critical correctness test: if the coefficients are
+    right, the runtime rank formula must reproduce the same ordering
+    that a straightforward front-to-back BSP walk would produce.
+    """
+    segments, textures = box_room_textured(
+        wad_path="doom1.wad", tex_size=8,
+    )
+    subset = build_scene_subset(segments, textures, max_bsp_nodes=16)
+    # Rebuild the tree with the same construction logic for reference.
+    tree = _build_balanced_bsp(list(range(len(segments))), segments, depth=0)
+
+    test_positions = [
+        (0.0, 0.0),     # center
+        (3.0, 2.0),     # off-center
+        (-2.5, 4.0),    # another quadrant
+        (4.9, -4.9),    # near a corner
+    ]
+    for (px, py) in test_positions:
+        reference = _traverse_scene_tree(tree, px, py)
+        computed = _rank_order_scene(subset, px, py)
+        assert computed == reference, (
+            f"at ({px}, {py}): rank order {computed} != tree DFS {reference}"
+        )
+
+
+def test_build_scene_subset_multi_room() -> None:
+    """22-seg multi_room scene: 21 BSP nodes, rank well-defined."""
+    segments, textures = multi_room_textured(
+        wad_path="doom1.wad", tex_size=8,
+    )
+    assert len(segments) == 22
+    subset = build_scene_subset(segments, textures, max_bsp_nodes=48)
+    assert len(subset.bsp_nodes) == 21
+    assert subset.seg_bsp_coeffs.shape == (22, 48)
+
+    # Sample positions in each room; rank produces a permutation of
+    # 0..N-1.  (A valid traversal visits each seg exactly once.)
+    tree = _build_balanced_bsp(list(range(len(segments))), segments, depth=0)
+    for (px, py) in [(-8.0, 0.0), (8.0, 0.0), (0.0, 0.0)]:
+        computed = _rank_order_scene(subset, px, py)
+        reference = _traverse_scene_tree(tree, px, py)
+        assert computed == reference, f"at ({px},{py}): {computed} != {reference}"
+        assert sorted(computed) == list(range(22))
+
+
+def test_build_scene_subset_single_seg() -> None:
+    """N=1 edge case: no BSP nodes, zero coefficients, trivial rank."""
+    segments = [Segment(ax=0, ay=0, bx=1, by=0,
+                        color=(0.5, 0.5, 0.5), texture_id=0)]
+    textures = [np.zeros((8, 8, 3), dtype=np.float64)]
+    subset = build_scene_subset(segments, textures, max_bsp_nodes=16)
+    assert len(subset.bsp_nodes) == 0
+    assert subset.seg_bsp_coeffs.shape == (1, 16)
+    assert np.all(subset.seg_bsp_coeffs == 0.0)
+    assert np.all(subset.seg_bsp_consts == 0.0)
+
+
+def test_build_scene_subset_too_many_segs_raises() -> None:
+    """N > max_bsp_nodes + 1 is rejected with a helpful ValueError."""
+    # 8 segs would need 7 nodes; max_bsp_nodes=4 is too small.
+    segments = [
+        Segment(ax=i, ay=0, bx=i + 1, by=0,
+                color=(0.5, 0.5, 0.5), texture_id=0)
+        for i in range(8)
+    ]
+    textures: List[np.ndarray] = []
+    with pytest.raises(ValueError, match="max_bsp_nodes"):
+        build_scene_subset(segments, textures, max_bsp_nodes=4)
+
+
+def test_build_scene_subset_empty_raises() -> None:
+    """Empty segment list raises ValueError."""
+    with pytest.raises(ValueError, match="at least 1"):
+        build_scene_subset([], [], max_bsp_nodes=16)

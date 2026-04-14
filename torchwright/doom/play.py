@@ -21,15 +21,21 @@ from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
 
-def _make_alt_walls(half=5.0):
+def _make_alt_segments(half=5.0):
     """Build an alternative L-shaped room layout for level-swap demo."""
     return [
-        {"ax": half, "ay": -half, "bx": half, "by": 0.0, "tex_id": 0.0},
-        {"ax": half, "ay": 0.0, "bx": 0.0, "by": 0.0, "tex_id": 1.0},
-        {"ax": 0.0, "ay": 0.0, "bx": 0.0, "by": half, "tex_id": 2.0},
-        {"ax": 0.0, "ay": half, "bx": -half, "by": half, "tex_id": 3.0},
-        {"ax": -half, "ay": half, "bx": -half, "by": -half, "tex_id": 0.0},
-        {"ax": -half, "ay": -half, "bx": half, "by": -half, "tex_id": 1.0},
+        Segment(ax=half, ay=-half, bx=half, by=0.0,
+                color=(0.5, 0.5, 0.5), texture_id=0),
+        Segment(ax=half, ay=0.0, bx=0.0, by=0.0,
+                color=(0.5, 0.5, 0.5), texture_id=1),
+        Segment(ax=0.0, ay=0.0, bx=0.0, by=half,
+                color=(0.5, 0.5, 0.5), texture_id=2),
+        Segment(ax=0.0, ay=half, bx=-half, by=half,
+                color=(0.5, 0.5, 0.5), texture_id=3),
+        Segment(ax=-half, ay=half, bx=-half, by=-half,
+                color=(0.5, 0.5, 0.5), texture_id=0),
+        Segment(ax=-half, ay=-half, bx=half, by=-half,
+                color=(0.5, 0.5, 0.5), texture_id=1),
     ]
 
 
@@ -70,15 +76,14 @@ def play(
         sys.exit(1)
 
     if mode == "transformer":
-        from torchwright.doom.compile import (
-            compile_game, step_frame, segments_to_walls,
-        )
+        from torchwright.doom.compile import compile_game, step_frame
+        from torchwright.doom.map_subset import build_scene_subset
 
-        walls_a = segments_to_walls(segments)
-        walls_b = _make_alt_walls()
-        max_walls = max(8, len(walls_a), len(walls_b))
+        segments_a = segments
+        segments_b = _make_alt_segments()
+        max_walls = max(8, len(segments_a), len(segments_b))
 
-        print(f"Compiling game graph ({len(walls_a)} walls, max_walls={max_walls})...")
+        print(f"Compiling game graph ({len(segments_a)} walls, max_walls={max_walls})...")
         module = compile_game(
             config, textures,
             max_walls=max_walls,
@@ -86,13 +91,15 @@ def play(
             d=2048,
             chunk_size=chunk_size,
         )
-        current_walls = [walls_a]  # mutable container for level-swap
+        subset_a = build_scene_subset(segments_a, textures)
+        subset_b = build_scene_subset(segments_b, textures)
+        current_subset = [subset_a]  # mutable container for level-swap
 
         def frame_fn(state, inputs):
-            return step_frame(module, state, inputs, current_walls[0], config,
+            return step_frame(module, state, inputs, current_subset[0], config,
                               textures=textures)
     else:
-        current_walls = [None]
+        current_subset = [None]
         trig_table = config.trig_table
 
         def frame_fn(state, inputs):
@@ -123,11 +130,11 @@ def play(
                 if event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_l and mode == "transformer":
-                    if current_walls[0] is walls_a:
-                        current_walls[0] = walls_b
+                    if current_subset[0] is subset_a:
+                        current_subset[0] = subset_b
                         level_name = "B"
                     else:
-                        current_walls[0] = walls_a
+                        current_subset[0] = subset_a
                         level_name = "A"
                     print(f"Level swap → {level_name} (no recompile)")
 

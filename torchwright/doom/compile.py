@@ -37,7 +37,7 @@ from torchwright.doom.game_graph import (
     build_game_graph,
 )
 from torchwright.graph.spherical_codes import index_to_vector
-from torchwright.reference_renderer.types import RenderConfig, Segment
+from torchwright.reference_renderer.types import RenderConfig
 
 
 def print_graph_stats(output_node, pos_encoding=None):
@@ -85,18 +85,6 @@ def print_graph_stats(output_node, pos_encoding=None):
 
     print(f"  {'TOTAL':<35s} {total_nodes:>7,} {total_params:>12,} {'100.0%':>9s}")
     print()
-
-
-def segments_to_walls(segments: List[Segment]) -> List[dict]:
-    """Convert Segment objects to the wall dict format expected by step_frame."""
-    return [
-        {
-            "ax": seg.ax, "ay": seg.ay,
-            "bx": seg.bx, "by": seg.by,
-            "tex_id": float(seg.texture_id if seg.texture_id is not None else 0),
-        }
-        for seg in segments
-    ]
 
 
 def compute_min_d_head(max_walls: int, tex_w: int) -> int:
@@ -252,9 +240,9 @@ def step_frame(
     module,
     state: GameState,
     inputs: PlayerInput,
-    walls_or_subset,
+    subset,
     config: RenderConfig,
-    textures: List[np.ndarray] = None,
+    textures: Optional[List[np.ndarray]] = None,
 ) -> Tuple[np.ndarray, GameState]:
     """Run one frame via the multi-phase rollout.
 
@@ -262,13 +250,13 @@ def step_frame(
         module: Compiled module from :func:`compile_game`.
         state: Current game state (x, y, angle).
         inputs: Player inputs for this frame.
-        walls_or_subset: Either a :class:`~torchwright.doom.map_subset.MapSubset`
-            (preferred; carries BSP structure) or a list of wall dicts with
-            keys ``ax``, ``ay``, ``bx``, ``by``, ``tex_id`` (legacy; a
-            trivial BSP-less subset is synthesized internally).
+        subset: :class:`~torchwright.doom.map_subset.MapSubset` carrying
+            segments, BSP planes, and precomputed rank coefficients.
+            Build one with :func:`build_scene_subset` (hand-authored
+            scenes) or :func:`load_map_subset` (WAD maps).
         config: Render configuration.
         textures: List of texture arrays, each (tex_w, tex_h, 3).
-            Defaults to the subset's textures when a MapSubset is passed.
+            Defaults to the subset's textures.
 
     Returns:
         ``(frame, new_state)`` where frame is ``(H, W, 3)`` float32.
@@ -288,39 +276,19 @@ def step_frame(
     d_input values are laid out at input field offsets.  The host feeds
     ``output[:d_input]`` directly as the next input — no remapping.
     """
-    # Local import to avoid a circular dep at module-load time.
-    from torchwright.doom.map_subset import (
-        MapSubset, subset_from_walls_with_sort,
-    )
-
     max_walls = int(module.metadata.get("max_walls", 8))
     cs = int(module.metadata.get("chunk_size", 20))
     max_bsp_nodes = int(module.metadata.get("max_bsp_nodes", 48))
 
-    if isinstance(walls_or_subset, MapSubset):
-        subset = walls_or_subset
-        # Convert subset segments back to the wall-dict shape used by
-        # the prefill loop below.
-        walls = [
-            {"ax": s.ax, "ay": s.ay, "bx": s.bx, "by": s.by,
-             "tex_id": float(s.texture_id)}
-            for s in subset.segments
-        ]
-        if textures is None:
-            textures = subset.textures
-    else:
-        walls = list(walls_or_subset)
-        assert textures is not None, "textures is required (or pass a MapSubset)"
-        # Legacy path: synthesize a trivial MapSubset whose rank ≡
-        # old-style central-ray sort score, so the BSP-aware graph
-        # produces the same sort order as the pre-BSP graph did.
-        subset = subset_from_walls_with_sort(
-            walls, textures,
-            player_x=float(state.x), player_y=float(state.y),
-            player_angle=int(state.angle),
-            trig_table=config.trig_table,
-            max_bsp_nodes=max_bsp_nodes,
-        )
+    if textures is None:
+        textures = subset.textures
+
+    # The prefill loop below iterates walls as dicts; convert once.
+    walls = [
+        {"ax": s.ax, "ay": s.ay, "bx": s.bx, "by": s.by,
+         "tex_id": float(s.texture_id)}
+        for s in subset.segments
+    ]
 
     N = len(walls)
     H = config.screen_height

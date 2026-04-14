@@ -303,6 +303,208 @@ def _compute_coefficients(
 
 
 # ---------------------------------------------------------------------------
+# Synthetic BSP builder (hand-authored scenes)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _BspTreeNode:
+    """In-memory BSP tree node used by :func:`build_scene_subset`.
+
+    Either a leaf (``seg_idx`` set, ``plane``/``front``/``back`` None) or
+    an internal node (``plane``/``front``/``back`` set, ``seg_idx`` None).
+    """
+
+    seg_idx: Optional[int] = None
+    plane: Optional[BspNodeSubset] = None
+    front: Optional["_BspTreeNode"] = None
+    back: Optional["_BspTreeNode"] = None
+
+    @property
+    def is_leaf(self) -> bool:
+        return self.seg_idx is not None
+
+
+def _build_balanced_bsp(
+    seg_indices: List[int],
+    segments: List["Segment"],
+    depth: int = 0,
+) -> _BspTreeNode:
+    """Build an axis-aligned balanced BSP over ``seg_indices``.
+
+    At each internal node the split axis alternates (x when ``depth`` is
+    even, y when odd).  Segments are partitioned by midpoint: sorting
+    by the chosen axis, the lower half goes BACK, the upper half goes
+    FRONT.  Recursion continues until each leaf holds exactly one seg.
+
+    The split value placed in the plane is the midpoint between the two
+    boundary midpoints, so the geometric partition matches the
+    combinatorial one for axis-separable segs.  If many midpoints share
+    the same axis value, the geometric split may not be perfect — but
+    the rank formula only depends on the tree's combinatorial structure,
+    not on geometric fidelity, so this remains correct for sorting.
+    """
+    if len(seg_indices) == 1:
+        return _BspTreeNode(seg_idx=seg_indices[0])
+
+    axis = depth % 2  # 0 = x, 1 = y
+
+    def midpoint_axis(idx: int) -> float:
+        s = segments[idx]
+        if axis == 0:
+            return (s.ax + s.bx) * 0.5
+        return (s.ay + s.by) * 0.5
+
+    sorted_indices = sorted(seg_indices, key=midpoint_axis)
+    split_pos = len(sorted_indices) // 2
+    back = sorted_indices[:split_pos]
+    front = sorted_indices[split_pos:]
+
+    split_value = (midpoint_axis(back[-1]) + midpoint_axis(front[0])) * 0.5
+
+    if axis == 0:
+        plane = BspNodeSubset(nx=1.0, ny=0.0, d=-split_value)
+    else:
+        plane = BspNodeSubset(nx=0.0, ny=1.0, d=-split_value)
+
+    return _BspTreeNode(
+        plane=plane,
+        front=_build_balanced_bsp(front, segments, depth + 1),
+        back=_build_balanced_bsp(back, segments, depth + 1),
+    )
+
+
+def _flatten_bsp_tree(
+    root: _BspTreeNode, n_segs: int,
+) -> Tuple[
+    List[BspNodeSubset],
+    Dict[int, List[Tuple[int, int]]],
+    Dict[int, int],
+    Dict[int, int],
+]:
+    """Flatten an in-memory BSP tree into lookup tables.
+
+    Returns ``(bsp_nodes, paths, front_counts, back_counts)``:
+
+    - ``bsp_nodes``: planes of internal nodes, numbered 0..M-1 in the
+      order they are first visited.
+    - ``paths[seg_idx]``: path from root to the leaf containing seg
+      ``seg_idx``, as a list of ``(node_id, side)`` pairs where
+      ``side = 0`` means the traversal descended into the front child,
+      ``1`` into the back child.
+    - ``front_counts[node_id]`` / ``back_counts[node_id]``: number of
+      segs in each subtree (always covers every seg because every seg
+      is a leaf).
+    """
+    bsp_nodes: List[BspNodeSubset] = []
+    paths: Dict[int, List[Tuple[int, int]]] = {}
+    front_counts: Dict[int, int] = {}
+    back_counts: Dict[int, int] = {}
+
+    def visit(node: _BspTreeNode, current_path: List[Tuple[int, int]]) -> int:
+        if node.is_leaf:
+            paths[node.seg_idx] = list(current_path)
+            return 1
+        node_id = len(bsp_nodes)
+        bsp_nodes.append(node.plane)
+
+        current_path.append((node_id, 0))
+        fc = visit(node.front, current_path)
+        current_path.pop()
+
+        current_path.append((node_id, 1))
+        bc = visit(node.back, current_path)
+        current_path.pop()
+
+        front_counts[node_id] = fc
+        back_counts[node_id] = bc
+        return fc + bc
+
+    total = visit(root, [])
+    assert total == n_segs, (
+        f"flattened tree seg count {total} != expected {n_segs}"
+    )
+    return bsp_nodes, paths, front_counts, back_counts
+
+
+def _compute_scene_coefficients(
+    n_segs: int,
+    paths: Dict[int, List[Tuple[int, int]]],
+    front_counts: Dict[int, int],
+    back_counts: Dict[int, int],
+    max_bsp_nodes: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build the ``(N, max_bsp_nodes)`` coefficient matrix and consts.
+
+    Same formula as :func:`_compute_coefficients` but keyed directly by
+    seg index (``0..N-1``) with node IDs already in ``[0, M-1]`` — no
+    subsector / node-id remapping.  See that function's docstring for
+    the derivation.
+    """
+    coeffs = np.zeros((n_segs, max_bsp_nodes), dtype=np.float64)
+    consts = np.zeros(n_segs, dtype=np.float64)
+    for seg_idx in range(n_segs):
+        for (node_id, side_W) in paths[seg_idx]:
+            if side_W == 0:
+                bc = back_counts[node_id]
+                coeffs[seg_idx, node_id] = -float(bc)
+                consts[seg_idx] += float(bc)
+            else:
+                fc = front_counts[node_id]
+                coeffs[seg_idx, node_id] = float(fc)
+    return coeffs, consts
+
+
+def build_scene_subset(
+    segments: List["Segment"],
+    textures: List[np.ndarray],
+    max_bsp_nodes: int = 48,
+) -> MapSubset:
+    """Build a :class:`MapSubset` from a hand-authored scene.
+
+    Constructs an axis-aligned balanced BSP over the segments' midpoints
+    (each seg becomes its own subsector/leaf).  The returned subset has
+    genuine BSP structure — sorting by rank reproduces DOOM's
+    front-to-back traversal on the synthetic tree.
+
+    Args:
+        segments: Scene walls.  Order is preserved as the output's
+            ``segments`` and ``original_seg_indices``.
+        textures: Texture atlas referenced by ``segment.texture_id``.
+        max_bsp_nodes: Width of the precomputed coefficient matrix.
+            Must be at least ``len(segments) - 1`` (a balanced BSP over
+            N leaves has N-1 internal nodes).
+
+    Raises:
+        ValueError: if ``segments`` is empty or the required BSP exceeds
+            ``max_bsp_nodes``.
+    """
+    N = len(segments)
+    if N == 0:
+        raise ValueError("build_scene_subset requires at least 1 segment")
+    if N - 1 > max_bsp_nodes:
+        raise ValueError(
+            f"scene has {N} segs ({N - 1} BSP nodes needed) but "
+            f"max_bsp_nodes={max_bsp_nodes}"
+        )
+
+    root = _build_balanced_bsp(list(range(N)), segments, depth=0)
+    bsp_nodes, paths, front_counts, back_counts = _flatten_bsp_tree(root, N)
+    coeffs, consts = _compute_scene_coefficients(
+        N, paths, front_counts, back_counts, max_bsp_nodes,
+    )
+    return MapSubset(
+        segments=list(segments),
+        textures=list(textures),
+        tex_name_to_id={},
+        bsp_nodes=bsp_nodes,
+        seg_bsp_coeffs=coeffs,
+        seg_bsp_consts=consts,
+        original_seg_indices=list(range(N)),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -460,160 +662,6 @@ def _reverse_lookup(d: Dict[str, int], value: int) -> str:
         if v == value:
             return k
     return "-"
-
-
-# ---------------------------------------------------------------------------
-# Trivial subsets (for test fixtures)
-# ---------------------------------------------------------------------------
-
-
-def make_trivial_subset(
-    segments: List["Segment"],
-    textures: List[np.ndarray],
-    max_bsp_nodes: int = 48,
-    tex_name_to_id: Optional[Dict[str, int]] = None,
-) -> MapSubset:
-    """Build a :class:`MapSubset` with **no BSP structure**.
-
-    All BSP coefficients are zero; per-seg constants are set to the
-    seg index, producing a deterministic sort order matching the
-    input order — regardless of player position.
-
-    This is **not BSP-correct** — it gives wrong occlusion order when
-    walls overlap on screen.  But for test scenes that rely on
-    non-overlapping walls (box rooms, simple multi-room), it
-    reproduces the previous distance-based sort behavior well enough
-    to keep regression tests stable while the graph transitions to
-    BSP-based ordering.
-    """
-    N = len(segments)
-    coeffs = np.zeros((N, max_bsp_nodes), dtype=np.float64)
-    # const_W = seg index → stable sort preserves input order
-    consts = np.arange(N, dtype=np.float64)
-    return MapSubset(
-        segments=list(segments),
-        textures=list(textures),
-        tex_name_to_id=dict(tex_name_to_id or {}),
-        bsp_nodes=[],
-        seg_bsp_coeffs=coeffs,
-        seg_bsp_consts=consts,
-        original_seg_indices=list(range(N)),
-    )
-
-
-def subset_from_walls(
-    walls: List[dict],
-    textures: List[np.ndarray],
-    max_bsp_nodes: int = 48,
-) -> MapSubset:
-    """Convert a list of wall dicts (old API) into a trivial MapSubset.
-
-    Accepts the ``[{"ax","ay","bx","by","tex_id"}, ...]`` shape used
-    by existing test fixtures and scene helpers.  The resulting
-    subset has no BSP structure — see :func:`make_trivial_subset`.
-    """
-    from torchwright.reference_renderer.types import Segment
-
-    segments = [
-        Segment(
-            ax=float(w["ax"]), ay=float(w["ay"]),
-            bx=float(w["bx"]), by=float(w["by"]),
-            color=(0.5, 0.5, 0.5),
-            texture_id=int(w.get("tex_id", -1)),
-        )
-        for w in walls
-    ]
-    return make_trivial_subset(segments, textures, max_bsp_nodes=max_bsp_nodes)
-
-
-def _central_ray_sort_scores(
-    walls: List[dict],
-    player_x: float,
-    player_y: float,
-    player_angle: int,
-    trig_table: np.ndarray,
-    sentinel: float = 99.0,
-) -> np.ndarray:
-    """Compute the pre-BSP distance-based sort scores per wall.
-
-    Reproduces the exact math previously in ``wall/sort_score`` in
-    ``game_graph.py``: for each wall the central viewing ray's
-    signed intersection distance (``t = num_t / den`` with positive
-    validity checks) is used as the sort score.  Invalid or behind-
-    player intersections get the sentinel (large) value.
-    """
-    cos_a = float(trig_table[player_angle % 256, 0])
-    sin_a = float(trig_table[player_angle % 256, 1])
-    scores = np.full(len(walls), sentinel, dtype=np.float64)
-    for i, w in enumerate(walls):
-        ax = float(w["ax"]); ay = float(w["ay"])
-        bx = float(w["bx"]); by = float(w["by"])
-        ex, ey = bx - ax, by - ay
-        fx = ax - player_x
-        gy = player_y - ay
-        den = ey * cos_a - ex * sin_a
-        num_t = ey * fx + ex * gy
-        if abs(den) < 0.05:
-            continue
-        # Mirror the graph's sign-adjustment so positive adj_num_t
-        # means "in front" irrespective of ``den``'s sign.
-        if den > 0:
-            adj_num_t, abs_den = num_t, den
-        else:
-            adj_num_t, abs_den = -num_t, -den
-        if adj_num_t <= 0.0:
-            continue
-        scores[i] = min(adj_num_t / abs_den, 1000.0)
-    return scores
-
-
-def subset_from_walls_with_sort(
-    walls: List[dict],
-    textures: List[np.ndarray],
-    player_x: float,
-    player_y: float,
-    player_angle: int,
-    trig_table: np.ndarray,
-    max_bsp_nodes: int = 48,
-) -> MapSubset:
-    """Build a trivial MapSubset whose ranks match the old distance sort.
-
-    Coefficients are zero (no BSP structure), but each wall's constant
-    is set to the central-ray sort score.  This preserves the sort
-    order produced by the old ``wall/sort_score`` block, so legacy
-    callers (tests, walkthrough, play) that pass only a wall list plus
-    player state still produce the same pixel output after BSP
-    integration.
-
-    Use this instead of :func:`subset_from_walls` when the caller has
-    access to the player's state and wants BSP-integration-era sort
-    correctness without building a real BSP tree.
-    """
-    from torchwright.reference_renderer.types import Segment
-
-    N = len(walls)
-    segments = [
-        Segment(
-            ax=float(w["ax"]), ay=float(w["ay"]),
-            bx=float(w["bx"]), by=float(w["by"]),
-            color=(0.5, 0.5, 0.5),
-            texture_id=int(w.get("tex_id", -1)),
-        )
-        for w in walls
-    ]
-    consts = _central_ray_sort_scores(
-        walls, player_x, player_y, player_angle, trig_table,
-    )
-    coeffs = np.zeros((N, max_bsp_nodes), dtype=np.float64)
-    return MapSubset(
-        segments=segments,
-        textures=list(textures),
-        tex_name_to_id={},
-        bsp_nodes=[],
-        seg_bsp_coeffs=coeffs,
-        seg_bsp_consts=consts,
-        original_seg_indices=list(range(N)),
-    )
 
 
 # ---------------------------------------------------------------------------
