@@ -1,19 +1,35 @@
-"""RENDER stage: per-column wall selection + height + texture + pixel fill.
+"""RENDER stage: chunked column fill + state machine for autoregressive loop.
 
-At each RENDER token (one per screen column, per patch row band) the
-graph:
+One RENDER token paints ``chunk_size`` vertical pixels of one screen
+column.  The wall being rendered is *not* picked here — it was chosen by
+the preceding THINKING token and its parameters arrive via the
+``render_feedback`` overlay (``fb_sort_den, fb_C, ...``).
 
-1. Attends over SORTED positions to pick the nearest **visible** wall
-   for this column (visibility mask dot-producted against a column
-   one-hot).  The wall's packed render precomputation + tex_id come
-   back as the attention value.
-2. Computes wall height from the precomputed ``H_inv`` and the
-   per-column horizontal angle offset.
-3. Computes the texture u-coordinate from the precomputed (D, E)
-   rotated-frame offsets.
-4. Attends over TEX_COL positions to fetch the ``tex_h * 3`` pixel
-   column matching this wall's (tex_id, column).
-5. Calls ``_textured_column_fill`` to paint the final patch-row pixels.
+Per-token flow:
+
+1. Derive the **active column**: if ``render_is_new_wall`` the column
+   resets to the wall's ``fb_col_lo``; otherwise it's ``render_col``.
+2. Compute wall height + texture u-coordinate using the feedback wall
+   data and the per-column angle offset.
+3. TEX_COL attention fetches the matching texture column pixels.
+4. Determine the **active chunk_start**: sentinel (-1) in the feedback
+   means "start at the wall's visible top"; otherwise continue from
+   ``render_chunk_start``.
+5. Fill ``chunk_size`` rows starting at ``active_start`` into the
+   column pixel strip.
+6. Compute state transitions — three exclusive cases:
+
+   * **more chunks**: ``active_start + cs < vis_bottom`` → stay on this
+     column, advance chunk_start by ``cs``.
+   * **advance col**: no more chunks, ``active_col + 1 ≤ fb_col_hi`` →
+     move to the next column, reset chunk_start sentinel.
+   * **advance wall**: no more chunks, no more columns → update
+     ``render_mask`` with ``fb_onehot``.  If all walls are masked, emit
+     ``done``.
+
+Next-token-type logic (``E8_THINKING`` on advance_wall, else
+``E8_RENDER``) is exposed separately so the orchestrator can compose
+it with the type selects for the other stages.
 """
 
 import math
@@ -32,6 +48,7 @@ from torchwright.ops.arithmetic_ops import (
     add_const,
     bool_to_01,
     clamp,
+    compare,
     floor_int,
     multiply_const,
     piecewise_linear,
@@ -40,12 +57,14 @@ from torchwright.ops.arithmetic_ops import (
     thermometer_floor_div,
 )
 from torchwright.ops.attention_ops import attend_argmax_dot
-from torchwright.ops.logic_ops import cond_gate
-from torchwright.ops.map_select import in_range
+from torchwright.ops.inout_nodes import create_literal_value
+from torchwright.ops.logic_ops import bool_all_true, bool_not, cond_gate
+from torchwright.ops.map_select import in_range, select
 from torchwright.reference_renderer.types import RenderConfig
 
-from torchwright.doom.graph_constants import DIFF_BP, TEX_E8_OFFSET
-from torchwright.doom.graph_utils import extract_from
+from torchwright.doom.graph_constants import (
+    DIFF_BP, E8_RENDER, E8_THINKING, TEX_E8_OFFSET,
+)
 from torchwright.doom.renderer import _textured_column_fill
 
 
@@ -56,30 +75,65 @@ from torchwright.doom.renderer import _textured_column_fill
 
 @dataclass
 class RenderInputs:
-    # Host-fed at RENDER positions.
-    col_idx: Node             # which screen column this token paints
-    patch_idx: Node           # which vertical patch band
-    texture_id_e8: Node       # host-fed (at TEX_COL positions)
-    tex_pixels: Node          # host-fed (at TEX_COL positions)
+    """Per-RENDER inputs.
+
+    Most fields come from ``render_feedback`` (an overlaid output).  The
+    orchestrator extracts each field from the packed feedback vector
+    before handing it here, so stage code stays flat.
+    """
+
+    # Iteration state (overlay).
+    render_mask: Node           # max_walls-wide, walls fully rendered so far
+    render_col: Node            # current column
+    render_is_new_wall: Node    # +1 if just transitioned to a new wall
+    render_chunk_start: Node    # current chunk start row; sentinel -1 = "new col"
+
+    # Wall data (overlay; populated by THINKING, forwarded by prior RENDER).
+    fb_sort_den: Node
+    fb_C: Node
+    fb_D: Node
+    fb_E: Node
+    fb_H_inv: Node
+    fb_tex_id: Node
+    fb_col_lo: Node
+    fb_col_hi: Node
+    fb_onehot: Node             # max_walls-wide
+
+    # TEX_COL inputs (host-fed at TEX_COL positions).
+    texture_id_e8: Node         # 8-wide
+    tex_pixels: Node
+
+    # TEX_COL stage output (per-TEX_COL-position one-hot).
+    tc_onehot_01: Node
 
     # Token-type flags.
     is_render: Node
-    is_sorted: Node
     is_tex_col: Node
-
-    # Outputs of the SORTED stage (per-SORTED-position Nodes, read via attention).
-    gated_render_data: Node
-    gated_vis_mask: Node
-
-    # Output of the TEX_COL stage (per-TEX_COL-position one-hot).
-    tc_onehot_01: Node
 
     pos_encoding: PosEncoding
 
 
 @dataclass
 class RenderOutputs:
-    pixels: Node              # rp * 3 floats, fills this column's pixel strip
+    """Outputs at RENDER positions.
+
+    * ``pixels`` / ``active_col`` / ``active_start`` / ``chunk_length``
+      land in overflow (host bitblits them to the framebuffer).
+    * ``next_render_feedback`` feeds back through the render_feedback
+      overlay on the next step.
+    * ``render_next_type`` is the next token type at RENDER positions:
+      ``E8_THINKING`` on advance_wall, else ``E8_RENDER``.
+    * ``done_flag`` signals to the host that all walls are fully
+      rendered (it can stop feeding RENDER tokens).
+    """
+
+    pixels: Node                # chunk_size * 3 floats
+    active_col: Node
+    active_start: Node
+    chunk_length: Node
+    done_flag: Node
+    next_render_feedback: Node
+    render_next_type: Node      # 8-wide: E8_THINKING or E8_RENDER
 
 
 # ---------------------------------------------------------------------------
@@ -91,39 +145,32 @@ def build_render(
     inputs: RenderInputs,
     config: RenderConfig,
     textures: List[np.ndarray],
-    rows_per_patch: int,
+    chunk_size: int,
     max_coord: float,
+    max_walls: int,
 ) -> RenderOutputs:
     H = config.screen_height
     W = config.screen_width
     fov = config.fov_columns
     tex_w, tex_h = textures[0].shape[0], textures[0].shape[1]
+    cs = chunk_size
 
-    with annotate("render/wall_attention"):
-        angle_offset, col_onehot_01 = _compute_column_features(
-            inputs.col_idx, W=W, fov=fov,
-        )
-        r_sort_den, r_C, r_D, r_E, r_H_inv, r_wall_tex = _attend_to_wall(
-            inputs.pos_encoding,
-            is_render=inputs.is_render,
-            is_sorted=inputs.is_sorted,
-            col_onehot_01=col_onehot_01,
-            gated_vis_mask=inputs.gated_vis_mask,
-            gated_render_data=inputs.gated_render_data,
-        )
+    with annotate("render/state_machine"):
+        active_col = select(inputs.render_is_new_wall, inputs.fb_col_lo, inputs.render_col)
+        angle_offset = _compute_angle_offset(active_col, W=W, fov=fov)
 
     with annotate("render/wall_height"):
         tan_o, tan_val_bp = _compute_angle_offset_tan(angle_offset, fov=fov)
         den_over_cos, abs_den_over_cos = _compute_den_over_cos(
-            r_sort_den, r_C, tan_o, tan_val_bp,
+            inputs.fb_sort_den, inputs.fb_C, tan_o, tan_val_bp,
         )
         wall_top, wall_bottom, wall_height = _compute_wall_height(
-            r_H_inv, abs_den_over_cos, H=H, max_coord=max_coord,
+            inputs.fb_H_inv, abs_den_over_cos, H=H, max_coord=max_coord,
         )
 
     with annotate("render/tex_coord"):
         tex_col_idx = _compute_texture_column(
-            r_D, r_E, tan_o, tan_val_bp,
+            inputs.fb_D, inputs.fb_E, tan_o, tan_val_bp,
             abs_den_over_cos, max_coord=max_coord, tex_w=tex_w,
         )
 
@@ -132,7 +179,7 @@ def build_render(
             inputs.pos_encoding,
             is_render=inputs.is_render,
             is_tex_col=inputs.is_tex_col,
-            r_wall_tex=r_wall_tex,
+            fb_tex_id=inputs.fb_tex_id,
             tex_col_idx=tex_col_idx,
             tc_onehot_01=inputs.tc_onehot_01,
             texture_id_e8=inputs.texture_id_e8,
@@ -142,73 +189,61 @@ def build_render(
         )
 
     with annotate("render/column_fill"):
-        patch_row_start = multiply_const(inputs.patch_idx, float(rows_per_patch))
-        pixels = _textured_column_fill(
-            wall_top, wall_bottom, wall_height,
-            tex_column_colors, tex_h, config, max_coord=max_coord,
-            patch_row_start=patch_row_start, rows_per_patch=rows_per_patch,
+        active_start, chunk_length, pixels = _chunk_fill(
+            wall_top, wall_bottom, wall_height, tex_column_colors,
+            render_chunk_start=inputs.render_chunk_start,
+            config=config, tex_h=tex_h, chunk_size=cs, max_coord=max_coord,
         )
 
-    return RenderOutputs(pixels=pixels)
+    with annotate("render/state_transitions"):
+        (
+            next_render_feedback,
+            done_flag,
+            render_next_type,
+        ) = _compute_next_state(
+            active_col=active_col,
+            active_start=active_start,
+            wall_bottom_clamped=clamp(wall_bottom, 0.0, float(H)),
+            render_mask=inputs.render_mask,
+            fb_onehot=inputs.fb_onehot,
+            fb_col_hi=inputs.fb_col_hi,
+            fb_sort_den=inputs.fb_sort_den,
+            fb_C=inputs.fb_C, fb_D=inputs.fb_D, fb_E=inputs.fb_E,
+            fb_H_inv=inputs.fb_H_inv, fb_tex_id=inputs.fb_tex_id,
+            fb_col_lo=inputs.fb_col_lo,
+            chunk_size=cs, max_walls=max_walls,
+        )
 
-
-# ---------------------------------------------------------------------------
-# Sub-computations
-# ---------------------------------------------------------------------------
-
-
-def _compute_column_features(col_idx: Node, *, W: int, fov: int):
-    """Per-column horizontal angle offset + column one-hot for wall attention."""
-    col_times_fov = multiply_const(col_idx, float(fov))
-    ao_raw = thermometer_floor_div(col_times_fov, W, fov * (W - 1))
-    angle_offset = add_const(ao_raw, float(-(fov // 2)))
-
-    col_p1 = add_const(col_idx, 1.0)
-    col_onehot_01 = bool_to_01(in_range(col_idx, col_p1, W))
-    return angle_offset, col_onehot_01
-
-
-def _attend_to_wall(
-    pos_encoding: PosEncoding,
-    *,
-    is_render: Node,
-    is_sorted: Node,
-    col_onehot_01: Node,
-    gated_vis_mask: Node,
-    gated_render_data: Node,
-):
-    """Argmax-dot attention to pick this column's visible wall.
-
-    Query: column one-hot (only nonzero at RENDER positions).
-    Key:   wall visibility mask + SORT_BIAS on is_sorted so ties break
-           toward SORTED positions.
-    """
-    VIS_GAIN = 500.0
-    SORT_BIAS = 100.0
-    render_attn = attend_argmax_dot(
-        pos_encoding,
-        query_vector=Concatenate([
-            cond_gate(is_render, col_onehot_01),
-            bool_to_01(is_render),
-        ]),
-        key_vector=Concatenate([
-            gated_vis_mask,
-            multiply_const(bool_to_01(is_sorted), SORT_BIAS),
-        ]),
-        value=gated_render_data,
-        match_gain=VIS_GAIN,
+    return RenderOutputs(
+        pixels=pixels,
+        active_col=active_col,
+        active_start=active_start,
+        chunk_length=chunk_length,
+        done_flag=done_flag,
+        next_render_feedback=next_render_feedback,
+        render_next_type=render_next_type,
     )
-    r_sort_den = extract_from(render_attn, 6, 0, 1, "r_sort_den")
-    r_C = extract_from(render_attn, 6, 1, 1, "r_C")
-    r_D = extract_from(render_attn, 6, 2, 1, "r_D")
-    r_E = extract_from(render_attn, 6, 3, 1, "r_E")
-    r_H_inv = extract_from(render_attn, 6, 4, 1, "r_H_inv")
-    r_wall_tex = extract_from(render_attn, 6, 5, 1, "r_tex")
-    return r_sort_den, r_C, r_D, r_E, r_H_inv, r_wall_tex
+
+
+# ---------------------------------------------------------------------------
+# Column features
+# ---------------------------------------------------------------------------
+
+
+def _compute_angle_offset(active_col: Node, *, W: int, fov: int) -> Node:
+    """Horizontal angle offset of ``active_col`` from the screen center (units: trig-table steps).
+
+    ``angle_offset = (active_col * fov / W) - fov/2``, implemented via
+    ``thermometer_floor_div`` so the result stays in the
+    piecewise-linear domain downstream uses.
+    """
+    col_times_fov = multiply_const(active_col, float(fov))
+    ao_raw = thermometer_floor_div(col_times_fov, W, fov * (W - 1))
+    return add_const(ao_raw, float(-(fov // 2)))
 
 
 def _compute_angle_offset_tan(angle_offset: Node, *, fov: int):
-    """tan(angle_offset) lookup, plus its breakpoints for the 2D product grids."""
+    """``tan(angle_offset)`` lookup, plus breakpoints for downstream 2D product grids."""
     half_fov = fov // 2
     tan_bp = [float(i) for i in range(-half_fov, half_fov + 1)]
     tan_o = piecewise_linear(
@@ -222,29 +257,32 @@ def _compute_angle_offset_tan(angle_offset: Node, *, fov: int):
 
 
 def _compute_den_over_cos(
-    r_sort_den: Node,
-    r_C: Node,
-    tan_o: Node,
-    tan_val_bp,
+    fb_sort_den: Node, fb_C: Node, tan_o: Node, tan_val_bp,
 ):
-    """den/cos = sort_den - C*tan(offset) — the horizontal projection factor."""
+    """``den/cos = sort_den - C*tan(offset)`` — per-column horizontal projection factor."""
     C_tan = piecewise_linear_2d(
-        r_C, tan_o, DIFF_BP, tan_val_bp,
+        fb_C, tan_o, DIFF_BP, tan_val_bp,
         lambda a, b: a * b, name="C_tan_o",
     )
-    den_over_cos = subtract(r_sort_den, C_tan)
+    den_over_cos = subtract(fb_sort_den, C_tan)
     abs_den_over_cos = abs(den_over_cos)
     return den_over_cos, abs_den_over_cos
 
 
+# ---------------------------------------------------------------------------
+# Wall height + texture coord
+# ---------------------------------------------------------------------------
+
+
 def _compute_wall_height(
-    r_H_inv: Node,
-    abs_den_over_cos: Node,
-    *,
-    H: int,
-    max_coord: float,
+    fb_H_inv: Node, abs_den_over_cos: Node, *, H: int, max_coord: float,
 ):
-    """Wall height = H_inv_num_t * |den/cos|, clamped; vertical span centered on H/2."""
+    """Wall height = H_inv * |den/cos|, clamped.  Wall span is centered on H/2.
+
+    Uses a log-spaced breakpoint grid for ``H_inv`` (values span ``0.01`` to
+    ``H/0.3``) because the division step produces a highly non-uniform
+    distribution.
+    """
     max_h_inv = float(H) / 0.3
     h_inv_n = 16
     h_inv_ratio = (max_h_inv / 0.01) ** (1.0 / (h_inv_n - 1))
@@ -256,7 +294,7 @@ def _compute_wall_height(
     doc_bp = [doc_max * i / 15 for i in range(16)]
 
     wall_height_raw = piecewise_linear_2d(
-        r_H_inv, abs_den_over_cos,
+        fb_H_inv, abs_den_over_cos,
         height_inv_bp, doc_bp,
         lambda a, b: a * b, name="wall_height_raw",
     )
@@ -276,21 +314,23 @@ def _compute_wall_height(
 
 
 def _compute_texture_column(
-    r_D: Node,
-    r_E: Node,
-    tan_o: Node,
-    tan_val_bp,
+    fb_D: Node, fb_E: Node, tan_o: Node, tan_val_bp,
     abs_den_over_cos: Node,
     *,
-    max_coord: float,
-    tex_w: int,
+    max_coord: float, tex_w: int,
 ) -> Node:
-    """Texture u-coordinate via (D + E*tan(offset)) / (den/cos), mapped to column index."""
+    """u-coordinate = ``(D + E*tan(offset)) / (den/cos)``, mapped to column index.
+
+    Known approximation: the final ratio goes through ``piecewise_linear_2d``
+    with a ``n/d`` lambda, which interpolates division bilinearly over a
+    grid — division isn't bilinear, so this drifts in the middle of each
+    grid cell.  Tracked by ``test_render.py::test_texture_column_division_known_bug``.
+    """
     E_tan = piecewise_linear_2d(
-        r_E, tan_o, DIFF_BP, tan_val_bp,
+        fb_E, tan_o, DIFF_BP, tan_val_bp,
         lambda a, b: a * b, name="E_tan_o",
     )
-    num_u_over_cos = add(r_D, E_tan)
+    num_u_over_cos = add(fb_D, E_tan)
     abs_nuc = abs(num_u_over_cos)
 
     doc_max = 2.5 * max_coord
@@ -312,7 +352,7 @@ def _attend_to_texture_column(
     *,
     is_render: Node,
     is_tex_col: Node,
-    r_wall_tex: Node,
+    fb_tex_id: Node,
     tex_col_idx: Node,
     tc_onehot_01: Node,
     texture_id_e8: Node,
@@ -320,9 +360,9 @@ def _attend_to_texture_column(
     num_tex: int,
     tex_w: int,
 ) -> Node:
-    """Argmax-dot attention from RENDER → TEX_COL matching (tex_id, col) keys."""
+    """Argmax-dot attention: RENDER token's (tex_id, col) → TEX_COL token's pixels."""
     tex_e8_query = piecewise_linear(
-        r_wall_tex,
+        fb_tex_id,
         [float(i) for i in range(num_tex)],
         lambda tid: [float(v) for v in
                      index_to_vector(int(round(tid)) + TEX_E8_OFFSET)],
@@ -344,3 +384,111 @@ def _attend_to_texture_column(
         value=cond_gate(is_tex_col, tex_pixels),
         match_gain=TEX_MATCH_GAIN,
     )
+
+
+# ---------------------------------------------------------------------------
+# Chunk fill + state transitions
+# ---------------------------------------------------------------------------
+
+
+def _chunk_fill(
+    wall_top: Node, wall_bottom: Node, wall_height: Node,
+    tex_column_colors: Node,
+    *,
+    render_chunk_start: Node,
+    config: RenderConfig,
+    tex_h: int,
+    chunk_size: int,
+    max_coord: float,
+):
+    """Determine active_start, chunk_length, and paint the chunk's pixels."""
+    H = config.screen_height
+    vis_top_render = clamp(wall_top, 0.0, float(H))
+    vis_bottom_render = clamp(wall_bottom, 0.0, float(H))
+
+    # Chunk-start sentinel: host writes -1 on "new column", meaning
+    # "start at the wall's visible top".
+    neg_half = create_literal_value(torch.tensor([-0.5]), name="neg_half")
+    is_new_col = compare(subtract(neg_half, render_chunk_start), 0.0)
+    active_start = select(is_new_col, vis_top_render, render_chunk_start)
+
+    chunk_length = clamp(
+        subtract(vis_bottom_render, active_start), 0.0, float(chunk_size),
+    )
+
+    pixels = _textured_column_fill(
+        wall_top, wall_bottom, wall_height,
+        tex_column_colors, tex_h, config, max_coord=max_coord,
+        patch_row_start=active_start, rows_per_patch=chunk_size,
+    )
+    return active_start, chunk_length, pixels
+
+
+def _compute_next_state(
+    *,
+    active_col: Node,
+    active_start: Node,
+    wall_bottom_clamped: Node,
+    render_mask: Node,
+    fb_onehot: Node,
+    fb_col_hi: Node,
+    fb_sort_den: Node, fb_C: Node, fb_D: Node, fb_E: Node,
+    fb_H_inv: Node, fb_tex_id: Node,
+    fb_col_lo: Node,
+    chunk_size: int,
+    max_walls: int,
+):
+    """Three-way state transition: more chunks / advance col / advance wall.
+
+    Emits ``next_render_feedback`` (packed state + forwarded wall data),
+    ``done_flag`` (set when the advance_wall transition completes the
+    last wall's mask bit), and ``render_next_type`` (E8_THINKING on
+    advance_wall, else E8_RENDER).
+    """
+    next_chunk_start_val = add_const(active_start, float(chunk_size))
+    has_more_chunks = compare(
+        subtract(wall_bottom_clamped, next_chunk_start_val), 0.5,
+    )
+
+    col_p1 = add_const(active_col, 1.0)
+    not_more_chunks = bool_not(has_more_chunks)
+    has_more_cols = compare(subtract(fb_col_hi, col_p1), 0.5)
+    advance_col = bool_all_true([not_more_chunks, has_more_cols])
+    advance_wall = bool_all_true([not_more_chunks, bool_not(has_more_cols)])
+
+    mask_with_new = add(render_mask, fb_onehot)
+    next_render_mask = select(advance_wall, mask_with_new, render_mask)
+
+    mask_sum = Linear(
+        mask_with_new, torch.ones(max_walls, 1), name="render_mask_sum",
+    )
+    all_walls_done = compare(mask_sum, max_walls - 0.5)
+    done_flag = bool_all_true([advance_wall, all_walls_done])
+
+    zero_col = create_literal_value(torch.tensor([0.0]), name="zero_col")
+    next_col_output = select(
+        has_more_chunks, active_col,
+        select(advance_col, col_p1, zero_col),
+    )
+    chunk_sentinel = create_literal_value(
+        torch.tensor([-1.0]), name="chunk_sentinel",
+    )
+    next_chunk = select(has_more_chunks, next_chunk_start_val, chunk_sentinel)
+
+    pos_one = create_literal_value(torch.tensor([1.0]), name="pos_one")
+    neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one")
+    next_is_new_wall = select(advance_wall, pos_one, neg_one)
+
+    render_next_type = select(
+        advance_wall,
+        create_literal_value(E8_THINKING, name="type_thinking"),
+        create_literal_value(E8_RENDER, name="type_render"),
+    )
+
+    next_render_feedback = Concatenate([
+        next_render_mask, next_col_output, next_is_new_wall, next_chunk,
+        fb_sort_den, fb_C, fb_D, fb_E, fb_H_inv, fb_tex_id,
+        fb_col_lo, fb_col_hi, fb_onehot,
+    ])
+
+    return next_render_feedback, done_flag, render_next_type

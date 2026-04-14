@@ -38,12 +38,19 @@ def _tiny_config() -> RenderConfig:
     )
 
 
+_MAX_BSP_NODES = 4
+
+
 @pytest.fixture(scope="module")
 def wall_collision_module():
-    """Compile just the collision-flag outputs of build_wall."""
+    """Compile just the collision-flag outputs of build_wall.
+
+    BSP inputs are passed in but their contribution doesn't reach the
+    collision outputs, so they won't actually be surfaced as ancestors
+    of the compiled subgraph.
+    """
     pos = create_pos_encoding()
 
-    # Same names build_wall expects via WallInputs.
     is_wall = create_input("is_wall", 1)
     move_cos = create_input("move_cos", 1)
     move_sin = create_input("move_sin", 1)
@@ -57,6 +64,9 @@ def wall_collision_module():
     wall_by = create_input("wall_by", 1)
     wall_index = create_input("wall_index", 1)
     wall_tex_id = create_input("wall_tex_id", 1)
+    wall_bsp_coeffs = create_input("wall_bsp_coeffs", _MAX_BSP_NODES)
+    wall_bsp_const = create_input("wall_bsp_const", 1)
+    side_P_vec = create_input("side_P_vec", _MAX_BSP_NODES)
 
     outputs = build_wall(
         WallInputs(
@@ -67,10 +77,14 @@ def wall_collision_module():
             is_wall=is_wall,
             vel_dx=vel_dx, vel_dy=vel_dy,
             move_cos=move_cos, move_sin=move_sin,
+            wall_bsp_coeffs=wall_bsp_coeffs,
+            wall_bsp_const=wall_bsp_const,
+            side_P_vec=side_P_vec,
         ),
         config=_tiny_config(),
         max_walls=_MAX_WALLS,
         max_coord=_MAX_COORD,
+        max_bsp_nodes=_MAX_BSP_NODES,
     )
     out = Concatenate([
         outputs.collision.hit_full,

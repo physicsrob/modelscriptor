@@ -101,8 +101,8 @@ class OnnxHeadlessModule:
         )
 
         # Discover KV cache topology from the ONNX graph's input spec.
-        # past_K_i inputs have shape (n_heads, n_past, d_head); the
-        # number of layers is the count of past_K_* entries.
+        # past_K_i inputs have shape (n_heads_i, n_past, d_head); after
+        # head trimming each layer may have a different head count.
         inputs = {inp.name: inp for inp in self._session.get_inputs()}
         self._n_layers = sum(
             1 for name in inputs if name.startswith("past_K_")
@@ -110,9 +110,10 @@ class OnnxHeadlessModule:
         assert self._n_layers > 0, (
             f"{onnx_path}: no past_K_* inputs — is this a cached-protocol model?"
         )
-        shape0 = inputs["past_K_0"].shape  # [n_heads, 'n_past', d_head]
-        self._n_heads = int(shape0[0])
-        self._d_head = int(shape0[2])
+        self._per_layer_n_heads = [
+            int(inputs[f"past_K_{i}"].shape[0]) for i in range(self._n_layers)
+        ]
+        self._d_head = int(inputs["past_K_0"].shape[2])
 
         # Cache the list of output names in the protocol order so we
         # can unpack session.run() results without another dict lookup.
@@ -122,9 +123,14 @@ class OnnxHeadlessModule:
 
     def empty_past(self) -> PastKV:
         """Zero-length past tensors suitable for a first prefill call."""
-        zeros = torch.zeros(self._n_heads, 0, self._d_head)
-        past_K = tuple(zeros.clone() for _ in range(self._n_layers))
-        past_V = tuple(zeros.clone() for _ in range(self._n_layers))
+        past_K = tuple(
+            torch.zeros(nh, 0, self._d_head)
+            for nh in self._per_layer_n_heads
+        )
+        past_V = tuple(
+            torch.zeros(nh, 0, self._d_head)
+            for nh in self._per_layer_n_heads
+        )
         return (past_K, past_V)
 
     def step(

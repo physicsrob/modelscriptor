@@ -11,8 +11,10 @@ Offsets into the packed payload (all widths in floats):
 
     [0 .. 5)            wall geometry       (ax, ay, bx, by, tex_id)
     [5 .. 10)           render precomputed  (sort_den, C, D, E, H_inv)
-    [10 .. 11)          center_ray_dist     (currently unused by SORTED;
-                                             preserved for behavior parity)
+    [10 .. 11)          bsp_rank            (the sort score — preserved in
+                                             the payload so SORTED can
+                                             forward it to downstream
+                                             consumers like THINKING)
     [11 .. 11+max_walls) position onehot    (sort-mask)
 
 Total width: ``payload_width(max_walls) == 11 + max_walls``.
@@ -31,12 +33,12 @@ from torchwright.doom.graph_utils import extract_from
 
 GEOMETRY_WIDTH = 5
 RENDER_WIDTH = 5
-CENTER_DIST_WIDTH = 1
+BSP_RANK_WIDTH = 1
 
 GEOMETRY_OFFSET = 0
 RENDER_OFFSET = GEOMETRY_OFFSET + GEOMETRY_WIDTH
-CENTER_DIST_OFFSET = RENDER_OFFSET + RENDER_WIDTH
-ONEHOT_OFFSET = CENTER_DIST_OFFSET + CENTER_DIST_WIDTH
+BSP_RANK_OFFSET = RENDER_OFFSET + RENDER_WIDTH
+ONEHOT_OFFSET = BSP_RANK_OFFSET + BSP_RANK_WIDTH
 
 # Sub-offsets within the geometry block.
 GEOMETRY_FIELD_OFFSETS = {
@@ -68,14 +70,14 @@ def pack_wall_payload(
     precomp_D: Node,
     precomp_E: Node,
     precomp_H_inv: Node,
-    center_ray_dist: Node,
+    bsp_rank: Node,
     position_onehot: Node,
 ) -> Node:
     """Concatenate per-WALL values into the canonical sort payload."""
     return Concatenate([
         wall_ax, wall_ay, wall_bx, wall_by, wall_tex_id,
         sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv,
-        center_ray_dist,
+        bsp_rank,
         position_onehot,
     ])
 
@@ -86,11 +88,13 @@ class UnpackedWallPayload:
 
     ``wall_data`` is 5-wide and can be further decomposed via
     ``extract_geometry_field``.  ``render_data`` is the 5-wide
-    [sort_den, C, D, E, H_inv] block.  ``onehot`` is max_walls-wide.
+    [sort_den, C, D, E, H_inv] block.  ``bsp_rank`` is 1-wide.
+    ``onehot`` is max_walls-wide.
     """
 
     wall_data: Node
     render_data: Node
+    bsp_rank: Node
     onehot: Node
 
 
@@ -102,6 +106,8 @@ def unpack_wall_payload(node: Node, max_walls: int) -> UnpackedWallPayload:
             node, d_total, GEOMETRY_OFFSET, GEOMETRY_WIDTH, "wall_data"),
         render_data=extract_from(
             node, d_total, RENDER_OFFSET, RENDER_WIDTH, "render_data"),
+        bsp_rank=extract_from(
+            node, d_total, BSP_RANK_OFFSET, BSP_RANK_WIDTH, "bsp_rank"),
         onehot=extract_from(
             node, d_total, ONEHOT_OFFSET, max_walls, "onehot"),
     )

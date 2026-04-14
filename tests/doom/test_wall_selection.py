@@ -263,13 +263,14 @@ class TestCompiledStructure:
         return compile_game(cfg, texs, max_walls=8, max_coord=10.0, d=2048, verbose=False)
 
     def _compiled_frame(self, module, box_data, px, py, angle):
-        from torchwright.doom.compile import step_frame, segments_to_walls
+        from torchwright.doom.compile import step_frame
         from torchwright.doom.game import GameState
         from torchwright.doom.input import PlayerInput
+        from torchwright.doom.map_subset import build_scene_subset
         segs, texs, cfg = box_data
-        walls = segments_to_walls(segs)
+        subset = build_scene_subset(segs, texs)
         state = GameState(x=px, y=py, angle=angle)
-        frame, _ = step_frame(module, state, PlayerInput(), walls, cfg,
+        frame, _ = step_frame(module, state, PlayerInput(), subset, cfg,
                               textures=texs)
         return frame
 

@@ -1,12 +1,16 @@
-"""WALL stage: per-wall collision + sort-score + render precomputation.
+"""WALL stage: per-wall collision + BSP-rank sort score + render precomputation.
 
 At every WALL token the graph computes, for one wall segment:
 
 * **Collision flags** for three rays (full velocity, x-only, y-only)
   against the player's movement ray.  Consumed by EOS for wall-sliding
   resolution.
-* **Central-ray intersection distance** (``center_ray_dist``) used as
-  the front-to-back sort score by SORTED's ``attend_argmin_unmasked``.
+* **BSP rank** ``rank(W) = dot(coeffs_W, side_P_vec) + const_W`` — a
+  front-to-back sort key derived from the BSP tree's spatial structure.
+  Walls parallel to the viewing ray (``|sort_den|`` ≈ 0) or behind the
+  player (``num_t`` disagrees in sign with ``den``) get a sentinel so
+  they sort last.  Used as the score by SORTED's
+  ``attend_argmin_unmasked``.
 * **Render precomputations** ``sort_den, C, D, E, H_inv`` — the wall
   geometry rotated into the player's angular frame so RENDER only
   needs per-column angle offsets.
@@ -31,15 +35,16 @@ from torchwright.ops.arithmetic_ops import (
     negate,
     piecewise_linear_2d,
     reciprocal,
-    signed_multiply,
     subtract,
+    sum_nodes,
 )
 from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.logic_ops import bool_all_true
+from torchwright.ops.logic_ops import bool_all_true, cond_gate
 from torchwright.ops.map_select import in_range, select
 from torchwright.reference_renderer.types import RenderConfig
 
-from torchwright.doom.graph_constants import BIG_DISTANCE, DIFF_BP, TRIG_BP, VEL_BP
+from torchwright.doom.graph_constants import DIFF_BP, TRIG_BP, VEL_BP
+from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.wall_payload import pack_wall_payload
 
 
@@ -84,6 +89,13 @@ class WallInputs:
     move_cos: Node
     move_sin: Node
 
+    # BSP rank precomputation: ``rank = dot(coeffs, side_P_vec) + const``.
+    # Host precomputes coefficients from the BSP tree structure; side_P_vec
+    # comes from the BSP stage's broadcast.
+    wall_bsp_coeffs: Node   # max_bsp_nodes-wide (meaningful at WALL positions)
+    wall_bsp_const: Node    # 1-wide (meaningful at WALL positions)
+    side_P_vec: Node        # max_bsp_nodes-wide (broadcast from BSP stage)
+
 
 @dataclass
 class WallOutputs:
@@ -103,6 +115,7 @@ def build_wall(
     config: RenderConfig,
     max_walls: int,
     max_coord: float,
+    max_bsp_nodes: int,
 ) -> WallOutputs:
     H = config.screen_height
 
@@ -117,9 +130,9 @@ def build_wall(
             _compute_render_precomputation(inputs, sort_num_t, H, max_coord)
         )
 
-    with annotate("wall/sort_score"):
-        center_ray_dist, sort_score = _compute_sort_score(
-            inputs.is_wall, sort_den, sort_num_t, max_coord,
+    with annotate("bsp/rank"):
+        bsp_rank = _compute_bsp_rank(
+            inputs, sort_den, sort_num_t, max_bsp_nodes,
         )
 
     with annotate("wall/onehot"):
@@ -129,13 +142,13 @@ def build_wall(
         inputs.wall_ax, inputs.wall_ay, inputs.wall_bx, inputs.wall_by,
         inputs.wall_tex_id,
         sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv,
-        center_ray_dist,
+        bsp_rank,
         position_onehot,
     )
 
     return WallOutputs(
         collision=collision,
-        sort_score=sort_score,
+        sort_score=bsp_rank,
         sort_value=sort_value,
         position_onehot=position_onehot,
     )
@@ -326,40 +339,80 @@ def _compute_render_precomputation(
     return precomp_C, precomp_D, precomp_E, precomp_H_inv
 
 
-def _compute_sort_score(
-    is_wall: Node,
+def _compute_bsp_rank(
+    inputs: WallInputs,
     sort_den: Node,
     sort_num_t: Node,
-    max_coord: float,
-):
-    """Divide num_t/den to get a front-to-back distance; sentinel-mask invalid cases.
+    max_bsp_nodes: int,
+) -> Node:
+    """BSP-derived front-to-back sort key.
 
-    Returns ``(center_ray_dist, sort_score)``.  ``sort_score`` additionally
-    zeros out non-WALL positions to the sentinel so the SORTED argmin
-    ignores them.
+        rank(W) = dot(coeffs_W, side_P_vec) + const_W
+
+    Since ``side_P_vec[i] ∈ {0, 1}``, the dot product simplifies to
+    "keep ``coeffs[i]`` where ``side_P[i]=1``, else 0" — implemented per
+    element with ``compare + cond_gate``.
+
+    Renderability gate: walls that are parallel to the viewing ray
+    (``|sort_den|`` near zero) or behind the player (``num_t`` disagrees
+    in sign with ``den``) would produce degenerate precomputed values.
+    They get ``bsp_sentinel = 99.0`` so they sort after all renderable
+    walls.  Tie-break among tied sentinels with ``wall_index * 0.1`` so
+    the argmin softmax can concentrate on a single winner instead of
+    averaging across ties.  Non-WALL positions get a slightly higher
+    sentinel (``99.9``) so they always lose to any wall, even an
+    unrenderable one.
+
+    Constraints:
+    * Real BSP ranks are a permutation of ``0..N-1`` with ``N ≤
+      max_walls``; sentinels must stay above ``max_walls - 1``.
+    * The tie-break offset ``0.1 * (max_walls-1)`` must stay below
+      ``1.0`` so real-rank spacing (1.0) is preserved — limiting this
+      scheme to ``max_walls ≤ 10``.
+    * Sentinels must stay within ``|score| ≤ 100`` (the
+      ``attend_argmin_unmasked`` bound) so the mask penalty can still
+      override them.
     """
-    sort_sign_den = compare(sort_den, 0.0)
-    sort_abs_den = abs(sort_den)
-    sort_adj_num_t = select(sort_sign_den, sort_num_t, negate(sort_num_t))
+    # Per-element product: keep coeffs[i] where side_P[i]=1, else 0.
+    bsp_products = []
+    for i in range(max_bsp_nodes):
+        c_i = extract_from(
+            inputs.wall_bsp_coeffs, max_bsp_nodes, i, 1, f"bsp_c_{i}",
+        )
+        s_i = extract_from(
+            inputs.side_P_vec, max_bsp_nodes, i, 1, f"bsp_s_{i}",
+        )
+        # Compare against 0.5 yields a stable ±1 bool even against small
+        # interpolation noise in side_P_vec's 0/1 values.
+        s_bool = compare(s_i, 0.5)
+        bsp_products.append(cond_gate(s_bool, c_i))
+    bsp_dot = sum_nodes(bsp_products)
+    bsp_rank_raw = add(bsp_dot, inputs.wall_bsp_const)
 
-    is_sort_den_nz = compare(sort_abs_den, 0.05)
-    is_sort_t_pos = compare(sort_adj_num_t, 0.0)
+    # Renderability gate: |sort_den| > ε AND num_t × sign(den) > 0.
+    abs_sort_den = abs(sort_den)
+    is_den_ok = compare(abs_sort_den, 0.05)
+    den_sign = compare(sort_den, 0.0)
+    adj_num_t = select(den_sign, sort_num_t, negate(sort_num_t))
+    is_t_pos = compare(adj_num_t, 0.0)
+    is_wall_renderable = bool_all_true([is_den_ok, is_t_pos])
 
-    sort_inv_den = reciprocal(
-        sort_abs_den, min_value=0.01, max_value=2.0 * max_coord,
+    bsp_sentinel = create_literal_value(
+        torch.tensor([99.0]), name="bsp_sentinel",
     )
-    sort_t = signed_multiply(
-        sort_adj_num_t, sort_inv_den,
-        max_abs1=2.0 * max_coord * max_coord,
-        max_abs2=1.0 / 0.01,
-        step=1.0, max_abs_output=BIG_DISTANCE,
+    bsp_rank_filtered = select(
+        is_wall_renderable, bsp_rank_raw, bsp_sentinel,
+    )
+    bsp_rank_tiebroken = add(
+        bsp_rank_filtered, multiply_const(inputs.wall_index, 0.1),
     )
 
-    is_sort_valid = bool_all_true([is_sort_den_nz, is_sort_t_pos])
-    sentinel = create_literal_value(torch.tensor([99.0]), name="sentinel")
-    center_ray_dist = select(is_sort_valid, sort_t, sentinel)
-    sort_score = select(is_wall, center_ray_dist, sentinel)
-    return center_ray_dist, sort_score
+    # Non-wall positions get a strictly higher sentinel so they never
+    # tie with wall_index=0's tiebroken sentinel.
+    nonwall_sentinel = create_literal_value(
+        torch.tensor([99.9]), name="nonwall_sentinel",
+    )
+    return select(inputs.is_wall, bsp_rank_tiebroken, nonwall_sentinel)
 
 
 def _compute_position_onehot(wall_index: Node, max_walls: int) -> Node:

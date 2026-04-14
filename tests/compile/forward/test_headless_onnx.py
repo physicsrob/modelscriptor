@@ -28,19 +28,22 @@ D = 256
 D_HEAD = 16
 
 
-def _empty_past_feeds(n_layers: int, n_heads: int, d_head: int) -> dict:
+def _empty_past_feeds(per_layer_n_heads: list, d_head: int) -> dict:
     feeds = {"past_len": np.array(0, dtype=np.int64)}
-    for i in range(n_layers):
-        feeds[f"past_K_{i}"] = np.zeros((n_heads, 0, d_head), dtype=np.float32)
-        feeds[f"past_V_{i}"] = np.zeros((n_heads, 0, d_head), dtype=np.float32)
+    for i, nh in enumerate(per_layer_n_heads):
+        feeds[f"past_K_{i}"] = np.zeros((nh, 0, d_head), dtype=np.float32)
+        feeds[f"past_V_{i}"] = np.zeros((nh, 0, d_head), dtype=np.float32)
     return feeds
 
 
 def _discover_meta(session):
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
-    shape0 = inputs["past_K_0"].shape
-    return n_layers, int(shape0[0]), int(shape0[2])
+    per_layer_n_heads = [
+        int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)
+    ]
+    d_head = int(inputs["past_K_0"].shape[2])
+    return n_layers, per_layer_n_heads, d_head
 
 
 def _build_sample_graph():
@@ -80,11 +83,11 @@ def test_headless_onnx_prefill_matches_compute():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, n_heads, d_head = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
 
         inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
         feeds = {"inputs": inputs_np}
-        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
         onnx_out = session.run(["outputs"], feeds)[0]
 
     assert np.allclose(onnx_out, expected, atol=1e-3), (
@@ -110,19 +113,19 @@ def test_headless_onnx_chunked_decode_matches_full_prefill():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, n_heads, d_head = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
         out_names = ["outputs"]
         for i in range(n_layers):
             out_names += [f"new_K_{i}", f"new_V_{i}"]
 
         # Full prefill (ground truth)
         feeds = {"inputs": inputs_np}
-        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
         full_outputs = session.run(["outputs"], feeds)[0]
 
         # Prefill 2 rows
         feeds = {"inputs": inputs_np[:2]}
-        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
         results = session.run(out_names, feeds)
         past_K = [results[1 + 2 * i] for i in range(n_layers)]
         past_V = [results[1 + 2 * i + 1] for i in range(n_layers)]
@@ -152,19 +155,19 @@ def test_headless_onnx_decode_step_matches_full_prefill():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, n_heads, d_head = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
         out_names = ["outputs"]
         for i in range(n_layers):
             out_names += [f"new_K_{i}", f"new_V_{i}"]
 
         # Full prefill
         feeds = {"inputs": inputs_np}
-        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
         full_outputs = session.run(["outputs"], feeds)[0]
 
         # Prefill 4 rows + decode 1 row
         feeds = {"inputs": inputs_np[:4]}
-        feeds.update(_empty_past_feeds(n_layers, n_heads, d_head))
+        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
         results = session.run(out_names, feeds)
         past_K = [results[1 + 2 * i] for i in range(n_layers)]
         past_V = [results[1 + 2 * i + 1] for i in range(n_layers)]
@@ -231,10 +234,10 @@ def test_onnx_headless_module_empty_past_shape():
         past_K, past_V = module.empty_past()
         assert len(past_K) == module._n_layers
         assert len(past_V) == module._n_layers
-        for K in past_K:
-            assert K.shape == (module._n_heads, 0, module._d_head)
-        for V in past_V:
-            assert V.shape == (module._n_heads, 0, module._d_head)
+        for i, K in enumerate(past_K):
+            assert K.shape == (module._per_layer_n_heads[i], 0, module._d_head)
+        for i, V in enumerate(past_V):
+            assert V.shape == (module._per_layer_n_heads[i], 0, module._d_head)
 
 
 # ---------------------------------------------------------------------------

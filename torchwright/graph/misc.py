@@ -5,14 +5,35 @@ import torch
 
 
 class InputNode(Node):
-    def __init__(self, name: str, d_output: int):
+    def __init__(self, d_output_or_name, d_output_or_nothing=None, name: str = ""):
+        # Support both old and new constructor patterns:
+        # - InputNode(d_output) - new anonymous pattern
+        # - InputNode(d_output, name=name) - new named pattern
+        # - InputNode(name, d_output) - legacy pattern
+        if isinstance(d_output_or_name, str):
+            # Legacy pattern: InputNode(name, d_output)
+            if d_output_or_nothing is None:
+                raise ValueError("d_output is required when name is the first argument")
+            d_output = d_output_or_nothing
+            name = d_output_or_name
+        else:
+            # New pattern: InputNode(d_output) or InputNode(d_output, name=name)
+            d_output = d_output_or_name
+            if d_output_or_nothing is not None and isinstance(d_output_or_nothing, str):
+                name = d_output_or_nothing
         super().__init__(d_output, [], name=name)
 
-    def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
-        if self.name not in input_values:
-            raise ValueError(f"Did not specify value for input variable {self.name}")
+    def compute(self, n_pos: int, input_values: dict, name: str = None) -> torch.Tensor:
+        # Use provided name or fall back to stored name
+        lookup_name = name if name is not None else self.name
+        if not lookup_name:
+            raise ValueError(
+                "InputNode has no name set and none was provided to compute()"
+            )
+        if lookup_name not in input_values:
+            raise ValueError(f"Did not specify value for input variable {lookup_name}")
 
-        val = input_values[self.name]
+        val = input_values[lookup_name]
         assert isinstance(val, torch.Tensor)
         assert val.shape == (
             n_pos,

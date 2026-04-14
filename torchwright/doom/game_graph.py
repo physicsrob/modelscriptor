@@ -1,81 +1,119 @@
-"""Walls-as-tokens game graph: multi-phase renderer with runtime wall geometry.
+"""Walls-as-tokens game graph — orchestrator.
 
 Token sequence per frame:
 
-    TEX_COL×(num_tex × tex_w) → INPUT → WALL×N → EOS → SORTED_WALL×N → RENDER×(W × H/rp)
+    TEX_COL×(num_tex × tex_w) → INPUT → BSP_NODE×M → WALL×N →
+    EOS → SORTED_WALL×N → (THINKING → RENDER×k)×N
 
-Six token types (E8 spherical codes):
+Eight token types (E8 spherical codes):
 
     TEX_COL (5)      Texture column pixel data.  Each token carries one
                      column of one texture (tex_h × 3 floats).  RENDER
                      tokens retrieve the right column via attention.
-    INPUT (0)        Player state + movement inputs.  Controls are fed
-                     only here; an attention head distributes velocity
-                     and trig values to WALL and EOS positions.
-    WALL (1)         Wall geometry (ax, ay, bx, by, tex_id).
-                     Graph computes distance from player for sort score.
-    EOS (2)          End of prefill.  Outputs E8_SORTED_WALL type to
-                     seed the autoregressive sort loop.
+    INPUT (0)        Player state + movement inputs.
+    BSP_NODE (7)     One splitting plane of the BSP tree.  Each token
+                     classifies the player as FRONT/BACK of its plane;
+                     the result lands in a shared ``side_P_vec`` used
+                     by WALL tokens to derive BSP rank.
+    WALL (1)         Wall geometry + BSP rank precomputation + runtime
+                     collision against the player's velocity + per-wall
+                     render precompute.
+    EOS (2)          End of prefill.  Resolves collisions and seeds the
+                     autoregressive sort loop.
     SORTED_WALL (3)  Autoregressive sort output.  attend_argmin_unmasked
-                     finds the next closest unmasked wall.  The host
-                     feeds each output back as the next input.
-    RENDER (4)       Autoregressive render output.  Attention selects
-                     the wall for this ray, parametric intersection +
-                     full texture pipeline produces pixels.
+                     finds the next-closest wall by BSP rank.
+    THINKING (6)     Wall selector hoisted out of RENDER — one per wall,
+                     populates the render_feedback overlay that feeds
+                     the next block of RENDER tokens.
+    RENDER (4)       Autoregressive column fill.  A state machine
+                     transitions through chunks, columns, and walls
+                     and emits ``done`` when finished.
 
-Every cross-position data dependency flows through attention:
-INPUT→WALL/EOS (velocity, trig), WALL→EOS (collision), EOS→SORTED
-(resolved state), WALL→SORTED (argmin), SORTED→RENDER (wall for
-column), TEX_COL→RENDER (texture pixels).
+Every cross-position data dependency flows through attention.  See each
+stage file for per-stage math.  This module does orchestration only.
 """
 
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 
 from torchwright.graph import Concatenate, Node, annotate
 from torchwright.graph.pos_encoding import PosEncoding
-from torchwright.doom.graph_constants import (
-    E8_EOS,
-    E8_INPUT,
-    E8_RENDER,
-    E8_SORTED_WALL,
-    E8_TEX_COL,
-    E8_WALL,
-    TEX_E8_OFFSET,
+from torchwright.ops.inout_nodes import (
+    create_input, create_literal_value, create_pos_encoding,
 )
-from torchwright.ops.inout_nodes import create_input, create_literal_value, create_pos_encoding
 from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.map_select import select
+from torchwright.reference_renderer.types import RenderConfig
 
+from torchwright.doom.graph_constants import (
+    E8_BSP_NODE, E8_EOS, E8_INPUT, E8_RENDER, E8_SORTED_WALL,
+    E8_TEX_COL, E8_THINKING, E8_WALL, TEX_E8_OFFSET,
+)
+
+# Re-export token constants for legacy callers that import them from
+# game_graph (compile.py, tooling, tests).  graph_constants is the
+# authoritative definition; these re-exports are just a compatibility
+# surface.
+__all__ = [
+    "GameGraphIO", "build_game_graph",
+    "E8_INPUT", "E8_WALL", "E8_EOS", "E8_SORTED_WALL", "E8_RENDER",
+    "E8_TEX_COL", "E8_THINKING", "E8_BSP_NODE",
+    "TEX_E8_OFFSET",
+]
 from torchwright.doom.graph_utils import extract_from
+from torchwright.doom.stages.bsp import BspInputs, build_bsp
 from torchwright.doom.stages.eos import EosInputs, build_eos
 from torchwright.doom.stages.input import InputInputs, build_input
 from torchwright.doom.stages.render import RenderInputs, build_render
 from torchwright.doom.stages.sorted import SortedInputs, build_sorted
 from torchwright.doom.stages.tex_col import TexColInputs, build_tex_col
+from torchwright.doom.stages.thinking import ThinkingInputs, build_thinking
 from torchwright.doom.stages.wall import WallInputs, build_wall
-from torchwright.reference_renderer.types import RenderConfig
-
-
-# Re-exported for callers that still import these symbols from
-# ``torchwright.doom.game_graph`` (tests, compile.py, external tools).
-# The canonical home for the constants is ``graph_constants.py``.
-__all__ = [
-    "E8_EOS",
-    "E8_INPUT",
-    "E8_RENDER",
-    "E8_SORTED_WALL",
-    "E8_TEX_COL",
-    "E8_WALL",
-    "TEX_E8_OFFSET",
-    "build_game_graph",
-]
 
 
 # ---------------------------------------------------------------------------
-# Main graph builder
+# I/O contract
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GameGraphIO:
+    """Structured return value of :func:`build_game_graph`.
+
+    ``inputs`` maps name → input node (host-fed at every position).
+    ``overlaid_outputs`` maps name → output node whose value lands back
+    at the matching input's columns via delta transfer — these carry
+    autoregressive feedback.  ``overflow_outputs`` maps name → output
+    node placed after the input region (pixels + metadata).
+    """
+
+    inputs: Dict[str, Node]
+    overlaid_outputs: Dict[str, Node]
+    overflow_outputs: Dict[str, Node]
+
+    def concat_output(self) -> Node:
+        """Single concatenated output node for legacy callers.
+
+        Order: token_type, sort_feedback, render_feedback, pixels, col,
+        start, length, done.
+        """
+        return Concatenate([
+            self.overlaid_outputs["token_type"],
+            self.overlaid_outputs["sort_feedback"],
+            self.overlaid_outputs["render_feedback"],
+            self.overflow_outputs["pixels"],
+            self.overflow_outputs["col"],
+            self.overflow_outputs["start"],
+            self.overflow_outputs["length"],
+            self.overflow_outputs["done"],
+        ])
+
+
+# ---------------------------------------------------------------------------
+# Main builder
 # ---------------------------------------------------------------------------
 
 
@@ -86,258 +124,385 @@ def build_game_graph(
     max_coord: float = 20.0,
     move_speed: float = 0.3,
     turn_speed: int = 4,
-    rows_per_patch: Optional[int] = None,
-) -> Tuple[Node, PosEncoding]:
+    chunk_size: int = 20,
+    max_bsp_nodes: int = 48,
+) -> Tuple[GameGraphIO, PosEncoding]:
     """Build the walls-as-tokens game graph.
 
-    Collision detection is runtime: each WALL token tests the player's
-    velocity ray against its wall segment and outputs three hit flags
-    (full, x-only, y-only).  The host resolves wall sliding.
-
-    Returns ``(output_node, pos_encoding)``.
+    See the module docstring for the per-token-type layout.
+    ``max_bsp_nodes`` is the width of the BSP side vector (one slot per
+    BSP_NODE token); it bounds how deep × broad the BSP tree can be.
     """
-    H = config.screen_height
-    W = config.screen_width
-    fov = config.fov_columns
     tex_w, tex_h = textures[0].shape[0], textures[0].shape[1]
-    rp = rows_per_patch if rows_per_patch is not None else H
+    cs = chunk_size
 
     pos_encoding = create_pos_encoding()
 
-    # --- Inputs (host-fed at every position) ---
-    token_type = create_input("token_type", 8)
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    player_angle = create_input("player_angle", 1)
-    input_forward = create_input("input_forward", 1)
-    input_backward = create_input("input_backward", 1)
-    input_turn_left = create_input("input_turn_left", 1)
-    input_turn_right = create_input("input_turn_right", 1)
-    input_strafe_left = create_input("input_strafe_left", 1)
-    input_strafe_right = create_input("input_strafe_right", 1)
-    wall_ax = create_input("wall_ax", 1)
-    wall_ay = create_input("wall_ay", 1)
-    wall_bx = create_input("wall_bx", 1)
-    wall_by = create_input("wall_by", 1)
-    wall_tex_id = create_input("wall_tex_id", 1)
-    wall_index = create_input("wall_index", 1)
-    d_sort_out = 8 + 5 + 2 * max_walls
-    sort_feedback = create_input("sort_feedback", d_sort_out)
-    prev_mask = extract_from(
-        sort_feedback, d_sort_out, 8 + 5 + max_walls, max_walls, "prev_mask",
+    inputs, fb_fields = _create_inputs(
+        max_walls=max_walls, tex_h=tex_h, max_bsp_nodes=max_bsp_nodes,
     )
-    col_idx = create_input("col_idx", 1)
-    patch_idx = create_input("patch_idx", 1)
-    tex_col_input = create_input("tex_col_input", 1)
-    tex_pixels = create_input("tex_pixels", tex_h * 3)
-    texture_id_e8 = create_input("texture_id_e8", 8)
+    tf = _detect_token_types(inputs["token_type"])
 
-    # --- Token type detection ---
-    with annotate("token_type"):
-        is_input = equals_vector(token_type, E8_INPUT)
-        is_wall = equals_vector(token_type, E8_WALL)
-        is_eos = equals_vector(token_type, E8_EOS)
-        is_sorted = equals_vector(token_type, E8_SORTED_WALL)
-        is_render = equals_vector(token_type, E8_RENDER)
-        is_tex_col = equals_vector(token_type, E8_TEX_COL)
-
-    # --- TEX_COL: column one-hot for key matching ---
-    tc_onehot_01 = build_tex_col(
-        TexColInputs(tex_col_input=tex_col_input), tex_w=tex_w,
-    ).tc_onehot_01
-
-    # =====================================================================
-    # INPUT: game logic (angle update + velocity) + broadcast to all positions
-    # =====================================================================
+    # ---------- INPUT ----------
     input_out = build_input(
         InputInputs(
-            player_angle=player_angle,
-            input_turn_left=input_turn_left,
-            input_turn_right=input_turn_right,
-            input_forward=input_forward,
-            input_backward=input_backward,
-            input_strafe_left=input_strafe_left,
-            input_strafe_right=input_strafe_right,
-            is_input=is_input,
+            player_angle=inputs["player_angle"],
+            input_turn_left=inputs["input_turn_left"],
+            input_turn_right=inputs["input_turn_right"],
+            input_forward=inputs["input_forward"],
+            input_backward=inputs["input_backward"],
+            input_strafe_left=inputs["input_strafe_left"],
+            input_strafe_right=inputs["input_strafe_right"],
+            is_input=tf["is_input"],
             pos_encoding=pos_encoding,
         ),
         turn_speed=turn_speed,
         move_speed=move_speed,
     )
-    attn_vel_dx = input_out.vel_dx
-    attn_vel_dy = input_out.vel_dy
-    attn_move_cos = input_out.move_cos
-    attn_move_sin = input_out.move_sin
-    attn_new_angle = input_out.new_angle
 
-    # =====================================================================
-    # WALL: collision flags + sort score + packed render precomputation
-    # =====================================================================
-    wall_out = build_wall(
-        WallInputs(
-            wall_ax=wall_ax, wall_ay=wall_ay,
-            wall_bx=wall_bx, wall_by=wall_by,
-            wall_tex_id=wall_tex_id, wall_index=wall_index,
-            player_x=player_x, player_y=player_y,
-            is_wall=is_wall,
-            vel_dx=input_out.vel_dx, vel_dy=input_out.vel_dy,
-            move_cos=input_out.move_cos, move_sin=input_out.move_sin,
-        ),
-        config=config, max_walls=max_walls, max_coord=max_coord,
+    # ---------- TEX_COL ----------
+    tex_col_out = build_tex_col(
+        TexColInputs(tex_col_input=inputs["tex_col_input"]),
+        tex_w=tex_w,
     )
 
-    # =====================================================================
-    # EOS: aggregate per-WALL collision flags + broadcast resolved state
-    # =====================================================================
+    # ---------- BSP ----------
+    bsp_out = build_bsp(
+        BspInputs(
+            player_x=inputs["player_x"],
+            player_y=inputs["player_y"],
+            bsp_plane_nx=inputs["bsp_plane_nx"],
+            bsp_plane_ny=inputs["bsp_plane_ny"],
+            bsp_plane_d=inputs["bsp_plane_d"],
+            bsp_node_id_onehot=inputs["bsp_node_id_onehot"],
+            is_bsp_node=tf["is_bsp_node"],
+            pos_encoding=pos_encoding,
+        ),
+        max_coord=max_coord,
+        max_bsp_nodes=max_bsp_nodes,
+    )
+
+    # ---------- WALL ----------
+    wall_out = build_wall(
+        WallInputs(
+            wall_ax=inputs["wall_ax"], wall_ay=inputs["wall_ay"],
+            wall_bx=inputs["wall_bx"], wall_by=inputs["wall_by"],
+            wall_tex_id=inputs["wall_tex_id"],
+            wall_index=inputs["wall_index"],
+            player_x=inputs["player_x"], player_y=inputs["player_y"],
+            is_wall=tf["is_wall"],
+            vel_dx=input_out.vel_dx, vel_dy=input_out.vel_dy,
+            move_cos=input_out.move_cos, move_sin=input_out.move_sin,
+            wall_bsp_coeffs=inputs["wall_bsp_coeffs"],
+            wall_bsp_const=inputs["wall_bsp_const"],
+            side_P_vec=bsp_out.side_P_vec,
+        ),
+        config=config,
+        max_walls=max_walls,
+        max_coord=max_coord,
+        max_bsp_nodes=max_bsp_nodes,
+    )
+
+    # ---------- EOS ----------
     eos_out = build_eos(EosInputs(
-        is_wall=is_wall,
-        is_eos=is_eos,
+        is_wall=tf["is_wall"],
+        is_eos=tf["is_eos"],
         collision=wall_out.collision,
-        player_x=player_x,
-        player_y=player_y,
-        vel_dx=input_out.vel_dx,
-        vel_dy=input_out.vel_dy,
+        player_x=inputs["player_x"], player_y=inputs["player_y"],
+        vel_dx=input_out.vel_dx, vel_dy=input_out.vel_dy,
         new_angle=input_out.new_angle,
         pos_encoding=pos_encoding,
     ))
 
-    # =====================================================================
-    # SORTED_WALL: argmin over WALLs + per-wall visibility mask
-    # =====================================================================
+    # ---------- SORTED ----------
     sorted_out = build_sorted(
         SortedInputs(
             sort_score=wall_out.sort_score,
             position_onehot=wall_out.position_onehot,
             sort_value=wall_out.sort_value,
-            prev_mask=prev_mask,
-            eos_px=eos_out.px,
-            eos_py=eos_out.py,
-            eos_angle=eos_out.angle,
-            is_sorted=is_sorted,
+            prev_mask=fb_fields["prev_mask"],
+            eos_px=eos_out.px, eos_py=eos_out.py, eos_angle=eos_out.angle,
+            is_sorted=tf["is_sorted"],
             pos_encoding=pos_encoding,
         ),
-        config=config, max_walls=max_walls, max_coord=max_coord,
+        config=config,
+        max_walls=max_walls,
+        max_coord=max_coord,
     )
 
-    # =====================================================================
-    # RENDER: visibility-masked wall pick → height → texture → column fill
-    # =====================================================================
-    render_out = build_render(
-        RenderInputs(
-            col_idx=col_idx,
-            patch_idx=patch_idx,
-            texture_id_e8=texture_id_e8,
-            tex_pixels=tex_pixels,
-            is_render=is_render,
-            is_sorted=is_sorted,
-            is_tex_col=is_tex_col,
+    # ---------- THINKING ----------
+    thinking_out = build_thinking(
+        ThinkingInputs(
+            sort_rank=sorted_out.sort_rank,
+            sort_rank_onehot=sorted_out.sort_rank_onehot,
             gated_render_data=sorted_out.gated_render_data,
-            gated_vis_mask=sorted_out.gated_vis_mask,
-            tc_onehot_01=tc_onehot_01,
+            vis_lo=sorted_out.vis_lo,
+            vis_hi=sorted_out.vis_hi,
+            render_mask=fb_fields["render_mask"],
+            is_sorted=tf["is_sorted"],
             pos_encoding=pos_encoding,
         ),
-        config=config, textures=textures,
-        rows_per_patch=rp, max_coord=max_coord,
-    )
-
-    # =====================================================================
-    # Output: gated by token type
-    # =====================================================================
-    output = _assemble_output(
-        is_eos=is_eos,
-        is_sorted=is_sorted,
-        is_render=is_render,
-        is_tex_col=is_tex_col,
-        sel_wall_data=sorted_out.sel_wall_data,
-        sel_onehot=sorted_out.sel_onehot,
-        updated_mask=sorted_out.updated_mask,
-        pixels=render_out.pixels,
-        resolved_x=eos_out.resolved_x,
-        resolved_y=eos_out.resolved_y,
-        new_angle=input_out.new_angle,
-        rows_per_patch=rp,
         max_walls=max_walls,
     )
-    return output, pos_encoding
+
+    # ---------- RENDER ----------
+    render_out = build_render(
+        RenderInputs(
+            render_mask=fb_fields["render_mask"],
+            render_col=fb_fields["render_col"],
+            render_is_new_wall=fb_fields["render_is_new_wall"],
+            render_chunk_start=fb_fields["render_chunk_start"],
+            fb_sort_den=fb_fields["fb_sort_den"],
+            fb_C=fb_fields["fb_C"],
+            fb_D=fb_fields["fb_D"],
+            fb_E=fb_fields["fb_E"],
+            fb_H_inv=fb_fields["fb_H_inv"],
+            fb_tex_id=fb_fields["fb_tex_id"],
+            fb_col_lo=fb_fields["fb_col_lo"],
+            fb_col_hi=fb_fields["fb_col_hi"],
+            fb_onehot=fb_fields["fb_onehot"],
+            texture_id_e8=inputs["texture_id_e8"],
+            tex_pixels=inputs["tex_pixels"],
+            tc_onehot_01=tex_col_out.tc_onehot_01,
+            is_render=tf["is_render"],
+            is_tex_col=tf["is_tex_col"],
+            pos_encoding=pos_encoding,
+        ),
+        config=config,
+        textures=textures,
+        chunk_size=cs,
+        max_coord=max_coord,
+        max_walls=max_walls,
+    )
+
+    # ---------- Output assembly ----------
+    overlaid, overflow = _assemble_output(
+        token_flags=tf,
+        fb_fields=fb_fields,
+        eos_out=eos_out, input_out=input_out,
+        sorted_out=sorted_out, thinking_out=thinking_out,
+        render_out=render_out,
+        max_walls=max_walls, chunk_size=cs,
+    )
+
+    return GameGraphIO(
+        inputs=inputs,
+        overlaid_outputs=overlaid,
+        overflow_outputs=overflow,
+    ), pos_encoding
 
 
 # ---------------------------------------------------------------------------
-# Output assembly
+# Orchestration helpers
 # ---------------------------------------------------------------------------
+
+
+def _create_inputs(
+    *, max_walls: int, tex_h: int, max_bsp_nodes: int,
+) -> Tuple[Dict[str, Node], Dict[str, Node]]:
+    """Create host-fed input nodes + unpack the overlaid feedback vectors.
+
+    Feedback unpacking lives here because the layouts are shared with
+    ``_assemble_output`` — keeping the two in the same module prevents
+    silent drift.
+    """
+    inputs: Dict[str, Node] = {}
+
+    inputs["token_type"] = create_input("token_type", 8)
+    inputs["player_x"] = create_input("player_x", 1)
+    inputs["player_y"] = create_input("player_y", 1)
+    inputs["player_angle"] = create_input("player_angle", 1)
+    for k in (
+        "input_forward", "input_backward",
+        "input_turn_left", "input_turn_right",
+        "input_strafe_left", "input_strafe_right",
+    ):
+        inputs[k] = create_input(k, 1)
+    for k in ("wall_ax", "wall_ay", "wall_bx", "wall_by", "wall_tex_id", "wall_index"):
+        inputs[k] = create_input(k, 1)
+    inputs["tex_col_input"] = create_input("tex_col_input", 1)
+    inputs["tex_pixels"] = create_input("tex_pixels", tex_h * 3)
+    inputs["texture_id_e8"] = create_input("texture_id_e8", 8)
+
+    inputs["bsp_plane_nx"] = create_input("bsp_plane_nx", 1)
+    inputs["bsp_plane_ny"] = create_input("bsp_plane_ny", 1)
+    inputs["bsp_plane_d"] = create_input("bsp_plane_d", 1)
+    inputs["bsp_node_id_onehot"] = create_input("bsp_node_id_onehot", max_bsp_nodes)
+    inputs["wall_bsp_coeffs"] = create_input("wall_bsp_coeffs", max_bsp_nodes)
+    inputs["wall_bsp_const"] = create_input("wall_bsp_const", 1)
+
+    d_sort_out = 8 + 5 + 3 + 2 * max_walls
+    sort_feedback = create_input("sort_feedback", d_sort_out)
+    inputs["sort_feedback"] = sort_feedback
+
+    d_render_fb = 2 * max_walls + 11
+    render_feedback = create_input("render_feedback", d_render_fb)
+    inputs["render_feedback"] = render_feedback
+
+    # Feedback field layout (must stay in sync with _assemble_output).
+    fields: Dict[str, Node] = {
+        "prev_mask": extract_from(
+            sort_feedback, d_sort_out, 8 + 5 + 3 + max_walls, max_walls, "prev_mask",
+        ),
+        "render_mask": extract_from(
+            render_feedback, d_render_fb, 0, max_walls, "render_mask",
+        ),
+        "render_col": extract_from(
+            render_feedback, d_render_fb, max_walls, 1, "render_col",
+        ),
+        "render_is_new_wall": extract_from(
+            render_feedback, d_render_fb, max_walls + 1, 1, "render_is_new_wall",
+        ),
+        "render_chunk_start": extract_from(
+            render_feedback, d_render_fb, max_walls + 2, 1, "render_chunk_start",
+        ),
+        "fb_sort_den": extract_from(
+            render_feedback, d_render_fb, max_walls + 3, 1, "fb_sort_den",
+        ),
+        "fb_C": extract_from(render_feedback, d_render_fb, max_walls + 4, 1, "fb_C"),
+        "fb_D": extract_from(render_feedback, d_render_fb, max_walls + 5, 1, "fb_D"),
+        "fb_E": extract_from(render_feedback, d_render_fb, max_walls + 6, 1, "fb_E"),
+        "fb_H_inv": extract_from(render_feedback, d_render_fb, max_walls + 7, 1, "fb_H_inv"),
+        "fb_tex_id": extract_from(render_feedback, d_render_fb, max_walls + 8, 1, "fb_tex_id"),
+        "fb_col_lo": extract_from(render_feedback, d_render_fb, max_walls + 9, 1, "fb_col_lo"),
+        "fb_col_hi": extract_from(render_feedback, d_render_fb, max_walls + 10, 1, "fb_col_hi"),
+        "fb_onehot": extract_from(
+            render_feedback, d_render_fb, max_walls + 11, max_walls, "fb_onehot",
+        ),
+    }
+    return inputs, fields
+
+
+def _detect_token_types(token_type: Node) -> Dict[str, Node]:
+    """Derive per-type boolean flags from the 8-wide token_type vector."""
+    with annotate("token_type"):
+        return {
+            "is_input": equals_vector(token_type, E8_INPUT),
+            "is_wall": equals_vector(token_type, E8_WALL),
+            "is_eos": equals_vector(token_type, E8_EOS),
+            "is_sorted": equals_vector(token_type, E8_SORTED_WALL),
+            "is_render": equals_vector(token_type, E8_RENDER),
+            "is_thinking": equals_vector(token_type, E8_THINKING),
+            "is_tex_col": equals_vector(token_type, E8_TEX_COL),
+            "is_bsp_node": equals_vector(token_type, E8_BSP_NODE),
+        }
 
 
 def _assemble_output(
     *,
-    is_eos: Node,
-    is_sorted: Node,
-    is_render: Node,
-    is_tex_col: Node,
-    sel_wall_data: Node,
-    sel_onehot: Node,
-    updated_mask: Node,
-    pixels: Node,
-    resolved_x: Node,
-    resolved_y: Node,
-    new_angle: Node,
-    rows_per_patch: int,
+    token_flags: Dict[str, Node],
+    fb_fields: Dict[str, Node],
+    eos_out,
+    input_out,
+    sorted_out,
+    thinking_out,
+    render_out,
     max_walls: int,
-) -> Node:
-    """Token-type-gated output: pad each per-phase payload to a common width and select."""
+    chunk_size: int,
+) -> Tuple[Dict[str, Node], Dict[str, Node]]:
+    """Build the three overlaid outputs + five overflow outputs.
+
+    Overlaid outputs fed back into the next step's input:
+        token_type, sort_feedback, render_feedback
+    Overflow outputs bitblitted by the host:
+        pixels, col, start, length, done
+    """
+    d_sort_out = 8 + 5 + 3 + 2 * max_walls
+    d_render_fb = 2 * max_walls + 11
+
     with annotate("output"):
-        # SORTED_WALL output: type + wall data + onehot + updated mask.
-        sort_output = Concatenate([
+        zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
+        zero_8 = create_literal_value(torch.zeros(8), name="zero_8")
+        zero_rf = create_literal_value(torch.zeros(d_render_fb), name="zero_rf")
+        zero_sf = create_literal_value(torch.zeros(d_sort_out), name="zero_sf")
+        zero_pixels = create_literal_value(
+            torch.zeros(chunk_size * 3), name="zero_pixels",
+        )
+        pos_one = create_literal_value(torch.tensor([1.0]), name="pos_one_out")
+        chunk_sentinel = create_literal_value(
+            torch.tensor([-1.0]), name="chunk_sentinel_out",
+        )
+
+        # THINKING's render_feedback output: seed the next block of RENDER
+        # tokens with the picked wall's data.  render_mask is forwarded
+        # unchanged (the advance_wall bit was added by the RENDER token
+        # that transitioned to THINKING, then fed back through the
+        # overlay — so fb_fields["render_mask"] already includes it).
+        thinking_render_fb = Concatenate([
+            fb_fields["render_mask"],
+            thinking_out.t_col_lo,     # render_col = first column of this wall
+            pos_one,                   # is_new_wall = +1
+            chunk_sentinel,            # chunk_start = -1 → start at wall_top
+            thinking_out.t_sort_den, thinking_out.t_C, thinking_out.t_D,
+            thinking_out.t_E, thinking_out.t_H_inv, thinking_out.t_tex_id,
+            thinking_out.t_col_lo, thinking_out.t_col_hi, thinking_out.t_onehot,
+        ])
+
+        sort_feedback_out = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="sort_type"),
-            sel_wall_data, sel_onehot, updated_mask,
+            sorted_out.sel_wall_data,
+            sorted_out.sort_rank,
+            sorted_out.vis_lo,
+            sorted_out.vis_hi,
+            sorted_out.sel_onehot,
+            sorted_out.updated_mask,
         ])
 
-        # RENDER output: type + pixels.
-        render_output = Concatenate([
-            create_literal_value(E8_RENDER, name="render_type"),
-            pixels,
-        ])
-
-        # INPUT output: type + padding (host ignores INPUT output).
-        input_output = Concatenate([
-            create_literal_value(E8_INPUT, name="input_type"),
-            create_literal_value(torch.zeros(3), name="input_pad"),
-        ])
-
-        # EOS output: seeds the sort loop with E8_SORTED_WALL type + resolved
-        # state at offsets 8-10 + zeros for the sort mask.
-        eos_output = Concatenate([
+        # EOS seeds the sort loop with a SORTED_WALL-type vector plus
+        # resolved player pose.  The rest of the layout is zero-padded
+        # since no wall has been picked yet.
+        eos_sort_seed = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="eos_sort_seed"),
-            resolved_x, resolved_y, new_angle,
+            eos_out.resolved_x, eos_out.resolved_y, input_out.new_angle,
             create_literal_value(
-                torch.zeros(2 + 2 * max_walls), name="eos_sort_pad"),
+                torch.zeros(2 + 3 + 2 * max_walls), name="eos_sort_pad",
+            ),
         ])
 
-        # TEX_COL output: type + padding (host ignores TEX_COL output).
-        tex_col_output = Concatenate([
-            create_literal_value(E8_TEX_COL, name="tex_col_type"),
-            create_literal_value(torch.zeros(3), name="tc_pad"),
-        ])
+        # Next token type per source:
+        #   THINKING → E8_RENDER (start rendering the picked wall)
+        #   RENDER   → render_out.render_next_type (E8_THINKING or E8_RENDER)
+        #   SORTED   → E8_SORTED_WALL
+        #   EOS      → E8_SORTED_WALL
+        out_token_type = select(
+            token_flags["is_thinking"],
+            create_literal_value(E8_RENDER, name="thinking_next_type"),
+            select(
+                token_flags["is_render"], render_out.render_next_type,
+                select(
+                    token_flags["is_sorted"],
+                    create_literal_value(E8_SORTED_WALL, name="sort_next_type"),
+                    select(
+                        token_flags["is_eos"],
+                        create_literal_value(E8_SORTED_WALL, name="eos_next_type"),
+                        zero_8))))
 
-        # Pad all to the same width so we can select between them.
-        d_sort_out = 8 + 5 + 2 * max_walls
-        d_render_out = 8 + rows_per_patch * 3
-        d_input_out = 8 + 3
-        d_eos_out = d_sort_out  # EOS seeds the sort loop
-        d_tc_out = 8 + 3
-        d_out = max(d_sort_out, d_render_out, d_input_out, d_eos_out, d_tc_out)
+        out_render_fb = select(
+            token_flags["is_thinking"], thinking_render_fb,
+            select(
+                token_flags["is_render"], render_out.next_render_feedback,
+                zero_rf))
 
-        def _pad(node, cur_width):
-            if cur_width >= d_out:
-                return node
-            return Concatenate([node, create_literal_value(
-                torch.zeros(d_out - cur_width), name="pad")])
+        out_sort_fb = select(
+            token_flags["is_sorted"], sort_feedback_out,
+            select(token_flags["is_eos"], eos_sort_seed, zero_sf))
 
-        sort_padded = _pad(sort_output, d_sort_out)
-        render_padded = _pad(render_output, d_render_out)
-        input_padded = _pad(input_output, d_input_out)
-        eos_padded = _pad(eos_output, d_eos_out)
-        tc_padded = _pad(tex_col_output, d_tc_out)
+        out_pixels = select(token_flags["is_render"], render_out.pixels, zero_pixels)
+        out_col = select(token_flags["is_render"], render_out.active_col, zero_1)
+        out_start = select(token_flags["is_render"], render_out.active_start, zero_1)
+        out_length = select(token_flags["is_render"], render_out.chunk_length, zero_1)
+        out_done = select(token_flags["is_render"], render_out.done_flag, zero_1)
 
-        inner1 = select(is_eos, eos_padded, input_padded)
-        inner2 = select(is_tex_col, tc_padded, inner1)
-        inner3 = select(is_sorted, sort_padded, inner2)
-        return select(is_render, render_padded, inner3)
+    overlaid = {
+        "token_type": out_token_type,
+        "sort_feedback": out_sort_fb,
+        "render_feedback": out_render_fb,
+    }
+    overflow = {
+        "pixels": out_pixels,
+        "col": out_col,
+        "start": out_start,
+        "length": out_length,
+        "done": out_done,
+    }
+    return overlaid, overflow

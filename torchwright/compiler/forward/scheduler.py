@@ -191,7 +191,15 @@ class LayerScheduler:
             if isinstance(node, Attn):
                 n_heads = (node.d_v + self.d_head - 1) // self.d_head
                 compute_candidates.append(("compute_attn", node, n_heads))
-            elif isinstance(node, Linear) and not isinstance(node.inputs[0], ReLU):
+            elif isinstance(node, Linear):
+                inp = node.inputs[0]
+                # Skip Linears whose ReLU input isn't yet computed — these will
+                # be scheduled as L->R->L chains in the MLP sublayer.  But if
+                # the ReLU IS computed (e.g., L1 was scheduled earlier due to
+                # fanout, then ReLU scheduled standalone), we can schedule L2
+                # as a standalone Linear reading from the ReLU's residual slot.
+                if isinstance(inp, ReLU) and inp not in computed_nodes:
+                    continue
                 n_heads = self._heads_for_linear(node)
                 compute_candidates.append(("compute_linear", node, n_heads))
         # Deferred Adds: neither input is dead, so we can't use add_into.
