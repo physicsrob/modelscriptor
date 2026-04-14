@@ -25,6 +25,7 @@ from torchwright.compiler.export import compile_headless
 from torchwright.doom.game import GameState
 from torchwright.doom.input import PlayerInput
 from torchwright.doom.game_graph import (
+    E8_BSP_NODE,
     E8_EOS,
     E8_INPUT,
     E8_RENDER,
@@ -36,7 +37,7 @@ from torchwright.doom.game_graph import (
     build_game_graph,
 )
 from torchwright.graph.spherical_codes import index_to_vector
-from torchwright.reference_renderer.types import RenderConfig, Segment
+from torchwright.reference_renderer.types import RenderConfig
 
 
 def print_graph_stats(output_node, pos_encoding=None):
@@ -86,18 +87,6 @@ def print_graph_stats(output_node, pos_encoding=None):
     print()
 
 
-def segments_to_walls(segments: List[Segment]) -> List[dict]:
-    """Convert Segment objects to the wall dict format expected by step_frame."""
-    return [
-        {
-            "ax": seg.ax, "ay": seg.ay,
-            "bx": seg.bx, "by": seg.by,
-            "tex_id": float(seg.texture_id if seg.texture_id is not None else 0),
-        }
-        for seg in segments
-    ]
-
-
 def compute_min_d_head(max_walls: int, tex_w: int) -> int:
     """Minimum d_head required by the game graph's attention heads.
 
@@ -126,6 +115,7 @@ def compile_game(
     verbose: bool = True,
     chunk_size: int = 20,
     d_hidden: Optional[int] = None,
+    max_bsp_nodes: int = 48,
     optimize: bool = True,
 ):
     """Compile the game graph to a HeadlessTransformerModule.
@@ -138,6 +128,7 @@ def compile_game(
         config, textures, max_walls, max_coord,
         move_speed, turn_speed,
         chunk_size=chunk_size,
+        max_bsp_nodes=max_bsp_nodes,
     )
 
     # Run graph optimizations (Linear fusion)
@@ -185,6 +176,7 @@ def compile_game(
         extra_metadata={
             "chunk_size": chunk_size,
             "max_walls": max_walls,
+            "max_bsp_nodes": max_bsp_nodes,
             "tex_h": tex_h,
             "overflow_names": list(graph_io.overflow_outputs),
         },
@@ -200,6 +192,7 @@ def _build_row(compiled, max_walls, **kwargs):
     tex_h = int(compiled.metadata.get("tex_h", 8))
     max_walls_meta = int(compiled.metadata.get("max_walls", 8))
     d_render_fb = 2 * max_walls_meta + 11
+    max_bsp_nodes = int(compiled.metadata.get("max_bsp_nodes", 48))
     defaults = {
         "input_backward": torch.zeros(1, device=device),
         "input_forward": torch.zeros(1, device=device),
@@ -222,6 +215,13 @@ def _build_row(compiled, max_walls, **kwargs):
         "wall_by": torch.zeros(1, device=device),
         "wall_index": torch.zeros(1, device=device),
         "wall_tex_id": torch.zeros(1, device=device),
+        # BSP-related inputs (zero at positions that don't use them).
+        "bsp_plane_nx": torch.zeros(1, device=device),
+        "bsp_plane_ny": torch.zeros(1, device=device),
+        "bsp_plane_d": torch.zeros(1, device=device),
+        "bsp_node_id_onehot": torch.zeros(max_bsp_nodes, device=device),
+        "wall_bsp_coeffs": torch.zeros(max_bsp_nodes, device=device),
+        "wall_bsp_const": torch.zeros(1, device=device),
     }
     defaults.update(kwargs)
     d_input = max(s + w for _, s, w in compiled._input_specs)
@@ -240,9 +240,9 @@ def step_frame(
     module,
     state: GameState,
     inputs: PlayerInput,
-    walls: List[dict],
+    subset,
     config: RenderConfig,
-    textures: List[np.ndarray] = None,
+    textures: Optional[List[np.ndarray]] = None,
 ) -> Tuple[np.ndarray, GameState]:
     """Run one frame via the multi-phase rollout.
 
@@ -250,9 +250,13 @@ def step_frame(
         module: Compiled module from :func:`compile_game`.
         state: Current game state (x, y, angle).
         inputs: Player inputs for this frame.
-        walls: List of wall dicts with keys ax, ay, bx, by, tex_id.
+        subset: :class:`~torchwright.doom.map_subset.MapSubset` carrying
+            segments, BSP planes, and precomputed rank coefficients.
+            Build one with :func:`build_scene_subset` (hand-authored
+            scenes) or :func:`load_map_subset` (WAD maps).
         config: Render configuration.
         textures: List of texture arrays, each (tex_w, tex_h, 3).
+            Defaults to the subset's textures.
 
     Returns:
         ``(frame, new_state)`` where frame is ``(H, W, 3)`` float32.
@@ -260,10 +264,11 @@ def step_frame(
     Host protocol — the host is a dumb token feeder + bitblitter:
         0. TEX_COL×(num_tex × tex_w) — feed texture column pixel data
         1. INPUT — feed player state + controls
-        2. WALL×N — feed wall geometry + player position
-        3. EOS — feed player position → read resolved state from output
-        4. SORTED_WALL×N — pure autoregressive: output IS next input
-        5. THINKING/RENDER×(dynamic) — autoregressive: output IS next
+        2. BSP_NODE×max_bsp_nodes — feed splitting plane coefficients
+        3. WALL×N — feed wall geometry + BSP rank coefficients
+        4. EOS — feed player position → read resolved state from output
+        5. SORTED_WALL×N — pure autoregressive: output IS next input
+        6. THINKING/RENDER×(dynamic) — autoregressive: output IS next
            input.  THINKING selects wall, RENDER renders pixels.  Host
            reads pixels from overflow region, bitblits to framebuffer.
 
@@ -271,10 +276,21 @@ def step_frame(
     d_input values are laid out at input field offsets.  The host feeds
     ``output[:d_input]`` directly as the next input — no remapping.
     """
-    assert textures is not None, "textures is required"
-    N = len(walls)
     max_walls = int(module.metadata.get("max_walls", 8))
     cs = int(module.metadata.get("chunk_size", 20))
+    max_bsp_nodes = int(module.metadata.get("max_bsp_nodes", 48))
+
+    if textures is None:
+        textures = subset.textures
+
+    # The prefill loop below iterates walls as dicts; convert once.
+    walls = [
+        {"ax": s.ax, "ay": s.ay, "bx": s.bx, "by": s.by,
+         "tex_id": float(s.texture_id)}
+        for s in subset.segments
+    ]
+
+    N = len(walls)
     H = config.screen_height
     W = config.screen_width
     num_tex = len(textures)
@@ -346,7 +362,7 @@ def step_frame(
 
     t_frame = time.perf_counter()
 
-    # --- Batched prefill: TEX_COL + INPUT + WALL + EOS in one forward ---
+    # --- Batched prefill: TEX_COL + INPUT + BSP_NODE + WALL + EOS ---
     # All prefill tokens are causally ordered and don't depend on each
     # other's outputs, so we process them in a single batched call.
     t0 = time.perf_counter()
@@ -367,8 +383,40 @@ def step_frame(
     # INPUT (controls only here)
     rows.append(_common(token_type=E8_INPUT, **input_kw))
 
-    # WALL × N
+    # BSP_NODE × max_bsp_nodes — real planes first, pad with null planes.
+    # The null plane (nx=0, ny=0, d=0) produces raw=0 at any player
+    # position, so side_P = compare(0,0) is BACK (cond_gate emits zero),
+    # and the padding contributes nothing to any wall's rank.
+    for i in range(max_bsp_nodes):
+        onehot = torch.zeros(max_bsp_nodes)
+        onehot[i] = 1.0
+        if i < len(subset.bsp_nodes):
+            plane = subset.bsp_nodes[i]
+            nx, ny, d = plane.nx, plane.ny, plane.d
+        else:
+            nx, ny, d = 0.0, 0.0, 0.0
+        rows.append(_common(
+            token_type=E8_BSP_NODE,
+            bsp_plane_nx=torch.tensor([nx], dtype=torch.float32),
+            bsp_plane_ny=torch.tensor([ny], dtype=torch.float32),
+            bsp_plane_d=torch.tensor([d], dtype=torch.float32),
+            bsp_node_id_onehot=onehot,
+        ))
+
+    # WALL × N — now each wall carries BSP rank coefficients precomputed
+    # by the host.  Rank = dot(coeffs, side_P_vec) + const is evaluated
+    # in the graph.
     for i, w in enumerate(walls):
+        if i < subset.seg_bsp_coeffs.shape[0]:
+            coeffs = torch.tensor(
+                subset.seg_bsp_coeffs[i, :max_bsp_nodes], dtype=torch.float32,
+            )
+            const = torch.tensor(
+                [float(subset.seg_bsp_consts[i])], dtype=torch.float32,
+            )
+        else:
+            coeffs = torch.zeros(max_bsp_nodes, dtype=torch.float32)
+            const = torch.zeros(1, dtype=torch.float32)
         rows.append(_common(
             token_type=E8_WALL,
             wall_ax=torch.tensor([w["ax"]]),
@@ -377,6 +425,8 @@ def step_frame(
             wall_by=torch.tensor([w["by"]]),
             wall_tex_id=torch.tensor([w["tex_id"]]),
             wall_index=torch.tensor([float(i)]),
+            wall_bsp_coeffs=coeffs,
+            wall_bsp_const=const,
         ))
 
     # EOS

@@ -59,6 +59,7 @@ from torchwright.ops.arithmetic_ops import (
     signed_multiply,
     square_signed,
     subtract,
+    sum_nodes,
     thermometer_floor_div,
 )
 from torchwright.ops.attention_ops import (
@@ -86,18 +87,20 @@ TOKEN_WALL = 1
 TOKEN_EOS = 2
 TOKEN_SORTED_WALL = 3
 TOKEN_RENDER = 4
+TOKEN_TEX_COL = 5
 TOKEN_THINKING = 6
+TOKEN_BSP_NODE = 7
 
 E8_INPUT = index_to_vector(TOKEN_INPUT)
 E8_WALL = index_to_vector(TOKEN_WALL)
 E8_EOS = index_to_vector(TOKEN_EOS)
 E8_SORTED_WALL = index_to_vector(TOKEN_SORTED_WALL)
 E8_RENDER = index_to_vector(TOKEN_RENDER)
-E8_THINKING = index_to_vector(TOKEN_THINKING)
-
-TOKEN_TEX_COL = 5
 E8_TEX_COL = index_to_vector(TOKEN_TEX_COL)
-TEX_E8_OFFSET = 7  # index_to_vector(7+i) = E8 code for texture i
+E8_THINKING = index_to_vector(TOKEN_THINKING)
+E8_BSP_NODE = index_to_vector(TOKEN_BSP_NODE)
+
+TEX_E8_OFFSET = 8  # index_to_vector(8+i) = E8 code for texture i
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +335,7 @@ def build_game_graph(
     move_speed: float = 0.3,
     turn_speed: int = 4,
     chunk_size: int = 20,
+    max_bsp_nodes: int = 48,
 ) -> Tuple[GameGraphIO, PosEncoding]:
     """Build the walls-as-tokens game graph.
 
@@ -399,6 +403,18 @@ def build_game_graph(
     tex_col_input = create_input("tex_col_input", 1)
     tex_pixels = create_input("tex_pixels", tex_h * 3)
     texture_id_e8 = create_input("texture_id_e8", 8)
+    # BSP plane inputs (meaningful at BSP_NODE positions; zero elsewhere).
+    # The plane equation is nx*x + ny*y + d with |nx|, |ny| ≤ 1 after
+    # normalization by the host.  ``bsp_node_id_onehot`` identifies which
+    # slot this node fills in the broadcast vector.
+    bsp_plane_nx = create_input("bsp_plane_nx", 1)
+    bsp_plane_ny = create_input("bsp_plane_ny", 1)
+    bsp_plane_d = create_input("bsp_plane_d", 1)
+    bsp_node_id_onehot = create_input("bsp_node_id_onehot", max_bsp_nodes)
+    # Per-wall BSP rank precomputation: rank(W) = dot(coeffs, side_P_vec)
+    # + const.  Host precomputes these from the BSP tree structure.
+    wall_bsp_coeffs = create_input("wall_bsp_coeffs", max_bsp_nodes)
+    wall_bsp_const = create_input("wall_bsp_const", 1)
 
     # --- Token type detection ---
     with annotate("token_type"):
@@ -409,6 +425,7 @@ def build_game_graph(
         is_render = equals_vector(token_type, E8_RENDER)
         is_thinking = equals_vector(token_type, E8_THINKING)
         is_tex_col = equals_vector(token_type, E8_TEX_COL)
+        is_bsp_node = equals_vector(token_type, E8_BSP_NODE)
 
     # --- TEX_COL: column one-hot for key matching ---
     with annotate("tex_col"):
@@ -446,6 +463,50 @@ def build_game_graph(
             attn_move_cos = _extract_from(ctrl_attn, 5, 2, 1, "a_mcos")
             attn_move_sin = _extract_from(ctrl_attn, 5, 3, 1, "a_msin")
             attn_new_angle = _extract_from(ctrl_attn, 5, 4, 1, "a_angle")
+
+    # =====================================================================
+    # BSP: classify player against each splitting plane, broadcast sides
+    # =====================================================================
+    #
+    # Each BSP_NODE token carries a normalized splitting plane
+    # ``(nx, ny, d)`` such that ``nx*px + ny*py + d > 0`` iff the
+    # player is on the FRONT side.  The host pre-normalizes so that
+    # ``|nx|, |ny| ≤ 1``.
+    #
+    # ``attend_mean_where(validity=is_bsp_node, value=onehot×side_P)``
+    # averages over all M BSP_NODE positions, yielding
+    # ``(1/M) × side_P_vec``.  Multiplying by M recovers the
+    # per-slot 0/1 side decisions at every position — ready for
+    # WALL tokens to dot-product with their precomputed coefficients.
+    with annotate("bsp/side_p"):
+        bsp_nx_px = multiply_2d(
+            bsp_plane_nx, player_x,
+            max_abs1=1.0, max_abs2=max_coord,
+            step1=0.1, step2=1.0,
+            name="bsp_nx_px",
+        )
+        bsp_ny_py = multiply_2d(
+            bsp_plane_ny, player_y,
+            max_abs1=1.0, max_abs2=max_coord,
+            step1=0.1, step2=1.0,
+            name="bsp_ny_py",
+        )
+        bsp_raw = add(add(bsp_nx_px, bsp_ny_py), bsp_plane_d)
+        # ±1 bool: +1 if raw > 0 (FRONT), -1 if raw ≤ 0 (BACK)
+        side_P_bool = compare(bsp_raw, 0.0)
+        # At BSP_NODE[i]: emit onehot_i when side=FRONT, zero otherwise.
+        # Other token types get a garbage value that attend_mean_where
+        # will ignore (validity=is_bsp_node filters to BSP_NODE positions).
+        side_P_spread = cond_gate(side_P_bool, bsp_node_id_onehot)
+
+    with annotate("bsp/broadcast"):
+        side_P_mean = attend_mean_where(
+            pos_encoding,
+            validity=is_bsp_node,
+            value=side_P_spread,
+        )
+        # Recover side_P values by undoing the average's division by M.
+        side_P_vec = multiply_const(side_P_mean, float(max_bsp_nodes))
 
     # =====================================================================
     # WALL: distance score + sort value + collision hit flags
@@ -543,27 +604,60 @@ def build_game_graph(
         )
         precomp_H_inv = multiply_const(inv_abs_num_t, float(H))
 
-    # --- Central ray distance for sort score ---
-    with annotate("wall/sort_score"):
-        sort_sign_den = compare(sort_den, 0.0)
-        sort_abs_den = abs(sort_den)
-        sort_adj_num_t = select(sort_sign_den, sort_num_t, negate(sort_num_t))
+    # --- BSP rank: sort key from the BSP tree's spatial structure ---
+    # Each WALL carries precomputed coefficients ``coeffs_W`` (M-dim) and
+    # a constant ``const_W``.  The rank is the linear-algebra form of
+    # DOOM's front-to-back traversal:
+    #
+    #     rank(W) = dot(coeffs_W, side_P_vec) + const_W
+    #
+    # Since ``side_P_vec[i] ∈ {0, 1}``, the product simplifies to "keep
+    # coeffs[i] where side_P[i]=1, else 0" — implemented per element
+    # with ``compare`` + ``cond_gate``.
+    #
+    # Renderability filter: walls that are parallel to the viewing ray
+    # (|sort_den| ≈ 0) produce degenerate precomp values.  They get the
+    # sentinel rank so they sort LAST, after all renderable walls —
+    # the same guarantee the old ``wall/sort_score`` block provided.
+    with annotate("bsp/rank"):
+        bsp_products: List[Node] = []
+        for i in range(max_bsp_nodes):
+            c_i = _extract_from(
+                wall_bsp_coeffs, max_bsp_nodes, i, 1, f"bsp_c_{i}",
+            )
+            s_i = _extract_from(
+                side_P_vec, max_bsp_nodes, i, 1, f"bsp_s_{i}",
+            )
+            # side_P_vec ∈ {0, 1}; compare against 0.5 yields a stable
+            # ±1 bool even against small interpolation noise.
+            s_bool = compare(s_i, 0.5)
+            p_i = cond_gate(s_bool, c_i)
+            bsp_products.append(p_i)
+        bsp_dot = sum_nodes(bsp_products)
+        bsp_rank_raw = add(bsp_dot, wall_bsp_const)
 
-        is_sort_den_nz = compare(sort_abs_den, 0.05)
-        is_sort_t_pos = compare(sort_adj_num_t, 0.0)
+        # Renderability gate: need |sort_den| > epsilon for the render
+        # pipeline's precomp values to be meaningful, AND num_t must
+        # agree in sign with den (intersection in front of the player).
+        abs_sort_den = abs(sort_den)
+        is_den_ok = compare(abs_sort_den, 0.05)
+        # num_t × sign(den) > 0 ⇔ wall is in front
+        den_sign = compare(sort_den, 0.0)
+        adj_num_t = select(den_sign, sort_num_t, negate(sort_num_t))
+        is_t_pos = compare(adj_num_t, 0.0)
+        is_wall_renderable = bool_all_true([is_den_ok, is_t_pos])
 
-        sort_inv_den = reciprocal(sort_abs_den, min_value=0.01, max_value=2.0 * max_coord)
-        sort_t = signed_multiply(
-            sort_adj_num_t, sort_inv_den,
-            max_abs1=2.0 * max_coord * max_coord,
-            max_abs2=1.0 / 0.01,
-            step=1.0, max_abs_output=BIG_DISTANCE,
+        # Sentinel chosen to dominate any plausible real rank:
+        # max_walls × max_walls (~1024 for max_walls=32) is a hard upper
+        # bound on |coeffs_W · side_P|, and const_W ≤ max_walls × depth
+        # (likewise bounded).  99999 safely exceeds both.
+        bsp_sentinel = create_literal_value(
+            torch.tensor([99999.0]), name="bsp_sentinel",
         )
-
-        is_sort_valid = bool_all_true([is_sort_den_nz, is_sort_t_pos])
-        sentinel = create_literal_value(torch.tensor([99.0]), name="sentinel")
-        center_ray_dist = select(is_sort_valid, sort_t, sentinel)
-        sort_score = select(is_wall, center_ray_dist, sentinel)
+        bsp_rank_filtered = select(
+            is_wall_renderable, bsp_rank_raw, bsp_sentinel,
+        )
+        bsp_rank = select(is_wall, bsp_rank_filtered, bsp_sentinel)
 
     # Wall index one-hot (host-fed wall_index: 0, 1, 2, ...)
     with annotate("wall/onehot"):
@@ -572,15 +666,18 @@ def build_game_graph(
         ones_oh = create_literal_value(torch.ones(max_walls), name="ones_oh")
         position_onehot = add_scaled_nodes(0.5, onehot_bool, 0.5, ones_oh)
 
-    # Pack wall value: geometry + precomputed render data + onehot
+    # Pack wall value: geometry + precomputed render data + BSP rank +
+    # onehot.  The BSP rank is both the sort score (used by argmin) AND
+    # carried through the sort output for debug/tiebreaking downstream.
+    #
     # Indices 0-4: ax,ay,bx,by,tex_id (vis mask needs 0-3)
     # Indices 5-9: sort_den, C, D, E, H_inv_num_t (render pipeline)
-    # Index 10: center_ray_dist (render attention distance tiebreak)
+    # Index 10:    bsp_rank (replaces old center_ray_dist slot)
     # Indices 11+: position_onehot (sort mask)
     wall_value_for_sort = Concatenate([
         wall_ax, wall_ay, wall_bx, wall_by, wall_tex_id,
         sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv,
-        center_ray_dist,
+        bsp_rank,
         position_onehot,
     ])
     d_sort_val = 11 + max_walls
@@ -642,7 +739,7 @@ def build_game_graph(
     with annotate("sort/attention"):
         selected_sort = attend_argmin_unmasked(
             pos_encoding=pos_encoding,
-            score=sort_score,
+            score=bsp_rank,
             mask_vector=prev_mask,
             position_onehot=position_onehot,
             value=wall_value_for_sort,
@@ -1101,6 +1198,15 @@ def build_game_graph(
             "wall_by": wall_by,
             "wall_index": wall_index,
             "wall_tex_id": wall_tex_id,
+            # BSP inputs: meaningful only at BSP_NODE / WALL positions;
+            # zero-padded elsewhere by the host.  Not overlaid outputs —
+            # no autoregressive feedback flows through them.
+            "bsp_plane_nx": bsp_plane_nx,
+            "bsp_plane_ny": bsp_plane_ny,
+            "bsp_plane_d": bsp_plane_d,
+            "bsp_node_id_onehot": bsp_node_id_onehot,
+            "wall_bsp_coeffs": wall_bsp_coeffs,
+            "wall_bsp_const": wall_bsp_const,
         },
         overlaid_outputs={
             "render_feedback": out_render_fb,
