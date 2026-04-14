@@ -128,9 +128,45 @@ The library ops compose primitives above. Principles:
 
 ## 4. What drives layer depth
 
-Layer count is **dominated by the critical path** — the longest chain
-of sequential dependencies through the graph — not by head or slot
-capacity.
+### What a critical path is
+
+A **critical path** is a chain of ops in the DAG where each op reads
+the previous op's output, traced from an input to an output node. Each
+edge in such a chain forces "consumer layer ≥ producer layer + 1," so
+the length of the longest chain is a **hard lower bound** on N. No
+amount of packing, sharding, or capacity tuning can violate it.
+
+Two things to keep straight:
+
+1. **There may be multiple chains tied at the maximum depth.**
+   Shortening one tied chain does not reduce N unless every chain of
+   max depth shortens — another chain of equal length still binds the
+   lower bound. Before celebrating a DAG-depth win, check that no
+   other chain is about to become the binding constraint.
+
+2. **DAG depth is a lower bound, not the compiled depth.** The
+   scheduler inflates beyond this bound when per-layer capacity
+   (heads/slots) or residual-stream pressure forces ops into separate
+   layers. In DOOM today the compiled layer count is roughly 2× the
+   DAG critical-path depth, so DAG-depth work and packing/capacity
+   work are both worth doing — a 1-layer DAG-depth win is a 1-layer
+   floor reduction, but actual N only drops if scheduling slack exists
+   at that depth.
+
+### Every output imposes the same depth constraint
+
+Overlaid outputs (bit-copied back into the next step's input buffer)
+and overflow outputs (read directly by the host, e.g., pixels) are
+**identical from the depth-lower-bound perspective**. Both must be
+computable by layer N of the current forward pass. A chain of DAG
+depth D ending at an overlaid output imposes N ≥ D just as strictly
+as a chain ending at an overflow output.
+
+The difference that autoregression introduces is covered in §6 — it's
+about splitting a *logical* computation across multiple forward
+passes, not about giving any single output slack within a pass.
+
+### Rules of thumb
 
 Rules of thumb for counting layers along a path:
 
@@ -220,7 +256,33 @@ Multi-phase graphs (e.g. `WALL → EOS → SORTED → RENDER` in DOOM)
 exploit the causal KV cache: position `j > i` can attend to `i`'s
 values from any prior layer where `i` already held them.
 
-Two consequences:
+### How autoregression interacts with the critical path
+
+Autoregression reduces N by **splitting a logically long computation
+across multiple forward passes**, not by giving overlaid outputs
+within-pass slack. The two mechanisms:
+
+- **Overlaid output emitted at step T → input at step T+1.** The
+  chain from inputs to the overlaid output must fit in N layers of
+  step T. At step T+1, the consumer reads the emitted value as a
+  regular input at layer 0 — no DAG depth carries across the step
+  boundary. This is how a computation that would be N=200 deep in
+  one pass can be split into, say, four passes of N=50 each.
+
+- **Same-pass cross-position attention read.** If position i produces
+  a value at layer L and position j > i attends to it within the
+  same forward pass, j's attn consumer sits at layer ≥ L+1. The
+  chain crosses positions but stays within one pass, so it **does**
+  extend the critical path for that pass.
+
+Common confusion worth flushing: an overlaid output does *not* have
+"extra slack" relative to an overflow output within a pass. Both must
+be computable by layer N. What's special about an overlaid output is
+that the *next* step's read of that value starts at layer 0 fresh —
+i.e., the chain terminates at the output, it doesn't extend into the
+next pass's DAG.
+
+Two consequences for graph design:
 
 ### (a) Precompute at an earlier token type
 
@@ -370,6 +432,22 @@ more heads per layer). It doesn't typically buy layer reduction.
 - Critical path length and annotation breakdown.
 - Longest contiguous annotation-runs on the critical path, ordered
   by length — these are the biggest depth-reduction targets.
+
+Two caveats when reading the critical-path output:
+
+- The tool prints **one example chain** of maximum DAG depth. If
+  multiple chains are tied at that depth (common in non-trivial
+  graphs), shortening only the displayed one may not reduce N
+  because another tied chain still binds the lower bound.
+- The **DAG depth reported is a lower bound**; the compiled layer
+  count may be substantially larger (roughly 2× in DOOM) because the
+  scheduler inflates N when per-layer capacity or residual-stream
+  pressure forces ops apart. A DAG-depth win of K layers only
+  translates to a compiled-N win of K if there's scheduling slack at
+  that depth. Check the layer spans in the per-annotation table to
+  sanity-check: if the targeted chain's layer span is much wider
+  than its op count, scheduling, not DAG depth, is the binding
+  constraint.
 
 Add `with annotate("subsystem"):` blocks liberally in your graph
 construction code; annotations are free at runtime and make
