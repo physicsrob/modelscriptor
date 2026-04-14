@@ -647,6 +647,45 @@ def test_relu_chain_broken_by_fanout():
     assert len(computed) > before
 
 
+def test_linear_with_computed_relu_input():
+    """Linear whose input ReLU is already computed can be scheduled standalone.
+
+    After Linear fusion or certain scheduling patterns, L1 and ReLU may be
+    computed in earlier layers while L2 is deferred. L2's input is a ReLU node
+    that's already in the residual stream, so L2 should be schedulable as a
+    standalone Linear (via attention sublayer) rather than as part of a chain.
+
+    This tests the fix for scheduler deadlock after optimization passes.
+    """
+    pos = _make_pos_encoding()
+    x = InputNode("x", 4)
+    l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
+    r = ReLU(l1, name="r")
+    l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
+
+    graph = GraphAnalyzer(l2)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(x)
+    rmap.allocate(l1)
+    rmap.allocate(r)
+    # Pretend L1 and ReLU were already computed in earlier layers
+    computed = {pos, x, l1, r}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    attn_ops, mlp_ops, biased = scheduler.schedule_layer(rmap, computed)
+
+    # L2 should be scheduled as a standalone Linear (compute_linear in attn sublayer)
+    compute_linears = [op for op in attn_ops if op.op_type == "compute_linear"]
+    assert len(compute_linears) == 1
+    assert compute_linears[0].node is l2
+    assert l2 in computed
+
+    # Should NOT be scheduled via compute_relu (that's for full chains)
+    relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]
+    assert len(relu_ops) == 0
+
+
 # ---------------------------------------------------------------------------
 # 9. Error cases
 # ---------------------------------------------------------------------------

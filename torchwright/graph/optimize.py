@@ -72,6 +72,16 @@ def fuse_consecutive_linears(
         if len(consumers[l1]) != 1:
             continue
 
+        # Skip if fusion would increase params (bottleneck patterns)
+        # This can happen when d_mid is much smaller than d_in or d_out
+        d_in = l1.output_matrix.shape[0]
+        d_mid = l1.output_matrix.shape[1]
+        d_out = l2.output_matrix.shape[1]
+        old_params = d_in * d_mid + d_mid + d_mid * d_out + d_out
+        new_params = d_in * d_out + d_out
+        if new_params > old_params:
+            continue
+
         fusions.append((l1, l2))
 
     if verbose and fusions:

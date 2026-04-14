@@ -88,3 +88,50 @@ def test_fuse_preserves_annotation():
 
     fuse_consecutive_linears({l2})
     assert l2.annotation == "second"
+
+
+def test_no_fuse_param_increase():
+    """Don't fuse when fusion would increase params (bottleneck patterns).
+
+    Example: L1 (4 -> 1) -> L2 (1 -> 100) uses 4*1 + 1 + 1*100 + 100 = 206 params.
+    Fused (4 -> 100) would use 4*100 + 100 = 500 params — almost 2.5x more.
+
+    This guards against "inverse bottleneck" patterns where the intermediate
+    dimension is smaller than both input and output.
+    """
+    inp = InputNode("x", d_output=4)
+    l1 = Linear(inp, torch.randn(4, 1), torch.randn(1), name="bottleneck")
+    l2 = Linear(l1, torch.randn(1, 100), torch.randn(100), name="expand")
+
+    # Original params: 4*1 + 1 + 1*100 + 100 = 206
+    # Fused params: 4*100 + 100 = 500
+    fused = fuse_consecutive_linears({l2})
+    assert fused == 0  # Should skip because it would increase params
+
+    # The nodes should be unchanged
+    assert l2.inputs[0] is l1
+    assert l1.inputs[0] is inp
+
+
+def test_fuse_param_decrease():
+    """Fusion that reduces params should proceed.
+
+    Example: L1 (100 -> 10) -> L2 (10 -> 3) uses 100*10 + 10 + 10*3 + 3 = 1043 params.
+    Fused (100 -> 3) uses 100*3 + 3 = 303 params — ~70% reduction.
+    """
+    inp = InputNode("x", d_output=100)
+    l1 = Linear(inp, torch.randn(100, 10), torch.randn(10), name="compress")
+    l2 = Linear(l1, torch.randn(10, 3), torch.randn(3), name="final")
+
+    n_pos = 5
+    x = torch.randn(n_pos, 100)
+    out_before = l2.compute(n_pos, {"x": x})
+
+    # Original params: 100*10 + 10 + 10*3 + 3 = 1043
+    # Fused params: 100*3 + 3 = 303
+    fused = fuse_consecutive_linears({l2})
+    assert fused == 1  # Should fuse
+
+    # The fused node should produce same output
+    out_after = l2.compute(n_pos, {"x": x})
+    assert torch.allclose(out_before, out_after, atol=1e-5)

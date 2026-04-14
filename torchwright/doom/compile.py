@@ -109,14 +109,13 @@ def compile_game(
     verbose: bool = True,
     rows_per_patch: Optional[int] = None,
     d_hidden: Optional[int] = None,
-    optimize: bool = False,
+    optimize: bool = True,
 ):
     """Compile the game graph to a HeadlessTransformerModule.
 
     Args:
         optimize: Run graph optimization passes (Linear fusion) before
-            compilation. Currently disabled by default due to a scheduler
-            issue with orphaned L->R->L chains after fusion.
+            compilation. Fuses consecutive Linear nodes to reduce layers.
     """
     output_node, pos_encoding = build_game_graph(
         config, textures, max_walls, max_coord,
