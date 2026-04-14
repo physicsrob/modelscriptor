@@ -647,17 +647,34 @@ def build_game_graph(
         is_t_pos = compare(adj_num_t, 0.0)
         is_wall_renderable = bool_all_true([is_den_ok, is_t_pos])
 
-        # Sentinel chosen to dominate any plausible real rank:
-        # max_walls × max_walls (~1024 for max_walls=32) is a hard upper
-        # bound on |coeffs_W · side_P|, and const_W ≤ max_walls × depth
-        # (likewise bounded).  99999 safely exceeds both.
+        # Sentinel must (a) exceed any real rank so unrenderable walls
+        # sort last, and (b) stay within the ``|score| <= 100`` bound of
+        # ``attend_argmin_unmasked`` so the mask penalty can still
+        # override it.  Real ranks are bounded above by ``max_walls - 1``
+        # (ranks are a permutation of ``0..N-1``), so 99.0 works for any
+        # max_walls up to ~99.
         bsp_sentinel = create_literal_value(
-            torch.tensor([99999.0]), name="bsp_sentinel",
+            torch.tensor([99.0]), name="bsp_sentinel",
         )
         bsp_rank_filtered = select(
             is_wall_renderable, bsp_rank_raw, bsp_sentinel,
         )
-        bsp_rank = select(is_wall, bsp_rank_filtered, bsp_sentinel)
+        # Tie-break: add ``wall_index * epsilon`` so walls sharing a rank
+        # (e.g. multiple unrenderable walls tied at the sentinel) still
+        # get distinct scores.  ``attend_argmin_unmasked`` blends tied
+        # positions via softmax — with ``_QUERY_GAIN = 80`` we need
+        # ``epsilon`` large enough that ``_QUERY_GAIN * epsilon > ~5``
+        # for the softmax to concentrate on a single winner (otherwise
+        # we get fractional onehot outputs that propagate to fractional
+        # masks and cascade into garbage selections).  ``0.1`` gives
+        # ``e^8 ≈ 3000×`` separation between consecutive walls while
+        # keeping the total offset ``epsilon * (max_walls-1) < 1`` so
+        # real-rank ordering (spacing 1.0) is preserved for
+        # ``max_walls ≤ 10``.
+        bsp_rank_tiebroken = add(
+            bsp_rank_filtered, multiply_const(wall_index, 0.1),
+        )
+        bsp_rank = select(is_wall, bsp_rank_tiebroken, bsp_sentinel)
 
     # Wall index one-hot (host-fed wall_index: 0, 1, 2, ...)
     with annotate("wall/onehot"):

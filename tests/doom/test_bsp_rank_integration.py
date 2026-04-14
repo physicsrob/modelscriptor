@@ -242,6 +242,37 @@ class TestBspIntegration:
         wall_mask = (diff_ceil > 1e-3) & (diff_floor > 1e-3)
         assert wall_mask.any(), f"angle={angle}: no wall pixels rendered"
 
+    def test_second_frame_renders(self, module, subset) -> None:
+        """Calling step_frame twice in a row must produce a valid second
+        frame.  Regression test for a bug where subsequent frames
+        early-terminate at 4 render steps (one per wall, no chunks),
+        producing a blank ceiling/floor-only image.
+        """
+        config = _small_config()
+        state1 = GameState(x=0.0, y=0.0, angle=0, move_speed=0.3, turn_speed=4)
+        frame1, state2 = step_frame(module, state1, PlayerInput(forward=True),
+                                    subset, config)
+        frame2, _ = step_frame(module, state2, PlayerInput(forward=True),
+                               subset, config)
+
+        ceil = np.array(config.ceiling_color)
+        floor = np.array(config.floor_color)
+
+        def wall_pixel_count(frame):
+            diff_ceil = np.abs(frame - ceil).sum(axis=-1)
+            diff_floor = np.abs(frame - floor).sum(axis=-1)
+            return int(((diff_ceil > 1e-3) & (diff_floor > 1e-3)).sum())
+
+        n1 = wall_pixel_count(frame1)
+        n2 = wall_pixel_count(frame2)
+        assert n1 > 0, "frame 1 should have wall pixels"
+        # Allow some variation (different player position), but frame 2
+        # should not collapse to ~zero wall pixels.
+        assert n2 > n1 // 4, (
+            f"frame 2 has {n2} wall pixels vs frame 1's {n1} — "
+            "second frame appears to have early-terminated"
+        )
+
     def test_matches_reference_render(self, module, subset) -> None:
         """Compiled output is close to the reference renderer's frame.
 
