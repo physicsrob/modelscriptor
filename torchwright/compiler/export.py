@@ -31,7 +31,7 @@ big graphs (e.g. the DOOM renderer) fit in realistic RAM.
 import json
 import os
 import time
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import onnx
@@ -245,46 +245,72 @@ def _add_scalar_inits(dense_inits: list) -> None:
 
 def _make_stream_layer_weights_cb(
     d: int,
+    d_head: int,
     dense_inits: list,
     sparse_inits: list,
+    per_layer_n_heads: list,
 ) -> Callable[[int, object], None]:
     """Factory for the forward_compile on_layer_compiled callback.
 
     Emits each freshly-compiled layer's dense weights into the
     dense/sparse init lists (sparsified on the fly when mostly zero) and
     nulls out the layer's tensor attributes so GC can reclaim them.
+
+    After head trimming, each layer's attention matrices have shape
+    ``(nh, d, d_head)`` where ``nh <= d // d_head``.  Weight matrices
+    are emitted at the trimmed size and per-layer reshape constants
+    are added so the ONNX graph can reshape to the correct head count.
+
+    Appends each layer's ``nh`` to ``per_layer_n_heads`` for Phase 2.
     """
 
     def on_layer_compiled(i: int, layer) -> None:
         attn = layer.attn.attn
         mlp = layer.mlp
 
+        nh = attn.n_heads  # post-trim head count
+        hd = nh * d_head
+        per_layer_n_heads.append(nh)
+
         def emit(name: str, arr: np.ndarray) -> None:
             dense_tp, sparse_tp = _tensor_to_proto(name, arr)
             _append_proto(dense_tp, sparse_tp, dense_inits, sparse_inits)
 
+        # (nh, d, d_head) → (d, nh, d_head) → (d, hd)
         emit(
             f"l{i}_WQ",
-            attn.query_matrix.permute(1, 0, 2).reshape(d, d).contiguous().cpu().numpy(),
+            attn.query_matrix.permute(1, 0, 2).reshape(d, hd).contiguous().cpu().numpy(),
         )
         attn.query_matrix = None
         emit(
             f"l{i}_WK",
-            attn.key_matrix.permute(1, 0, 2).reshape(d, d).contiguous().cpu().numpy(),
+            attn.key_matrix.permute(1, 0, 2).reshape(d, hd).contiguous().cpu().numpy(),
         )
         attn.key_matrix = None
         emit(
             f"l{i}_WV",
-            attn.value_matrix.permute(1, 0, 2).reshape(d, d).contiguous().cpu().numpy(),
+            attn.value_matrix.permute(1, 0, 2).reshape(d, hd).contiguous().cpu().numpy(),
         )
         attn.value_matrix = None
-        # (n_heads, d_head, d) → (d, d): canonical W_O layout that feeds
-        # one (t, d) @ (d, d) MatMul at inference time.
+        # (nh, d_head, d) → (hd, d): canonical W_O layout that feeds
+        # one (t, hd) @ (hd, d) MatMul at inference time.
         emit(
             f"l{i}_WO",
-            attn.output_matrix.reshape(d, d).contiguous().cpu().numpy(),
+            attn.output_matrix.reshape(hd, d).contiguous().cpu().numpy(),
         )
         attn.output_matrix = None
+
+        # Per-layer reshape constants for the ONNX graph.
+        _add_int64_init(
+            f"l{i}_qkv_view_shape",
+            np.array([0, nh, d_head], dtype=np.int64),
+            dense_inits,
+        )
+        _add_int64_init(
+            f"l{i}_ctx_flat_shape",
+            np.array([0, hd], dtype=np.int64),
+            dense_inits,
+        )
 
         emit(f"l{i}_W1", mlp.linear1.output_matrix.cpu().numpy())
         mlp.linear1.output_matrix = None
@@ -392,6 +418,11 @@ def _emit_cached_layer_nodes(
     outputs ``new_K_{i}`` / ``new_V_{i}``.  Uses the shared ``mask_3d``
     produced by :func:`_emit_cached_preamble`.
 
+    ``n_heads`` is the (possibly trimmed) head count for this layer.
+    Per-layer reshape constants ``l{i}_qkv_view_shape`` and
+    ``l{i}_ctx_flat_shape`` are expected to have been emitted by the
+    streaming weight callback.
+
     Returns the name of the next residual stream tensor.
     """
     p = f"l{layer_idx}"
@@ -401,15 +432,15 @@ def _emit_cached_layer_nodes(
 
     # Project Q, K_new, V_new from the new rows only, reshape to heads.
     node("MatMul", [current_res, f"{p}_WQ"], [f"{p}_Q_flat"])
-    node("Reshape", [f"{p}_Q_flat", "_qkv_view_shape"], [f"{p}_Q_view"])
+    node("Reshape", [f"{p}_Q_flat", f"{p}_qkv_view_shape"], [f"{p}_Q_view"])
     node("Transpose", [f"{p}_Q_view"], [f"{p}_Q"], perm=[1, 0, 2])
 
     node("MatMul", [current_res, f"{p}_WK"], [f"{p}_K_flat"])
-    node("Reshape", [f"{p}_K_flat", "_qkv_view_shape"], [f"{p}_K_view"])
+    node("Reshape", [f"{p}_K_flat", f"{p}_qkv_view_shape"], [f"{p}_K_view"])
     node("Transpose", [f"{p}_K_view"], [f"{p}_K_new"], perm=[1, 0, 2])
 
     node("MatMul", [current_res, f"{p}_WV"], [f"{p}_V_flat"])
-    node("Reshape", [f"{p}_V_flat", "_qkv_view_shape"], [f"{p}_V_view"])
+    node("Reshape", [f"{p}_V_flat", f"{p}_qkv_view_shape"], [f"{p}_V_view"])
     node("Transpose", [f"{p}_V_view"], [f"{p}_V_new"], perm=[1, 0, 2])
 
     # Concatenate the cached past with the new rows along the seq axis.
@@ -443,9 +474,9 @@ def _emit_cached_layer_nodes(
     node("Softmax", [f"{p}_logits_masked"], [f"{p}_weights"], axis=-1)
     node("MatMul", [f"{p}_weights", f"new_V_{layer_idx}"], [f"{p}_ctx"])
 
-    # Fused output projection: (n_heads, t, d_head) → (t, d) → (t, d)
+    # Fused output projection: (n_heads, t, d_head) → (t, hd) → (t, d)
     node("Transpose", [f"{p}_ctx"], [f"{p}_ctx_t"], perm=[1, 0, 2])
-    node("Reshape", [f"{p}_ctx_t", "_ctx_flat_shape"], [f"{p}_ctx_flat"])
+    node("Reshape", [f"{p}_ctx_t", f"{p}_ctx_flat_shape"], [f"{p}_ctx_flat"])
     node("MatMul", [f"{p}_ctx_flat", f"{p}_WO"], [f"{p}_attn_sum"])
     node("Add", [current_res, f"{p}_attn_sum"], [f"{p}_res_attn"])
 
@@ -461,9 +492,12 @@ def _emit_cached_layer_nodes(
 
 
 def _kv_io_value_info(
-    n_layers: int, n_heads: int, d_head: int
+    per_layer_n_heads: List[int], d_head: int
 ) -> tuple[list, list]:
     """Build ValueInfoProto entries for the KV-cache inputs and outputs.
+
+    ``per_layer_n_heads`` gives the (possibly trimmed) head count for
+    each layer, so each layer's KV tensors carry only the heads it uses.
 
     Returns:
         (past_vis, new_vis) — each a list of length 2*n_layers
@@ -472,25 +506,25 @@ def _kv_io_value_info(
     """
     past_vis: list = []
     new_vis: list = []
-    for i in range(n_layers):
+    for i, nh in enumerate(per_layer_n_heads):
         past_vis.append(
             helper.make_tensor_value_info(
-                f"past_K_{i}", TensorProto.FLOAT, [n_heads, "n_past", d_head]
+                f"past_K_{i}", TensorProto.FLOAT, [nh, "n_past", d_head]
             )
         )
         past_vis.append(
             helper.make_tensor_value_info(
-                f"past_V_{i}", TensorProto.FLOAT, [n_heads, "n_past", d_head]
+                f"past_V_{i}", TensorProto.FLOAT, [nh, "n_past", d_head]
             )
         )
         new_vis.append(
             helper.make_tensor_value_info(
-                f"new_K_{i}", TensorProto.FLOAT, [n_heads, "n_total", d_head]
+                f"new_K_{i}", TensorProto.FLOAT, [nh, "n_total", d_head]
             )
         )
         new_vis.append(
             helper.make_tensor_value_info(
-                f"new_V_{i}", TensorProto.FLOAT, [n_heads, "n_total", d_head]
+                f"new_V_{i}", TensorProto.FLOAT, [nh, "n_total", d_head]
             )
         )
     return past_vis, new_vis
@@ -512,6 +546,7 @@ def compile_headless_to_onnx(
     verbose: bool = True,
     extra_metadata: Optional[dict] = None,
     d_hidden: Optional[int] = None,
+    trim_heads: bool = True,
 ) -> None:
     """Compile a float-I/O graph to a KV-cached ONNX model.
 
@@ -535,8 +570,11 @@ def compile_headless_to_onnx(
     """
     dense_inits: list = []
     sparse_inits: list = []
+    per_layer_n_heads: list = []
 
-    on_layer_compiled = _make_stream_layer_weights_cb(d, dense_inits, sparse_inits)
+    on_layer_compiled = _make_stream_layer_weights_cb(
+        d, d_head, dense_inits, sparse_inits, per_layer_n_heads,
+    )
 
     # --- Phase 1: streaming compile ---------------------------------------
     t0 = time.perf_counter()
@@ -550,12 +588,12 @@ def compile_headless_to_onnx(
         device=None,
         on_layer_compiled=on_layer_compiled,
         d_hidden=d_hidden,
+        trim_heads=trim_heads,
     )
     t_compile = time.perf_counter() - t0
 
     # --- Phase 2: metadata + graph assembly -------------------------------
     assert compiled.residual_assignment is not None
-    n_heads = d // d_head
     n_layers = len(compiled.layers)
 
     t0 = time.perf_counter()
@@ -614,14 +652,8 @@ def compile_headless_to_onnx(
     _add_int64_init(
         "output_gather_indices_init", output_gather_indices, dense_inits
     )
-    _add_int64_init(
-        "_qkv_view_shape",
-        np.array([0, n_heads, d_head], dtype=np.int64),
-        dense_inits,
-    )
-    _add_int64_init(
-        "_ctx_flat_shape", np.array([0, d], dtype=np.int64), dense_inits
-    )
+    # Per-layer reshape constants (l{i}_qkv_view_shape, l{i}_ctx_flat_shape)
+    # are emitted by the streaming weight callback.
     _add_scalar_inits(dense_inits)
 
     # Nodes: preamble (mask + pos), residual stream, layers, postamble.
@@ -639,7 +671,7 @@ def compile_headless_to_onnx(
     current_res = "res_0"
     for i in range(n_layers):
         current_res = _emit_cached_layer_nodes(
-            nodes, i, current_res, d, d_head, n_heads
+            nodes, i, current_res, d, d_head, per_layer_n_heads[i]
         )
 
     add(
@@ -654,7 +686,7 @@ def compile_headless_to_onnx(
         "inputs", TensorProto.FLOAT, ["n_new", d_input]
     )
     past_len_vi = helper.make_tensor_value_info("past_len", TensorProto.INT64, [])
-    past_vis, new_vis = _kv_io_value_info(n_layers, n_heads, d_head)
+    past_vis, new_vis = _kv_io_value_info(per_layer_n_heads, d_head)
     outputs_vi = helper.make_tensor_value_info(
         "outputs", TensorProto.FLOAT, ["n_new", d_output]
     )
@@ -708,6 +740,7 @@ def compile_to_onnx(
     max_seq_len: int = 512,
     max_layers: int = 200,
     verbose: bool = True,
+    trim_heads: bool = True,
 ) -> None:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -727,8 +760,11 @@ def compile_to_onnx(
     """
     dense_inits: list = []
     sparse_inits: list = []
+    per_layer_n_heads: list = []
 
-    on_layer_compiled = _make_stream_layer_weights_cb(d, dense_inits, sparse_inits)
+    on_layer_compiled = _make_stream_layer_weights_cb(
+        d, d_head, dense_inits, sparse_inits, per_layer_n_heads,
+    )
 
     # --- Phase 1: streaming compile ---------------------------------------
     t0 = time.perf_counter()
@@ -741,12 +777,12 @@ def compile_to_onnx(
         max_layers=max_layers,
         device=None,
         on_layer_compiled=on_layer_compiled,
+        trim_heads=trim_heads,
     )
     t_compile = time.perf_counter() - t0
 
     # --- Phase 2: metadata + graph assembly -------------------------------
     assert compiled.residual_assignment is not None
-    n_heads = d // d_head
     n_layers = len(compiled.layers)
 
     t0 = time.perf_counter()
@@ -808,14 +844,8 @@ def compile_to_onnx(
     _add_int64_init(
         "output_gather_indices_init", output_gather_indices, dense_inits
     )
-    _add_int64_init(
-        "_qkv_view_shape",
-        np.array([0, n_heads, d_head], dtype=np.int64),
-        dense_inits,
-    )
-    _add_int64_init(
-        "_ctx_flat_shape", np.array([0, d], dtype=np.int64), dense_inits
-    )
+    # Per-layer reshape constants (l{i}_qkv_view_shape, l{i}_ctx_flat_shape)
+    # are emitted by the streaming weight callback.
     _add_scalar_inits(dense_inits)
 
     # Nodes: preamble (mask + pos), token embed, residual stream, layers,
@@ -836,7 +866,7 @@ def compile_to_onnx(
     current_res = "res_0"
     for i in range(n_layers):
         current_res = _emit_cached_layer_nodes(
-            nodes, i, current_res, d, d_head, n_heads
+            nodes, i, current_res, d, d_head, per_layer_n_heads[i]
         )
 
     add(
@@ -854,7 +884,7 @@ def compile_to_onnx(
         "token_ids", TensorProto.INT64, ["n_new"]
     )
     past_len_vi = helper.make_tensor_value_info("past_len", TensorProto.INT64, [])
-    past_vis, new_vis = _kv_io_value_info(n_layers, n_heads, d_head)
+    past_vis, new_vis = _kv_io_value_info(per_layer_n_heads, d_head)
     logits_vi = helper.make_tensor_value_info(
         "logits", TensorProto.FLOAT, ["n_new", vocab_size]
     )
@@ -908,6 +938,116 @@ def compile_to_onnx(
 # ---------------------------------------------------------------------------
 
 
+def _compute_io_layout(
+    io: Dict[str, Tuple[Optional[Node], Optional[Node]]]
+) -> Tuple[List[tuple], List[tuple], Dict[Node, Tuple[Optional[Node], List[int]]], int]:
+    """Compute column assignments from io spec.
+
+    The io dict declares the I/O contract:
+    - Key: field name (string) — used for alphabetical ordering
+    - Value: (input_node, output_node) tuple where:
+      - (in, out) → overlaid: output lands at input's columns via delta transfer
+      - (in, None) → input-only: columns hold input value, no output
+      - (None, out) → output-only: overflow columns appended after input region
+
+    Returns:
+        input_specs: List[(name, offset, width, input_node)] for input fields
+        output_specs: List[(name, offset, width, output_node)] for output fields
+        overlays: Dict[output_node -> (input_node or None, target_cols)] for delta transfer
+            - For overlaid: (input_node, target_cols) - subtract input before adding output
+            - For overflow: (None, target_cols) - just copy to target (subtract zero)
+        d_input: Total width of input region
+    """
+    # Sort by name (alphabetical)
+    sorted_names = sorted(io.keys())
+
+    # Input region: all entries with non-None input
+    input_specs = []
+    input_name_to_offset = {}
+    offset = 0
+    for name in sorted_names:
+        in_node, out_node = io[name]
+        if in_node is not None:
+            width = len(in_node)
+            input_specs.append((name, offset, width, in_node))
+            input_name_to_offset[name] = offset
+            offset += width
+    d_input = offset
+
+    # Output region: overlaid at input positions, overflow after
+    output_specs = []
+    overlays = {}
+    overflow_offset = d_input
+
+    for name in sorted_names:
+        in_node, out_node = io[name]
+        if out_node is not None:
+            width = len(out_node)
+            if in_node is not None:
+                # Overlaid: output at input's columns via delta transfer
+                in_offset = input_name_to_offset[name]
+                output_specs.append((name, in_offset, width, out_node))
+                target_cols = list(range(in_offset, in_offset + width))
+                overlays[out_node] = (in_node, target_cols)
+            else:
+                # Overflow: output after input region, also via delta transfer
+                # (delta transfer from source to overflow cols, subtracting zero)
+                output_specs.append((name, overflow_offset, width, out_node))
+                target_cols = list(range(overflow_offset, overflow_offset + width))
+                overlays[out_node] = (None, target_cols)  # None means subtract zero
+                overflow_offset += width
+
+    return input_specs, output_specs, overlays, d_input
+
+
+def _validate_io_spec(
+    io: Dict[str, Tuple[Optional[Node], Optional[Node]]]
+) -> None:
+    """Validate the io spec.
+
+    Raises ValueError if:
+    - Any entry has both nodes as None (empty tuple)
+    - Overlaid pairs have mismatched widths
+    - Duplicate nodes across different entries (same node in two different names)
+
+    Note: It's valid for in_node == out_node (identity case) within the same entry.
+    """
+    seen_input_nodes = set()
+    seen_output_nodes = set()
+
+    for name, (in_node, out_node) in io.items():
+        # Check for empty tuple
+        if in_node is None and out_node is None:
+            raise ValueError(
+                f"io entry '{name}' has both input and output as None"
+            )
+
+        # Check for duplicate input nodes across entries
+        if in_node is not None:
+            if in_node in seen_input_nodes:
+                raise ValueError(
+                    f"Input node {in_node} appears in multiple io entries"
+                )
+            seen_input_nodes.add(in_node)
+
+        # Check for duplicate output nodes across entries
+        # Allow same node to appear as both input and output within the same entry
+        if out_node is not None and out_node is not in_node:
+            if out_node in seen_output_nodes:
+                raise ValueError(
+                    f"Output node {out_node} appears in multiple io entries"
+                )
+            seen_output_nodes.add(out_node)
+
+        # Check width mismatch for overlaid pairs
+        if in_node is not None and out_node is not None:
+            if len(in_node) != len(out_node):
+                raise ValueError(
+                    f"io entry '{name}' has width mismatch: "
+                    f"input width {len(in_node)} != output width {len(out_node)}"
+                )
+
+
 class CompiledHeadless:
     """Callable wrapper around :class:`HeadlessTransformer`.
 
@@ -929,19 +1069,26 @@ class CompiledHeadless:
         input_specs: List[tuple],
         output_indices: torch.Tensor,
         metadata: Optional[dict] = None,
+        output_specs: Optional[List[tuple]] = None,
     ) -> None:
         self._net = net
         # input_specs: list of (name, start_col, width) in input-tensor column order.
         self._input_specs = list(input_specs)
         self._output_indices = output_indices
+        # output_specs: list of (name, offset_in_out, width) in gathered-output
+        # column order.  None for legacy callers that compile a single
+        # concatenated output_node and do not declare field names.
+        self._output_specs = list(output_specs) if output_specs is not None else []
         self.input_names: List[str] = [name for name, _, _ in input_specs]
         self.metadata: dict = dict(metadata or {})
 
         # KV cache shape metadata — discovered from the compiled transformer
         # so empty_past() can build zero-length tensors of the right shape.
-        first_attn = net.layers[0].attn.attn
-        self._n_heads = first_attn.n_heads
-        self._d_head = first_attn.d_head
+        # After head trimming each layer may have a different n_heads.
+        self._per_layer_n_heads = [
+            layer.attn.attn.n_heads for layer in net.layers
+        ]
+        self._d_head = net.layers[0].attn.attn.d_head
         self._n_layers = len(net.layers)
 
     def _build_res_stream(
@@ -967,9 +1114,14 @@ class CompiledHeadless:
     ) -> tuple:
         """Zero-length past tensors suitable for a first prefill call."""
         device = self._net.device
-        zeros = torch.zeros(self._n_heads, 0, self._d_head, device=device)
-        past_K = tuple(zeros.clone() for _ in range(self._n_layers))
-        past_V = tuple(zeros.clone() for _ in range(self._n_layers))
+        past_K = tuple(
+            torch.zeros(nh, 0, self._d_head, device=device)
+            for nh in self._per_layer_n_heads
+        )
+        past_V = tuple(
+            torch.zeros(nh, 0, self._d_head, device=device)
+            for nh in self._per_layer_n_heads
+        )
         return (past_K, past_V)
 
     def step(
@@ -1018,10 +1170,24 @@ class CompiledHeadless:
     def eval(self) -> "CompiledHeadless":
         return self
 
+    def input_slice(self, name: str, inputs: torch.Tensor) -> torch.Tensor:
+        """Return the slice of ``inputs`` for the named input field."""
+        for n, s, w in self._input_specs:
+            if n == name:
+                return inputs[..., s:s + w]
+        raise KeyError(f"input field {name!r} not found")
+
+    def output_slice(self, name: str, outputs: torch.Tensor) -> torch.Tensor:
+        """Return the slice of ``outputs`` (post-gather) for the named output field."""
+        for n, s, w in self._output_specs:
+            if n == name:
+                return outputs[..., s:s + w]
+        raise KeyError(f"output field {name!r} not found")
+
 
 def compile_headless(
-    output_node: Node,
-    pos_encoding: PosEncoding,
+    first_arg,
+    second_arg=None,
     d: int = 1024,
     d_head: int = 16,
     max_layers: int = 100,
@@ -1029,6 +1195,11 @@ def compile_headless(
     device: str = "cpu",
     extra_metadata: Optional[dict] = None,
     d_hidden: Optional[int] = None,
+    trim_heads: bool = True,
+    # Named parameters for new API
+    io: Optional[Dict[str, Tuple[Optional[Node], Optional[Node]]]] = None,
+    # Legacy named parameter
+    output_node: Optional[Node] = None,
 ) -> CompiledHeadless:
     """Compile a headless graph to an in-process callable.
 
@@ -1038,10 +1209,140 @@ def compile_headless(
     artifact, autoregressive decode, fast startup), use
     :func:`compile_headless_to_onnx` instead.
 
+    Supports two calling patterns:
+    - New API: ``compile_headless(pos_encoding, io={"name": (input, output)}, ...)``
+    - Legacy API: ``compile_headless(output_node, pos_encoding, ...)``
+
+    The ``io`` dict declares the I/O contract:
+    - Key: field name (string) — used for alphabetical ordering
+    - Value: ``(input_node, output_node)`` tuple where:
+      - ``(in, out)`` → overlaid: output lands at input's columns
+      - ``(in, None)`` → input-only: columns hold input value, no output
+      - ``(None, out)`` → output-only: overflow columns appended after input region
+
+    For overlaid entries, the output is placed at the same columns as the
+    input via delta transfer, enabling autoregressive feedback where the
+    transformer output IS the next input.
+
     ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
     when omitted; pass an explicit value to decouple the MLP intermediate
     width from the residual stream width.
     """
+    # Detect API based on argument types
+    # Legacy: compile_headless(output_node, pos_encoding, ...)
+    # New: compile_headless(pos_encoding, io=..., ...)
+
+    if isinstance(first_arg, PosEncoding):
+        # New API: first_arg is pos_encoding
+        pos_encoding = first_arg
+        # second_arg should be None or io dict (not used positionally in new API)
+        if second_arg is not None and io is None:
+            # Allow compile_headless(pos_encoding, io_dict, ...) positionally
+            io = second_arg
+    else:
+        # Legacy API: first_arg is output_node, second_arg is pos_encoding
+        if output_node is not None:
+            raise ValueError("Cannot specify output_node both positionally and as keyword")
+        output_node = first_arg
+        pos_encoding = second_arg
+
+    # Handle legacy API
+    if output_node is not None:
+        if io is not None:
+            raise ValueError("Cannot specify both io and output_node")
+        return _compile_headless_legacy(
+            output_node=output_node,
+            pos_encoding=pos_encoding,
+            d=d,
+            d_head=d_head,
+            max_layers=max_layers,
+            verbose=verbose,
+            device=device,
+            extra_metadata=extra_metadata,
+            d_hidden=d_hidden,
+            trim_heads=trim_heads,
+        )
+
+    # New io-based path
+    if io is None:
+        raise ValueError("Either io or output_node must be provided")
+
+    # New io-based path
+    assert io is not None
+    _validate_io_spec(io)
+
+    # Set names on InputNodes from io dict keys
+    # This enables HeadlessTransformer.get_input_res_stream to look up values
+    for name, (in_node, out_node) in io.items():
+        if in_node is not None and isinstance(in_node, InputNode):
+            in_node.name = name
+
+    input_specs, output_specs, overlays, d_input = _compute_io_layout(io)
+
+    # Build the combined output node for forward_compile
+    # Collect all output nodes (both overlaid and overflow)
+    output_nodes = [spec[3] for spec in output_specs]
+    if len(output_nodes) == 0:
+        raise ValueError("io must have at least one output")
+    elif len(output_nodes) == 1:
+        combined_output = output_nodes[0]
+    else:
+        combined_output = Concatenate(output_nodes)
+
+    # Map input nodes to their names for the residual assignment
+    input_node_to_name = {spec[3]: spec[0] for spec in input_specs}
+
+    net = forward_compile(
+        d=d,
+        d_head=d_head,
+        output_node=combined_output,
+        pos_encoding=pos_encoding,
+        verbose=verbose,
+        max_layers=max_layers,
+        device=device,
+        d_hidden=d_hidden,
+        trim_heads=trim_heads,
+        overlays=overlays,
+    )
+
+    assert net.residual_assignment is not None
+    out_state = net.layers[-1].mlp.out_state
+
+    # Build input_specs for CompiledHeadless (name, offset, width)
+    ch_input_specs = [(name, offset, width) for name, offset, width, _ in input_specs]
+
+    # Build output indices from output_specs
+    # For overlaid outputs, offset is the input's column offset
+    # For overflow outputs, offset is in the overflow region
+    output_indices = []
+    ch_output_specs: List[tuple] = []
+    running = 0
+    for name, offset, width, out_node in output_specs:
+        output_indices.extend(range(offset, offset + width))
+        ch_output_specs.append((name, running, width))
+        running += width
+
+    output_indices_tensor = torch.tensor(output_indices, dtype=torch.long)
+
+    return CompiledHeadless(
+        net, ch_input_specs, output_indices_tensor,
+        metadata=extra_metadata, output_specs=ch_output_specs,
+    )
+
+
+def _compile_headless_legacy(
+    output_node: Node,
+    pos_encoding: PosEncoding,
+    d: int,
+    d_head: int,
+    max_layers: int,
+    verbose: bool,
+    device: str,
+    extra_metadata: Optional[dict],
+    d_hidden: Optional[int],
+    trim_heads: bool,
+) -> CompiledHeadless:
+    """Legacy compile_headless implementation using output_node parameter."""
     net = forward_compile(
         d=d,
         d_head=d_head,
@@ -1051,6 +1352,7 @@ def compile_headless(
         max_layers=max_layers,
         device=device,
         d_hidden=d_hidden,
+        trim_heads=trim_heads,
     )
 
     assert net.residual_assignment is not None

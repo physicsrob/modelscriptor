@@ -653,3 +653,81 @@ across heads via the V/O splitting mechanism).
   attention heads (e.g., 4 heads of width 32 covering column groups).
 - Move visibility selection out of attention entirely — use MLP-based
   dynamic extraction instead, at the cost of more transformer layers.
+
+**Update (render-token branch):** This problem went away.  The old
+per-column `attend_argmax_dot` with W-wide visibility masks was replaced
+by `attend_argmin_unmasked` with max_walls-wide masks.  The render
+attention now selects walls by sort rank (front-to-back), not by column
+visibility.  This drops d_head from 64 to 32 for typical configs (W=32,
+max_walls=8), halving attention parameter count and VRAM.  The
+column-visibility logic moved from query-time to the state machine:
+the graph iterates columns col_lo..col_hi for each wall, and the host
+skips out-of-bounds columns.
+
+---
+
+## Autoregressive render: the host as a dumb bitblitter
+
+The render phase changed from host-driven (``for col, for shard``) to
+transformer-driven (the graph emits one render token per wall-column-chunk).
+Each token outputs:
+
+    [col | start_y | length | done | pixels(cs×3) | feedback(mask+3)]
+
+The host's render loop:
+1. Copy feedback from previous output to next input (verbatim)
+2. Bitblit ``length`` pixels at ``(col, start_y)`` to frame, skipping
+   already-filled pixels
+3. After all walls: fill unfilled pixels with ceiling/floor colors
+
+The transformer decides wall ordering (front-to-back via sort rank),
+column iteration (col_lo to col_hi), and chunk iteration (vis_top
+downward in chunk_size steps).  The state machine uses three signals
+in the feedback: ``render_mask`` (which walls are done),
+``render_col`` (current column), and ``render_chunk_start`` (current
+chunk offset within the column, or -1 sentinel for "new column").
+
+**Key design decision:** the graph's done flag checks
+``mask_sum > max_walls − 0.5``, which only fires when **all**
+max_walls slots are masked.  When the scene has fewer walls than
+max_walls, the graph never produces a done signal — the host terminates
+by counting mask bits (``n_masked >= N``).  This is intentional: the
+graph doesn't know N, and adding an input for it would add width to
+every position's input vector.  The host bit-count is trivially dumb
+(no game logic), and N is already known to the host.
+
+**Performance characteristic:** render token count is
+O(N × W × ⌈H/cs⌉) in the worst case (every wall spans every column).
+With walls that only span part of the screen, fewer tokens are needed.
+The old fixed-grid approach was always exactly W × H/rp tokens
+regardless of wall coverage.  At 120×100 with 4 walls spanning the
+full screen, we measured 740 render steps — close to the theoretical
+4 × 124 × 1 = 496 (the extra comes from out-of-bounds columns in
+the col_lo..col_hi range).
+
+**Precision trade-off:** the old per-column ``attend_argmax_dot``
+independently selected the closest visible wall for each column.  The
+new ``attend_argmin_unmasked`` selects walls by sort rank and iterates
+all columns for each wall.  If the sort phase produces imprecise data
+(e.g., averaging two walls at similar distances), the old approach could
+sometimes bypass the bad data at individual columns, while the new
+approach commits to it for the entire wall.  In practice this manifests
+as a ~0.05 increase in max pixel error at a few oblique angles where
+sort precision is tight.
+
+## d_head dropped from 64 to 32 — and VRAM halved
+
+Replacing `attend_argmax_dot` (d_qk = W + 2 = 34 for W=32) with
+`attend_argmin_unmasked` (d_head = 1 + max_walls + value_width) for
+the render phase changed the binding constraint:
+
+    Old:    max(W+2, 8+tex_w+1)  =  max(34, 17)  =  34  →  d_head=64
+    New:    max(12+2·max_walls, 9+2·max_walls, 8+tex_w+1)
+          = max(28, 25, 17) = 28  →  d_head=32
+
+With d=2048, that means n_heads doubles from 32 to 64 — but each head
+is half the size.  Attention parameter count per layer drops from
+4 × 2048 × 64 = 524K to 4 × 2048 × 32 = 262K.  Measured VRAM at
+test time dropped from 7.92 GiB to 3.34 GiB — the
+`trim_unused_heads` optimization (merged from main) further reduces
+the live parameter count by removing trailing zero-weight heads.

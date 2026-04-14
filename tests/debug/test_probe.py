@@ -94,27 +94,32 @@ def test_probe_clean_on_v2_box_room(tiny_config):
     """
     textures = default_texture_atlas()
     max_walls = 8
-    output_node, pos_encoding = build_game_graph(
+    max_bsp_nodes = 48
+    graph_io, pos_encoding = build_game_graph(
         tiny_config, textures, max_walls=max_walls,
         max_coord=10.0, move_speed=0.3, turn_speed=4,
+        max_bsp_nodes=max_bsp_nodes,
     )
+    output_node = graph_io.concat_output()
 
     from torchwright.doom.game_graph import E8_INPUT
+    d_render_fb = 2 * max_walls + 11
+    d_sort_out = 8 + 5 + 3 + 2 * max_walls
+    tex_h = textures[0].shape[1]
     input_values = {
-        "col_idx": torch.tensor([[0.0]]),
         "input_backward": torch.tensor([[0.0]]),
         "input_forward": torch.tensor([[0.0]]),
         "input_strafe_left": torch.tensor([[0.0]]),
         "input_strafe_right": torch.tensor([[0.0]]),
         "input_turn_left": torch.tensor([[0.0]]),
         "input_turn_right": torch.tensor([[0.0]]),
-        "patch_idx": torch.tensor([[0.0]]),
         "player_angle": torch.tensor([[0.0]]),
         "player_x": torch.tensor([[0.0]]),
         "player_y": torch.tensor([[0.0]]),
-        "sort_feedback": torch.zeros(1, 8 + 5 + 2 * max_walls),
+        "render_feedback": torch.zeros(1, d_render_fb),
+        "sort_feedback": torch.zeros(1, d_sort_out),
         "tex_col_input": torch.tensor([[0.0]]),
-        "tex_pixels": torch.zeros(1, textures[0].shape[1] * 3),
+        "tex_pixels": torch.zeros(1, tex_h * 3),
         "texture_id_e8": torch.zeros(1, 8),
         "token_type": E8_INPUT.unsqueeze(0),
         "wall_ax": torch.tensor([[0.0]]),
@@ -123,6 +128,12 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         "wall_by": torch.tensor([[0.0]]),
         "wall_index": torch.tensor([[0.0]]),
         "wall_tex_id": torch.tensor([[0.0]]),
+        "bsp_plane_nx": torch.tensor([[0.0]]),
+        "bsp_plane_ny": torch.tensor([[0.0]]),
+        "bsp_plane_d": torch.tensor([[0.0]]),
+        "bsp_node_id_onehot": torch.zeros(1, max_bsp_nodes),
+        "wall_bsp_coeffs": torch.zeros(1, max_bsp_nodes),
+        "wall_bsp_const": torch.tensor([[0.0]]),
     }
 
     # The v2 graph has large intermediate values in square_signed and

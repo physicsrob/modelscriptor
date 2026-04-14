@@ -2,7 +2,7 @@
 
 Token sequence per frame:
 
-    TEX_COL×(num_tex × tex_w) → INPUT → WALL×N → EOS → SORTED_WALL×N → RENDER×(W × H/rp)
+    TEX_COL×(num_tex × tex_w) → INPUT → WALL×N → EOS → SORTED_WALL×N → RENDER×(dynamic)
 
 Six token types (E8 spherical codes):
 
@@ -30,7 +30,8 @@ column), TEX_COL→RENDER (texture pixels).
 """
 
 import math
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -49,6 +50,7 @@ from torchwright.ops.arithmetic_ops import (
     compare,
     floor_int,
     mod_const,
+    multiply_2d,
     multiply_const,
     negate,
     piecewise_linear,
@@ -57,6 +59,7 @@ from torchwright.ops.arithmetic_ops import (
     signed_multiply,
     square_signed,
     subtract,
+    sum_nodes,
     thermometer_floor_div,
 )
 from torchwright.ops.attention_ops import (
@@ -65,7 +68,7 @@ from torchwright.ops.attention_ops import (
     attend_mean_where,
 )
 from torchwright.ops.inout_nodes import create_input, create_literal_value, create_pos_encoding
-from torchwright.ops.logic_ops import bool_all_true, bool_any_true, cond_gate, equals_vector
+from torchwright.ops.logic_ops import bool_all_true, bool_any_true, bool_not, cond_gate, equals_vector
 from torchwright.ops.map_select import in_range, select
 
 from torchwright.doom.renderer import (
@@ -84,16 +87,20 @@ TOKEN_WALL = 1
 TOKEN_EOS = 2
 TOKEN_SORTED_WALL = 3
 TOKEN_RENDER = 4
+TOKEN_TEX_COL = 5
+TOKEN_THINKING = 6
+TOKEN_BSP_NODE = 7
 
 E8_INPUT = index_to_vector(TOKEN_INPUT)
 E8_WALL = index_to_vector(TOKEN_WALL)
 E8_EOS = index_to_vector(TOKEN_EOS)
 E8_SORTED_WALL = index_to_vector(TOKEN_SORTED_WALL)
 E8_RENDER = index_to_vector(TOKEN_RENDER)
-
-TOKEN_TEX_COL = 5
 E8_TEX_COL = index_to_vector(TOKEN_TEX_COL)
-TEX_E8_OFFSET = 6  # index_to_vector(6+i) = E8 code for texture i
+E8_THINKING = index_to_vector(TOKEN_THINKING)
+E8_BSP_NODE = index_to_vector(TOKEN_BSP_NODE)
+
+TEX_E8_OFFSET = 8  # index_to_vector(8+i) = E8 code for texture i
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +115,47 @@ _TRIG_BP = [-1, -0.9, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 0.9, 1]
 _SQRT_BP = [0, 0.25, 1, 2, 4, 9, 16, 25, 36, 49, 64, 100, 225, 400, 900, 1600, 3200]
 
 BIG_DISTANCE = 1000.0
+
+
+# ---------------------------------------------------------------------------
+# I/O contract
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GameGraphIO:
+    """Structured return value of :func:`build_game_graph`.
+
+    ``inputs`` maps name → input node (host-fed at every position).
+    ``overlaid_outputs`` maps name → output node whose value should land
+    back at the matching input's columns (via delta transfer) — these
+    carry autoregressive feedback.  ``overflow_outputs`` maps name →
+    output-only node, placed after the input region (pixels + metadata).
+    """
+
+    inputs: Dict[str, Node]
+    overlaid_outputs: Dict[str, Node]
+    overflow_outputs: Dict[str, Node]
+
+    def concat_output(self) -> Node:
+        """Single concatenated output node, for legacy callers.
+
+        Preserves the historical compact order (token_type, sort_feedback,
+        render_feedback, pixels, col, start, length, done) so downstream
+        layout assumptions stay valid for legacy paths that have not yet
+        migrated to the io API.
+        """
+        nodes = [
+            self.overlaid_outputs["token_type"],
+            self.overlaid_outputs["sort_feedback"],
+            self.overlaid_outputs["render_feedback"],
+            self.overflow_outputs["pixels"],
+            self.overflow_outputs["col"],
+            self.overflow_outputs["start"],
+            self.overflow_outputs["length"],
+            self.overflow_outputs["done"],
+        ]
+        return Concatenate(nodes)
 
 
 # ---------------------------------------------------------------------------
@@ -286,21 +334,27 @@ def build_game_graph(
     max_coord: float = 20.0,
     move_speed: float = 0.3,
     turn_speed: int = 4,
-    rows_per_patch: Optional[int] = None,
-) -> Tuple[Node, PosEncoding]:
+    chunk_size: int = 20,
+    max_bsp_nodes: int = 48,
+) -> Tuple[GameGraphIO, PosEncoding]:
     """Build the walls-as-tokens game graph.
 
     Collision detection is runtime: each WALL token tests the player's
     velocity ray against its wall segment and outputs three hit flags
     (full, x-only, y-only).  The host resolves wall sliding.
 
-    Returns ``(output_node, pos_encoding)``.
+    Returns ``(graph_io, pos_encoding)`` where ``graph_io`` is a
+    :class:`GameGraphIO` exposing named inputs plus the per-field output
+    nodes.  Overlaid outputs (``render_feedback``, ``sort_feedback``,
+    ``token_type``) carry autoregressive feedback; overflow outputs
+    (``pixels``, ``col``, ``start``, ``length``, ``done``) are the host's
+    bitblit payload and control-flow flags.
     """
     H = config.screen_height
     W = config.screen_width
     fov = config.fov_columns
     tex_w, tex_h = textures[0].shape[0], textures[0].shape[1]
-    rp = rows_per_patch if rows_per_patch is not None else H
+    cs = chunk_size
 
     pos_encoding = create_pos_encoding()
 
@@ -321,16 +375,46 @@ def build_game_graph(
     wall_by = create_input("wall_by", 1)
     wall_tex_id = create_input("wall_tex_id", 1)
     wall_index = create_input("wall_index", 1)
-    d_sort_out = 8 + 5 + 2 * max_walls
+    d_sort_out = 8 + 5 + 3 + 2 * max_walls
     sort_feedback = create_input("sort_feedback", d_sort_out)
     prev_mask = _extract_from(
-        sort_feedback, d_sort_out, 8 + 5 + max_walls, max_walls, "prev_mask",
+        sort_feedback, d_sort_out, 8 + 5 + 3 + max_walls, max_walls, "prev_mask",
     )
-    col_idx = create_input("col_idx", 1)
-    patch_idx = create_input("patch_idx", 1)
+    d_render_fb = 2 * max_walls + 11
+    render_feedback = create_input("render_feedback", d_render_fb)
+    render_mask = _extract_from(render_feedback, d_render_fb, 0, max_walls, "render_mask")
+    render_col = _extract_from(render_feedback, d_render_fb, max_walls, 1, "render_col")
+    render_is_new_wall = _extract_from(
+        render_feedback, d_render_fb, max_walls + 1, 1, "render_is_new_wall",
+    )
+    render_chunk_start = _extract_from(
+        render_feedback, d_render_fb, max_walls + 2, 1, "render_chunk_start",
+    )
+    # Wall data fields (populated by THINKING, forwarded by RENDER)
+    fb_sort_den = _extract_from(render_feedback, d_render_fb, max_walls + 3, 1, "fb_sort_den")
+    fb_C        = _extract_from(render_feedback, d_render_fb, max_walls + 4, 1, "fb_C")
+    fb_D        = _extract_from(render_feedback, d_render_fb, max_walls + 5, 1, "fb_D")
+    fb_E        = _extract_from(render_feedback, d_render_fb, max_walls + 6, 1, "fb_E")
+    fb_H_inv    = _extract_from(render_feedback, d_render_fb, max_walls + 7, 1, "fb_H_inv")
+    fb_tex_id   = _extract_from(render_feedback, d_render_fb, max_walls + 8, 1, "fb_tex_id")
+    fb_col_lo   = _extract_from(render_feedback, d_render_fb, max_walls + 9, 1, "fb_col_lo")
+    fb_col_hi   = _extract_from(render_feedback, d_render_fb, max_walls + 10, 1, "fb_col_hi")
+    fb_onehot   = _extract_from(render_feedback, d_render_fb, max_walls + 11, max_walls, "fb_onehot")
     tex_col_input = create_input("tex_col_input", 1)
     tex_pixels = create_input("tex_pixels", tex_h * 3)
     texture_id_e8 = create_input("texture_id_e8", 8)
+    # BSP plane inputs (meaningful at BSP_NODE positions; zero elsewhere).
+    # The plane equation is nx*x + ny*y + d with |nx|, |ny| ≤ 1 after
+    # normalization by the host.  ``bsp_node_id_onehot`` identifies which
+    # slot this node fills in the broadcast vector.
+    bsp_plane_nx = create_input("bsp_plane_nx", 1)
+    bsp_plane_ny = create_input("bsp_plane_ny", 1)
+    bsp_plane_d = create_input("bsp_plane_d", 1)
+    bsp_node_id_onehot = create_input("bsp_node_id_onehot", max_bsp_nodes)
+    # Per-wall BSP rank precomputation: rank(W) = dot(coeffs, side_P_vec)
+    # + const.  Host precomputes these from the BSP tree structure.
+    wall_bsp_coeffs = create_input("wall_bsp_coeffs", max_bsp_nodes)
+    wall_bsp_const = create_input("wall_bsp_const", 1)
 
     # --- Token type detection ---
     with annotate("token_type"):
@@ -339,7 +423,9 @@ def build_game_graph(
         is_eos = equals_vector(token_type, E8_EOS)
         is_sorted = equals_vector(token_type, E8_SORTED_WALL)
         is_render = equals_vector(token_type, E8_RENDER)
+        is_thinking = equals_vector(token_type, E8_THINKING)
         is_tex_col = equals_vector(token_type, E8_TEX_COL)
+        is_bsp_node = equals_vector(token_type, E8_BSP_NODE)
 
     # --- TEX_COL: column one-hot for key matching ---
     with annotate("tex_col"):
@@ -377,6 +463,50 @@ def build_game_graph(
             attn_move_cos = _extract_from(ctrl_attn, 5, 2, 1, "a_mcos")
             attn_move_sin = _extract_from(ctrl_attn, 5, 3, 1, "a_msin")
             attn_new_angle = _extract_from(ctrl_attn, 5, 4, 1, "a_angle")
+
+    # =====================================================================
+    # BSP: classify player against each splitting plane, broadcast sides
+    # =====================================================================
+    #
+    # Each BSP_NODE token carries a normalized splitting plane
+    # ``(nx, ny, d)`` such that ``nx*px + ny*py + d > 0`` iff the
+    # player is on the FRONT side.  The host pre-normalizes so that
+    # ``|nx|, |ny| ≤ 1``.
+    #
+    # ``attend_mean_where(validity=is_bsp_node, value=onehot×side_P)``
+    # averages over all M BSP_NODE positions, yielding
+    # ``(1/M) × side_P_vec``.  Multiplying by M recovers the
+    # per-slot 0/1 side decisions at every position — ready for
+    # WALL tokens to dot-product with their precomputed coefficients.
+    with annotate("bsp/side_p"):
+        bsp_nx_px = multiply_2d(
+            bsp_plane_nx, player_x,
+            max_abs1=1.0, max_abs2=max_coord,
+            step1=0.1, step2=1.0,
+            name="bsp_nx_px",
+        )
+        bsp_ny_py = multiply_2d(
+            bsp_plane_ny, player_y,
+            max_abs1=1.0, max_abs2=max_coord,
+            step1=0.1, step2=1.0,
+            name="bsp_ny_py",
+        )
+        bsp_raw = add(add(bsp_nx_px, bsp_ny_py), bsp_plane_d)
+        # ±1 bool: +1 if raw > 0 (FRONT), -1 if raw ≤ 0 (BACK)
+        side_P_bool = compare(bsp_raw, 0.0)
+        # At BSP_NODE[i]: emit onehot_i when side=FRONT, zero otherwise.
+        # Other token types get a garbage value that attend_mean_where
+        # will ignore (validity=is_bsp_node filters to BSP_NODE positions).
+        side_P_spread = cond_gate(side_P_bool, bsp_node_id_onehot)
+
+    with annotate("bsp/broadcast"):
+        side_P_mean = attend_mean_where(
+            pos_encoding,
+            validity=is_bsp_node,
+            value=side_P_spread,
+        )
+        # Recover side_P values by undoing the average's division by M.
+        side_P_vec = multiply_const(side_P_mean, float(max_bsp_nodes))
 
     # =====================================================================
     # WALL: distance score + sort value + collision hit flags
@@ -474,27 +604,81 @@ def build_game_graph(
         )
         precomp_H_inv = multiply_const(inv_abs_num_t, float(H))
 
-    # --- Central ray distance for sort score ---
-    with annotate("wall/sort_score"):
-        sort_sign_den = compare(sort_den, 0.0)
-        sort_abs_den = abs(sort_den)
-        sort_adj_num_t = select(sort_sign_den, sort_num_t, negate(sort_num_t))
+    # --- BSP rank: sort key from the BSP tree's spatial structure ---
+    # Each WALL carries precomputed coefficients ``coeffs_W`` (M-dim) and
+    # a constant ``const_W``.  The rank is the linear-algebra form of
+    # DOOM's front-to-back traversal:
+    #
+    #     rank(W) = dot(coeffs_W, side_P_vec) + const_W
+    #
+    # Since ``side_P_vec[i] ∈ {0, 1}``, the product simplifies to "keep
+    # coeffs[i] where side_P[i]=1, else 0" — implemented per element
+    # with ``compare`` + ``cond_gate``.
+    #
+    # Renderability filter: walls that are parallel to the viewing ray
+    # (|sort_den| ≈ 0) produce degenerate precomp values.  They get the
+    # sentinel rank so they sort LAST, after all renderable walls —
+    # the same guarantee the old ``wall/sort_score`` block provided.
+    with annotate("bsp/rank"):
+        bsp_products: List[Node] = []
+        for i in range(max_bsp_nodes):
+            c_i = _extract_from(
+                wall_bsp_coeffs, max_bsp_nodes, i, 1, f"bsp_c_{i}",
+            )
+            s_i = _extract_from(
+                side_P_vec, max_bsp_nodes, i, 1, f"bsp_s_{i}",
+            )
+            # side_P_vec ∈ {0, 1}; compare against 0.5 yields a stable
+            # ±1 bool even against small interpolation noise.
+            s_bool = compare(s_i, 0.5)
+            p_i = cond_gate(s_bool, c_i)
+            bsp_products.append(p_i)
+        bsp_dot = sum_nodes(bsp_products)
+        bsp_rank_raw = add(bsp_dot, wall_bsp_const)
 
-        is_sort_den_nz = compare(sort_abs_den, 0.05)
-        is_sort_t_pos = compare(sort_adj_num_t, 0.0)
+        # Renderability gate: need |sort_den| > epsilon for the render
+        # pipeline's precomp values to be meaningful, AND num_t must
+        # agree in sign with den (intersection in front of the player).
+        abs_sort_den = abs(sort_den)
+        is_den_ok = compare(abs_sort_den, 0.05)
+        # num_t × sign(den) > 0 ⇔ wall is in front
+        den_sign = compare(sort_den, 0.0)
+        adj_num_t = select(den_sign, sort_num_t, negate(sort_num_t))
+        is_t_pos = compare(adj_num_t, 0.0)
+        is_wall_renderable = bool_all_true([is_den_ok, is_t_pos])
 
-        sort_inv_den = reciprocal(sort_abs_den, min_value=0.01, max_value=2.0 * max_coord)
-        sort_t = signed_multiply(
-            sort_adj_num_t, sort_inv_den,
-            max_abs1=2.0 * max_coord * max_coord,
-            max_abs2=1.0 / 0.01,
-            step=1.0, max_abs_output=BIG_DISTANCE,
+        # Sentinels must (a) exceed any real rank so unrenderable walls
+        # sort last, and (b) stay within the ``|score| <= 100`` bound of
+        # ``attend_argmin_unmasked`` so the mask penalty can still
+        # override it.  Real ranks are bounded above by ``max_walls - 1``
+        # (ranks are a permutation of ``0..N-1``).
+        bsp_sentinel = create_literal_value(
+            torch.tensor([99.0]), name="bsp_sentinel",
         )
-
-        is_sort_valid = bool_all_true([is_sort_den_nz, is_sort_t_pos])
-        sentinel = create_literal_value(torch.tensor([99.0]), name="sentinel")
-        center_ray_dist = select(is_sort_valid, sort_t, sentinel)
-        sort_score = select(is_wall, center_ray_dist, sentinel)
+        bsp_rank_filtered = select(
+            is_wall_renderable, bsp_rank_raw, bsp_sentinel,
+        )
+        # Tie-break: add ``wall_index * 0.1`` so tied walls (e.g. multiple
+        # unrenderable walls at the sentinel) get distinct scores.
+        # ``attend_argmin_unmasked`` blends tied positions via softmax —
+        # with ``_QUERY_GAIN = 80`` we need ``> ~5`` separation in
+        # logit space for the softmax to concentrate on a single winner;
+        # ``0.1`` gives ``e^8 ≈ 3000×``.  The total offset
+        # ``0.1 * (max_walls-1)`` must stay under ``1.0`` so real-rank
+        # ordering (spacing 1.0) is preserved — limiting this scheme to
+        # ``max_walls ≤ 10``.
+        bsp_rank_tiebroken = add(
+            bsp_rank_filtered, multiply_const(wall_index, 0.1),
+        )
+        # Non-wall positions get a strictly higher sentinel (99.9) so
+        # they lose the sort to any wall, even an unrenderable one.
+        # Otherwise non-wall positions (which outnumber walls) would
+        # tie with wall_index=0's tiebroken sentinel (99.0) and softmax
+        # would weight-average all of them, dominating the true wall.
+        nonwall_sentinel = create_literal_value(
+            torch.tensor([99.9]), name="nonwall_sentinel",
+        )
+        bsp_rank = select(is_wall, bsp_rank_tiebroken, nonwall_sentinel)
 
     # Wall index one-hot (host-fed wall_index: 0, 1, 2, ...)
     with annotate("wall/onehot"):
@@ -503,15 +687,18 @@ def build_game_graph(
         ones_oh = create_literal_value(torch.ones(max_walls), name="ones_oh")
         position_onehot = add_scaled_nodes(0.5, onehot_bool, 0.5, ones_oh)
 
-    # Pack wall value: geometry + precomputed render data + onehot
+    # Pack wall value: geometry + precomputed render data + BSP rank +
+    # onehot.  The BSP rank is both the sort score (used by argmin) AND
+    # carried through the sort output for debug/tiebreaking downstream.
+    #
     # Indices 0-4: ax,ay,bx,by,tex_id (vis mask needs 0-3)
     # Indices 5-9: sort_den, C, D, E, H_inv_num_t (render pipeline)
-    # Index 10: center_ray_dist (render attention distance tiebreak)
+    # Index 10:    bsp_rank (replaces old center_ray_dist slot)
     # Indices 11+: position_onehot (sort mask)
     wall_value_for_sort = Concatenate([
         wall_ax, wall_ay, wall_bx, wall_by, wall_tex_id,
         sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv,
-        center_ray_dist,
+        bsp_rank,
         position_onehot,
     ])
     d_sort_val = 11 + max_walls
@@ -573,11 +760,22 @@ def build_game_graph(
     with annotate("sort/attention"):
         selected_sort = attend_argmin_unmasked(
             pos_encoding=pos_encoding,
-            score=sort_score,
+            score=bsp_rank,
             mask_vector=prev_mask,
             position_onehot=position_onehot,
             value=wall_value_for_sort,
         )
+
+        # Sort rank: number of walls already selected (= sum of mask entries).
+        # At step k the mask has k bits set, so sort_rank = k.
+        sort_rank = Linear(
+            prev_mask, torch.ones(max_walls, 1), name="sort_rank",
+        )
+
+        # One-hot encoding of sort_rank for render-phase wall selection
+        sort_rank_p1 = add_const(sort_rank, 1.0)
+        sr_onehot_bool = in_range(sort_rank, sort_rank_p1, max_walls)
+        sort_rank_onehot = add_scaled_nodes(0.5, sr_onehot_bool, 0.5, ones_oh)
 
         sel_wall_data = _extract_from(selected_sort, d_sort_val, 0, 5, "sel_wall_data")
         sel_render = _extract_from(selected_sort, d_sort_val, 5, 5, "sel_render")
@@ -628,95 +826,119 @@ def build_game_graph(
                                 lambda a, b: a * b, name="sin_dby_b"),
         )
 
-        dot_a_sign = compare(dot_a, 0.0)
-        dot_a_abs = abs(dot_a)
-        dot_a_clamped = select(
-            compare(dot_a_abs, 0.1),
-            dot_a_abs,
-            create_literal_value(torch.tensor([0.1]), name="dot_min"),
-        )
-        inv_dot_a = reciprocal(dot_a_clamped, min_value=0.1, max_value=2.0 * max_coord)
-        signed_inv_dot_a = select(dot_a_sign, inv_dot_a, negate(inv_dot_a))
-        tan_a = signed_multiply(cross_a, signed_inv_dot_a,
-                                max_abs1=max_coord, max_abs2=1.0 / 0.1,
-                                step=0.5, max_abs_output=20.0)
+        # Tangent computation: cross/dot → column index.
+        #
+        # Optimized pipeline (6 sequential MLP sublayers per endpoint,
+        # down from 10):
+        #   abs(dot) → clamp(0.1,20) → reciprocal → multiply_2d(cross,inv)
+        #   → atan_clamped → select(sign, col, W-col)
+        #
+        # Key changes vs the original:
+        # - clamp(abs) replaces compare+select (1 sublayer vs 2)
+        # - multiply_2d replaces signed_multiply (1 sublayer vs 3)
+        # - atan bakes in column clamping (1 sublayer vs 2)
+        # - sign handling moved after atan so compare(dot,0) runs
+        #   in parallel with the main chain
 
-        dot_b_sign = compare(dot_b, 0.0)
-        dot_b_abs = abs(dot_b)
-        dot_b_clamped = select(
-            compare(dot_b_abs, 0.1),
-            dot_b_abs,
-            create_literal_value(torch.tensor([0.1]), name="dot_min_b"),
-        )
-        inv_dot_b = reciprocal(dot_b_clamped, min_value=0.1, max_value=2.0 * max_coord)
-        signed_inv_dot_b = select(dot_b_sign, inv_dot_b, negate(inv_dot_b))
-        tan_b = signed_multiply(cross_b, signed_inv_dot_b,
-                                max_abs1=max_coord, max_abs2=1.0 / 0.1,
-                                step=0.5, max_abs_output=20.0)
-
-        _ATAN_BP = [-20, -10, -5, -3, -2, -1.5, -1, -0.75, -0.5, -0.25,
-                    0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 10, 20]
+        _ATAN_BP = [-100, -20, -10, -5, -3, -2, -1.5, -1, -0.75, -0.5,
+                    -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 10,
+                    20, 100]
         fov_rad = float(fov) * math.pi / 128.0
         col_from_tan_scale = float(W) / fov_rad
+        half_W = float(W) / 2.0
+        col_lo, col_hi = -2.0, float(W + 2)
 
-        col_a = piecewise_linear(
-            tan_a, _ATAN_BP,
-            lambda t: math.atan(t) * col_from_tan_scale + W / 2.0,
-            name="col_a",
-        )
-        col_b = piecewise_linear(
-            tan_b, _ATAN_BP,
-            lambda t: math.atan(t) * col_from_tan_scale + W / 2.0,
-            name="col_b",
-        )
+        def _atan_clamped(t):
+            return max(col_lo, min(col_hi, math.atan(t) * col_from_tan_scale + half_W))
 
-        col_a_c = clamp(col_a, -2.0, float(W + 2))
-        col_b_c = clamp(col_b, -2.0, float(W + 2))
+        max_inv = 1.0 / 0.1  # = 10
+
+        # --- Endpoint A ---
+        dot_a_sign = compare(dot_a, 0.0)           # parallel with chain below
+        dot_a_clamped = clamp(abs(dot_a), 0.1, 2.0 * max_coord)
+        inv_dot_a = reciprocal(dot_a_clamped, min_value=0.1, max_value=2.0 * max_coord)
+        tan_a = multiply_2d(cross_a, inv_dot_a,
+                            max_abs1=max_coord, max_abs2=max_inv,
+                            step1=0.5, step2=0.5, min2=0.0)
+        col_a_pos = piecewise_linear(tan_a, _ATAN_BP, _atan_clamped, name="col_a")
+        col_a_neg = Linear(col_a_pos, torch.tensor([[-1.0]]),
+                           torch.tensor([float(W)]), name="col_a_neg")
+        col_a_c = select(dot_a_sign, col_a_pos, col_a_neg)
+
+        # --- Endpoint B ---
+        dot_b_sign = compare(dot_b, 0.0)
+        dot_b_clamped = clamp(abs(dot_b), 0.1, 2.0 * max_coord)
+        inv_dot_b = reciprocal(dot_b_clamped, min_value=0.1, max_value=2.0 * max_coord)
+        tan_b = multiply_2d(cross_b, inv_dot_b,
+                            max_abs1=max_coord, max_abs2=max_inv,
+                            step1=0.5, step2=0.5, min2=0.0)
+        col_b_pos = piecewise_linear(tan_b, _ATAN_BP, _atan_clamped, name="col_b")
+        col_b_neg = Linear(col_b_pos, torch.tensor([[-1.0]]),
+                           torch.tensor([float(W)]), name="col_b_neg")
+        col_b_c = select(dot_b_sign, col_b_pos, col_b_neg)
 
         a_lt_b = compare(subtract(col_b_c, col_a_c), 0.0)
         vis_lo = select(a_lt_b, col_a_c, col_b_c)
         vis_hi = select(a_lt_b, col_b_c, col_a_c)
 
-        vis_mask = in_range(vis_lo, vis_hi, W)
-        gated_vis_mask = cond_gate(is_sorted, vis_mask)
-
     # =====================================================================
-    # RENDER: visibility-masked wall selection + parametric intersection
+    # THINKING: wall selection via attend_argmin_unmasked (one per wall)
     # =====================================================================
 
-    with annotate("render/wall_attention"):
+    with annotate("thinking/wall_attention"):
+        # Build score + position_onehot for attend_argmin_unmasked
+        render_sentinel = create_literal_value(
+            torch.tensor([99.0]), name="render_sentinel",
+        )
+        render_score = select(is_sorted, sort_rank, render_sentinel)
+        z_mw = create_literal_value(
+            torch.zeros(max_walls), name="z_mw",
+        )
+        render_position_onehot = select(is_sorted, sort_rank_onehot, z_mw)
+
+        # Value: render data + col bounds + onehot for mask update
+        render_value = Concatenate([
+            gated_render_data,   # 6: [sort_den, C, D, E, H_inv, tex_id]
+            vis_lo,              # 1: col_lo
+            vis_hi,              # 1: col_hi
+            sort_rank_onehot,    # max_walls: for mask update
+        ])
+        render_value_gated = cond_gate(is_sorted, render_value)
+
+        selected_render = attend_argmin_unmasked(
+            pos_encoding=pos_encoding,
+            score=render_score,
+            mask_vector=render_mask,
+            position_onehot=render_position_onehot,
+            value=render_value_gated,
+        )
+
+        d_rv = 8 + max_walls
+        t_sort_den = _extract_from(selected_render, d_rv, 0, 1, "t_sort_den")
+        t_C        = _extract_from(selected_render, d_rv, 1, 1, "t_C")
+        t_D        = _extract_from(selected_render, d_rv, 2, 1, "t_D")
+        t_E        = _extract_from(selected_render, d_rv, 3, 1, "t_E")
+        t_H_inv    = _extract_from(selected_render, d_rv, 4, 1, "t_H_inv")
+        t_tex_id   = _extract_from(selected_render, d_rv, 5, 1, "t_tex_id")
+        t_col_lo   = _extract_from(selected_render, d_rv, 6, 1, "t_col_lo")
+        t_col_hi   = _extract_from(selected_render, d_rv, 7, 1, "t_col_hi")
+        t_onehot   = _extract_from(selected_render, d_rv, 8, max_walls, "t_onehot")
+
+    # =====================================================================
+    # RENDER: column iteration + pixel rendering (reads wall data from
+    # feedback, populated by THINKING and forwarded by prior RENDER tokens)
+    # =====================================================================
+
+    with annotate("render/state_machine"):
+        # Active column: new wall → use col_lo from feedback; else feedback col
+        active_col = select(render_is_new_wall, fb_col_lo, render_col)
+
         # Per-column angle offset from player's forward direction
-        col_times_fov = multiply_const(col_idx, float(fov))
+        col_times_fov = multiply_const(active_col, float(fov))
         ao_raw = thermometer_floor_div(col_times_fov, W, fov * (W - 1))
         angle_offset = add_const(ao_raw, float(-(fov // 2)))
 
-        col_p1 = add_const(col_idx, 1.0)
-        col_onehot_01 = bool_to_01(in_range(col_idx, col_p1, W))
-
-        VIS_GAIN = 500.0
-        SORT_BIAS = 100.0
-        render_attn = attend_argmax_dot(
-            pos_encoding,
-            query_vector=Concatenate([
-                cond_gate(is_render, col_onehot_01),
-                bool_to_01(is_render),
-            ]),
-            key_vector=Concatenate([
-                gated_vis_mask,
-                multiply_const(bool_to_01(is_sorted), SORT_BIAS),
-            ]),
-            value=gated_render_data,
-            match_gain=VIS_GAIN,
-        )
-
-        r_sort_den    = _extract_from(render_attn, 6, 0, 1, "r_sort_den")
-        r_C           = _extract_from(render_attn, 6, 1, 1, "r_C")
-        r_D           = _extract_from(render_attn, 6, 2, 1, "r_D")
-        r_E           = _extract_from(render_attn, 6, 3, 1, "r_E")
-        r_H_inv_num_t = _extract_from(render_attn, 6, 4, 1, "r_H_inv")
-        r_wall_tex    = _extract_from(render_attn, 6, 5, 1, "r_tex")
-
-    # --- Wall height from precomputed values ---
+    # --- Wall height from feedback wall data (available at layer 0) ---
     with annotate("render/wall_height"):
         half_fov = fov // 2
         tan_bp = [float(i) for i in range(-half_fov, half_fov + 1)]
@@ -729,10 +951,10 @@ def build_game_graph(
         max_tan = math.tan(half_fov * 2.0 * math.pi / 256.0) * 1.1
         tan_val_bp = [-max_tan + i * (2 * max_tan / 10) for i in range(11)]
         C_tan = piecewise_linear_2d(
-            r_C, tan_o, _DIFF_BP, tan_val_bp,
+            fb_C, tan_o, _DIFF_BP, tan_val_bp,
             lambda a, b: a * b, name="C_tan_o",
         )
-        den_over_cos = subtract(r_sort_den, C_tan)
+        den_over_cos = subtract(fb_sort_den, C_tan)
         abs_den_over_cos = abs(den_over_cos)
 
         max_h_inv = float(H) / 0.3
@@ -746,7 +968,7 @@ def build_game_graph(
         doc_bp = [doc_max * i / 15 for i in range(16)]
 
         wall_height_raw = piecewise_linear_2d(
-            r_H_inv_num_t, abs_den_over_cos,
+            fb_H_inv, abs_den_over_cos,
             height_inv_bp, doc_bp,
             lambda a, b: a * b, name="wall_height_raw",
         )
@@ -766,10 +988,10 @@ def build_game_graph(
     # --- Texture u-coordinate via tan(offset) ---
     with annotate("render/tex_coord"):
         E_tan = piecewise_linear_2d(
-            r_E, tan_o, _DIFF_BP, tan_val_bp,
+            fb_E, tan_o, _DIFF_BP, tan_val_bp,
             lambda a, b: a * b, name="E_tan_o",
         )
-        num_u_over_cos = add(r_D, E_tan)
+        num_u_over_cos = add(fb_D, E_tan)
         abs_nuc = abs(num_u_over_cos)
 
         u_raw = piecewise_linear_2d(
@@ -786,7 +1008,7 @@ def build_game_graph(
     with annotate("render/tex_attention"):
         num_tex = len(textures)
         tex_e8_query = piecewise_linear(
-            r_wall_tex,
+            fb_tex_id,
             [float(i) for i in range(num_tex)],
             lambda tid: [float(v) for v in
                          index_to_vector(int(round(tid)) + TEX_E8_OFFSET)],
@@ -812,78 +1034,213 @@ def build_game_graph(
 
         tex_column_colors = tex_col_attn
 
-    # Column fill
+    # Column fill — chunk-based
     with annotate("render/column_fill"):
-        patch_row_start = multiply_const(patch_idx, float(rp))
+        vis_top_render = clamp(wall_top, 0.0, float(H))
+        vis_bottom_render = clamp(wall_bottom, 0.0, float(H))
+
+        # New column detection (chunk_start < -0.5 = sentinel)
+        neg_half = create_literal_value(torch.tensor([-0.5]), name="neg_half")
+        is_new_col = compare(subtract(neg_half, render_chunk_start), 0.0)
+        active_start = select(is_new_col, vis_top_render, render_chunk_start)
+
+        chunk_length = clamp(
+            subtract(vis_bottom_render, active_start), 0.0, float(cs),
+        )
+
         pixels = _textured_column_fill(
             wall_top, wall_bottom, wall_height,
             tex_column_colors, tex_h, config, max_coord=max_coord,
-            patch_row_start=patch_row_start, rows_per_patch=rp,
+            patch_row_start=active_start, rows_per_patch=cs,
         )
 
+    # State transitions (3-way: more chunks / advance col / advance wall)
+    with annotate("render/state_transitions"):
+        next_chunk_start_val = add_const(active_start, float(cs))
+        has_more_chunks = compare(
+            subtract(vis_bottom_render, next_chunk_start_val), 0.5,
+        )
+
+        col_p1 = add_const(active_col, 1.0)
+        not_more_chunks = bool_not(has_more_chunks)
+        has_more_cols = compare(subtract(fb_col_hi, col_p1), 0.5)
+        advance_col = bool_all_true([not_more_chunks, has_more_cols])
+        advance_wall = bool_all_true([not_more_chunks, bool_not(has_more_cols)])
+
+        # Mask update
+        mask_with_new = add(render_mask, fb_onehot)
+        next_render_mask = select(advance_wall, mask_with_new, render_mask)
+
+        # Done detection
+        mask_sum = Linear(
+            mask_with_new, torch.ones(max_walls, 1), name="render_mask_sum",
+        )
+        all_walls_done = compare(mask_sum, max_walls - 0.5)
+        done_flag = bool_all_true([advance_wall, all_walls_done])
+
+        # Next feedback fields — iteration state
+        zero_col = create_literal_value(torch.tensor([0.0]), name="zero_col")
+        next_col_output = select(
+            has_more_chunks, active_col,
+            select(advance_col, col_p1, zero_col),
+        )
+        chunk_sentinel = create_literal_value(
+            torch.tensor([-1.0]), name="chunk_sentinel",
+        )
+        next_chunk = select(has_more_chunks, next_chunk_start_val, chunk_sentinel)
+        pos_one = create_literal_value(torch.tensor([1.0]), name="pos_one")
+        neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one")
+        next_is_new_wall = select(advance_wall, pos_one, neg_one)
+
+        # Next token type: THINKING for new wall, RENDER to continue
+        next_type = select(advance_wall,
+                           create_literal_value(E8_THINKING, name="type_thinking"),
+                           create_literal_value(E8_RENDER, name="type_render"))
+
+        # Full render feedback: iteration state + forwarded wall data
+        next_render_feedback = Concatenate([
+            next_render_mask, next_col_output, next_is_new_wall, next_chunk,
+            fb_sort_den, fb_C, fb_D, fb_E, fb_H_inv, fb_tex_id,
+            fb_col_lo, fb_col_hi, fb_onehot,
+        ])
+
     # =====================================================================
-    # Output: gated by token type
+    # Output: autoregressive state at input offsets + pixel overflow
+    #
+    # The first d_input values of the output match the flat input layout
+    # (alphabetical field order).  The host feeds output[:d_input] directly
+    # as the next input — no remapping needed.  Pixel data and render
+    # metadata live in an overflow region after d_input.
+    #
+    # To minimize residual stream pressure, we build per-FIELD selects
+    # rather than per-TOKEN-TYPE full-width outputs.
     # =====================================================================
     with annotate("output"):
 
-        # SORTED_WALL output: type + wall data + onehot + updated mask
-        sort_output = Concatenate([
+        # --- Per-field output values (select by token type) ---
+
+        # THINKING render_feedback: wall data from wall_attention
+        thinking_render_fb = Concatenate([
+            render_mask,  # forwarded (not updated yet)
+            t_col_lo,     # first column of this wall
+            pos_one,      # is_new_wall = +1
+            chunk_sentinel,  # chunk_start = -1
+            t_sort_den, t_C, t_D, t_E, t_H_inv, t_tex_id,
+            t_col_lo, t_col_hi, t_onehot,
+        ])
+
+        # SORTED_WALL sort_feedback
+        sort_feedback_out = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="sort_type"),
             sel_wall_data,
+            sort_rank,
+            vis_lo,
+            vis_hi,
             sel_onehot,
             updated_mask,
         ])
 
-        # RENDER output: type + pixels
-        render_output = Concatenate([
-            create_literal_value(E8_RENDER, name="render_type"),
-            pixels,
-        ])
-
-        # INPUT output: type + padding (host ignores INPUT output)
-        input_output = Concatenate([
-            create_literal_value(E8_INPUT, name="input_type"),
-            create_literal_value(torch.zeros(3), name="input_pad"),
-        ])
-
-        # EOS output: seeds the sort loop with E8_SORTED_WALL type + resolved
-        # state at offsets 8-10 + zeros for sort mask.
-        eos_output = Concatenate([
+        # EOS sort_feedback (seeds sort loop)
+        eos_sort_seed = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="eos_sort_seed"),
             resolved_x, resolved_y, attn_new_angle,
             create_literal_value(
-                torch.zeros(2 + 2 * max_walls), name="eos_sort_pad"),
+                torch.zeros(2 + 3 + 2 * max_walls), name="eos_sort_pad"),
         ])
 
-        # TEX_COL output: type + padding (host ignores TEX_COL output)
-        tex_col_output = Concatenate([
-            create_literal_value(E8_TEX_COL, name="tex_col_type"),
-            create_literal_value(torch.zeros(3), name="tc_pad"),
-        ])
+        # token_type field: what the NEXT token should be
+        zero_8 = create_literal_value(torch.zeros(8), name="zero_8")
+        out_token_type = select(is_thinking,
+            create_literal_value(E8_RENDER, name="thinking_next_type"),
+            select(is_render, next_type,
+                select(is_sorted,
+                    create_literal_value(E8_SORTED_WALL, name="sort_next_type"),
+                    select(is_eos,
+                        create_literal_value(E8_SORTED_WALL, name="eos_next_type"),
+                        zero_8))))
 
-        # Pad all to same width and select
-        d_sort_out = 8 + 5 + 2 * max_walls
-        d_render_out = 8 + rp * 3
-        d_input_out = 8 + 3
-        d_eos_out = d_sort_out  # EOS seeds the sort loop
-        d_tc_out = 8 + 3
-        d_out = max(d_sort_out, d_render_out, d_input_out, d_eos_out, d_tc_out)
+        # render_feedback field
+        zero_rf = create_literal_value(torch.zeros(d_render_fb), name="zero_rf")
+        out_render_fb = select(is_thinking, thinking_render_fb,
+                          select(is_render, next_render_feedback,
+                            zero_rf))
 
-        def _pad(node, cur_width):
-            if cur_width >= d_out:
-                return node
-            return Concatenate([node, create_literal_value(
-                torch.zeros(d_out - cur_width), name="pad")])
+        # sort_feedback field
+        zero_sf = create_literal_value(torch.zeros(d_sort_out), name="zero_sf")
+        out_sort_fb = select(is_sorted, sort_feedback_out,
+                        select(is_eos, eos_sort_seed,
+                          zero_sf))
 
-        sort_padded = _pad(sort_output, d_sort_out)
-        render_padded = _pad(render_output, d_render_out)
-        input_padded = _pad(input_output, d_input_out)
-        eos_padded = _pad(eos_output, d_eos_out)
-        tc_padded = _pad(tex_col_output, d_tc_out)
+        # Build output at input offsets: the first d_input values match the
+        # flat input layout (alphabetical).  The host feeds output[:d_input]
+        # directly as the next input.  Pixels + metadata overflow after d_input.
+        #
+        # Active fields in alphabetical order:
+        #   render_feedback (rf), sort_feedback (sf), token_type (tt)
+        # Everything else is zero.  Adjacent zero fields are merged into
+        # gap-fill nodes to minimize residual stream pressure.
 
-        inner1 = select(is_eos, eos_padded, input_padded)
-        inner2 = select(is_tex_col, tc_padded, inner1)
-        inner3 = select(is_sorted, sort_padded, inner2)
-        output = select(is_render, render_padded, inner3)
+        # Compact output: [token_type(8), sort_feedback(d_sort_out),
+        #                  render_feedback(d_render_fb),
+        #                  pixels(cs*3), col(1), start(1), length(1), done(1)]
+        #
+        # The host maps these three fields to their input offsets via
+        # _out_to_input (three slice copies).
 
-    return output, pos_encoding
+        zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
+        zero_pixels = create_literal_value(torch.zeros(cs * 3), name="zero_pixels")
+
+        out_pixels = select(is_render, pixels, zero_pixels)
+        out_col = select(is_render, active_col, zero_1)
+        out_start = select(is_render, active_start, zero_1)
+        out_length = select(is_render, chunk_length, zero_1)
+        out_done = select(is_render, done_flag, zero_1)
+
+    graph_io = GameGraphIO(
+        inputs={
+            "input_backward": input_backward,
+            "input_forward": input_forward,
+            "input_strafe_left": input_strafe_left,
+            "input_strafe_right": input_strafe_right,
+            "input_turn_left": input_turn_left,
+            "input_turn_right": input_turn_right,
+            "player_angle": player_angle,
+            "player_x": player_x,
+            "player_y": player_y,
+            "render_feedback": render_feedback,
+            "sort_feedback": sort_feedback,
+            "tex_col_input": tex_col_input,
+            "tex_pixels": tex_pixels,
+            "texture_id_e8": texture_id_e8,
+            "token_type": token_type,
+            "wall_ax": wall_ax,
+            "wall_ay": wall_ay,
+            "wall_bx": wall_bx,
+            "wall_by": wall_by,
+            "wall_index": wall_index,
+            "wall_tex_id": wall_tex_id,
+            # BSP inputs: meaningful only at BSP_NODE / WALL positions;
+            # zero-padded elsewhere by the host.  Not overlaid outputs —
+            # no autoregressive feedback flows through them.
+            "bsp_plane_nx": bsp_plane_nx,
+            "bsp_plane_ny": bsp_plane_ny,
+            "bsp_plane_d": bsp_plane_d,
+            "bsp_node_id_onehot": bsp_node_id_onehot,
+            "wall_bsp_coeffs": wall_bsp_coeffs,
+            "wall_bsp_const": wall_bsp_const,
+        },
+        overlaid_outputs={
+            "render_feedback": out_render_fb,
+            "sort_feedback": out_sort_fb,
+            "token_type": out_token_type,
+        },
+        overflow_outputs={
+            "pixels": out_pixels,
+            "col": out_col,
+            "start": out_start,
+            "length": out_length,
+            "done": out_done,
+        },
+    )
+
+    return graph_io, pos_encoding

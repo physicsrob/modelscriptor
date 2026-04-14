@@ -3,63 +3,217 @@
 ## Vision
 
 Implement DOOM's E1M1 as a transformer — not by training, but by **compiling
-the game logic directly into transformer weights** using torchwright. The
-transformer *is* the game engine. This is the flagship demo for torchwright.
+DOOM's rendering algorithm directly into transformer architecture** using
+torchwright. WAD assets (walls, textures, BSP tree) flow through the
+transformer as input tokens. The transformer *is* the game engine. This is
+the flagship demo for torchwright.
+
+## Architectural Analogues
+
+DOOM's 1993 architecture maps naturally onto transformer architecture.
+These aren't superficial parallels — they share the same abstract structure.
+
+| DOOM | Transformer | Why they fit |
+|------|-------------|--------------|
+| Screen column | Autoregressive position | Independent units, processed sequentially |
+| Wall segment (seg) | Token | Atomic primitive with properties |
+| BSP plane test | Attention comparison | Binary spatial classification |
+| BSP tree structure | Sparse attention pattern | Each seg attends to its ~log(N) ancestors |
+| Sector properties | Shared context via attention | Many segs reference one sector |
+| Front-to-back draw | Autoregressive output | Ordered sequential generation |
+| Column clipper | Attention mask | Track what's visible/occluded |
+| Texture column | Attention-based lookup | Retrieve pixels by column index |
+
+The deepest analogy: **DOOM's column-by-column rendering IS autoregressive**.
+DOOM was designed around the observation that each screen column is
+independent; the transformer's autoregressive structure processes independent
+positions. They're the same abstraction, 30 years apart.
+
 
 ## How It Works
 
-One forward pass of the transformer renders one frame of gameplay.
+One forward pass renders one frame. All game assets flow through the
+transformer as tokens — nothing is baked into weights.
 
-### Input (Residual Stream at Position 0)
+### Token Sequence (Per Frame)
 
-The first position acts as a BOS token. It encodes:
+```
+TEX_COL × (num_tex × tex_w) → INPUT → BSP_NODE × M → WALL × N → EOS
+    → SORTED_WALL × N → THINKING/RENDER × (dynamic)
+```
 
-- **Player input**: the full DOOM input set (move forward/back, strafe
-  left/right, turn left/right, shoot, use/open)
-- **Current game state**: player x, y, angle/heading, and whatever additional
-  state the game logic requires (health, ammo, door states, enemy positions,
-  etc.)
+Seven token types drive the pipeline:
 
-### Computation (Transformer Layers)
+| Token | Purpose |
+|-------|---------|
+| **TEX_COL** | Texture column pixel data. Each token carries one column of one texture. RENDER tokens retrieve pixels via attention. |
+| **INPUT** | Player state (x, y, angle) + movement controls. Attention distributes velocity and trig values to downstream tokens. |
+| **BSP_NODE** | BSP splitting plane (nx, ny, d). Each node computes `side_P = sign(nx·px + ny·py + d)` — "which side of this plane is the player on?" |
+| **WALL** | Wall segment geometry + BSP coefficients for sort. Computes collision flags and BSP rank. |
+| **EOS** | End of prefill. Outputs resolved player state (after collision) and seeds the sort phase. |
+| **SORTED_WALL** | Autoregressive sort by BSP rank. Each step finds the next wall in BSP traversal order via `attend_argmin_unmasked`. |
+| **THINKING** | Wall selection for current screen region. Hoists wall-attention out of per-chunk RENDER tokens. |
+| **RENDER** | Pixel output. Each token renders a chunk of rows for the current column. |
 
-The transformer layers implement the game logic:
+### Data Flow
 
-- **State update**: process player input to compute new position, handle
-  collision detection, update enemy AI, door/elevator mechanics, combat
-- **Raycasting**: for each screen column, cast a ray from the player's position
-  and angle to determine wall distance, texture, lighting
+1. **Prefill** (batched): Load texture columns, player state, BSP structure, and wall geometry
+2. **Sort** (autoregressive): Order walls front-to-back by BSP rank
+3. **Render** (autoregressive): For each screen column, select visible wall and render pixels
 
-The map geometry of E1M1 is **baked into the weights** (via lookup tables,
-conditionals, etc.). Each compiled transformer is specific to one map.
+All cross-position data flows through attention. The host is a dumb token
+feeder and pixel bitblitter — it copies autoregressive outputs back as
+inputs and composites pixels to the framebuffer.
 
-### Output (Residual Stream After Final Layer)
+### WAD-to-Transformer Pipeline
 
-No embedding or unembedding layers. The residual stream directly contains:
+```
+┌──────────────┐     ┌───────────────────────┐     ┌──────────────────────┐
+│   WAD File   │────▶│   load_map_subset()   │────▶│  Segments +          │
+│  (doom1.wad) │     │   (x, y, max_walls)   │     │  Textures +          │
+└──────────────┘     └───────────────────────┘     │  BSP nodes + coeffs  │
+                                                    └──────────┬───────────┘
+                                                               │
+                     ┌─────────────────────────┐              │
+                     │     Transformer         │◀─────────────┘
+                     │     (~65 layers)        │
+                     └────────────┬────────────┘
+                                  │
+                                  ▼
+                     ┌─────────────────────────┐
+                     │   Frame + State         │
+                     └─────────────────────────┘
+```
 
-- **Rendered pixel columns**: raw RGB values for each column of the frame
-- **Updated game state**: new x, y, angle, enemy positions, etc. — everything
-  needed to feed back in as input to the next frame
+A single Python function loads the WAD, selects walls by distance to player,
+extracts the minimal BSP subtree covering them, and precomputes BSP
+coefficients per wall. The transformer remains a dumb feeder + bitblitter.
 
-Each autoregressive position after the BOS corresponds to one screen column,
-rendered left to right (column 0, 1, 2, ...). Each position's output includes
-the RGB pixel values for that column (one value per pixel row per channel).
 
-### Multi-Frame Rollout
+## BSP Integration
 
-Soft goal: the architecture should support rolling out multiple frames in a
-single autoregressive sequence. Frame N's final state becomes frame N+1's BOS.
+BSP is DOOM's signature innovation. Rather than computing distances and
+sorting (what a modern engine might do), DOOM uses the BSP tree's pre-computed
+spatial structure to determine rendering order via O(log N) binary decisions.
 
-## Parameterization
+### BSP in the Transformer
 
-The torchwright graph definition should be parameterizable so a single codebase
-can compile transformers at different fidelity levels:
+The BSP tree flows through as **BSP_NODE tokens** — not baked into weights,
+not flattened into walls. Each node is a first-class token with a distinct
+architectural role.
 
-- **Resolution**: number of columns (screen width) and rows (screen height)
-- **Feature set**: walls only, walls + doors, walls + doors + enemies, etc.
-- **Map complexity**: full E1M1 vs. a single room subset
+### BSP Rank: Linear Algebra from Tree Structure
 
-This produces a spectrum from "tiny transformer playable in real time" to
-"massive transformer that renders full E1M1 faithfully."
+For each wall W at subsector S, its position in BSP traversal order is:
+
+```
+rank(W) = Σ over ancestors i of: (side_P[i] ≠ side_W[i]) × sibling_size[i]
+```
+
+The intuition: at each ancestor, if the player is on the same side as W, we
+visit W's subtree first (add 0). Otherwise we visit the sibling subtree
+first (add its size).
+
+This collapses into a **sparse dot product**:
+
+```
+rank(W) = dot(coeffs_W, side_P_vec) + const_W
+```
+
+Where:
+- `side_P_vec` is the M-dim vector of BSP decisions (computed at runtime)
+- `coeffs_W` is a precomputed M-dim sparse vector (non-zero at ancestors)
+- `const_W` is a precomputed scalar
+
+**The tree structure — traversal order, sibling sizes, path membership —
+collapses into linear coefficients.** What was recursive tree traversal in
+1993 becomes a dot product in the transformer.
+
+### Computation in the Transformer
+
+| Step | Operation | Layers |
+|------|-----------|--------|
+| 1 | Each BSP_NODE computes `side_P = sign(nx·px + ny·py + d)` | 1 |
+| 2 | Each WALL gathers `side_P_vec` via attention to BSP_NODEs | 1 |
+| 3 | Each WALL computes `rank = dot(coeffs_W, side_P_vec) + const_W` | 1 |
+| 4 | Sort phase uses rank via existing `attend_argmin_unmasked` | unchanged |
+
+### What the Host Precomputes
+
+`load_map_subset` does BSP work on the CPU:
+
+1. Parse WAD lumps (NODES, SSECTORS, SEGS, VERTEXES, LINEDEFS, SIDEDEFS)
+2. Select ~32 closest segs to player position
+3. Find their subsectors, extract minimal covering BSP subtree
+4. Renumber nodes 0..M-1
+5. For each seg: trace ancestors, compute `coeffs_W` and `const_W` from
+   sibling subtree sizes and path sides
+
+### Tradeoff vs Distance-Based Sort
+
+| | Distance sort (current) | BSP rank |
+|---|---|---|
+| Sort key computation | ~21 layers (intersection + score) | ~3 layers (dot product) |
+| Per-wall input | 5 floats | ~46 floats (5 + M+1 coeffs) |
+| Host complexity | Simple | BSP parsing + precomputation |
+| Algorithm authenticity | Generic | DOOM's actual algorithm |
+
+The BSP version moves ~18 layers of transformer computation into host-side
+precomputation — a good trade when the host is Python and the transformer
+is compiled.
+
+
+## Current State
+
+### What's Working
+
+The renderer is fully functional for textured, playable walkthroughs with
+distance-based sorting:
+
+- **Textured walls** from real DOOM WAD textures (downscaled to 8×8)
+- **Player movement** with full DOOM input set (forward/back, strafe, turn)
+- **Collision detection** via velocity-ray intersection
+- **Front-to-back wall ordering** via autoregressive sort (distance-based)
+- **Multi-room scenes** with diagonal walls (tested up to 22 segments)
+- **Walkthrough generation** (`make walkthrough` produces GIF output)
+
+### Architecture Stats (120×100, 8 walls, 4 textures)
+
+```
+Layers:           65
+Allocated params: ~1.2B
+Non-zero params:  ~8M (0.7% density)
+d_model:          2048
+d_head:           128
+```
+
+### Layer Breakdown (current, distance-based sort)
+
+| Component | Layers | Notes |
+|-----------|--------|-------|
+| render (total) | 43 | tex_sample dominates at 23 layers |
+| sort/visibility | 17 | Col_lo/col_hi tangent computation |
+| wall/collision | 17 | Per-wall collision detection |
+| wall/intersection | 10 | Central ray intersection (for sort) |
+| wall/sort_score | 11 | Distance → sort key |
+| input/game_logic | 12 | Angle update, velocity computation |
+| eos/collision_resolve | 12 | Resolve collision across all walls |
+| sort/attention | 9 | Argmin attention for sort |
+| thinking/wall_attention | 7 | Wall selection for render |
+
+### Test Scenes
+
+- **box_room**: 4-wall square room (10×10 units)
+- **multi_room**: 22-segment scene with two rooms, corridor, diagonal walls
+
+### Known Limitations
+
+1. **No WAD map loading** — only hand-authored scenes
+2. **Ceiling/floor fill** — currently done by host, not transformer
+3. **Out-of-bounds columns** — wasted steps for columns outside [0, W)
+4. **Fixed wall height** — no variable-height sectors yet
+5. **Distance-based sort** — not using BSP structure
+
 
 ## Scope
 
@@ -67,574 +221,277 @@ This produces a spectrum from "tiny transformer playable in real time" to
 
 Full E1M1 playable in a compiled transformer:
 
-- Complete DOOM input set
-- Full map geometry baked into weights
-- Enemies, items, doors, elevators, combat
-- Raw RGB pixel output per column
-- State carried forward between frames
+- Walk through the complete level geometry
+- Doors, elevators, switches functional
+- Items collectible, enemies fightable
+- Raw RGB pixel output, state carried between frames
 
 ### Acceptable Reductions
 
-- Subset of E1M1 geometry
-- Reduced enemy/item set
-- Simplified lighting
-- Lower resolution
+- Subset of visible geometry per frame (≤32 walls)
+- Reduced enemy/item count
+- Simplified lighting (sector-based, no distance dimming)
+- Lower resolution (120×100 baseline)
 
 ### Non-Goals (For Now)
 
-- Real-time performance (proof of principle first; can require a supercomputer)
+- Real-time performance (proof of principle first)
 - Multiple maps (E1M1 only)
-- Sound
-- Network multiplayer
-- Training or learning of any kind — this is pure compilation
-
-## Rendering Approach: Parallel Segment Intersection
-
-Doom uses BSP-based segment rendering, not grid-based raycasting (that's
-Wolfenstein). We follow Doom's approach: the map is a set of wall segments,
-and rendering tests a ray against all segments to find the nearest hit.
-
-See [raycasting_approaches.md](raycasting_approaches.md) for the full analysis
-of DDA vs segment-based vs BSP. Summary: parallel segment intersection is
-comparably difficult to parallel DDA for the intermediate goal, and carries
-forward to E1M1's geometry (diagonal walls, variable-height sectors) without
-algorithmic rewrite. BSP is used for sector identification (floor/ceiling
-heights, lighting), not for rendering culling — see **BSP Strategy** below.
-
-### How It Works (Per Screen Column)
-
-Each autoregressive position computes one screen column:
-
-1. **Ray direction**: from player angle + column offset, look up trig values
-   (sin, cos) from a 256-entry table baked into weights.
-2. **Shared products**: compute `Px * sin(angle)` and `Py * cos(angle)` once.
-   These are reused across all segment tests.
-3. **Per-segment intersection** (all segments in parallel):
-   - `num_t = (A-P) × (B-A)` — linear in P → **free** (no MLP cost)
-   - `den = D × (B-A)` — linear in D → **free**
-   - Validity checks (t > 0, 0 ≤ u ≤ 1) via sign comparisons
-   - Mask invalid intersections
-4. **Min-reduction**: find nearest valid intersection via parallel comparison
-   tree (log2(N) stages).
-5. **Wall height**: `screen_height / perpendicular_distance` for the winner.
-6. **Column fill**: given wall height and color, produce ceiling/wall/floor
-   pixels.
-
-### Key Property
-
-Most per-segment math is linear in the runtime inputs (P and D) with constant
-coefficients (segment endpoints baked into weights). This means the per-segment
-cost is dominated by validity checks and the min-reduction, not the intersection
-math itself.
-
-### Scaling to E1M1
-
-For the intermediate goal (~30 segments), brute-force parallel testing is fine.
-For E1M1 (~300+ segments), brute-force parallel testing **still works**. The key
-property — segment endpoints baked into weights make intersection math free — means
-all 300 segments cost the same depth as 30. Width grows (peak ~1500 columns at
-d_model=2048), but the min-reduction only adds `ceil(log2(300/30))` ≈ 3 extra
-stages (~9 layers). See **BSP Strategy** and **Layer Budget** below for the full
-analysis.
-
-## Primary Intermediate Goal: Minimal Segment-Based Renderer
-
-Before tackling full Doom, the first major milestone is a **standalone
-segment-based renderer compiled into a transformer** — the rendering core of
-Doom, isolated from all game logic.
-
-### What It Does
-
-Given a player position and viewing angle, render a first-person view of a
-small map defined by wall segments. No movement, no enemies, no doors — just:
-"you are here, looking this way, here is what you see."
-
-### Specification
-
-- **Map**: small set of wall segments (~20-30), defining a few rooms. Walls are
-  solid colors, no textures. Can include diagonal walls.
-- **Resolution**: parameterized, baseline ~32 columns × 40 rows
-- **Input** (position 0 of residual stream):
-  - Player x, y as fixed-point integers
-  - Player angle as a discrete index into a trig table (0–255)
-- **Output** (residual stream after final layer):
-  - One autoregressive position per screen column
-  - Each position contains raw RGB values for every pixel row in that column
-- **Rendering algorithm**: per column, test ray against all wall segments in
-  parallel, find nearest hit, compute projected wall height, fill pixels
-
-### New Primitives Required
-
-See **Phase 1** below for the full breakdown. Summary:
-
-- **Already exist:** `reduce_min` (parallel min-reduction), `map_to_table`
-  (trig lookup), `reciprocal`, `signed_multiply`
-- **Need to build:** fixed-point multiply (extend `multiply_integers` for
-  fractional bits), modulo (angle wrapping)
-- **Infrastructure:** raw numeric I/O (no embedding/unembedding), reference
-  software renderer for verification
-- **Composition (not new ops):** column fill (compare + select per row), trig
-  lookup (map_to_table with precomputed sin/cos table)
-
-### Why This Is the Right Intermediate Goal
-
-- **Rendering is the hardest novel subproblem** in Doom. Game logic (movement,
-  collision, AI) is complex but compositionally built from arithmetic and
-  conditionals that torchwright already handles. Rendering requires spatial
-  math, trig, and a pipeline that doesn't exist yet.
-- **Every new primitive carries forward**. Trig, fixed-point math, parallel min,
-  raw output — all are needed for the full Doom goal. Nothing is throwaway.
-- **The rendering algorithm scales directly to E1M1.** Unlike grid-based DDA,
-  segment intersection handles Doom's actual geometry (diagonal walls, variable
-  sectors) without algorithmic changes. Scaling from 30 to 300 segments adds
-  width but only ~9 layers of depth (3 extra reduction stages).
-- **It's self-contained and testable**. Verify correctness by comparing the
-  transformer's output against a reference software renderer pixel by pixel.
-- **It's visually compelling**. Even a 32×40 flat-shaded renderer produces
-  recognizable 3D-looking output from a compiled transformer.
-
-## BSP Strategy
-
-Doom uses a BSP (Binary Space Partitioning) tree for rendering. The BSP tree
-partitions the map into convex subsectors and provides a front-to-back
-traversal order from any player position. Doom uses this to skip
-already-occluded geometry.
-
-### Why BSP Doesn't Help Rendering in a Fixed Graph
-
-BSP's value in Doom is **skipping work**: traverse front-to-back, track which
-screen columns are filled, stop drawing once everything is occluded. This
-reduces ~300 segments to ~20-50 actually drawn per column.
-
-In a fixed computation graph, **you cannot skip work**. Every node is always
-evaluated. The graph's width is set at construction time. Runtime conditions
-can mask results (set distance = BIG) but cannot prevent computation. This
-removes BSP's primary motivation.
-
-Three alternative BSP-for-rendering approaches were analyzed:
-
-**BSP-driven PVS routing** — use BSP to identify the player's subsector, look
-up a precomputed Potentially Visible Set, and only test those segments. This
-genuinely reduces width (300 → 80 segments), but segment endpoints are now
-**runtime values** loaded from a table instead of **constants** baked into
-weights. This means intersection math requires `multiply_integers` (~3 MLP
-sublayers) instead of being free. Net result: spend ~8 layers (BSP traversal +
-table lookup + runtime multiplies) to save ~6 layers (shorter reduction). A
-net loss of ~2 layers, plus PVS correctness risk in open areas.
-
-**Parallel BSP evaluation with masking** — evaluate all ~200 BSP node
-decisions in parallel, compute per-subsector visibility, mask invisible
-segments. This adds ~4 layers for BSP but saves nothing: all 300 segments are
-still computed and still enter the min-reduction. Masking just ensures masked
-segments lose comparisons — they don't go away.
-
-**BSP-ordered sequential traversal** — use `unrolled_loop` to test segments
-in BSP front-to-back order, freezing on first hit. This trades width for
-depth: instead of 300 parallel segments, test sequentially. With ~300
-iterations unrolled at ~12 layers each, this is ~3600 layers. Completely
-unviable.
-
-### Recommendation: BSP for Sector Identification
-
-BSP is genuinely useful for a different purpose: **classifying the player's
-position into a subsector/sector**. This gives floor height, ceiling height,
-light level, and sector type — all needed for rendering beyond flat-shaded
-single-height walls.
-
-Each BSP node has a splitting line. The test "which side of the line is the
-player on?" is linear in (Px, Py) — a single Linear node (free) followed by
-one `compare` (1 MLP sublayer). All ~200 BSP node tests run in parallel in **1
-MLP sublayer**. Then per-subsector leaf identification uses `bool_all_true` over
-~12 ancestor decisions in **2 MLP sublayers**. Sector property lookup via
-`map_to_table` adds **1 MLP sublayer**.
-
-**Total BSP cost: ~4 layers, ~360 peak columns** (freed before rendering
-starts). This is cheap, authentic to Doom, and enables real features.
-
-The rendering pipeline remains brute-force parallel segment intersection. The
-blog post narrative:
-
-> The BSP tree's 200 splitting planes are baked into the transformer's early
-> layers, classifying the player's position into one of E1M1's 150 subsectors
-> in 4 layers. The transformer then tests all 300 wall segments simultaneously
-> — BSP was invented because CPUs can only test one segment at a time. A
-> transformer doesn't have that limitation.
-
-
-## Layer Budget
-
-Constraints: **≤120 layers, d_model ≤ 8192**. Layer counts below are based on
-the cost of the underlying primitives: `compare` = 1 MLP sublayer, `select` = 2
-MLP sublayers (cond_add_vector + ReLU gate), `reduce_min` stage = 3 MLP sublayers
-(compare + 2× parallel select), `multiply_integers` = 3 MLP sublayers.
-
-### Per-Column Rendering Pipeline
-
-| Phase | Layers | Notes |
-|-------|--------|-------|
-| **Ray setup** | | |
-| Trig lookup (sin/cos from angle) | 1 | `map_to_table`, 256 entries |
-| Shared products (Px·sinθ, Py·cosθ, etc.) | 3 | `multiply_integers`, 4 products parallel |
-| **Segment intersection (300 segs)** | | |
-| Validity checks (t>0, 0≤u≤1, den≠0) | 5 | compare + select, all segments parallel |
-| Mask invalid intersections | 2 | select → distance = BIG |
-| **Min-reduction** | **27** | **9 stages × 3 layers/stage** |
-| **Post-intersection rendering** | | |
-| Wall height (1/distance × scale) | 3 | `reciprocal` via `piecewise_linear` |
-| Sector properties lookup | 1 | `map_to_table` on segment's sector ID |
-| Upper/lower wall bounds (variable heights) | 4 | arithmetic from sector floor/ceil heights |
-| Column fill (ceiling/wall/floor per row) | 5 | compares for row classification + selects |
-| Texture column computation | 3 | `multiply_integers` for u × tex_width |
-| Texture pixel lookup | 2 | split lookup: by column then by row |
-| Distance-based lighting | 4 | `piecewise_linear` dimming + multiply RGB |
-| Floor/ceiling rendering | 10 | reciprocal per row + flat lookup + lighting |
-| **Per-frame (shared across columns)** | | |
-| BSP sector identification | 4 | 200 split tests + leaf ID + sector lookup |
-| Game state (movement, collision) | 12 | input processing, position update, collision |
-| | | |
-| **TOTAL** | **~86** | |
-
-### What Dominates
-
-The min-reduction is the single largest component at 27 layers (31% of total).
-It's determined by segment count: `ceil(log2(N))` stages × 3 layers/stage.
-Reducing segment count from 300 to 80 saves only 6 layers (27→21), which is
-why BSP-based culling isn't worth the overhead it adds.
-
-### Fidelity Knobs
-
-If needed, layer count can be reduced via fidelity reductions rather than
-BSP-based culling:
-
-- **Flat-colored floors/ceilings** instead of textured: saves ~8 layers
-- **Solid-color walls** instead of textured: saves ~5 layers
-- **Simplified lighting** (sector-only, no distance dimming): saves ~3 layers
-- **Fewer segments** (subset of E1M1 geometry): saves ~3 layers per halving
-
-### Intermediate Goal Budget
-
-The minimal segment-based renderer (flat-shaded, ~30 segments, no game logic):
-
-| Phase | Layers |
-|-------|--------|
-| Trig lookup | 1 |
-| Shared products | 3 |
-| Validity checks + masking | 7 |
-| Min-reduction (30 segs, 5 stages) | 15 |
-| Wall height | 3 |
-| Column fill | 5 |
-| **TOTAL** | **~34** |
+- Sound, network multiplayer
+- Training or learning — this is pure compilation
 
 
 ## Phased Plan
 
-Nine phases from here to E1M1. Each phase has a concrete, testable deliverable.
+Six phases from current state to E1M1 playable. Each phase has a concrete
+deliverable.
 
-### Phase 1: Rendering Primitives
+### Phase 1: WAD Loading + BSP Integration
 
-Build the ops and infrastructure that don't exist yet. No compiled transformer
-— just unit-tested primitives ready to compose.
+Parse E1M1 geometry from the WAD. Replace distance-based sort with BSP rank
+sort. First render of real E1M1 geometry.
 
-**New ops:**
+**New in `wad.py`:**
 
-- **Fixed-point multiply** — extend `multiply_integers` (or use
-  `signed_multiply` with scale factors) for values with fractional bits. Core
-  primitive for all spatial math.
-- **Modulo** — `a % b = a - floor(a/b) * b` via `thermometer_floor_div` +
-  `multiply_integers`. Needed for angle wrapping (0–255).
+- Parse VERTEXES lump → vertex coordinates
+- Parse LINEDEFS lump → wall endpoints + sidedef references
+- Parse SIDEDEFS lump → texture names + sector references
+- Parse SEGS lump → wall fragments + subsector assignment
+- Parse SSECTORS lump → BSP leaves
+- Parse NODES lump → BSP tree structure
 
-**Existing ops** that turn out to already cover some of the "New Primitives
-Required" list:
+**New function: `load_map_subset`:**
 
-- `reduce_min` — parallel min-reduction already exists
-- `map_to_table` — trig lookup is just `map_to_table` with a precomputed
-  256-entry sin/cos table
-- `reciprocal` — already exists via `piecewise_linear`
-- `signed_multiply` — already exists
+```python
+def load_map_subset(
+    wad_path: str,
+    map_name: str,                # "E1M1"
+    x: float, y: float,           # Player position
+    max_walls: int = 32,
+    max_textures: int = 8,
+    tex_size: int = 8,
+) -> Tuple[List[Segment], List[np.ndarray], List[BspNode]]:
+    """Load walls, textures, and BSP subset near (x, y) from a DOOM map.
+    
+    - Selects closest max_walls segs to player
+    - Extracts minimal BSP subtree covering their subsectors
+    - Precomputes BSP coefficients per seg
+    - Returns ready-to-feed tokens
+    """
+```
 
-**Infrastructure:**
+**New in transformer:**
 
-- **Raw numeric I/O** — compile pipeline must handle graphs with no
-  `Embedding`/`Unembedding`. Input is raw scalars via `create_input`; output
-  is raw scalars read directly from the residual stream. May require changes
-  to `CompiledTransformerModule`.
-- **Reference software renderer** — a simple Python software renderer that
-  takes (Px, Py, angle, segments) and produces pixel output. Used for
-  pixel-exact verification in all subsequent phases.
+- BSP_NODE token type with plane coefficients `(nx, ny, d)`
+- WALL token input expanded with `coeffs_W` (M-dim) + `const_W` (scalar)
+- BSP_NODE computes `side_P = sign(nx·px + ny·py + d)` (1 layer)
+- WALL gathers `side_P_vec` via attention to BSP_NODEs (1 layer)
+- WALL computes `rank = dot(coeffs_W, side_P_vec) + const_W` (1 layer)
+- Replace distance-based sort key with BSP rank in SORTED_WALL phase
 
-**Deliverable:** all new ops unit-tested; compile pipeline handles raw I/O;
-reference renderer produces correct images.
+**Removed:**
 
+- `wall/intersection` for sort (collision still needs it)
+- `wall/sort_score` (replaced by BSP rank)
 
-### Phase 2: Flat-Shaded Static Renderer
+**Map:** E1M1 (WAD), rendered as ~32-wall subset near player.
 
-Compose Phase 1 primitives into a complete rendering pipeline compiled into a
-transformer. First visible output.
+**Deliverable:** Walk through E1M1 geometry with BSP-based wall ordering.
+Walls are fed dynamically from WAD based on player position. BSP tree flows
+through the transformer as tokens.
 
-**What it does:** given (Px, Py, angle), render a first-person view of a small
-map. Solid-color walls, uniform floor/ceiling colors.
-
-**Map:** ~20-30 wall segments defining a few connected rooms. Includes at
-least one diagonal wall to validate non-axis-aligned geometry.
-
-**Resolution:** parameterized, baseline 32 columns × 40 rows.
-
-**Pipeline (per column):**
-
-1. Trig lookup → sin/cos of ray angle
-2. Shared products (Px·sin, Py·cos, etc.) via `multiply_integers`
-3. Per-segment intersection — linear in (P, D) with constant coefficients → free
-4. Validity checks + masking → `compare` + `select`
-5. `reduce_min` → nearest valid intersection
-6. Wall height → `reciprocal(distance)`
-7. Column fill → ceiling/wall/floor pixels via `compare` + `select` per row
-
-**Deliverable:** compiled transformer that takes static (Px, Py, angle) and
-outputs a 32×40 RGB image. **Pixel-exact match** against the reference
-software renderer at multiple test positions and angles.
-
-**Estimate:** ~34 layers, d_model ~512.
+**Estimate:** Net layer change ~0 (remove ~21, add ~3, keep visibility at 17).
+Input size grows per WALL (adds M+1 coefficients).
 
 
-### Phase 3: Player Movement + Collision
+### Phase 2: Variable-Height Sectors
 
-Add game state. The transformer becomes playable.
+Add DOOM-style architecture with different floor and ceiling heights per
+sector. Requires sector data — decide architecture (SECTOR tokens vs
+flattened into WALL/BSP_NODE).
 
 **What's new:**
 
-- **Input processing** — player inputs (forward, back, strafe, turn) encoded
-  in position 0 alongside game state.
-- **Position update** — new_x = x + speed·cos(angle), etc. Uses the same
-  fixed-point multiply and trig ops.
-- **Collision detection** — test the movement vector against wall segments to
-  prevent walking through walls. This is another segment intersection pass
-  (same math, different ray).
-- **State carry** — the output residual stream includes updated (x, y, angle)
-  alongside rendered pixels. This state feeds back as input to the next frame.
-- **Angle wrapping** — modulo to keep angle in 0–255 range.
+- **Sector data** (architecture TBD based on Phase 1 learnings):
+  - Option A: SECTOR tokens, WALL/BSP_LEAF reference by ID
+  - Option B: Sector props flattened into WALL tokens
+  - Option C: Sector props on BSP leaf nodes
+- **Player sector identification** via BSP leaf traversal
+- **Multi-section column fill**: upper wall, main wall, lower wall for
+  varying sector heights
+- **Height clipping** for walls spanning sector boundaries
 
-**Map:** same as Phase 2 (or slightly expanded).
+**Map:** E1M1 region with stairs or height variation.
 
-**Deliverable:** a playable first-person walkthrough. Player moves with
-keyboard inputs, can't walk through walls, view updates each frame. State
-persists across frames via autoregressive rollout.
+**Deliverable:** Stairs and platforms render correctly. Walking up/down
+stairs changes view appropriately. Player's current sector properties
+(floor/ceiling height) available for rendering.
 
-**Estimate:** ~50 layers (rendering + collision + state update), d_model ~512.
+**Estimate:** +5-10 layers for multi-section column fill and sector lookup.
 
 
-### Phase 4: BSP + Variable-Height Sectors
+### Phase 3: Floor/Ceiling Rendering in Transformer
 
-Add Doom-style architecture: sectors with different floor and ceiling heights.
-Requires BSP for sector identification.
+Move floor and ceiling fill into the transformer (currently done by host).
 
 **What's new:**
 
-- **BSP decision tree** — all ~N BSP split-line tests in parallel (1 layer),
-  leaf identification via `bool_all_true` (2 layers), sector property lookup
-  via `map_to_table` (1 layer). See **BSP Strategy** above.
-- **Sector properties** — floor height, ceiling height, light level per
-  sector. Baked into a lookup table indexed by sector ID.
-- **Multi-section column fill** — a wall between two sectors of different
-  heights shows upper wall, main wall, lower wall. Column fill becomes
-  multi-section: compute wall_top/wall_bottom for each section, classify each
-  row, select the right color.
-- **Segment metadata** — each segment carries front/back sector IDs through
-  the min-reduction so the winner's sector properties are available for column
-  fill.
+- **Per-row distance**: reciprocal of row offset from horizon
+- **Flat-colored floors/ceilings**: use sector colors from Phase 2 data
+- **Proper clipping**: floor/ceiling only where no wall
 
-**Map:** a purpose-built test map (~40-50 segments) with stairs, platforms,
-and height variation. Multiple sectors at different heights connected by
-steps and drops.
+**Deliverable:** Complete frames output by transformer, no host-side fill.
+Ceiling and floor colors match sector properties.
 
-**Deliverable:** compiled transformer correctly renders variable-height
-architecture. Stairs look like stairs. The BSP tree is baked into the weights
-and correctly identifies the player's sector.
-
-**Estimate:** ~60 layers, d_model ~1024.
+**Estimate:** +5-8 layers for per-row reciprocal and fill logic.
 
 
-### Phase 5: Textures + Lighting
+### Phase 4: Lighting
 
-Visual fidelity. After this phase, the renderer looks recognizably Doom-like.
+Add sector-based and distance-based lighting.
 
 **What's new:**
 
-- **Wall textures** — compute texture coordinates (u from hit position along
-  wall, v from vertical position within wall). Look up texture pixels via
-  split `map_to_table` (by column then by row). Texture data baked into
-  weights.
-- **Floor/ceiling textures** — for each row above/below the wall, compute
-  world-space (x, y) of that floor/ceiling point via `reciprocal` of row
-  distance, then look up flat texture.
-- **Lighting** — combine sector light level (from BSP) with distance-based
-  dimming. Apply as a multiply on RGB values.
+- **Sector light level** from SECTORS lump (0-255 range)
+- **Distance dimming**: distant walls darker
+- **RGB multiply**: apply light level to texture colors
 
-**Map:** same test map as Phase 4, now with textures and lighting applied.
+**Deliverable:** Dark sectors are dark, distant walls fade. Matches DOOM's
+lighting model.
 
-**Deliverable:** textured walls, floors, and ceilings with lighting. Side-by-
-side comparison with a reference Doom-style renderer.
-
-**Estimate:** ~80 layers, d_model ~1024-2048.
-
-**Key risk:** texture data is large. Doom textures are 64×64 = 4096 pixels.
-A single `map_to_table` with 4096 entries needs d_hidden = 4096. Split lookup
-(by column then by row, 2 layers) is the likely approach. Total texture
-parameter count could be significant. Texture encoding strategy should be
-validated early in this phase.
+**Estimate:** +3-5 layers for light computation and multiply.
 
 
-### Phase 6: E1M1 Geometry
+### Phase 5: E1M1 Walkthrough
 
-Scale from test maps to the real E1M1 map.
+First major visual milestone: full E1M1 walkthrough with textures, lighting,
+and variable heights.
 
 **What's new:**
 
-- **WAD data import** — tooling to extract E1M1's segments, sectors, BSP tree,
-  and textures from the Doom WAD file (or a cleaned-up derivative). Converts
-  to the format expected by the graph constructor.
-- **Scale to ~300 segments** — brute-force parallel intersection at full
-  scale. Min-reduction grows from 5 stages to 9 stages (+12 layers).
-  Width grows to peak ~1500 columns.
-- **Full BSP tree** — ~200 BSP nodes, ~150 subsectors. Same 4-layer
-  structure, just wider.
-- **All E1M1 sector properties** — every sector's floor height, ceiling
-  height, light level, and textures.
+- Tune `max_walls` for complex E1M1 areas (may need 32-48)
+- More textures from WAD
+- Full map traversal testing (enter, walk through rooms, navigate layout)
+- Performance tuning for larger N
 
-**Map:** E1M1.
+**Deliverable:** GIF walkthrough of E1M1 — enter the level, walk through
+rooms, navigate the layout. Visually recognizable as E1M1.
 
-**Deliverable:** walk through E1M1 in a compiled transformer with full visual
-fidelity (textures, lighting, variable heights). Compare against a reference
-Doom renderer or actual Doom screenshots.
-
-**Estimate:** ~92 layers, d_model ~2048.
-
-This is the first major visual milestone: **it looks like Doom E1M1.**
+**Estimate:** May need to tune sort/render efficiency for larger N.
 
 
-### Phase 7: Doors, Elevators, Switches
+### Phase 6: Doors and Elevators
 
 Interactive environment mechanics.
 
 **What's new:**
 
-- **Mutable sector state** — door and elevator positions stored in the game
-  state vector. Sector floor/ceiling heights become state-dependent (base
-  height + offset from game state) rather than static constants.
-- **Door logic** — when the player presses "use" near a door segment, the
-  door's sector ceiling begins moving up. After a delay, it moves back down.
-  Implemented with `unrolled_loop` or frame-by-frame state updates.
-- **Elevator logic** — similar to doors but for floor height. Trigger by
-  walking onto the elevator sector.
-- **Switch/trigger detection** — proximity test (player near a linedef with a
-  special type) using segment distance checks.
+- **Mutable sector state**: door/elevator positions in game state
+- **Sector height offsets**: base height + state offset
+- **Use input**: player presses "use" near a door to open it
+- **Timed state**: doors close after delay
 
-**Map:** E1M1 with functional doors and elevators.
+**Deliverable:** Doors open and close. Elevators move. Can navigate E1M1's
+door-blocked areas.
 
-**Deliverable:** doors open and close, elevators move, switches trigger
-actions. Player can navigate through E1M1's door-blocked areas.
-
-**Estimate:** ~98 layers, d_model ~2048. Main cost is mutable state in the
-game state vector and the conditional sector-height logic.
+**Estimate:** +5-10 layers for state transitions and conditional heights.
 
 
-### Phase 8: Sprite Rendering + Items
+### Future Phases (Deferred)
 
-Render 2D sprites (items, decorations) composited into the 3D scene.
+These phases are documented but not immediately planned:
 
-**What's new:**
+**Sprites + Items**: Render items/decorations as 2D sprites composited into
+the 3D scene. Item pickup updates game state.
 
-- **Sprite projection** — for each sprite, compute screen-space position and
-  scale from player-relative coordinates. This is similar to wall projection:
-  translate to player space, compute angle, project.
-- **Per-column sprite test** — for each column, determine which sprites (if
-  any) overlap that column and are closer than the wall. This is a second
-  parallel reduction (similar to segment intersection) over all active sprites.
-- **Depth compositing** — compare sprite distance vs wall distance per column.
-  If the sprite is closer, its pixel replaces the wall/floor pixel.
-- **Sprite pixel lookup** — `map_to_table` indexed by (sprite_type,
-  sprite_column, sprite_row) to get pixel color. Transparent pixels
-  (color key) fall through to the wall behind.
-- **Item pickup** — proximity test between player and item positions. When
-  close enough, the item's state flag is set to "collected" and it stops
-  rendering. Update health/ammo/keys in game state.
-
-**Map:** E1M1 with items (health packs, ammo, armor, keys) and decorations
-(barrels, pillars, lamps) placed at their canonical positions.
-
-**Deliverable:** items and decorations are visible as sprites in the 3D view.
-Player can walk over items to collect them. Keys are required to open
-keyed doors (from Phase 7).
-
-**Estimate:** ~106 layers, d_model ~2048-4096. Sprite rendering adds a second
-parallel reduction pass (~15-20 layers) and sprite pixel lookups.
+**Enemies + Combat**: Enemy state machine, AI movement, hitscan weapons,
+damage system. Full E1M1 gameplay.
 
 
-### Phase 9: Enemies + Combat → Full E1M1
+## Phase Summary
 
-The final phase. Add enemies and combat to complete the E1M1 experience.
-
-**What's new:**
-
-- **Enemy state** — per-enemy: position, health, AI state (idle, chasing,
-  attacking, pain, dead), animation frame. Stored in the game state vector.
-- **Enemy AI** — simplified state machine. Idle enemies activate on line of
-  sight or sound. Chasing enemies move toward the player (pathfinding
-  simplified to direct movement with collision). Attacking enemies fire
-  projectiles or hitscan attacks at intervals.
-- **Enemy rendering** — enemies are sprites (Phase 8 infrastructure).
-  Animation frame selected by AI state + frame counter.
-- **Player combat** — hitscan weapon (pistol/shotgun): on "shoot" input,
-  check if the player's crosshair ray intersects an enemy. Apply damage.
-- **Projectile handling** — if enemies use projectile attacks, projectiles are
-  entities with position + velocity, advanced each frame, with
-  player-collision checks.
-- **Damage + death** — player takes damage, enemy takes damage. Health
-  reaches 0 → death state (enemy falls, player game-over).
-
-**Map:** full E1M1 with all enemies, items, and secrets at canonical
-placements.
-
-**Deliverable:** **full E1M1 playable in a compiled transformer.** Walk
-through the level, fight enemies, collect items, open doors, find secrets,
-reach the exit. Every frame is one forward pass.
-
-**Estimate:** ~115 layers, d_model ~4096. Enemy AI and combat add ~10-15
-layers (state machine logic, line-of-sight checks, damage computation).
-Width grows with number of active entities (enemies + projectiles + items).
+| Phase | Deliverable | Status | ~Layers |
+|-------|-------------|--------|---------|
+| — | Textured playable renderer (distance sort) | **Done** | 65 |
+| 1 | WAD loading + BSP_NODE tokens + BSP sort | Not started | ~65 |
+| 2 | Variable-height sectors | Not started | +10 |
+| 3 | Floor/ceiling in transformer | Not started | +8 |
+| 4 | Sector + distance lighting | Not started | +5 |
+| 5 | E1M1 walkthrough | Not started | ~88 |
+| 6 | Doors + elevators | Not started | +10 |
+| — | Sprites + items | Deferred | — |
+| — | Enemies + combat | Deferred | — |
 
 
-### Phase Summary
+## Technical Notes
 
-| Phase | Deliverable | New capability | ~Layers | ~d_model |
-|-------|-------------|----------------|---------|----------|
-| 1 | Unit-tested ops + raw I/O | Fixed-point, modulo, reference renderer | — | — |
-| 2 | Static flat-shaded renderer | Segment intersection + column fill | 34 | 512 |
-| 3 | Playable walkthrough | Movement, collision, state carry | 50 | 512 |
-| 4 | Variable-height architecture | BSP sector ID, multi-height sectors | 60 | 1024 |
-| 5 | Textured + lit renderer | Textures, floor/ceiling, lighting | 80 | 2048 |
-| 6 | E1M1 visuals | Full map, WAD import, 300 segments | 92 | 2048 |
-| 7 | Interactive E1M1 | Doors, elevators, switches | 98 | 2048 |
-| 8 | Items + decorations | Sprite rendering, pickups | 106 | 4096 |
-| 9 | **Full E1M1** | **Enemies, combat, AI** | **115** | **4096** |
+### Subset Selection Strategy
+
+`load_map_subset` selects walls by distance from player position. Simple
+Euclidean distance from player to wall midpoint (or closest point on wall).
+No angle filtering — the transformer's BSP-based sort handles visibility.
+
+For E1M1's ~732 segs, naive sorting is fast enough on the host. If needed,
+spatial indexing (grid, quadtree) can speed selection.
+
+### BSP Subset Extraction
+
+Given selected segs and their subsectors, find the minimal BSP subtree:
+1. Collect unique subsector IDs
+2. Walk each subsector's ancestor path in the full BSP
+3. Union all ancestors — these are the nodes in the subset
+4. Renumber 0..M-1 for the transformer
+
+For 32 segs from ~25 subsectors with depth ~8, expect ~30-40 BSP_NODE tokens.
+
+### Texture Management
+
+Each frame uses at most `max_textures` distinct textures (limited by TEX_COL
+prefill size and attention capacity). The subset selector:
+
+1. Selects walls by distance
+2. Collects unique texture IDs from selected walls
+3. If > max_textures, prioritizes textures on closer walls
+4. Loads and downscales selected textures from WAD
+
+### Layer Budget
+
+Target: ≤120 layers at d_model ≤ 4096.
+
+Current: 65 layers at d_model 2048 for 8 walls.
+
+Phase 1 is roughly layer-neutral (removes distance sort layers, adds BSP
+rank layers). Subsequent phases have ~45 layers of headroom for variable
+heights, lighting, doors, and beyond.
+
+### Sequence Length Scaling
+
+The sort phase is O(N) autoregressive steps. At ~70ms/step on A100:
+
+| Walls | Sort steps | Sort time |
+|-------|------------|-----------|
+| 8 | 8 | ~0.6s |
+| 16 | 16 | ~1.1s |
+| 32 | 32 | ~2.2s |
+| 48 | 48 | ~3.4s |
+
+Prefill grows with N + M (walls + BSP nodes): ~75 tokens for a 32-wall
+subset vs ~42 currently.
 
 
 ## Open Questions
 
-- **Coordinate representation**: discrete vs. fixed-point vs. scaled integers?
-  Depends on what arithmetic ops can support at the needed precision.
-- **State size**: what is the minimal state vector for E1M1? How much of the
-  game state fits in the residual stream?
-- **Column output encoding**: exact layout of RGB values in the residual stream
-  per position. One row per residual-stream dimension, or packed differently?
-- **Texture encoding**: Doom textures are 64×64 or 128×128 pixels. A single
-  `map_to_table` with 4096+ entries needs d_hidden=4096, which may exceed d_model.
-  Split lookup (by column then by row) needs 2 layers but requires an
-  intermediate representation. Texture data dominates parameter count.
-- **Floor/ceiling rendering**: Doom renders floors/ceilings as horizontal
-  textured spans. Per-column, each row above/below the wall needs a reciprocal
-  (row→world distance) + sector lookup + texture lookup. Estimated at ~10
-  layers but this is the least certain estimate in the budget. Flat-colored
-  floors/ceilings save ~8 layers if the budget is tight.
-- **Collision detection sharing**: game-state collision detection is essentially
-  a second segment intersection pass. Can the reduction tree be shared or
-  reused, or does collision need a smaller dedicated segment set?
+- **Optimal max_walls**: What's the minimum N that covers typical E1M1
+  views? Need to test with real map data.
+
+- **Sector architecture (Phase 2)**: SECTOR tokens vs flattened vs on BSP
+  leaves. Decide based on Phase 1 learnings about BSP_NODE patterns.
+
+- **Door state encoding**: How many simultaneously-animating doors does
+  E1M1 require? Affects game state vector size.
+
+- **Texture atlas size**: E1M1 uses ~40 unique textures. With max_textures=8
+  per frame, need priority logic for which to load.
+
+- **BSP rank encoding**: `side_P` as ±1 or 0/1? Formula assumes 0/1 for
+  clean XOR; map `compare` output accordingly.

@@ -61,32 +61,33 @@ def generate_transformer(
     scene: str = "box",
     width: int = 120,
     height: int = 100,
-    rows_per_patch: int = 10,
+    chunk_size: int = 20,
     tex_size: int = 64,
     frames: int = 10,
     fps: int = 10,
     scale: int = 4,
     d: int = 2048,
 ) -> bytes:
-    from torchwright.doom.compile import compile_game, step_frame, segments_to_walls
+    from torchwright.doom.compile import compile_game, step_frame
+    from torchwright.doom.map_subset import build_scene_subset
     from torchwright.doom.walkthrough import generate_walkthrough, save_gif
 
     config = _config(width, height)
     segments, textures, start_x, start_y, start_angle, max_coord = _scene_data(scene, tex_size)
 
-    walls = segments_to_walls(segments)
-    print(f"Compiling game graph (walls-as-tokens, {len(walls)} walls)...")
+    print(f"Compiling game graph (walls-as-tokens, {len(segments)} walls)...")
     module = compile_game(
         config, textures,
-        max_walls=max(8, len(walls)),
+        max_walls=max(8, len(segments)),
         max_coord=max_coord,
         d=d,
-        rows_per_patch=rows_per_patch,
+        chunk_size=chunk_size,
         device="cuda",
     )
+    subset = build_scene_subset(segments, textures)
 
     def frame_fn(state, inputs):
-        return step_frame(module, state, inputs, walls, config,
+        return step_frame(module, state, inputs, subset, config,
                           textures=textures)
 
     print(f"Generating {frames} transformer frames at {width}x{height}...")
@@ -147,7 +148,7 @@ def main(
     scene: str = "box",
     width: int = 120,
     height: int = 100,
-    rows_per_patch: int = 10,
+    chunk_size: int = 20,
     tex_size: int = 64,
     frames: int = 10,
     fps: int = 10,
@@ -157,7 +158,7 @@ def main(
     # Launch both in parallel
     transformer_call = generate_transformer.spawn(
         scene=scene, width=width, height=height,
-        rows_per_patch=rows_per_patch, tex_size=tex_size,
+        chunk_size=chunk_size, tex_size=tex_size,
         frames=frames, fps=fps, scale=scale, d=d,
     )
     reference_call = generate_reference.spawn(
