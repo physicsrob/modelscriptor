@@ -94,9 +94,11 @@ def test_probe_clean_on_v2_box_room(tiny_config):
     """
     textures = default_texture_atlas()
     max_walls = 8
+    max_bsp_nodes = 48
     output_node, pos_encoding = build_game_graph(
         tiny_config, textures, max_walls=max_walls,
         max_coord=10.0, move_speed=0.3, turn_speed=4,
+        max_bsp_nodes=max_bsp_nodes,
     )
 
     from torchwright.doom.game_graph import E8_INPUT
@@ -123,6 +125,12 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         "wall_by": torch.tensor([[0.0]]),
         "wall_index": torch.tensor([[0.0]]),
         "wall_tex_id": torch.tensor([[0.0]]),
+        "bsp_plane_nx": torch.tensor([[0.0]]),
+        "bsp_plane_ny": torch.tensor([[0.0]]),
+        "bsp_plane_d": torch.tensor([[0.0]]),
+        "bsp_node_id_onehot": torch.zeros(1, max_bsp_nodes),
+        "wall_bsp_coeffs": torch.zeros(1, max_bsp_nodes),
+        "wall_bsp_const": torch.tensor([[0.0]]),
     }
 
     # The v2 graph has large intermediate values in square_signed and

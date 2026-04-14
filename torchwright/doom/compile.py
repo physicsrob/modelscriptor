@@ -24,6 +24,7 @@ from torchwright.compiler.export import compile_headless
 from torchwright.doom.game import GameState
 from torchwright.doom.input import PlayerInput
 from torchwright.doom.game_graph import (
+    E8_BSP_NODE,
     E8_EOS,
     E8_INPUT,
     E8_RENDER,
@@ -109,15 +110,19 @@ def compile_game(
     verbose: bool = True,
     rows_per_patch: Optional[int] = None,
     d_hidden: Optional[int] = None,
+    max_bsp_nodes: int = 48,
 ):
     """Compile the game graph to a HeadlessTransformerModule."""
     output_node, pos_encoding = build_game_graph(
         config, textures, max_walls, max_coord,
         move_speed, turn_speed,
         rows_per_patch=rows_per_patch,
+        max_bsp_nodes=max_bsp_nodes,
     )
     # d_head must be >= max d_qk across all Attn nodes.
     # Render attention: d_qk = W + 1.  TEX_COL attention: d_qk = 8 + tex_w + 1.
+    # BSP broadcast (attend_mean_where over BSP_NODE positions) uses the
+    # standard d_qk = 2 — covered by the render/tex minimum.
     if d_head is None:
         W = config.screen_width
         tex_w = textures[0].shape[0]
@@ -137,6 +142,7 @@ def compile_game(
         extra_metadata={
             "rows_per_patch": rp,
             "max_walls": max_walls,
+            "max_bsp_nodes": max_bsp_nodes,
             "tex_h": tex_h,
         },
         d_hidden=d_hidden,
@@ -149,6 +155,7 @@ def _build_row(compiled, max_walls, **kwargs):
     """Build a (1, d_input) row for module.step()."""
     device = compiled._net.device
     tex_h = int(compiled.metadata.get("tex_h", 8))
+    max_bsp_nodes = int(compiled.metadata.get("max_bsp_nodes", 48))
     defaults = {
         "col_idx": torch.zeros(1, device=device),
         "input_backward": torch.zeros(1, device=device),
@@ -172,6 +179,13 @@ def _build_row(compiled, max_walls, **kwargs):
         "wall_by": torch.zeros(1, device=device),
         "wall_index": torch.zeros(1, device=device),
         "wall_tex_id": torch.zeros(1, device=device),
+        # BSP-related inputs (zero at positions that don't use them).
+        "bsp_plane_nx": torch.zeros(1, device=device),
+        "bsp_plane_ny": torch.zeros(1, device=device),
+        "bsp_plane_d": torch.zeros(1, device=device),
+        "bsp_node_id_onehot": torch.zeros(max_bsp_nodes, device=device),
+        "wall_bsp_coeffs": torch.zeros(max_bsp_nodes, device=device),
+        "wall_bsp_const": torch.zeros(1, device=device),
     }
     defaults.update(kwargs)
     d_input = max(s + w for _, s, w in compiled._input_specs)
@@ -190,7 +204,7 @@ def step_frame(
     module,
     state: GameState,
     inputs: PlayerInput,
-    walls: List[dict],
+    walls_or_subset,
     config: RenderConfig,
     textures: List[np.ndarray] = None,
 ) -> Tuple[np.ndarray, GameState]:
@@ -200,9 +214,13 @@ def step_frame(
         module: Compiled module from :func:`compile_game`.
         state: Current game state (x, y, angle).
         inputs: Player inputs for this frame.
-        walls: List of wall dicts with keys ax, ay, bx, by, tex_id.
+        walls_or_subset: Either a :class:`~torchwright.doom.map_subset.MapSubset`
+            (preferred; carries BSP structure) or a list of wall dicts with
+            keys ``ax``, ``ay``, ``bx``, ``by``, ``tex_id`` (legacy; a
+            trivial BSP-less subset is synthesized internally).
         config: Render configuration.
         textures: List of texture arrays, each (tex_w, tex_h, 3).
+            Defaults to the subset's textures when a MapSubset is passed.
 
     Returns:
         ``(frame, new_state)`` where frame is ``(H, W, 3)`` float32.
@@ -210,18 +228,50 @@ def step_frame(
     Host protocol — the host is a dumb token feeder:
         0. TEX_COL×(num_tex × tex_w) — feed texture column pixel data
         1. INPUT — feed player state + controls
-        2. WALL×N — feed wall geometry + player position
-        3. EOS — feed player position → read resolved state from output
-        4. SORTED_WALL×N — pure autoregressive: feed prev output back
-        5. RENDER×(W×H/rp) — feed (col, patch) → read pixels
+        2. BSP_NODE×max_bsp_nodes — feed splitting plane coefficients
+        3. WALL×N — feed wall geometry + player position + BSP coeffs
+        4. EOS — feed player position → read resolved state from output
+        5. SORTED_WALL×N — pure autoregressive: feed prev output back
+        6. RENDER×(W×H/rp) — feed (col, patch) → read pixels
 
     Every cross-position dependency flows through attention.  The host
     never computes on intermediate results — it just forwards outputs
     back as inputs for the sort phase.
     """
-    assert textures is not None, "textures is required"
-    N = len(walls)
+    # Local import to avoid a circular dep at module-load time.
+    from torchwright.doom.map_subset import (
+        MapSubset, subset_from_walls_with_sort,
+    )
+
     max_walls = int(module.metadata.get("max_walls", 8))
+    max_bsp_nodes = int(module.metadata.get("max_bsp_nodes", 48))
+
+    if isinstance(walls_or_subset, MapSubset):
+        subset = walls_or_subset
+        # Convert subset segments back to the wall-dict shape used by
+        # the prefill loop below.
+        walls = [
+            {"ax": s.ax, "ay": s.ay, "bx": s.bx, "by": s.by,
+             "tex_id": float(s.texture_id)}
+            for s in subset.segments
+        ]
+        if textures is None:
+            textures = subset.textures
+    else:
+        walls = list(walls_or_subset)
+        assert textures is not None, "textures is required (or pass a MapSubset)"
+        # Legacy path: synthesize a trivial MapSubset whose rank ≡
+        # old-style central-ray sort score, so the BSP-aware graph
+        # produces the same sort order as the pre-BSP graph did.
+        subset = subset_from_walls_with_sort(
+            walls, textures,
+            player_x=float(state.x), player_y=float(state.y),
+            player_angle=int(state.angle),
+            trig_table=config.trig_table,
+            max_bsp_nodes=max_bsp_nodes,
+        )
+
+    N = len(walls)
     rp = int(module.metadata.get("rows_per_patch", config.screen_height))
     H = config.screen_height
     W = config.screen_width
@@ -234,7 +284,15 @@ def step_frame(
 
     past = module.empty_past()
     step = 0
-    total_steps = num_tex * tex_w + 1 + N + 1 + N + W * shards_per_col
+    total_steps = (
+        num_tex * tex_w
+        + 1                    # INPUT
+        + max_bsp_nodes        # BSP_NODE × M
+        + N                    # WALL × N
+        + 1                    # EOS
+        + N                    # SORTED_WALL × N
+        + W * shards_per_col   # RENDER
+    )
     px, py, angle = float(state.x), float(state.y), float(state.angle)
 
     # Output layout indices
@@ -269,7 +327,7 @@ def step_frame(
 
     t_frame = time.perf_counter()
 
-    # --- Batched prefill: TEX_COL + INPUT + WALL + EOS in one forward ---
+    # --- Batched prefill: TEX_COL + INPUT + BSP_NODE + WALL + EOS ---
     # All prefill tokens are causally ordered and don't depend on each
     # other's outputs, so we process them in a single batched call.
     t0 = time.perf_counter()
@@ -290,8 +348,40 @@ def step_frame(
     # INPUT (controls only here)
     rows.append(_common(token_type=E8_INPUT, **input_kw))
 
-    # WALL × N
+    # BSP_NODE × max_bsp_nodes — real planes first, pad with null planes.
+    # The null plane (nx=0, ny=0, d=0) produces raw=0 at any player
+    # position, so side_P = compare(0,0) is BACK (cond_gate emits zero),
+    # and the padding contributes nothing to any wall's rank.
+    for i in range(max_bsp_nodes):
+        onehot = torch.zeros(max_bsp_nodes)
+        onehot[i] = 1.0
+        if i < len(subset.bsp_nodes):
+            plane = subset.bsp_nodes[i]
+            nx, ny, d = plane.nx, plane.ny, plane.d
+        else:
+            nx, ny, d = 0.0, 0.0, 0.0
+        rows.append(_common(
+            token_type=E8_BSP_NODE,
+            bsp_plane_nx=torch.tensor([nx], dtype=torch.float32),
+            bsp_plane_ny=torch.tensor([ny], dtype=torch.float32),
+            bsp_plane_d=torch.tensor([d], dtype=torch.float32),
+            bsp_node_id_onehot=onehot,
+        ))
+
+    # WALL × N — now each wall carries BSP rank coefficients precomputed
+    # by the host.  Rank = dot(coeffs, side_P_vec) + const is evaluated
+    # in the graph.
     for i, w in enumerate(walls):
+        if i < subset.seg_bsp_coeffs.shape[0]:
+            coeffs = torch.tensor(
+                subset.seg_bsp_coeffs[i, :max_bsp_nodes], dtype=torch.float32,
+            )
+            const = torch.tensor(
+                [float(subset.seg_bsp_consts[i])], dtype=torch.float32,
+            )
+        else:
+            coeffs = torch.zeros(max_bsp_nodes, dtype=torch.float32)
+            const = torch.zeros(1, dtype=torch.float32)
         rows.append(_common(
             token_type=E8_WALL,
             wall_ax=torch.tensor([w["ax"]]),
@@ -300,6 +390,8 @@ def step_frame(
             wall_by=torch.tensor([w["by"]]),
             wall_tex_id=torch.tensor([w["tex_id"]]),
             wall_index=torch.tensor([float(i)]),
+            wall_bsp_coeffs=coeffs,
+            wall_bsp_const=const,
         ))
 
     # EOS
