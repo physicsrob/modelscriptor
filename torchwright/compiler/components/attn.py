@@ -96,6 +96,21 @@ class AttnLayerComponent(Component):
 
         return output, (K, V)
 
+    def trim_unused_heads(self):
+        """Remove trailing unused (all-zero) heads after compilation.
+
+        Heads are allocated contiguously from index 0, so slicing
+        [:used_heads] is safe.  Keeps at least 1 head to avoid
+        degenerate empty-tensor shapes in downstream ops.
+        """
+        n = max(self.used_heads, 1)
+        if n < self.n_heads:
+            self.query_matrix = self.query_matrix[:n].contiguous()
+            self.key_matrix = self.key_matrix[:n].contiguous()
+            self.value_matrix = self.value_matrix[:n].contiguous()
+            self.output_matrix = self.output_matrix[:n].contiguous()
+            self.n_heads = n
+
     def num_params(self) -> int:
         return (
             self.query_matrix.numel()
