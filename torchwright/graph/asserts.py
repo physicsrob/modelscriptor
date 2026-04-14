@@ -255,3 +255,146 @@ def assert_unique_values(
         )
 
     return Assert(node, predicate, message=f"unique values (margin={margin})")
+
+
+def assert_distinct_across(
+    value: Node, where: Node, *, margin: float = 0.5,
+) -> Node:
+    """Assert per-position ``value`` is pairwise-distinct across rows where ``where ≈ 1``.
+
+    Use this for cross-position uniqueness invariants like "``bsp_rank``
+    values at WALL positions are all different" — the precondition that
+    keeps a downstream ``attend_argmin_unmasked`` softmax concentrated
+    on a single key.
+
+    Rows with ``where.squeeze(-1) ≤ 0.5`` are ignored (the predicate
+    sees only the valid subset).  This makes the check tolerant of both
+    ±1 bool validity (where ``≥ 0.5`` maps to "valid") and {0, 1}
+    indicator validity.
+
+    Pairwise comparison uses L∞ distance on the ``d_value``-wide vectors
+    (for the common 1-wide scalar case, L∞ is just absolute difference);
+    any pair closer than ``margin`` triggers failure.  Default margin
+    (0.5) is larger than typical PL2D fuzz and smaller than the natural
+    spacing of integer ranks (1.0).
+
+    **Safe placement**: pre- or post-attention.  Prefer upstream of the
+    attention that consumes ``value`` so a tie is caught before it
+    can blend.
+
+    Implementation mirrors :func:`assert_strictly_less` — composes the
+    two inputs via ``Concatenate`` so no new two-input Assert shape is
+    required; a trailing ``Linear`` projects the asserted composite
+    back to ``value``'s width for downstream use.
+    """
+    d_value = len(value)
+    d_where = len(where)
+
+    def predicate(x: torch.Tensor) -> tuple:
+        val = x[:, :d_value]
+        valid = x[:, d_value:d_value + d_where]
+        if d_where == 1:
+            mask = valid.squeeze(-1) > 0.5
+        else:
+            # Multi-wide validity collapses to "any slot ≥ 0.5".
+            mask = (valid > 0.5).any(dim=-1)
+        rows = val[mask]
+        if rows.shape[0] < 2:
+            return True, ""
+        diffs = (rows.unsqueeze(1) - rows.unsqueeze(0)).abs().max(dim=-1).values
+        eye = torch.eye(rows.shape[0], dtype=torch.bool, device=rows.device)
+        bad = (diffs < margin) & ~eye
+        if not bad.any():
+            return True, ""
+        i, j = bad.nonzero(as_tuple=False)[0].tolist()
+        return False, (
+            f"valid-subset rows {i},{j} within margin={margin}: "
+            f"{rows[i].tolist()} vs {rows[j].tolist()}"
+        )
+
+    composite = Concatenate([value, where])
+    wrapped = Assert(
+        composite, predicate,
+        message=f"distinct_across (margin={margin})",
+    )
+    from torchwright.graph import Linear
+    proj = torch.zeros(d_value + d_where, d_value)
+    for i in range(d_value):
+        proj[i, i] = 1.0
+    return Linear(wrapped, proj, name="distinct_across_value")
+
+
+def assert_picked_from(
+    result: Node, values: Node, keys: Node, *, atol: float = 1e-2,
+) -> Node:
+    """Assert an attention output matches exactly one valid per-position value row.
+
+    For a pick-style attention (``attend_argmin_unmasked`` or
+    ``attend_argmax_dot``), the output at every query row should equal
+    ``values[k]`` for some key row ``k`` where ``keys ≈ 1`` — a blend
+    of two or more values indicates a softmax that failed to
+    concentrate.  That's exactly the angle-192 rendering artifact in
+    DOOM: the compiled softmax returned a weighted average of walls
+    instead of one wall.
+
+    ``result`` and ``values`` must share width ``d`` (the attention
+    op's contract — output width equals value width).  ``keys`` is a
+    (n_pos, 1) validity flag; rows with ``keys > 0.5`` are treated
+    as valid candidate picks.
+
+    Predicate: for every query row ``q``, compute the L∞ distance from
+    ``result[q]`` to every valid ``values[k]`` row; fail if the minimum
+    exceeds ``atol``.  Default ``atol`` (1e-2) is loose enough to
+    absorb PL-softmax jitter on clean picks and tight enough to catch
+    the ~3% blend we saw at angle 192 (which produced 0.15-unit drift
+    on magnitude-5 values).
+
+    **Safe placement**: **post-attention, compiled-side only.**
+    Reference math at high match-gain is exact; only the compiled
+    piecewise-linear softmax drifts.  Expect this assert to fire
+    through :func:`torchwright.debug.probe.check_asserts_on_compiled`,
+    not during :func:`reference_eval`.
+    """
+    d_r = len(result)
+    d_v = len(values)
+    d_k = len(keys)
+    if d_r != d_v:
+        raise ValueError(
+            f"assert_picked_from: result/values width mismatch "
+            f"(result={d_r}, values={d_v})"
+        )
+
+    def predicate(x: torch.Tensor) -> tuple:
+        res = x[:, :d_r]
+        vals = x[:, d_r:d_r + d_v]
+        keys_t = x[:, d_r + d_v:d_r + d_v + d_k]
+        if d_k == 1:
+            mask = keys_t.squeeze(-1) > 0.5
+        else:
+            mask = (keys_t > 0.5).any(dim=-1)
+        valid_vals = vals[mask]
+        if valid_vals.shape[0] == 0:
+            return False, "no valid key positions"
+        # (n_pos, 1, d) - (1, n_keys, d) → (n_pos, n_keys, d); max over d = L∞.
+        dists = (res.unsqueeze(1) - valid_vals.unsqueeze(0)).abs().max(dim=-1).values
+        min_dists, argmin_k = dists.min(dim=-1)
+        bad = min_dists > atol
+        if not bad.any():
+            return True, ""
+        q = bad.nonzero(as_tuple=False)[0].item()
+        return False, (
+            f"query row {q}: result doesn't match any value row "
+            f"within atol={atol}; closest valid key #{argmin_k[q].item()} "
+            f"at L∞ distance {min_dists[q].item():.4f}"
+        )
+
+    composite = Concatenate([result, values, keys])
+    wrapped = Assert(
+        composite, predicate,
+        message=f"attention picked one (atol={atol})",
+    )
+    from torchwright.graph import Linear
+    proj = torch.zeros(d_r + d_v + d_k, d_r)
+    for i in range(d_r):
+        proj[i, i] = 1.0
+    return Linear(wrapped, proj, name="picked_from_result")

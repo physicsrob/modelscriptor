@@ -26,8 +26,10 @@ from torchwright.graph import Assert, Concatenate, LiteralValue, annotate
 from torchwright.graph.asserts import (
     assert_01,
     assert_bool,
+    assert_distinct_across,
     assert_in_range,
     assert_onehot,
+    assert_picked_from,
     assert_strictly_less,
     assert_unique_values,
     collect_asserts,
@@ -342,3 +344,218 @@ def test_check_asserts_on_compiled_raises_when_compiled_violates():
             mod, asserts,
             input_values={"x": inp_val}, n_pos=1,
         )
+
+
+# ---------------------------------------------------------------------------
+# assert_distinct_across — cross-position uniqueness with validity gate
+# ---------------------------------------------------------------------------
+
+
+def test_distinct_across_accepts_distinct_valid_rows():
+    """Three valid rows with ranks 0, 1, 2 at margin 0.5 → passes."""
+    value = create_input("value", 1)
+    where = create_input("where", 1)
+    wrapped = assert_distinct_across(value, where, margin=0.5)
+    _eval(wrapped, {
+        "value": torch.tensor([[0.0], [1.0], [2.0], [99.0]]),
+        "where": torch.tensor([[1.0], [1.0], [1.0], [-1.0]]),  # last row invalid
+    }, n_pos=4)
+
+
+def test_distinct_across_rejects_tied_valid_rows():
+    """Two valid rows with values 1.0 and 1.1 at margin 0.5 → fails."""
+    value = create_input("value", 1)
+    where = create_input("where", 1)
+    wrapped = assert_distinct_across(value, where, margin=0.5)
+    with pytest.raises(AssertionError, match=r"valid-subset rows"):
+        _eval(wrapped, {
+            "value": torch.tensor([[1.0], [1.1], [99.0]]),
+            "where": torch.tensor([[1.0], [1.0], [-1.0]]),
+        }, n_pos=3)
+
+
+def test_distinct_across_ignores_invalid_rows():
+    """Ties among where<0.5 rows are not a violation."""
+    value = create_input("value", 1)
+    where = create_input("where", 1)
+    wrapped = assert_distinct_across(value, where, margin=0.5)
+    _eval(wrapped, {
+        "value": torch.tensor([[5.0], [5.0], [5.0], [1.0]]),
+        "where": torch.tensor([[0.0], [0.0], [0.0], [1.0]]),  # only row 3 valid
+    }, n_pos=4)
+
+
+def test_distinct_across_zero_or_one_valid_row_passes():
+    """Trivially distinct with < 2 valid rows."""
+    value = create_input("value", 1)
+    where = create_input("where", 1)
+    wrapped = assert_distinct_across(value, where, margin=0.5)
+    # Zero valid
+    _eval(wrapped, {
+        "value": torch.tensor([[5.0], [5.0]]),
+        "where": torch.tensor([[0.0], [0.0]]),
+    }, n_pos=2)
+    # One valid
+    _eval(wrapped, {
+        "value": torch.tensor([[5.0], [5.0]]),
+        "where": torch.tensor([[1.0], [0.0]]),
+    }, n_pos=2)
+
+
+def test_distinct_across_multi_dim_uses_l_infinity():
+    """With d=2 values, the tightest component dominates the margin check."""
+    value = create_input("value", 2)
+    where = create_input("where", 1)
+    wrapped = assert_distinct_across(value, where, margin=0.5)
+    # Rows [1, 0] and [1, 0.1] — L∞ distance 0.1 < margin 0.5 → fail.
+    with pytest.raises(AssertionError):
+        _eval(wrapped, {
+            "value": torch.tensor([[1.0, 0.0], [1.0, 0.1]]),
+            "where": torch.tensor([[1.0], [1.0]]),
+        }, n_pos=2)
+    # Rows [1, 0] and [1, 2] — L∞ distance 2.0 → pass.
+    _eval(wrapped, {
+        "value": torch.tensor([[1.0, 0.0], [1.0, 2.0]]),
+        "where": torch.tensor([[1.0], [1.0]]),
+    }, n_pos=2)
+
+
+def test_distinct_across_returns_value_width():
+    """The wrapped result must have the same width as the input value."""
+    value = create_input("value", 3)
+    where = create_input("where", 1)
+    wrapped = assert_distinct_across(value, where, margin=0.5)
+    assert len(wrapped) == 3
+
+
+# ---------------------------------------------------------------------------
+# assert_picked_from — attention-concentration
+# ---------------------------------------------------------------------------
+
+
+def test_picked_from_accepts_clean_pick():
+    """Result matches one of the valid value rows exactly → passes."""
+    result = create_input("result", 2)
+    values = create_input("values", 2)
+    keys = create_input("keys", 1)
+    wrapped = assert_picked_from(result, values, keys, atol=1e-3)
+    # At every query row, result = [1.0, 2.0] — which matches value row 1 (valid key).
+    _eval(wrapped, {
+        "result": torch.tensor([[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]]),
+        "values": torch.tensor([[9.9, 9.9], [1.0, 2.0], [3.0, 4.0]]),
+        "keys":   torch.tensor([[0.0],      [1.0],      [0.0]]),  # only row 1 valid
+    }, n_pos=3)
+
+
+def test_picked_from_rejects_blend():
+    """Synthetic blend — result is midpoint of two value rows, matches neither."""
+    result = create_input("result", 1)
+    values = create_input("values", 1)
+    keys = create_input("keys", 1)
+    wrapped = assert_picked_from(result, values, keys, atol=1e-2)
+    # Valid values are 0.0 and 1.0; result = 0.5 matches neither within atol=0.01.
+    with pytest.raises(AssertionError, match=r"doesn't match any value row"):
+        _eval(wrapped, {
+            "result": torch.tensor([[0.5]]),
+            "values": torch.tensor([[0.0]]),
+            "keys":   torch.tensor([[1.0]]),
+        }, n_pos=1)
+
+
+def test_picked_from_rejects_no_valid_keys():
+    """Zero valid key positions must fail explicitly."""
+    result = create_input("result", 1)
+    values = create_input("values", 1)
+    keys = create_input("keys", 1)
+    wrapped = assert_picked_from(result, values, keys, atol=1e-3)
+    with pytest.raises(AssertionError, match=r"no valid key positions"):
+        _eval(wrapped, {
+            "result": torch.tensor([[0.5], [0.3]]),
+            "values": torch.tensor([[1.0], [2.0]]),
+            "keys":   torch.tensor([[0.0], [0.0]]),
+        }, n_pos=2)
+
+
+def test_picked_from_accepts_duplicate_valid_values():
+    """Multiple identical valid value rows → passes (result matches one of them)."""
+    result = create_input("result", 1)
+    values = create_input("values", 1)
+    keys = create_input("keys", 1)
+    wrapped = assert_picked_from(result, values, keys, atol=1e-3)
+    _eval(wrapped, {
+        "result": torch.tensor([[3.0], [3.0]]),
+        "values": torch.tensor([[3.0], [3.0]]),   # two rows, same value
+        "keys":   torch.tensor([[1.0], [1.0]]),   # both valid
+    }, n_pos=2)
+
+
+def test_picked_from_width_mismatch_raises():
+    """Result/values width mismatch is caught at construction time."""
+    result = create_input("result", 2)
+    values = create_input("values", 3)
+    keys = create_input("keys", 1)
+    with pytest.raises(ValueError, match=r"width mismatch"):
+        assert_picked_from(result, values, keys)
+
+
+def test_picked_from_returns_result_width():
+    """The wrapped result preserves ``result``'s width for downstream use."""
+    result = create_input("result", 4)
+    values = create_input("values", 4)
+    keys = create_input("keys", 1)
+    wrapped = assert_picked_from(result, values, keys)
+    assert len(wrapped) == 4
+
+
+def test_picked_from_compiled_fires_on_blend():
+    """Compile-side check fires when the compiled softmax blends two close scores.
+
+    Build an ``attend_argmin_unmasked`` over four key positions whose
+    scores are very close (0.0, 0.01, 0.02, 0.03).  With
+    ``match_gain=10`` (deliberately low) the compiled piecewise-linear
+    softmax can't concentrate on one key, producing a blend.  At
+    reference eval, the same graph runs the exact softmax via
+    ``torch.softmax`` and concentrates correctly on the argmin (key 0).
+    The assert fires only under compile.
+    """
+    from torchwright.ops.attention_ops import attend_argmin_unmasked
+
+    pos = create_pos_encoding()
+    # Per-position inputs.  Values are (n_pos, 2) so each key carries a
+    # distinct identifier that a blend wouldn't reproduce.
+    score = create_input("score", 1)
+    position_onehot = create_input("position_onehot", 4)
+    mask = create_input("mask", 4)
+    values_node = create_input("values_node", 2)
+    keys = create_input("keys", 1)
+
+    picked = attend_argmin_unmasked(
+        pos_encoding=pos,
+        score=score,
+        mask_vector=mask,
+        position_onehot=position_onehot,
+        value=values_node,
+    )
+    # Assert the pick is a single value row (within a tight atol that
+    # a blended midpoint can't satisfy).
+    wrapped = assert_picked_from(picked, values_node, keys, atol=1e-2)
+    asserts = collect_asserts(wrapped)
+
+    # 5 positions: 4 candidate keys + 1 query (which also participates
+    # as a key with high score so it loses).
+    input_values = {
+        "score":            torch.tensor([[0.0], [0.01], [0.02], [0.03], [99.0]]),
+        "position_onehot":  torch.eye(4)[[0, 1, 2, 3]].tolist() + [[0.0, 0.0, 0.0, 0.0]],
+        "mask":             torch.zeros(5, 4),
+        "values_node":      torch.tensor([
+            [1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0], [0.0, 0.0],
+        ]),
+        "keys":             torch.tensor([[1.0], [1.0], [1.0], [1.0], [0.0]]),
+    }
+    input_values["position_onehot"] = torch.tensor(input_values["position_onehot"])
+
+    mod = compile_headless(
+        wrapped, pos, d=512, d_head=32, max_layers=30, verbose=False,
+    )
+    with pytest.raises(AssertionError, match=r"doesn't match any value row"):
+        check_asserts_on_compiled(mod, asserts, input_values, n_pos=5)
