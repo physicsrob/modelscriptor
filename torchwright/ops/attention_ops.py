@@ -9,20 +9,25 @@ running mask".
 
 All primitives here follow this template:
 
-- ``query_in`` is the positional encoding (and, for the unmasked variant,
-  also the running mask vector). Its projection to ``d_head`` uses only
-  one row — the slowest cosine component, ``pos_enc[j, d_pos-1]`` — which
-  is near-constant for any realistic sequence length, giving us a stable
-  positive per-query gain of ``_QUERY_GAIN ≈ 8``.
-- ``key_in`` is a ``Concatenate`` of the positional encoding, the content
-  nodes that drive selection, and ``pos_encoding.get_position_scalar()``
-  for a clean linear tiebreak toward later positions.
-- ``key_matrix`` has only column 0 non-zero (for the basic variants); it
-  spells out the linear combination of ``score`` and ``tiebreak`` that
-  becomes the attention logit. The ``_where`` variants add a large
-  ``_VALIDITY_LARGE`` penalty for invalid positions; ``_unmasked`` uses
-  extra ``d_head`` columns to compute a per-query ``mask · position_onehot``
-  dot product.
+- ``query_in`` is the positional encoding (and, for the ``_above_integer``
+  / ``_unmasked`` / ``_dot`` variants, also the per-query signal that
+  rendezvous with a key-side vector). ``query_matrix`` populates row
+  ``d_pos - 1`` — the slowest *cosine* component ``pos_enc[j, d_pos-1]``,
+  which is ≈ 1 for any realistic ``j`` — with ``_QUERY_GAIN`` so that
+  column 0 of the logit gets a stable positive per-query gain.
+- ``key_in`` contains **only** what ``key_matrix`` reads from: the
+  positional encoding (for the tiebreak — see below), plus the content
+  nodes that drive selection (score, validity, indicators, onehot, etc.).
+  Never concat a node into ``key_in`` without wiring up at least one
+  non-zero ``key_matrix`` row for it; ``Attn.__init__`` enforces this.
+- The **tiebreak** lives on row ``d_pos - 2`` of ``key_matrix`` — the
+  slowest *sine* component ``sin(j · freq)`` where
+  ``freq = pos_encoding.slow_sin_freq()``. For sort lengths well inside
+  the first quarter-period, this is monotonically increasing in ``j``
+  and approximately equal to ``j · freq``, giving us a linear-in-position
+  tiebreak without materialising a separate ``position_scalar`` subtree.
+  Coefficients are scaled by ``1 / freq`` so the effective per-position
+  strength matches ``_TIEBREAK_COEFF``.
 - ``value_in`` is whatever node we want to read at the selected key
   position; ``value_matrix`` and ``output_matrix`` are identity projections
   that copy it through unchanged.
@@ -193,16 +198,14 @@ def attend_argmin(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
     assert len(score) == 1, "attend_argmin expects a 1D scalar score node"
     d_head = _assert_value_fits(pos_encoding, value)
 
-    # Position scalar (width 1, value ≈ position index) provides a clean
-    # linear tiebreak toward later positions.
-    position_scalar = pos_encoding.get_position_scalar()
-
-    # key_in = [pos_encoding (d_pos), score (1), position_scalar (1)]
-    # Row -1 = position_scalar, row -2 = score.
-    key_in = Concatenate([pos_encoding, score, position_scalar])
+    # key_in = [pos_encoding (d_pos), score (1)]
+    # Slow-sin row (d_pos - 2) carries the linear-in-position tiebreak.
+    d_pos = pos_encoding.d_pos
+    freq = pos_encoding.slow_sin_freq()
+    key_in = Concatenate([pos_encoding, score])
     key_matrix = torch.zeros((len(key_in), d_head))
-    key_matrix[-2, 0] = -1.0                # smaller score → larger logit
-    key_matrix[-1, 0] = _TIEBREAK_COEFF     # latest-position tiebreak
+    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq  # latest-position tiebreak
+    key_matrix[d_pos, 0] = -1.0                         # smaller score → larger logit
 
     return _build_selection_attn(pos_encoding, key_in, key_matrix, value)
 
@@ -225,11 +228,12 @@ def attend_argmax(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
     assert len(score) == 1, "attend_argmax expects a 1D scalar score node"
     d_head = _assert_value_fits(pos_encoding, value)
 
-    position_scalar = pos_encoding.get_position_scalar()
-    key_in = Concatenate([pos_encoding, score, position_scalar])
+    d_pos = pos_encoding.d_pos
+    freq = pos_encoding.slow_sin_freq()
+    key_in = Concatenate([pos_encoding, score])
     key_matrix = torch.zeros((len(key_in), d_head))
-    key_matrix[-2, 0] = 1.0                 # larger score → larger logit
-    key_matrix[-1, 0] = _TIEBREAK_COEFF     # latest-position tiebreak
+    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq  # latest-position tiebreak
+    key_matrix[d_pos, 0] = 1.0                          # larger score → larger logit
 
     return _build_selection_attn(pos_encoding, key_in, key_matrix, value)
 
@@ -281,14 +285,15 @@ def attend_argmin_where(
     assert len(validity) == 1, "attend_argmin_where expects a 1D boolean validity"
     d_head = _assert_value_fits(pos_encoding, value)
 
-    position_scalar = pos_encoding.get_position_scalar()
-    # key_in = [pos_encoding (d_pos), score (1), validity (1), position_scalar (1)]
-    # Row -1 = position_scalar, -2 = validity, -3 = score.
-    key_in = Concatenate([pos_encoding, score, validity, position_scalar])
+    # key_in = [pos_encoding (d_pos), score (1), validity (1)]
+    # Slow-sin row of pos_encoding carries the linear-in-position tiebreak.
+    d_pos = pos_encoding.d_pos
+    freq = pos_encoding.slow_sin_freq()
+    key_in = Concatenate([pos_encoding, score, validity])
     key_matrix = torch.zeros((len(key_in), d_head))
-    key_matrix[-3, 0] = -1.0                 # smaller score → larger logit
-    key_matrix[-2, 0] = _VALIDITY_LARGE      # validity dominates score
-    key_matrix[-1, 0] = _TIEBREAK_COEFF      # latest-valid-position tiebreak
+    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq   # latest-valid-position tiebreak
+    key_matrix[d_pos, 0] = -1.0                          # smaller score → larger logit
+    key_matrix[d_pos + 1, 0] = _VALIDITY_LARGE           # validity dominates score
 
     return _build_selection_attn(pos_encoding, key_in, key_matrix, value)
 
@@ -317,12 +322,13 @@ def attend_argmax_where(
     assert len(validity) == 1, "attend_argmax_where expects a 1D boolean validity"
     d_head = _assert_value_fits(pos_encoding, value)
 
-    position_scalar = pos_encoding.get_position_scalar()
-    key_in = Concatenate([pos_encoding, score, validity, position_scalar])
+    d_pos = pos_encoding.d_pos
+    freq = pos_encoding.slow_sin_freq()
+    key_in = Concatenate([pos_encoding, score, validity])
     key_matrix = torch.zeros((len(key_in), d_head))
-    key_matrix[-3, 0] = 1.0                  # larger score → larger logit
-    key_matrix[-2, 0] = _VALIDITY_LARGE      # validity dominates score
-    key_matrix[-1, 0] = _TIEBREAK_COEFF      # latest-valid-position tiebreak
+    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq   # latest-valid-position tiebreak
+    key_matrix[d_pos, 0] = 1.0                           # larger score → larger logit
+    key_matrix[d_pos + 1, 0] = _VALIDITY_LARGE           # validity dominates score
 
     return _build_selection_attn(pos_encoding, key_in, key_matrix, value)
 
@@ -404,15 +410,15 @@ def attend_argmin_above_integer(
     n_thresholds = len(indicators_above)
     d_value = len(value)
     d_pos = pos_encoding.d_pos
+    freq = pos_encoding.slow_sin_freq()
     # d_head layout:
     #   col 0:                             score + tiebreak logit
     #   cols 1..n_thresholds:              threshold_onehot · indicators_above terms
     #   cols n_thresholds+1 .. +d_value:   value pass-through
     d_head = 1 + n_thresholds + d_value
 
-    position_scalar = pos_encoding.get_position_scalar()
     query_in = Concatenate([pos_encoding, threshold_onehot])
-    key_in = Concatenate([pos_encoding, score, position_scalar, indicators_above])
+    key_in = Concatenate([pos_encoding, score, indicators_above])
 
     # --- Query matrix, shape (d_pos + n_thresholds, d_head) ---
     query_matrix = torch.zeros((len(query_in), d_head))
@@ -424,14 +430,13 @@ def attend_argmin_above_integer(
     for c in range(n_thresholds):
         query_matrix[d_pos + c, 1 + c] = _ABOVE_BONUS
 
-    # --- Key matrix, shape (d_pos + 2 + n_thresholds, d_head) ---
+    # --- Key matrix, shape (d_pos + 1 + n_thresholds, d_head) ---
     key_matrix = torch.zeros((len(key_in), d_head))
     score_row = d_pos
-    pos_scalar_row = d_pos + 1
-    indicators_start_row = d_pos + 2
-    # Col 0: -score + tiebreak · position_scalar.
+    indicators_start_row = d_pos + 1
+    # Col 0: -score + tiebreak · slow_sin(pos).
+    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq
     key_matrix[score_row, 0] = -1.0
-    key_matrix[pos_scalar_row, 0] = _TIEBREAK_COEFF
     # Cols 1..n_thresholds: each indicator_above column.
     for c in range(n_thresholds):
         key_matrix[indicators_start_row + c, 1 + c] = 1.0
@@ -539,15 +544,15 @@ def attend_argmin_unmasked(
     n_slots = len(mask_vector)
     d_value = len(value)
     d_pos = pos_encoding.d_pos
+    freq = pos_encoding.slow_sin_freq()
     # Layout of d_head:
     #   col 0:                         score + tiebreak logit
     #   cols 1 .. n_slots:             mask · position_onehot dot-product terms
     #   cols n_slots+1 .. n_slots+d_value:  value pass-through
     d_head = 1 + n_slots + d_value
 
-    position_scalar = pos_encoding.get_position_scalar()
     query_in = Concatenate([pos_encoding, mask_vector])
-    key_in = Concatenate([pos_encoding, score, position_scalar, position_onehot])
+    key_in = Concatenate([pos_encoding, score, position_onehot])
 
     # --- Query matrix, shape (d_pos + n_slots, d_head) ---
     query_matrix = torch.zeros((len(query_in), d_head))
@@ -557,15 +562,14 @@ def attend_argmin_unmasked(
     for c in range(n_slots):
         query_matrix[d_pos + c, 1 + c] = -_UNMASKED_PENALTY
 
-    # --- Key matrix, shape (d_pos + 2 + n_slots, d_head) ---
+    # --- Key matrix, shape (d_pos + 1 + n_slots, d_head) ---
     key_matrix = torch.zeros((len(key_in), d_head))
-    # Row order in key_in: [pos_enc (d_pos), score (1), pos_scalar (1), onehot (n_slots)]
+    # Row order in key_in: [pos_enc (d_pos), score (1), onehot (n_slots)]
     score_row = d_pos
-    pos_scalar_row = d_pos + 1
-    onehot_start_row = d_pos + 2
-    # Col 0: -score + tiebreak · position_scalar.
+    onehot_start_row = d_pos + 1
+    # Col 0: -score + tiebreak · slow_sin(pos).
+    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq
     key_matrix[score_row, 0] = -1.0
-    key_matrix[pos_scalar_row, 0] = _TIEBREAK_COEFF
     # Cols 1 .. n_slots: position_onehot[c]  (identity into d_head cols 1..n_slots).
     for c in range(n_slots):
         key_matrix[onehot_start_row + c, 1 + c] = 1.0
@@ -643,16 +647,16 @@ def attend_mean_where(
     query_matrix = torch.zeros((len(pos_encoding), d_qk))
     query_matrix[-1, 0] = _QUERY_GAIN
 
-    key_in = Concatenate([pos_encoding, validity])
-    key_matrix = torch.zeros((len(key_in), d_qk))
-    key_matrix[-1, 0] = _VALIDITY_LARGE
+    # No tiebreak needed, so pos_encoding doesn't appear in key_in.
+    key_matrix = torch.zeros((len(validity), d_qk))
+    key_matrix[0, 0] = _VALIDITY_LARGE
 
     value_matrix = torch.eye(d_v)
     output_matrix = torch.eye(d_v)
 
     return Attn(
         query_in=pos_encoding,
-        key_in=key_in,
+        key_in=validity,
         value_in=value,
         query_matrix=query_matrix,
         key_matrix=key_matrix,
@@ -730,21 +734,21 @@ def attend_argmax_dot(
     #   col  W:       position tiebreak (earliest wins)
     d_qk = W + 1
 
-    position_scalar = pos_encoding.get_position_scalar()
+    d_pos = pos_encoding.d_pos
+    freq = pos_encoding.slow_sin_freq()
 
     # --- Query ---
     # Columns 0..W-1: match_gain * query_vector[c]
     # Column W: _QUERY_GAIN from the slowest cosine of pos_encoding
     query_in = Concatenate([pos_encoding, query_vector])
     query_matrix = torch.zeros((len(query_in), d_qk))
-    d_pos = pos_encoding.d_pos
     for c in range(W):
         query_matrix[d_pos + c, c] = match_gain
     query_matrix[d_pos - 1, W] = _QUERY_GAIN
 
     # --- Key ---
     # Columns 0..W-1: key_vector[c] (identity)
-    # Column W: -tiebreak * position_scalar (earliest wins).
+    # Column W: -tiebreak * slow_sin(pos) (earliest wins).
     # The tiebreak is derived from match_gain so the caller controls
     # both match and tiebreak strength through one parameter.
     # Logit per position = match_gain / _DOT_TB_DIVISOR.
@@ -752,11 +756,11 @@ def attend_argmax_dot(
     # Increase match_gain for harder selection over longer sequences.
     _DOT_TB_DIVISOR = 100.0
     dot_tiebreak = match_gain / (_QUERY_GAIN * _DOT_TB_DIVISOR)
-    key_in = Concatenate([pos_encoding, key_vector, position_scalar])
+    key_in = Concatenate([pos_encoding, key_vector])
     key_matrix = torch.zeros((len(key_in), d_qk))
     for c in range(W):
         key_matrix[d_pos + c, c] = 1.0
-    key_matrix[d_pos + W, W] = -dot_tiebreak
+    key_matrix[d_pos - 2, W] = -dot_tiebreak / freq
 
     # --- Value / Output: identity pass-through ---
     value_matrix = torch.eye(d_v)
