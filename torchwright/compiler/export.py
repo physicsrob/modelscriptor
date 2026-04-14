@@ -1069,11 +1069,16 @@ class CompiledHeadless:
         input_specs: List[tuple],
         output_indices: torch.Tensor,
         metadata: Optional[dict] = None,
+        output_specs: Optional[List[tuple]] = None,
     ) -> None:
         self._net = net
         # input_specs: list of (name, start_col, width) in input-tensor column order.
         self._input_specs = list(input_specs)
         self._output_indices = output_indices
+        # output_specs: list of (name, offset_in_out, width) in gathered-output
+        # column order.  None for legacy callers that compile a single
+        # concatenated output_node and do not declare field names.
+        self._output_specs = list(output_specs) if output_specs is not None else []
         self.input_names: List[str] = [name for name, _, _ in input_specs]
         self.metadata: dict = dict(metadata or {})
 
@@ -1164,6 +1169,20 @@ class CompiledHeadless:
 
     def eval(self) -> "CompiledHeadless":
         return self
+
+    def input_slice(self, name: str, inputs: torch.Tensor) -> torch.Tensor:
+        """Return the slice of ``inputs`` for the named input field."""
+        for n, s, w in self._input_specs:
+            if n == name:
+                return inputs[..., s:s + w]
+        raise KeyError(f"input field {name!r} not found")
+
+    def output_slice(self, name: str, outputs: torch.Tensor) -> torch.Tensor:
+        """Return the slice of ``outputs`` (post-gather) for the named output field."""
+        for n, s, w in self._output_specs:
+            if n == name:
+                return outputs[..., s:s + w]
+        raise KeyError(f"output field {name!r} not found")
 
 
 def compile_headless(
@@ -1296,13 +1315,18 @@ def compile_headless(
     # For overlaid outputs, offset is the input's column offset
     # For overflow outputs, offset is in the overflow region
     output_indices = []
+    ch_output_specs: List[tuple] = []
+    running = 0
     for name, offset, width, out_node in output_specs:
         output_indices.extend(range(offset, offset + width))
+        ch_output_specs.append((name, running, width))
+        running += width
 
     output_indices_tensor = torch.tensor(output_indices, dtype=torch.long)
 
     return CompiledHeadless(
-        net, ch_input_specs, output_indices_tensor, metadata=extra_metadata,
+        net, ch_input_specs, output_indices_tensor,
+        metadata=extra_metadata, output_specs=ch_output_specs,
     )
 
 

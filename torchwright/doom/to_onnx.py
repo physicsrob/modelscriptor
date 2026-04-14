@@ -82,13 +82,14 @@ def main():
         max_coord = 15.0
 
     print(f"Building game graph (d={args.d}, max_walls={args.max_walls})...")
-    output_node, pos_encoding = build_game_graph(
+    graph_io, pos_encoding = build_game_graph(
         config, textures,
         max_walls=args.max_walls,
         max_coord=max_coord,
         move_speed=0.3, turn_speed=4,
         chunk_size=args.chunk_size,
     )
+    output_node = graph_io.concat_output()
 
     # Sequence length: TEX_COL + INPUT + WALL*N + EOS + SORTED_WALL*N + RENDER (dynamic)
     cs = args.chunk_size

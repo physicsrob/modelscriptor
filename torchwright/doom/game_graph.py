@@ -30,7 +30,8 @@ column), TEX_COL→RENDER (texture pixels).
 """
 
 import math
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -111,6 +112,47 @@ _TRIG_BP = [-1, -0.9, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 0.9, 1]
 _SQRT_BP = [0, 0.25, 1, 2, 4, 9, 16, 25, 36, 49, 64, 100, 225, 400, 900, 1600, 3200]
 
 BIG_DISTANCE = 1000.0
+
+
+# ---------------------------------------------------------------------------
+# I/O contract
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GameGraphIO:
+    """Structured return value of :func:`build_game_graph`.
+
+    ``inputs`` maps name → input node (host-fed at every position).
+    ``overlaid_outputs`` maps name → output node whose value should land
+    back at the matching input's columns (via delta transfer) — these
+    carry autoregressive feedback.  ``overflow_outputs`` maps name →
+    output-only node, placed after the input region (pixels + metadata).
+    """
+
+    inputs: Dict[str, Node]
+    overlaid_outputs: Dict[str, Node]
+    overflow_outputs: Dict[str, Node]
+
+    def concat_output(self) -> Node:
+        """Single concatenated output node, for legacy callers.
+
+        Preserves the historical compact order (token_type, sort_feedback,
+        render_feedback, pixels, col, start, length, done) so downstream
+        layout assumptions stay valid for legacy paths that have not yet
+        migrated to the io API.
+        """
+        nodes = [
+            self.overlaid_outputs["token_type"],
+            self.overlaid_outputs["sort_feedback"],
+            self.overlaid_outputs["render_feedback"],
+            self.overflow_outputs["pixels"],
+            self.overflow_outputs["col"],
+            self.overflow_outputs["start"],
+            self.overflow_outputs["length"],
+            self.overflow_outputs["done"],
+        ]
+        return Concatenate(nodes)
 
 
 # ---------------------------------------------------------------------------
@@ -290,14 +332,19 @@ def build_game_graph(
     move_speed: float = 0.3,
     turn_speed: int = 4,
     chunk_size: int = 20,
-) -> Tuple[Node, PosEncoding]:
+) -> Tuple[GameGraphIO, PosEncoding]:
     """Build the walls-as-tokens game graph.
 
     Collision detection is runtime: each WALL token tests the player's
     velocity ray against its wall segment and outputs three hit flags
     (full, x-only, y-only).  The host resolves wall sliding.
 
-    Returns ``(output_node, pos_encoding)``.
+    Returns ``(graph_io, pos_encoding)`` where ``graph_io`` is a
+    :class:`GameGraphIO` exposing named inputs plus the per-field output
+    nodes.  Overlaid outputs (``render_feedback``, ``sort_feedback``,
+    ``token_type``) carry autoregressive feedback; overflow outputs
+    (``pixels``, ``col``, ``start``, ``length``, ``done``) are the host's
+    bitblit payload and control-flow flags.
     """
     H = config.screen_height
     W = config.screen_width
@@ -1031,18 +1078,42 @@ def build_game_graph(
         out_length = select(is_render, chunk_length, zero_1)
         out_done = select(is_render, done_flag, zero_1)
 
-        output = Concatenate([
-            out_token_type,     # 8
-            out_sort_fb,        # d_sort_out
-            out_render_fb,      # d_render_fb
-            out_pixels,         # cs * 3
-            out_col,            # 1
-            out_start,          # 1
-            out_length,         # 1
-            out_done,           # 1
-        ])
+    graph_io = GameGraphIO(
+        inputs={
+            "input_backward": input_backward,
+            "input_forward": input_forward,
+            "input_strafe_left": input_strafe_left,
+            "input_strafe_right": input_strafe_right,
+            "input_turn_left": input_turn_left,
+            "input_turn_right": input_turn_right,
+            "player_angle": player_angle,
+            "player_x": player_x,
+            "player_y": player_y,
+            "render_feedback": render_feedback,
+            "sort_feedback": sort_feedback,
+            "tex_col_input": tex_col_input,
+            "tex_pixels": tex_pixels,
+            "texture_id_e8": texture_id_e8,
+            "token_type": token_type,
+            "wall_ax": wall_ax,
+            "wall_ay": wall_ay,
+            "wall_bx": wall_bx,
+            "wall_by": wall_by,
+            "wall_index": wall_index,
+            "wall_tex_id": wall_tex_id,
+        },
+        overlaid_outputs={
+            "render_feedback": out_render_fb,
+            "sort_feedback": out_sort_fb,
+            "token_type": out_token_type,
+        },
+        overflow_outputs={
+            "pixels": out_pixels,
+            "col": out_col,
+            "start": out_start,
+            "length": out_length,
+            "done": out_done,
+        },
+    )
 
-    # Expose compact output layout for the host protocol
-    output.d_state = 8 + d_sort_out + d_render_fb
-
-    return output, pos_encoding
+    return graph_io, pos_encoding

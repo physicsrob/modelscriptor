@@ -94,10 +94,11 @@ def test_probe_clean_on_v2_box_room(tiny_config):
     """
     textures = default_texture_atlas()
     max_walls = 8
-    output_node, pos_encoding = build_game_graph(
+    graph_io, pos_encoding = build_game_graph(
         tiny_config, textures, max_walls=max_walls,
         max_coord=10.0, move_speed=0.3, turn_speed=4,
     )
+    output_node = graph_io.concat_output()
 
     from torchwright.doom.game_graph import E8_INPUT
     d_render_fb = 2 * max_walls + 11

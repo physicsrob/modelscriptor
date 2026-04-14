@@ -222,13 +222,14 @@ def _profile_one(
     d: int,
     d_head: int,
 ) -> dict:
-    output_node, pos_encoding = build_game_graph(
+    graph_io, pos_encoding = build_game_graph(
         config, textures,
         max_walls=max(8, len(segments)),
         max_coord=max_coord,
         move_speed=0.3, turn_speed=4,
         chunk_size=chunk_size,
     )
+    output_node = graph_io.concat_output()
 
     buf = io.StringIO()
     real_stdout = sys.stdout

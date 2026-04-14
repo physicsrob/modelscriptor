@@ -269,10 +269,11 @@ def main():
     print(f"Transformer config: d={d}, d_head={d_head}, d_hidden={d_hidden}, "
           f"n_heads={d // d_head}")
 
-    output, pos = build_game_graph(
+    graph_io, pos = build_game_graph(
         config, textures, max_walls=max_walls, max_coord=max_coord,
         chunk_size=args.chunk_size,
     )
+    output = graph_io.concat_output()
 
     all_nodes = get_ancestor_nodes({output, pos})
 

@@ -128,7 +128,7 @@ def compile_game(
     d_hidden: Optional[int] = None,
 ):
     """Compile the game graph to a HeadlessTransformerModule."""
-    output_node, pos_encoding = build_game_graph(
+    graph_io, pos_encoding = build_game_graph(
         config, textures, max_walls, max_coord,
         move_speed, turn_speed,
         chunk_size=chunk_size,
@@ -141,14 +141,29 @@ def compile_game(
             d_head *= 2
         assert d % d_head == 0, f"d={d} not divisible by d_head={d_head}"
     tex_h = textures[0].shape[1]
+
+    # Build io dict: overlaid entries share a name between input and
+    # output (compiler places the output at the input's columns via
+    # delta transfer).  Input-only entries have no output node.  Overflow
+    # entries have no input and live in overflow columns after d_input.
+    io = {}
+    for name, node in graph_io.inputs.items():
+        out_node = graph_io.overlaid_outputs.get(name)
+        io[name] = (node, out_node)
+    for name, node in graph_io.overflow_outputs.items():
+        assert name not in io, f"overflow name collides with input: {name}"
+        io[name] = (None, node)
+
     module = compile_headless(
-        output_node, pos_encoding,
+        pos_encoding,
+        io=io,
         d=d, d_head=d_head, max_layers=400,
         device=device, verbose=verbose,
         extra_metadata={
             "chunk_size": chunk_size,
             "max_walls": max_walls,
             "tex_h": tex_h,
+            "overflow_names": list(graph_io.overflow_outputs),
         },
         d_hidden=d_hidden,
     )
@@ -252,26 +267,32 @@ def step_frame(
     d_input = max(s + w for _, s, w in module._input_specs)
     d_sort_out = 8 + 5 + 3 + 2 * max_walls
     d_render_fb = 2 * max_walls + 11
-    d_state = 8 + d_sort_out + d_render_fb
     device = module._net.device
 
-    # Input field offsets (alphabetical)
-    _offsets = {name: (start, width) for name, start, width in module._input_specs}
-    sf_off, sf_w = _offsets["sort_feedback"]
-    rf_off, rf_w = _offsets["render_feedback"]
-    tt_off, tt_w = _offsets["token_type"]
+    # Field offsets resolved by name — host stays layout-agnostic.
+    in_by_name = {n: (s, w) for n, s, w in module._input_specs}
+    out_by_name = {n: (s, w) for n, s, w in module._output_specs}
 
-    # Compact output layout:
-    # [token_type(8), sort_feedback(d_sort_out), render_feedback(d_render_fb),
-    #  pixels(cs*3), col(1), start(1), length(1), done(1)]
-    _O_TT = 0
-    _O_SF = 8
-    _O_RF = 8 + d_sort_out
-    _O_PIX = d_state
-    _O_COL = d_state + cs * 3
-    _O_START = d_state + cs * 3 + 1
-    _O_LEN = d_state + cs * 3 + 2
-    _O_DONE = d_state + cs * 3 + 3
+    # Input-side offsets (overlaid fields' write targets on the next input)
+    tt_off, _ = in_by_name["token_type"]
+    sf_off, _ = in_by_name["sort_feedback"]
+    rf_off, _ = in_by_name["render_feedback"]
+
+    # Output-side offsets in the gathered output tensor
+    sf_out_s, _ = out_by_name["sort_feedback"]
+    rf_out_s, _ = out_by_name["render_feedback"]
+    pix_out_s, _ = out_by_name["pixels"]
+    col_out_s, _ = out_by_name["col"]
+    start_out_s, _ = out_by_name["start"]
+    length_out_s, _ = out_by_name["length"]
+    done_out_s, _ = out_by_name["done"]
+
+    # Overlaid fields: any name appearing in both input and output specs.
+    # The host copies these from output to input each step (delta transfer
+    # places them at the same columns in the residual stream, but the
+    # gathered output tensor has its own running layout, so we copy
+    # explicitly).
+    overlaid_names = [n for n, _s, _w in module._input_specs if n in out_by_name]
 
     # Player input tensors (reused at START, WALL, and EOS positions
     # so the graph computes velocity consistently at all three)
@@ -347,20 +368,25 @@ def step_frame(
     print(f"  prefill  {step} steps  kv={_kv_len(past)}  {t_prefill*1000:.0f}ms")
 
     # Read collision-resolved state from EOS output (last row).
-    # EOS compact output: [token_type(8), sort_feedback(d_sort_out), ...]
-    # sort_feedback starts with E8_SORTED_WALL(8), then resolved x,y,angle.
+    # sort_feedback begins with E8_SORTED_WALL(8), then resolved x, y, angle.
     eos_out = out[-1:]  # (1, d_output)
-    px = eos_out[0, _O_SF + 8].item()
-    py = eos_out[0, _O_SF + 9].item()
-    new_angle_raw = eos_out[0, _O_SF + 10].item()
+    px = eos_out[0, sf_out_s + 8].item()
+    py = eos_out[0, sf_out_s + 9].item()
+    new_angle_raw = eos_out[0, sf_out_s + 10].item()
     angle = new_angle_raw
 
     def _out_to_input(raw_out):
-        """Map compact output fields to flat input tensor."""
+        """Map overlaid output fields to a flat input row.
+
+        Every name present in both input and output specs is overlaid —
+        iterate the intersection rather than naming fields explicitly so
+        the host stays layout-agnostic.
+        """
         row = torch.zeros(1, d_input, device=device)
-        row[0, tt_off:tt_off + 8] = raw_out[0, _O_TT:_O_TT + 8]
-        row[0, sf_off:sf_off + d_sort_out] = raw_out[0, _O_SF:_O_SF + d_sort_out]
-        row[0, rf_off:rf_off + d_render_fb] = raw_out[0, _O_RF:_O_RF + d_render_fb]
+        for name in overlaid_names:
+            in_s, w = in_by_name[name]
+            out_s, _ = out_by_name[name]
+            row[0, in_s:in_s + w] = raw_out[0, out_s:out_s + w]
         return row
 
     # --- Phase 1: Sort ---
@@ -371,7 +397,7 @@ def step_frame(
         step += 1
         prev = _out_to_input(out)
         # Diagnostics: read sort_feedback from compact output
-        raw_sf = out[0, _O_SF:_O_SF + d_sort_out].cpu().numpy()
+        raw_sf = out[0, sf_out_s:sf_out_s + d_sort_out].cpu().numpy()
         wall_data = raw_sf[8:13]
         s_rank = raw_sf[13]
         s_col_lo = raw_sf[14]
@@ -392,7 +418,7 @@ def step_frame(
     filled = np.zeros((H, W), dtype=bool)
 
     # Seed: E8_THINKING + render_feedback with is_new_wall=+1, chunk_start=-1
-    prev = _out_to_input(torch.zeros(1, d_state + cs * 3 + 4, device=device))
+    prev = torch.zeros(1, d_input, device=device)
     prev[0, tt_off:tt_off + 8] = E8_THINKING.to(device)
     seed_rf = torch.zeros(d_render_fb, device=device)
     seed_rf[max_walls + 1] = 1.0   # is_new_wall = +1
@@ -409,11 +435,11 @@ def step_frame(
         raw = out[0].detach().cpu().numpy()
 
         # Pixels and metadata from compact output
-        col = int(round(raw[_O_COL]))
-        start_y = int(round(raw[_O_START]))
-        length = int(round(raw[_O_LEN]))
-        done = raw[_O_DONE]
-        pix = raw[_O_PIX:_O_PIX + cs * 3].reshape(cs, 3)
+        col = int(round(raw[col_out_s]))
+        start_y = int(round(raw[start_out_s]))
+        length = int(round(raw[length_out_s]))
+        done = raw[done_out_s]
+        pix = raw[pix_out_s:pix_out_s + cs * 3].reshape(cs, 3)
 
         # Bitblit with skip-filled (length=0 for THINKING tokens → no-op)
         for row_idx in range(length):
@@ -429,7 +455,7 @@ def step_frame(
         prev = _out_to_input(out)
 
         # Host-side termination: check render_mask from render_feedback
-        mask_vals = out[0, _O_RF:_O_RF + max_walls].cpu().numpy()
+        mask_vals = out[0, rf_out_s:rf_out_s + max_walls].cpu().numpy()
         n_masked = int(np.sum(np.round(mask_vals).clip(0, 1)))
         if n_masked >= N:
             break
