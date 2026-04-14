@@ -117,6 +117,10 @@ def forward_compile(
     """
     # 1. Analyze graph
     graph = GraphAnalyzer(output_node)
+    # GraphAnalyzer may have stripped the output if it was an Assert; use
+    # the effective output from here on so the loop's termination check
+    # matches the graph's actual terminal node.
+    output_node = graph.get_output_node()
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
 
     # Auto-create pos_encoding if needed (required for attention ops)

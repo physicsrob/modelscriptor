@@ -1343,6 +1343,15 @@ def _compile_headless_legacy(
     trim_heads: bool,
 ) -> CompiledHeadless:
     """Legacy compile_headless implementation using output_node parameter."""
+    # Unwrap Assert nodes at the output root — compilation strips them
+    # from the interior of the graph, but the caller's output_node
+    # reference may still point at one.  Downstream lookups
+    # (residual-stream indices, etc.) must match the compiled graph's
+    # effective terminal node.
+    from torchwright.graph.misc import Assert
+    while isinstance(output_node, Assert):
+        output_node = output_node.inputs[0]
+
     net = forward_compile(
         d=d,
         d_head=d_head,
