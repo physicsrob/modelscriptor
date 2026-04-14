@@ -109,13 +109,33 @@ def compile_game(
     verbose: bool = True,
     rows_per_patch: Optional[int] = None,
     d_hidden: Optional[int] = None,
+    optimize: bool = False,
 ):
-    """Compile the game graph to a HeadlessTransformerModule."""
+    """Compile the game graph to a HeadlessTransformerModule.
+
+    Args:
+        optimize: Run graph optimization passes (Linear fusion) before
+            compilation. Currently disabled by default due to a scheduler
+            issue with orphaned L->R->L chains after fusion.
+    """
     output_node, pos_encoding = build_game_graph(
         config, textures, max_walls, max_coord,
         move_speed, turn_speed,
         rows_per_patch=rows_per_patch,
     )
+
+    # Run graph optimizations (Linear fusion)
+    if optimize:
+        from torchwright.graph.optimize import fuse_consecutive_linears
+        total_fused = 0
+        while True:
+            fused = fuse_consecutive_linears({output_node, pos_encoding}, verbose=False)
+            if fused == 0:
+                break
+            total_fused += fused
+        if verbose and total_fused > 0:
+            print(f"Optimized: fused {total_fused} Linear pairs")
+
     # d_head must be >= max d_qk across all Attn nodes.
     # Render attention: d_qk = W + 1.  TEX_COL attention: d_qk = 8 + tex_w + 1.
     if d_head is None:
