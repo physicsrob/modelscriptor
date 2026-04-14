@@ -647,34 +647,38 @@ def build_game_graph(
         is_t_pos = compare(adj_num_t, 0.0)
         is_wall_renderable = bool_all_true([is_den_ok, is_t_pos])
 
-        # Sentinel must (a) exceed any real rank so unrenderable walls
+        # Sentinels must (a) exceed any real rank so unrenderable walls
         # sort last, and (b) stay within the ``|score| <= 100`` bound of
         # ``attend_argmin_unmasked`` so the mask penalty can still
         # override it.  Real ranks are bounded above by ``max_walls - 1``
-        # (ranks are a permutation of ``0..N-1``), so 99.0 works for any
-        # max_walls up to ~99.
+        # (ranks are a permutation of ``0..N-1``).
         bsp_sentinel = create_literal_value(
             torch.tensor([99.0]), name="bsp_sentinel",
         )
         bsp_rank_filtered = select(
             is_wall_renderable, bsp_rank_raw, bsp_sentinel,
         )
-        # Tie-break: add ``wall_index * epsilon`` so walls sharing a rank
-        # (e.g. multiple unrenderable walls tied at the sentinel) still
-        # get distinct scores.  ``attend_argmin_unmasked`` blends tied
-        # positions via softmax — with ``_QUERY_GAIN = 80`` we need
-        # ``epsilon`` large enough that ``_QUERY_GAIN * epsilon > ~5``
-        # for the softmax to concentrate on a single winner (otherwise
-        # we get fractional onehot outputs that propagate to fractional
-        # masks and cascade into garbage selections).  ``0.1`` gives
-        # ``e^8 ≈ 3000×`` separation between consecutive walls while
-        # keeping the total offset ``epsilon * (max_walls-1) < 1`` so
-        # real-rank ordering (spacing 1.0) is preserved for
+        # Tie-break: add ``wall_index * 0.1`` so tied walls (e.g. multiple
+        # unrenderable walls at the sentinel) get distinct scores.
+        # ``attend_argmin_unmasked`` blends tied positions via softmax —
+        # with ``_QUERY_GAIN = 80`` we need ``> ~5`` separation in
+        # logit space for the softmax to concentrate on a single winner;
+        # ``0.1`` gives ``e^8 ≈ 3000×``.  The total offset
+        # ``0.1 * (max_walls-1)`` must stay under ``1.0`` so real-rank
+        # ordering (spacing 1.0) is preserved — limiting this scheme to
         # ``max_walls ≤ 10``.
         bsp_rank_tiebroken = add(
             bsp_rank_filtered, multiply_const(wall_index, 0.1),
         )
-        bsp_rank = select(is_wall, bsp_rank_tiebroken, bsp_sentinel)
+        # Non-wall positions get a strictly higher sentinel (99.9) so
+        # they lose the sort to any wall, even an unrenderable one.
+        # Otherwise non-wall positions (which outnumber walls) would
+        # tie with wall_index=0's tiebroken sentinel (99.0) and softmax
+        # would weight-average all of them, dominating the true wall.
+        nonwall_sentinel = create_literal_value(
+            torch.tensor([99.9]), name="nonwall_sentinel",
+        )
+        bsp_rank = select(is_wall, bsp_rank_tiebroken, nonwall_sentinel)
 
     # Wall index one-hot (host-fed wall_index: 0, 1, 2, ...)
     with annotate("wall/onehot"):
