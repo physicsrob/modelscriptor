@@ -24,6 +24,19 @@ class PosEncoding(Node):
     def compute(self, n_pos: int, input_values: dict):
         return self.get_pos_encoding(n_pos)
 
+    def slow_sin_freq(self) -> float:
+        """Angular frequency of the slowest sinusoidal component of the
+        positional encoding (the ``sin`` at row ``d_pos - 2``).
+
+        For positions ``p`` with ``p · freq < π/2`` — i.e. roughly
+        ``p < π/(2·freq)`` — the slow sin is monotonically increasing,
+        and ``sin(p · freq) ≈ p · freq`` within a few percent. That makes
+        it a cheap linear-in-position proxy for tiebreak terms on the
+        key side of an attention head, without having to invert back
+        through :meth:`get_position_scalar`.
+        """
+        return math.exp((self.d_pos - 2) * -(math.log(10000.0) / self.d_pos))
+
     def get_position_scalar(self, max_pos: int = 2048) -> Node:
         """Recover position index as a 1D scalar node.
 
@@ -35,7 +48,7 @@ class PosEncoding(Node):
         from torchwright.graph.linear import Linear
         from torchwright.ops.arithmetic_ops import piecewise_linear
 
-        freq = math.exp((self.d_pos - 2) * -(math.log(10000.0) / self.d_pos))
+        freq = self.slow_sin_freq()
 
         # Extract the slowest sin component (raw, no scaling)
         weight = torch.zeros(self.d_pos, 1)

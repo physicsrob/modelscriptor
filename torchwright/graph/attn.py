@@ -9,6 +9,58 @@ from torchwright.graph import Node
 CAUSAL_MASK_SENTINEL = -1e6
 
 
+def _assert_no_dead_children(
+    query_in: Node,
+    key_in: Node,
+    value_in: Node,
+    query_matrix: torch.Tensor,
+    key_matrix: torch.Tensor,
+    value_matrix: torch.Tensor,
+) -> None:
+    """Catch Concatenate children that contribute nothing to any projection.
+
+    For each Concatenate input, walk its flattened children. A child is
+    "dead" if its row slab is all-zero in every matrix whose input shares
+    this Concatenate — i.e. nothing reads it on any of query/key/value.
+    When Q, K, and V share the same residual-stream Concatenate (a common
+    pattern), rows read by only one matrix are still live because the
+    other matrices' zero rows represent "this matrix doesn't care",
+    not "nothing cares".
+    """
+    from torchwright.graph import Concatenate
+
+    roles = [
+        ("query", query_in, query_matrix),
+        ("key", key_in, key_matrix),
+        ("value", value_in, value_matrix),
+    ]
+
+    seen: set[int] = set()
+    for _role, input_node, _matrix in roles:
+        if id(input_node) in seen or not isinstance(input_node, Concatenate):
+            continue
+        seen.add(id(input_node))
+
+        shared = [(r, m) for (r, i, m) in roles if i is input_node]
+        shared_roles = [r for r, _ in shared]
+
+        row = 0
+        for child in input_node.flatten_inputs():
+            live = any(
+                bool((m[row : row + len(child)] != 0).any()) for _r, m in shared
+            )
+            if not live:
+                raise AssertionError(
+                    f"Attn input shared across {shared_roles} has a dead "
+                    f"child at rows {row}..{row + len(child)} "
+                    f"({type(child).__name__}, width {len(child)}) — "
+                    f"all-zero in "
+                    f"{' and '.join(r + '_matrix' for r in shared_roles)}. "
+                    f"Nothing reads it; remove it from the Concatenate."
+                )
+            row += len(child)
+
+
 class Attn(Node):
     """Single causal attention head with explicit Q/K/V/O weight matrices.
 
@@ -49,6 +101,11 @@ class Attn(Node):
 
         assert key_matrix.shape[1] == self.d_qk
         assert output_matrix.shape[0] == self.d_v
+
+        _assert_no_dead_children(
+            query_in, key_in, value_in,
+            query_matrix, key_matrix, value_matrix,
+        )
 
         self.query_matrix = query_matrix
         self.key_matrix = key_matrix

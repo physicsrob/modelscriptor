@@ -249,7 +249,6 @@ def build_combined_graph(
 
     # Build the render attention input: combine query-side and key-side features
     render_attn_in = Concatenate([
-        pos_encoding,            # for standard attention machinery
         gated_ray_cos,           # query side: ray direction
         gated_ray_sin,
         is_render_01,            # query side: bias term
@@ -260,17 +259,15 @@ def build_combined_graph(
         gated_wall_data,         # value side: wall geometry
     ])
 
-    d_pe = len(pos_encoding)
     d_attn_in = len(render_attn_in)
-    # Slots after pos_encoding:
-    s_ray_cos = d_pe
-    s_ray_sin = d_pe + 1
-    s_is_render = d_pe + 2
-    s_dx = d_pe + 3
-    s_dy = d_pe + 4
-    s_dist = d_pe + 5
-    s_is_sorted = d_pe + 6
-    s_wall_data = d_pe + 7  # 5 wide
+    s_ray_cos = 0
+    s_ray_sin = 1
+    s_is_render = 2
+    s_dx = 3
+    s_dy = 4
+    s_dist = 5
+    s_is_sorted = 6
+    s_wall_data = 7  # 5 wide
 
     d_head_render = 3 + 5  # 3 for Q·K dims, 5 for value pass-through
 
