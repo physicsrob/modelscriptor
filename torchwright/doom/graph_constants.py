@@ -1,0 +1,56 @@
+"""Shared constants for the DOOM game graph.
+
+Centralizes token type E8 codes, piecewise-linear breakpoint tables, and
+miscellaneous magic numbers used across the per-stage files under
+``torchwright.doom.stages``.  Everything here is pure data — no graph
+construction — so importing from either ``game_graph.py`` or any stage
+file is safe from circular-import issues.
+"""
+
+from torchwright.graph.spherical_codes import index_to_vector
+
+
+# ---------------------------------------------------------------------------
+# Token types
+# ---------------------------------------------------------------------------
+
+TOKEN_INPUT = 0
+TOKEN_WALL = 1
+TOKEN_EOS = 2
+TOKEN_SORTED_WALL = 3
+TOKEN_RENDER = 4
+TOKEN_TEX_COL = 5
+
+E8_INPUT = index_to_vector(TOKEN_INPUT)
+E8_WALL = index_to_vector(TOKEN_WALL)
+E8_EOS = index_to_vector(TOKEN_EOS)
+E8_SORTED_WALL = index_to_vector(TOKEN_SORTED_WALL)
+E8_RENDER = index_to_vector(TOKEN_RENDER)
+E8_TEX_COL = index_to_vector(TOKEN_TEX_COL)
+
+# Texture E8 codes start at index 6, so texture i maps to index_to_vector(6 + i).
+TEX_E8_OFFSET = 6
+
+
+# ---------------------------------------------------------------------------
+# Breakpoints for piecewise_linear / piecewise_linear_2d products
+# ---------------------------------------------------------------------------
+
+DIFF_BP = [
+    -40, -30, -20, -15, -10, -7, -5, -3, -2, -1, -0.5,
+    0, 0.5, 1, 2, 3, 5, 7, 10, 15, 20, 30, 40,
+]
+TRIG_BP = [-1, -0.9, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 0.9, 1]
+SQRT_BP = [0, 0.25, 1, 2, 4, 9, 16, 25, 36, 49, 64, 100, 225, 400, 900, 1600, 3200]
+VEL_BP = [-0.7, -0.5, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.5, 0.7]
+ATAN_BP = [
+    -20, -10, -5, -3, -2, -1.5, -1, -0.75, -0.5, -0.25,
+    0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 10, 20,
+]
+
+
+# ---------------------------------------------------------------------------
+# Misc magic numbers
+# ---------------------------------------------------------------------------
+
+BIG_DISTANCE = 1000.0
