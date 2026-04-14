@@ -229,18 +229,26 @@ class TestBspIntegration:
 
     @pytest.mark.parametrize("angle", [0, 64, 128, 192])
     def test_renders_in_all_four_directions(self, module, subset, angle) -> None:
-        """Looking in any cardinal direction inside the box should produce
-        a visible wall."""
+        """Looking in each cardinal direction produces the correct wall.
+
+        Each direction faces a wall with a distinctly different texture
+        (brick/stone/stripe/checker), so a wrong-wall sort error —
+        e.g. always selecting the east wall regardless of direction —
+        creates a large pixel error vs. the reference renderer.
+        """
         config = _small_config()
         state = GameState(x=0.0, y=0.0, angle=angle, move_speed=0.3, turn_speed=4)
         frame, _ = step_frame(module, state, PlayerInput(), subset, config)
 
-        ceil = np.array(config.ceiling_color)
-        floor = np.array(config.floor_color)
-        diff_ceil = np.abs(frame - ceil).sum(axis=-1)
-        diff_floor = np.abs(frame - floor).sum(axis=-1)
-        wall_mask = (diff_ceil > 1e-3) & (diff_floor > 1e-3)
-        assert wall_mask.any(), f"angle={angle}: no wall pixels rendered"
+        ref = render_frame(
+            state.x, state.y, angle, subset.segments, config,
+            textures=subset.textures,
+        )
+        max_err = np.abs(frame - ref).max()
+        assert max_err < 0.35, (
+            f"angle={angle}: max pixel error {max_err:.3f} exceeds 0.35 — "
+            "likely wrong wall selected by BSP sort"
+        )
 
     def test_matches_reference_render(self, module, subset) -> None:
         """Compiled output is close to the reference renderer's frame.
@@ -262,7 +270,7 @@ class TestBspIntegration:
                 textures=subset.textures,
             )
         max_err = np.abs(frame - ref).max()
-        assert max_err < 0.65, (
+        assert max_err < 0.35, (
             f"compiled render diverges from reference: max_err={max_err:.3f}"
         )
 

@@ -88,8 +88,8 @@ class TestGameGraph:
         mean_err = np.abs(frame - ref).mean()
         print(f"\nbox room: max_err={max_err:.3f}, mean_err={mean_err:.3f}")
 
-        assert max_err < 0.65, (
-            f"max pixel error {max_err:.3f} exceeds 0.5 (mean {mean_err:.3f})"
+        assert max_err < 0.35, (
+            f"max pixel error {max_err:.3f} exceeds 0.35 (mean {mean_err:.3f})"
         )
 
     def test_game_logic_angle_update(self, module, box_room):
@@ -127,8 +127,8 @@ class TestGameGraph:
         ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
 
         max_err = np.abs(frame - ref).max()
-        assert max_err < 0.65, (
-            f"angle={angle}: max pixel error {max_err:.3f} exceeds 0.5"
+        assert max_err < 0.35, (
+            f"angle={angle}: max pixel error {max_err:.3f} exceeds 0.35"
         )
 
     @pytest.mark.parametrize("angle", [20, 45, 100, 160, 210])
@@ -147,8 +147,8 @@ class TestGameGraph:
         max_err = np.abs(frame - ref).max()
         mean_err = np.abs(frame - ref).mean()
         print(f"\n  oblique angle={angle}: max_err={max_err:.3f}, mean_err={mean_err:.3f}")
-        assert max_err < 0.75, (
-            f"angle={angle}: max pixel error {max_err:.3f} exceeds 0.75"
+        assert max_err < 0.45, (
+            f"angle={angle}: max pixel error {max_err:.3f} exceeds 0.45"
         )
 
     @pytest.mark.parametrize("px,py,angle", [
@@ -174,8 +174,8 @@ class TestGameGraph:
         mean_err = np.abs(frame - ref).mean()
         print(f"\n  off-center ({px},{py}) angle={angle}: "
               f"max_err={max_err:.3f}, mean_err={mean_err:.3f}")
-        assert max_err < 0.65, (
-            f"({px},{py}) angle={angle}: max pixel error {max_err:.3f} exceeds 0.5"
+        assert max_err < 0.35, (
+            f"({px},{py}) angle={angle}: max pixel error {max_err:.3f} exceeds 0.35"
         )
 
     # ── Collision detection tests ──────────────────────────────────
