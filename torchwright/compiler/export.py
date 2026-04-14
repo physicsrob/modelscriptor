@@ -31,7 +31,7 @@ big graphs (e.g. the DOOM renderer) fit in realistic RAM.
 import json
 import os
 import time
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import onnx
@@ -938,6 +938,116 @@ def compile_to_onnx(
 # ---------------------------------------------------------------------------
 
 
+def _compute_io_layout(
+    io: Dict[str, Tuple[Optional[Node], Optional[Node]]]
+) -> Tuple[List[tuple], List[tuple], Dict[Node, Tuple[Optional[Node], List[int]]], int]:
+    """Compute column assignments from io spec.
+
+    The io dict declares the I/O contract:
+    - Key: field name (string) — used for alphabetical ordering
+    - Value: (input_node, output_node) tuple where:
+      - (in, out) → overlaid: output lands at input's columns via delta transfer
+      - (in, None) → input-only: columns hold input value, no output
+      - (None, out) → output-only: overflow columns appended after input region
+
+    Returns:
+        input_specs: List[(name, offset, width, input_node)] for input fields
+        output_specs: List[(name, offset, width, output_node)] for output fields
+        overlays: Dict[output_node -> (input_node or None, target_cols)] for delta transfer
+            - For overlaid: (input_node, target_cols) - subtract input before adding output
+            - For overflow: (None, target_cols) - just copy to target (subtract zero)
+        d_input: Total width of input region
+    """
+    # Sort by name (alphabetical)
+    sorted_names = sorted(io.keys())
+
+    # Input region: all entries with non-None input
+    input_specs = []
+    input_name_to_offset = {}
+    offset = 0
+    for name in sorted_names:
+        in_node, out_node = io[name]
+        if in_node is not None:
+            width = len(in_node)
+            input_specs.append((name, offset, width, in_node))
+            input_name_to_offset[name] = offset
+            offset += width
+    d_input = offset
+
+    # Output region: overlaid at input positions, overflow after
+    output_specs = []
+    overlays = {}
+    overflow_offset = d_input
+
+    for name in sorted_names:
+        in_node, out_node = io[name]
+        if out_node is not None:
+            width = len(out_node)
+            if in_node is not None:
+                # Overlaid: output at input's columns via delta transfer
+                in_offset = input_name_to_offset[name]
+                output_specs.append((name, in_offset, width, out_node))
+                target_cols = list(range(in_offset, in_offset + width))
+                overlays[out_node] = (in_node, target_cols)
+            else:
+                # Overflow: output after input region, also via delta transfer
+                # (delta transfer from source to overflow cols, subtracting zero)
+                output_specs.append((name, overflow_offset, width, out_node))
+                target_cols = list(range(overflow_offset, overflow_offset + width))
+                overlays[out_node] = (None, target_cols)  # None means subtract zero
+                overflow_offset += width
+
+    return input_specs, output_specs, overlays, d_input
+
+
+def _validate_io_spec(
+    io: Dict[str, Tuple[Optional[Node], Optional[Node]]]
+) -> None:
+    """Validate the io spec.
+
+    Raises ValueError if:
+    - Any entry has both nodes as None (empty tuple)
+    - Overlaid pairs have mismatched widths
+    - Duplicate nodes across different entries (same node in two different names)
+
+    Note: It's valid for in_node == out_node (identity case) within the same entry.
+    """
+    seen_input_nodes = set()
+    seen_output_nodes = set()
+
+    for name, (in_node, out_node) in io.items():
+        # Check for empty tuple
+        if in_node is None and out_node is None:
+            raise ValueError(
+                f"io entry '{name}' has both input and output as None"
+            )
+
+        # Check for duplicate input nodes across entries
+        if in_node is not None:
+            if in_node in seen_input_nodes:
+                raise ValueError(
+                    f"Input node {in_node} appears in multiple io entries"
+                )
+            seen_input_nodes.add(in_node)
+
+        # Check for duplicate output nodes across entries
+        # Allow same node to appear as both input and output within the same entry
+        if out_node is not None and out_node is not in_node:
+            if out_node in seen_output_nodes:
+                raise ValueError(
+                    f"Output node {out_node} appears in multiple io entries"
+                )
+            seen_output_nodes.add(out_node)
+
+        # Check width mismatch for overlaid pairs
+        if in_node is not None and out_node is not None:
+            if len(in_node) != len(out_node):
+                raise ValueError(
+                    f"io entry '{name}' has width mismatch: "
+                    f"input width {len(in_node)} != output width {len(out_node)}"
+                )
+
+
 class CompiledHeadless:
     """Callable wrapper around :class:`HeadlessTransformer`.
 
@@ -1057,8 +1167,8 @@ class CompiledHeadless:
 
 
 def compile_headless(
-    output_node: Node,
-    pos_encoding: PosEncoding,
+    first_arg,
+    second_arg=None,
     d: int = 1024,
     d_head: int = 16,
     max_layers: int = 100,
@@ -1067,6 +1177,10 @@ def compile_headless(
     extra_metadata: Optional[dict] = None,
     d_hidden: Optional[int] = None,
     trim_heads: bool = True,
+    # Named parameters for new API
+    io: Optional[Dict[str, Tuple[Optional[Node], Optional[Node]]]] = None,
+    # Legacy named parameter
+    output_node: Optional[Node] = None,
 ) -> CompiledHeadless:
     """Compile a headless graph to an in-process callable.
 
@@ -1076,10 +1190,135 @@ def compile_headless(
     artifact, autoregressive decode, fast startup), use
     :func:`compile_headless_to_onnx` instead.
 
+    Supports two calling patterns:
+    - New API: ``compile_headless(pos_encoding, io={"name": (input, output)}, ...)``
+    - Legacy API: ``compile_headless(output_node, pos_encoding, ...)``
+
+    The ``io`` dict declares the I/O contract:
+    - Key: field name (string) — used for alphabetical ordering
+    - Value: ``(input_node, output_node)`` tuple where:
+      - ``(in, out)`` → overlaid: output lands at input's columns
+      - ``(in, None)`` → input-only: columns hold input value, no output
+      - ``(None, out)`` → output-only: overflow columns appended after input region
+
+    For overlaid entries, the output is placed at the same columns as the
+    input via delta transfer, enabling autoregressive feedback where the
+    transformer output IS the next input.
+
     ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
     when omitted; pass an explicit value to decouple the MLP intermediate
     width from the residual stream width.
     """
+    # Detect API based on argument types
+    # Legacy: compile_headless(output_node, pos_encoding, ...)
+    # New: compile_headless(pos_encoding, io=..., ...)
+
+    if isinstance(first_arg, PosEncoding):
+        # New API: first_arg is pos_encoding
+        pos_encoding = first_arg
+        # second_arg should be None or io dict (not used positionally in new API)
+        if second_arg is not None and io is None:
+            # Allow compile_headless(pos_encoding, io_dict, ...) positionally
+            io = second_arg
+    else:
+        # Legacy API: first_arg is output_node, second_arg is pos_encoding
+        if output_node is not None:
+            raise ValueError("Cannot specify output_node both positionally and as keyword")
+        output_node = first_arg
+        pos_encoding = second_arg
+
+    # Handle legacy API
+    if output_node is not None:
+        if io is not None:
+            raise ValueError("Cannot specify both io and output_node")
+        return _compile_headless_legacy(
+            output_node=output_node,
+            pos_encoding=pos_encoding,
+            d=d,
+            d_head=d_head,
+            max_layers=max_layers,
+            verbose=verbose,
+            device=device,
+            extra_metadata=extra_metadata,
+            d_hidden=d_hidden,
+            trim_heads=trim_heads,
+        )
+
+    # New io-based path
+    if io is None:
+        raise ValueError("Either io or output_node must be provided")
+
+    # New io-based path
+    assert io is not None
+    _validate_io_spec(io)
+
+    # Set names on InputNodes from io dict keys
+    # This enables HeadlessTransformer.get_input_res_stream to look up values
+    for name, (in_node, out_node) in io.items():
+        if in_node is not None and isinstance(in_node, InputNode):
+            in_node.name = name
+
+    input_specs, output_specs, overlays, d_input = _compute_io_layout(io)
+
+    # Build the combined output node for forward_compile
+    # Collect all output nodes (both overlaid and overflow)
+    output_nodes = [spec[3] for spec in output_specs]
+    if len(output_nodes) == 0:
+        raise ValueError("io must have at least one output")
+    elif len(output_nodes) == 1:
+        combined_output = output_nodes[0]
+    else:
+        combined_output = Concatenate(output_nodes)
+
+    # Map input nodes to their names for the residual assignment
+    input_node_to_name = {spec[3]: spec[0] for spec in input_specs}
+
+    net = forward_compile(
+        d=d,
+        d_head=d_head,
+        output_node=combined_output,
+        pos_encoding=pos_encoding,
+        verbose=verbose,
+        max_layers=max_layers,
+        device=device,
+        d_hidden=d_hidden,
+        trim_heads=trim_heads,
+        overlays=overlays,
+    )
+
+    assert net.residual_assignment is not None
+    out_state = net.layers[-1].mlp.out_state
+
+    # Build input_specs for CompiledHeadless (name, offset, width)
+    ch_input_specs = [(name, offset, width) for name, offset, width, _ in input_specs]
+
+    # Build output indices from output_specs
+    # For overlaid outputs, offset is the input's column offset
+    # For overflow outputs, offset is in the overflow region
+    output_indices = []
+    for name, offset, width, out_node in output_specs:
+        output_indices.extend(range(offset, offset + width))
+
+    output_indices_tensor = torch.tensor(output_indices, dtype=torch.long)
+
+    return CompiledHeadless(
+        net, ch_input_specs, output_indices_tensor, metadata=extra_metadata,
+    )
+
+
+def _compile_headless_legacy(
+    output_node: Node,
+    pos_encoding: PosEncoding,
+    d: int,
+    d_head: int,
+    max_layers: int,
+    verbose: bool,
+    device: str,
+    extra_metadata: Optional[dict],
+    d_hidden: Optional[int],
+    trim_heads: bool,
+) -> CompiledHeadless:
+    """Legacy compile_headless implementation using output_node parameter."""
     net = forward_compile(
         d=d,
         d_head=d_head,

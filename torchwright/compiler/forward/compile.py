@@ -81,6 +81,7 @@ def forward_compile(
     d_hidden: Optional[int] = None,
     on_node_scheduled: Optional[Callable[[Node, int], None]] = None,
     trim_heads: bool = True,
+    overlays: Optional[dict] = None,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -104,6 +105,11 @@ def forward_compile(
             state objects (``layer.attn.in_state`` / ``layer.mlp.out_state``)
             stay valid regardless and are consumed later when building
             ``residual_assignment``.
+        overlays: Optional dict mapping output_node -> (input_node, target_cols)
+            for delta transfer. When provided, a final layer is added that
+            transfers each output's value to the specified target columns
+            via delta: target += (output - target). This enables overlaid
+            I/O where output replaces input in-place.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -256,6 +262,30 @@ def forward_compile(
             f"({pct_used:.1f}%), "
             f"{total_layer_time:.2f}s total layer time"
         )
+
+    # 3b. Delta transfer layer for overlaid I/O
+    # When overlays is provided, add a final layer that transfers each output
+    # value to the input's columns via delta: target += (output - target).
+    if overlays:
+        delta_layer = net.add_layer(append=True)
+        delta_ops = []
+        for out_node, (in_node, target_cols) in overlays.items():
+            # Source columns: where the output value was computed
+            source_cols = residual_map.get_indices(out_node)
+            # Subtract columns: same as target (the input columns)
+            subtract_cols = target_cols
+            delta_ops.append(AttnHeadOp(
+                op_type="delta_transfer",
+                node=out_node,
+                target_cols=target_cols,
+                source_cols=source_cols,
+                subtract_cols=subtract_cols,
+            ))
+        write_attn_sublayer(delta_layer, delta_ops, residual_map, pos_encoding)
+        if verbose:
+            print(f"  Delta transfer layer: {len(delta_ops)} overlays")
+        if on_layer_compiled is not None:
+            on_layer_compiled(len(net.layers) - 1, delta_layer)
 
     # Ensure at least one layer exists for ResidualAssignment states.
     # If compile produced zero layers (trivial graph), run the callback on

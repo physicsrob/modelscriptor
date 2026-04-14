@@ -6,18 +6,29 @@ import torch
 from torchwright.graph.embedding import Unembedding
 
 
-def create_input(name: str, d: int) -> Node:
+def create_input(name_or_width, width: int = None) -> Node:
     """
-    Create an input node with a specified name and dimension.
+    Create an input node with optional name and specified dimension.
+
+    Supports two call patterns:
+    - create_input(width) -> anonymous InputNode with given width
+    - create_input(name, width) -> named InputNode (legacy pattern)
 
     Args:
-    - name (str): Name of the input node.
-    - d (int): Dimension of the input node.
+    - name_or_width: Either the input name (str) or width (int)
+    - width: Width when name is provided (optional)
 
     Returns:
     - Node: The created input node.
     """
-    return InputNode(name, d)
+    if isinstance(name_or_width, int):
+        # New pattern: create_input(width)
+        return InputNode(name_or_width)
+    else:
+        # Legacy pattern: create_input(name, width)
+        if width is None:
+            raise ValueError("width is required when name is provided")
+        return InputNode(width, name=name_or_width)
 
 
 def create_literal_value(vector: torch.Tensor, name: str = "") -> Node:
