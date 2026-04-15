@@ -56,6 +56,49 @@ def test_fuse_chain_of_three():
     assert torch.allclose(out_before, out_after, atol=1e-5)
 
 
+def test_fuse_chain_ordering_regression():
+    """Fusion count must be exactly 2 regardless of global_node_id offset.
+
+    With offset=5, CPython's set iteration places L3 (ID=8, slot 8%8=0)
+    before L2 (ID=7, slot 7%8=7), so without a topological sort the
+    candidates loop appends (L2,L3) before (L1,L2).  Processing bottom-up
+    leaves L3 depending on L1, which a second while-True pass fuses again,
+    reporting total=3 instead of 2.
+
+    The topological sort (by l1.node_id) makes the function correct for
+    any starting offset.
+    """
+    import torchwright.graph.node as node_module
+
+    for offset in [0, 5, 101, 997]:
+        node_module.global_node_id = offset
+
+        inp = InputNode("x", 4)
+        l1 = Linear(inp, torch.randn(4, 3), name="l1")
+        l2 = Linear(l1, torch.randn(3, 2), name="l2")
+        l3 = Linear(l2, torch.randn(2, 1), name="l3")
+
+        n_pos = 5
+        x = torch.randn(n_pos, 4)
+        out_before = l3.compute(n_pos, {"x": x})
+
+        total = 0
+        while True:
+            fused = fuse_consecutive_linears({l3})
+            if fused == 0:
+                break
+            total += fused
+
+        assert total == 2, f"offset={offset}: expected 2 fusions, got {total}"
+        assert l3.output_matrix.shape == (4, 1)
+        assert l3.inputs[0] is inp
+
+        out_after = l3.compute(n_pos, {"x": x})
+        assert torch.allclose(out_before, out_after, atol=1e-5), (
+            f"offset={offset}: numeric mismatch after fusion"
+        )
+
+
 def test_no_fuse_multiple_consumers():
     """Don't fuse when L1 has multiple consumers."""
     inp = InputNode("x", 4)
