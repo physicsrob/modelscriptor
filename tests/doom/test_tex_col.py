@@ -16,6 +16,8 @@ from torchwright.reference_renderer.textures import default_texture_atlas
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
+from tests._utils.image_compare import compare_images
+
 
 def _box_room_config():
     trig = generate_trig_table()
@@ -81,13 +83,7 @@ class TestTexCol:
 
         assert frame.max() > 0.1, "frame appears blank"
 
-        max_err = np.abs(frame - ref).max()
-        mean_err = np.abs(frame - ref).mean()
-        print(f"\ntex_col box room: max_err={max_err:.3f}, mean_err={mean_err:.3f}")
-
-        assert max_err < 0.65, (
-            f"max pixel error {max_err:.3f} exceeds 0.65 (mean {mean_err:.3f})"
-        )
+        compare_images(frame, ref).assert_matches()
 
     @pytest.mark.parametrize("angle", [0, 64, 128, 192])
     def test_renders_from_angle(self, module, box_room, angle):
@@ -101,7 +97,4 @@ class TestTexCol:
                               textures=textures)
         ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
 
-        max_err = np.abs(frame - ref).max()
-        assert max_err < 0.65, (
-            f"angle={angle}: max pixel error {max_err:.3f} exceeds 0.65"
-        )
+        compare_images(frame, ref).assert_matches()

@@ -57,6 +57,8 @@ from torchwright.reference_renderer.textures import default_texture_atlas
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
+from tests._utils.image_compare import compare_images
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -365,11 +367,6 @@ def test_parametric_render_hits_wall():
         col, px, py, 0, [seg], config, textures=textures,
     )
 
-    # Compare — generous tolerance for accumulated piecewise_linear errors
-    # across ~8 stages of approximation.
-    max_err = np.abs(got_frame - ref_frame).max()
-    mean_err = np.abs(got_frame - ref_frame).mean()
-
     # Wall region should be textured, not blank
     H = config.screen_height
     wall_region = got_frame[H // 4 : 3 * H // 4]
@@ -377,11 +374,7 @@ def test_parametric_render_hits_wall():
         "wall region appears blank — intersection might have missed"
     )
 
-    # Allow generous tolerance: each stage introduces some error.
-    assert max_err < 0.35, (
-        f"pixel max error {max_err:.3f} exceeds tolerance 0.35 "
-        f"(mean error {mean_err:.3f})"
-    )
+    compare_images(got_frame[:, None, :], ref_frame[:, None, :]).assert_matches()
 
 
 def test_parametric_render_misses_wall():
@@ -462,10 +455,7 @@ def test_parametric_render_two_columns():
     for j, col in enumerate(cols):
         got = out[j].numpy().reshape(config.screen_height, 3)
         ref = render_column(col, px, py, 0, [seg], config, textures=textures)
-        max_err = np.abs(got - ref).max()
-        assert max_err < 0.35, (
-            f"col {col}: max pixel error {max_err:.3f} exceeds 0.35"
-        )
+        compare_images(got[:, None, :], ref[:, None, :]).assert_matches()
 
 
 def test_probe_parametric_render():
