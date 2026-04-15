@@ -990,11 +990,15 @@ def _compute_io_layout(
                 target_cols = list(range(in_offset, in_offset + width))
                 overlays[out_node] = (in_node, target_cols)
             else:
-                # Overflow: output after input region, also via delta transfer
-                # (delta transfer from source to overflow cols, subtracting zero)
+                # Overflow: output after input region, also via delta
+                # transfer.  Like the overlay case, the delta layer
+                # subtracts whatever is currently at ``target_cols`` (see
+                # forward/compile.py where ``subtract_cols = target_cols``
+                # unconditionally), so the overflow path does not rely on
+                # the caller zero-initialising the overflow region.
                 output_specs.append((name, overflow_offset, width, out_node))
                 target_cols = list(range(overflow_offset, overflow_offset + width))
-                overlays[out_node] = (None, target_cols)  # None means subtract zero
+                overlays[out_node] = (None, target_cols)
                 overflow_offset += width
 
     return input_specs, output_specs, overlays, d_input
