@@ -1,5 +1,124 @@
 # TODO
 
+## `piecewise_linear_2d` interior oscillation
+
+`torchwright.ops.arithmetic_ops.piecewise_linear_2d` reproduces grid
+vertex values exactly but produces wildly wrong values in cell
+**interiors**.  A direct probe at non-vertex point `(-1.25, 8.5)` inside
+the cell `(-1.5, 7)–(-1, 10)` evaluates `atan(x/y)` to `-1.04` where
+bilinear interpolation gives `-0.15` — a 0.9-unit error, which scales
+to ~37 screen columns after `col_scale ≈ 40.7`.  Even the simpler
+`x*y` shows 0.44-unit interior error per cell with the same grid (vs
+zero at vertices).
+
+**Consequence (load-bearing):** this is the mechanism behind the two
+residual `test_game_graph.py` precision failures
+(`test_renders_oblique_angle[20]`,
+`test_renders_off_center_oblique[1.0,-3.0,50]`).  Both touch a wall
+endpoint that lands at `(cross=-1.07, dot=8.88)` — mid-cell — which
+`_endpoint_to_column` projects to `-2.000` (clamp floor) vs oracle
+`3.114`.  Since `multiply_2d` delegates to `piecewise_linear_2d`
+internally, the old `reciprocal → multiply_2d → atan` chain hit the
+same bug through a different path, which is why swapping it for a
+fused `piecewise_linear_2d(cross, |dot|)` lookup produced roughly the
+same residual magnitude rather than a decisive improvement.
+
+### Suspected root cause
+
+The op builds an **overcomplete** hyperplane family — vertical,
+horizontal, sum diagonal (`x+y=const`), and difference diagonal
+(`x-y=const`) through every grid vertex — then solves for output
+weights via `torch.linalg.pinv` least-squares, constraining only the
+grid vertex values.  With N grid points and ~4N hyperplanes the
+system is underdetermined: there is a manifold of solutions that
+exactly interpolate vertices.  `pinv` picks the minimum-L2-norm
+element of that manifold, which has no reason to be the
+piecewise-linear interpolant.  Empirically the min-norm solution
+packs large cancelling ReLU weights that agree at vertices but
+oscillate across cell interiors.
+
+A proper piecewise-linear interpolant on a rectangular grid is
+triangulation-based (one diagonal per cell, linear on each triangle)
+and is representable with a single diagonal family per cell — but the
+op includes *both* diagonals for every vertex, so the triangulation
+isn't enforced by the least-squares constraint set.
+
+### How to verify
+
+Self-contained repro (≤ 50 lines):
+
+```python
+import torch, math
+from torchwright.ops.arithmetic_ops import piecewise_linear_2d
+from torchwright.ops.inout_nodes import create_input
+from torchwright.debug.probe import reference_eval
+
+x = create_input("x", 1); y = create_input("y", 1)
+bp_x = [-2.0, -1.5, -1.0, -0.75, -0.5, -0.25, -0.1, 0.0,
+        0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+bp_y = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
+
+out = piecewise_linear_2d(x, y, bp_x, bp_y,
+                          lambda a, b: math.atan(a/b), name="atan")
+
+# Grid vertex — exact to float precision.
+# Interior — arbitrarily wrong.
+for pt in [(-1.0, 7.0), (-1.25, 8.5)]:
+    c = reference_eval(out, {"x": torch.tensor([[pt[0]]]),
+                              "y": torch.tensor([[pt[1]]])}, n_pos=1)
+    got = c[out][0].item()
+    print(pt, "→", got, "vs oracle", math.atan(pt[0]/pt[1]))
+```
+
+Two probe tests already saved under `tests/doom/stages/`:
+
+- `test_visibility_probe.py` — compiles `_compute_visibility_columns`
+  on the failing integration scenes and compares against a Python
+  oracle; shows 4.2-column drift on a real endpoint.
+- `test_endpoint_projection.py` — the 2 `xfail`-marked cases live at
+  the same cell interior that `test_visibility_probe` flags.
+
+### Fix candidates
+
+1. **Drop the pinv least-squares, triangulate explicitly.**  For each
+   cell pick one diagonal; build the per-triangle linear function
+   analytically; assemble via ReLU.  Same op count as current,
+   guaranteed to be a proper piecewise-linear interpolant.
+2. **Shrink the hyperplane family.**  Keep only one diagonal direction
+   per cell (not both).  The pinv system becomes square (or nearly so)
+   and the solution is forced close to the triangulated interpolant.
+   Smaller change than (1); may still have numerical wobble at rank
+   boundary.
+3. **Switch to bilinear interpolation.**  Bilinear is quadratic in
+   `(x, y)`, not linear — not representable in a single MLP sublayer.
+   Would require composing via `multiply` or chained 1-D piecewise
+   linears, undoing the point of the op.  Not recommended.
+
+Option 1 is the clean fix.
+
+### Consequences of fixing
+
+- The 2 residual `test_game_graph.py` render failures and the 2
+  `xfail` cases in `test_endpoint_projection.py` should go green.
+- `multiply_2d` (delegates to `piecewise_linear_2d`) gets interior
+  precision for free — tightens any other site living with ~1-col
+  drift, e.g., the frustum-clip `t_star = f_a / (f_a − f_b)` that
+  already has its own scale-by-100 workaround.
+- Rendering-test `matched_fraction` values currently sitting at
+  0.98–0.99 due to projection drift should rise; worst-case pixel
+  errors (0.3–0.5 today) should drop under the 0.15
+  `compare_images` threshold.
+- Walkthrough texture "smearing" at production scale is partly this
+  bug; expect visible improvement.
+
+### Scope
+
+Self-contained change in `torchwright/ops/arithmetic_ops.py:499-696`.
+Existing `tests/ops/test_piecewise_linear_2d.py` is the regression
+barrier and will need new cases covering non-vertex correctness.
+Call-site compatibility is preserved — the only behavioural change
+is that cell interiors now match the advertised docstring behaviour.
+
 ## fp16 inference for Flash Attention
 
 The render decode loop runs at ~35ms/step (GPU-bound). The bottleneck is SDPA

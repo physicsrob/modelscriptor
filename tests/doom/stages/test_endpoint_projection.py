@@ -92,6 +92,9 @@ _CASES = [
     ("moderate_right", 2.0, 5.0),
     ("slight_right_far", 0.5, 10.0),
     ("failing_angle_100_endpoint_a", -0.693, 7.037),
+    # Shared endpoint (5, 5) projected from player (1, -3) angle 50 —
+    # the actual drifting case behind ``test_renders_off_center_oblique[1.0,-3.0,50]``.
+    ("failing_oc50_shared_vertex", -1.07, 8.88),
     ("right_45_deg", 1.0, 1.0),
     ("left_45_deg", -1.0, 1.0),
     ("very_slight_right", 0.01, 5.0),
