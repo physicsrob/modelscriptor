@@ -24,6 +24,11 @@ ALWAYS use `make test` to run tests. NEVER invoke pytest directly.
 - NEVER run tests in the background. Always foreground, always wait for completion.
 - NEVER run pytest directly. `make test` includes a cross-session mutex lock.
 - NEVER run tests in parallel (no pytest-xdist, no &, no background execution).
+- NEVER re-run tests just because you lost output (e.g. you piped through
+  `| tail -10` and now want to grep). If the code hasn't changed, the previous
+  run's full output is in the log file — `make test` prints its path at the
+  start and end, and `/tmp/torchwright-test.log` symlinks to the latest run.
+  Grep that file instead of spending another ~90s re-running the suite.
 
 ## How Test Sharding Works
 
