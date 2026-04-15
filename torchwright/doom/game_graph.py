@@ -218,6 +218,7 @@ def build_game_graph(
     sorted_out = build_sorted(
         SortedInputs(
             sort_score=wall_out.sort_score,
+            is_renderable=wall_out.is_renderable,
             position_onehot=wall_out.position_onehot,
             sort_value=wall_out.sort_value,
             prev_mask=fb_fields["prev_mask"],

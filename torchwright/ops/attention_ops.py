@@ -592,6 +592,115 @@ def attend_argmin_unmasked(
     )
 
 
+def attend_argmin_valid_unmasked(
+    pos_encoding: PosEncoding,
+    score: Node,
+    validity: Node,
+    mask_vector: Node,
+    position_onehot: Node,
+    value: Node,
+) -> Node:
+    """Argmin of ``score`` restricted to valid keys, with a per-query mask.
+
+    Combines ``attend_argmin_where``'s per-key validity signal with
+    ``attend_argmin_unmasked``'s per-query mask rendezvous. The logit at
+    key position ``i`` under query position ``j`` is
+
+        _QUERY_GAIN · (−score[i] + _VALIDITY_LARGE · validity[i]
+                       + _TIEBREAK_COEFF · pos_scalar[i])
+        −_UNMASKED_PENALTY · mask_vector_j[position_onehot_i]
+
+    Separation (with ``_QUERY_GAIN=80``, ``_VALIDITY_LARGE=1000``,
+    ``_UNMASKED_PENALTY=10000``, ``|score| ≤ 100``):
+
+    * worst valid-unmasked logit ≈ ``80 · (-100 + 1000) = +72000``
+    * best masked-valid logit ≈ ``80 · (+0 + 1000) - 10000 = +70000``
+    * best unmasked-invalid logit ≈ ``80 · (+0 - 1000) = -80000``
+    * masked-invalid is even more negative.
+
+    Because ``_QUERY_GAIN · _VALIDITY_LARGE = 80000 > _UNMASKED_PENALTY =
+    10000``, validity dominates mask: a masked-valid key still beats an
+    unmasked-invalid key by ~150000 logit units. The softmax thus prefers
+    valid+unmasked, then valid+masked (re-pick of a prior winner, a safe
+    fallback), then anything invalid.
+
+    **End-of-sort behavior.** When ``N_renderable < max_walls``, after
+    all valid keys are picked the attention re-picks the last-picked
+    valid key (masked-valid). Wasteful but correct — callers that want
+    early termination must gate downstream consumers on a compiled
+    "done" signal.
+
+    Compile cost: one vanilla attention head.
+    ``d_head = 1 + n_slots + len(value)``.
+
+    Args:
+        pos_encoding: The graph's positional encoding node.
+        score: 1D scalar node.
+        validity: 1D boolean node (+1 valid, −1 invalid).
+        mask_vector: Width-``N`` per-query ``{0, 1}`` mask.
+        position_onehot: Width-``N`` per-key one-hot of input-slot index.
+        value: Node to read at the selected key position.
+
+    Returns:
+        Attn node of width ``len(value)``.
+    """
+    assert len(score) == 1, "attend_argmin_valid_unmasked expects a 1D scalar score"
+    assert len(validity) == 1, (
+        "attend_argmin_valid_unmasked expects a 1D boolean validity"
+    )
+    assert len(mask_vector) == len(position_onehot), (
+        "mask_vector and position_onehot must have the same width "
+        f"(got {len(mask_vector)} and {len(position_onehot)})"
+    )
+    n_slots = len(mask_vector)
+    d_value = len(value)
+    d_pos = pos_encoding.d_pos
+    freq = pos_encoding.slow_sin_freq()
+    # Layout of d_head:
+    #   col 0:                              score + validity + tiebreak logit
+    #   cols 1 .. n_slots:                  mask · position_onehot dot-product terms
+    #   cols n_slots+1 .. n_slots+d_value:  value pass-through
+    d_head = 1 + n_slots + d_value
+
+    query_in = Concatenate([pos_encoding, mask_vector])
+    key_in = Concatenate([pos_encoding, score, validity, position_onehot])
+
+    # --- Query matrix, shape (d_pos + n_slots, d_head) ---
+    query_matrix = torch.zeros((len(query_in), d_head))
+    query_matrix[d_pos - 1, 0] = _QUERY_GAIN
+    for c in range(n_slots):
+        query_matrix[d_pos + c, 1 + c] = -_UNMASKED_PENALTY
+
+    # --- Key matrix, shape (d_pos + 2 + n_slots, d_head) ---
+    # Row order in key_in: [pos_enc (d_pos), score (1), validity (1), onehot (n_slots)]
+    key_matrix = torch.zeros((len(key_in), d_head))
+    score_row = d_pos
+    validity_row = d_pos + 1
+    onehot_start_row = d_pos + 2
+    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq   # latest-position tiebreak
+    key_matrix[score_row, 0] = -1.0                      # smaller score → larger logit
+    key_matrix[validity_row, 0] = _VALIDITY_LARGE        # validity dominates mask
+    for c in range(n_slots):
+        key_matrix[onehot_start_row + c, 1 + c] = 1.0
+
+    # --- Value pass-through into the tail cols of d_head. ---
+    value_matrix = torch.zeros((d_value, d_head))
+    output_matrix = torch.zeros((d_head, d_value))
+    for v in range(d_value):
+        value_matrix[v, 1 + n_slots + v] = 1.0
+        output_matrix[1 + n_slots + v, v] = 1.0
+
+    return Attn(
+        query_in=query_in,
+        key_in=key_in,
+        value_in=value,
+        query_matrix=query_matrix,
+        key_matrix=key_matrix,
+        value_matrix=value_matrix,
+        output_matrix=output_matrix,
+    )
+
+
 def attend_mean_where(
     pos_encoding: PosEncoding,
     validity: Node,
