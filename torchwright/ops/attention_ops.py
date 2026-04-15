@@ -44,6 +44,7 @@ import torch
 
 from torchwright.graph import Node, Concatenate, Attn
 from torchwright.graph.pos_encoding import PosEncoding
+from torchwright.graph.value_type import NodeValueType
 
 
 # Coefficient applied to the slowest-cosine component of the positional
@@ -127,6 +128,10 @@ def _build_selection_attn(
     Callers supply ``key_in`` (a Concatenate of pos_encoding and content
     nodes) and a populated ``key_matrix``; this helper fills in the
     query / value / output matrices shared across all primitives below.
+
+    Hard selection means the output equals exactly one of ``value``'s
+    rows, so we pass ``value.value_type`` straight through as the
+    declared output type.
     """
     d_head = _assert_value_fits(pos_encoding, value)
 
@@ -159,6 +164,7 @@ def _build_selection_attn(
         key_matrix=key_matrix,
         value_matrix=value_matrix,
         output_matrix=output_matrix,
+        declared_output_type=value.value_type,
     )
 
 
@@ -451,6 +457,7 @@ def attend_argmin_above_integer(
         key_matrix=key_matrix,
         value_matrix=value_matrix,
         output_matrix=output_matrix,
+        declared_output_type=value.value_type,
     )
 
 
@@ -585,6 +592,7 @@ def attend_argmin_unmasked(
         key_matrix=key_matrix,
         value_matrix=value_matrix,
         output_matrix=output_matrix,
+        declared_output_type=value.value_type,
     )
 
 
@@ -650,6 +658,10 @@ def attend_mean_where(
     value_matrix = torch.eye(d_v)
     output_matrix = torch.eye(d_v)
 
+    # Mean of integers is not integer; only the range (a superset of a
+    # convex combination within value's range) survives.
+    mean_output_type = NodeValueType(value_range=value.value_type.value_range)
+
     return Attn(
         query_in=pos_encoding,
         key_in=key_in,
@@ -658,6 +670,7 @@ def attend_mean_where(
         key_matrix=key_matrix,
         value_matrix=value_matrix,
         output_matrix=output_matrix,
+        declared_output_type=mean_output_type,
     )
 
 
@@ -770,4 +783,5 @@ def attend_argmax_dot(
         key_matrix=key_matrix,
         value_matrix=value_matrix,
         output_matrix=output_matrix,
+        declared_output_type=value.value_type,
     )
