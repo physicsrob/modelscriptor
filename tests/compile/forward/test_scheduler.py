@@ -217,12 +217,19 @@ def test_schedule_cancellation():
     rmap.allocate(x)
     rmap.allocate(a)
     computed = {pos, x, a}
+    x_cols = set(rmap.get_indices(x))
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     cancel_ops = [op for op in attn_ops if op.op_type == "cancel"]
-    assert any(op.node is x for op in cancel_ops)
+    # Cancels are coalesced into a single AttnHeadOp whose target_cols
+    # is the union of all cols to clear in this layer — check that x's
+    # cols are present in that batch.
+    cancel_targets = {c for op in cancel_ops for c in op.target_cols}
+    assert x_cols <= cancel_targets, (
+        f"expected x's cols {x_cols} within cancel targets {cancel_targets}"
+    )
     assert not rmap.is_allocated(x)  # columns freed
 
 
@@ -268,6 +275,12 @@ def test_schedule_deferred_add_via_compute():
     can't reuse columns. Instead, compute_add copies both inputs to fresh
     columns via attention.
     """
+    # Use a larger d so the attention-head budget has room for both the
+    # three compute ops (a_other, b_other, add_node) and the per-op
+    # dirty-col cancellation emitted by the scheduler.  With the default
+    # D=64 there are only 4 heads per layer, which is a tight fit that
+    # cancellation can push over.
+    d_test = 128
     pos = _make_pos_encoding()
     a = InputNode("a", 4)
     b = InputNode("b", 4)
@@ -278,16 +291,19 @@ def test_schedule_deferred_add_via_compute():
     out = _make_linear(out_cat, 1, "out")
 
     graph = GraphAnalyzer(out)
-    rmap = ResidualStreamMap(D)
+    rmap = ResidualStreamMap(d_test)
     rmap.allocate(pos)
     rmap.allocate(a)
     rmap.allocate(b)
+    rmap.mark_clean(rmap.get_indices(pos))
+    rmap.mark_clean(rmap.get_indices(a))
+    rmap.mark_clean(rmap.get_indices(b))
     computed = {pos, a, b}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, d_test, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
-    add_ops = [op for op in attn_ops if op.node is add_node]
+    add_ops = [op for op in attn_ops if op.node is add_node and op.op_type != "cancel"]
     assert len(add_ops) == 1
     assert add_ops[0].op_type == "compute_add"
     assert add_node in computed
@@ -434,13 +450,18 @@ def test_schedule_under_column_pressure():
     rmap.allocate(a)
     assert rmap.get_free_count() == 0
     computed = {pos, filler, x, a}
+    x_cols = set(rmap.get_indices(x))
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
-    # Must cancel x (dead) to free columns
+    # Must cancel x (dead) to free columns; cancels are coalesced so
+    # check the merged target_cols for x's columns.
     cancel_ops = [op for op in attn_ops if op.op_type == "cancel"]
-    assert any(op.node is x for op in cancel_ops)
+    cancel_targets = {c for op in cancel_ops for c in op.target_cols}
+    assert x_cols <= cancel_targets, (
+        f"expected x's cols {x_cols} within cancel targets {cancel_targets}"
+    )
 
     # Relu chain should still be scheduled
     relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]
