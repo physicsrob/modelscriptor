@@ -4,6 +4,8 @@ from typing import List, Dict, Optional
 
 import torch
 
+from torchwright.graph.value_type import NodeValueType
+
 global_node_id = 0
 
 _current_annotation: ContextVar[Optional[str]] = ContextVar(
@@ -59,6 +61,21 @@ class Node:
         self.name = name
         self.annotation = _current_annotation.get()
         global_node_id += 1
+        self._value_type = self.compute_value_type()
+
+    @property
+    def value_type(self) -> NodeValueType:
+        return self._value_type
+
+    def compute_value_type(self) -> NodeValueType:
+        """Return the static value-type of this node's output.
+
+        Default: ``unknown()`` (fail-closed). Subclasses override to
+        propagate properties from their inputs or declare constants.
+        Called eagerly from ``__init__`` so rule errors surface at graph
+        build time.
+        """
+        return NodeValueType.unknown()
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         raise NotImplementedError()
