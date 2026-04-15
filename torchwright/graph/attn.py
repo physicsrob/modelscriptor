@@ -4,8 +4,10 @@ from torchwright.graph import Node
 # Causal mask sentinel: future positions are filled with this value before
 # softmax.  Must be large enough that no valid logit ever falls below it,
 # otherwise the softmax will prefer "hidden" future positions over the
-# real current position.  With _QUERY_GAIN = 80 and |score| up to 120,
-# the worst valid logit is 80 × (−120) = −9600, still far above −1e6.
+# real current position.  With _QUERY_GAIN = 8, _VALIDITY_DIRECT = 1000,
+# _UNMASKED_PENALTY = 1000, and |score| up to 120, the worst valid
+# logit is around −3000, still far above −1e6.  Retained at −1e6 so
+# that existing oracle/compiled parity is preserved.
 CAUSAL_MASK_SENTINEL = -1e6
 
 

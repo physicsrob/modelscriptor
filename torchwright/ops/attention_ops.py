@@ -32,12 +32,20 @@ All primitives here follow this template:
   position; ``value_matrix`` and ``output_matrix`` are identity projections
   that copy it through unchanged.
 
-Query gain.  With the causal-mask sentinel at ``-1e6`` in
-``Attn.compute``, ``_QUERY_GAIN = 80`` keeps the worst valid logit at
-``80 × 120 = 9600``, far above ``-1e6``.  A unit score delta produces a
-logit delta of 80 → ``exp(80) ≈ 5.5e34`` softmax weight ratio —
-effectively hard selection for any non-degenerate gap.  Exact ties are
-still weighted-averaged, matching ``get_prev_value``'s behaviour.
+Query gain.  ``_QUERY_GAIN = 8`` is extracted from the slowest cosine
+of the positional encoding (``cos(j · d[-1]) ≈ 1`` for any realistic
+``j``), giving a per-unit-score logit delta of 8 → ``exp(8) ≈ 2981``
+softmax weight ratio — ``≥ 99.9 %`` concentration for any integer
+score gap.  All current callers operate on integer-valued scores (BSP
+rank, digit, slot index) with gap ≥ 1, so the integer-score invariant
+is what secures hard selection, not a large gain.
+
+Validity is additive, not gained.  The ``_where`` variants route
+validity through a dedicated ``d_qk`` column (``Q = 1.0``,
+``K = _VALIDITY_DIRECT``) rather than combining it with the score
+column under ``_QUERY_GAIN``.  This keeps worst-case ``|Q·K|`` in the
+low thousands instead of tens of thousands, so pre-softmax logits
+survive comfortably in bf16.
 
 Step-function logits (e.g. strict ``>`` comparisons against a runtime
 threshold) are not expressible in bilinear Q·K. The ``_where`` and
@@ -52,17 +60,16 @@ from torchwright.graph.pos_encoding import PosEncoding
 
 
 # Coefficient applied to the slowest-cosine component of the positional
-# encoding inside the query projection. Chosen so that
-# Coefficient applied to the slowest-cosine component of the positional
-# encoding inside the query projection. Chosen so that
-# ``Q[j, 0] ≈ _QUERY_GAIN`` for every position ``j`` in a realistic
-# sequence length (the slowest cosine is ``cos(j · d[-1]) ≈ 1`` for
-# ``j`` up to a few thousand). With the causal-mask sentinel at -1e6
-# in ``Attn.compute``, gains up to ~8000 are safe for |score| ≤ 120.
-# We use 80 for a comfortable 10× margin: a unit score delta produces
-# a logit delta of 80, i.e. ``exp(80) ≈ 5.5e34`` softmax weight
-# ratio — effectively hard selection for any non-degenerate score gap.
-_QUERY_GAIN = 80.0
+# encoding inside the query projection. The slowest cosine
+# ``cos(j · d[-1]) ≈ 1`` for any realistic ``j``, so ``Q[j, 0] ≈
+# _QUERY_GAIN`` independent of query position. A unit score delta then
+# produces a logit delta of 8 → ``exp(8) ≈ 2981`` softmax weight ratio,
+# i.e. ``≥ 99.9 %`` concentration. All current callers produce
+# integer-valued scores with gap ≥ 1, so this is sufficient; larger
+# gains (e.g. 80) are historical — they bought unused margin at the
+# cost of pushing K·Q magnitudes above the range where bf16 precision
+# resolves softmax-significant gaps.
+_QUERY_GAIN = 8.0
 
 # Coefficient on the position-scalar tiebreak in key-space. Must satisfy
 # ``_TIEBREAK_COEFF * n_pos < 1`` so that a unit score difference
@@ -71,27 +78,39 @@ _QUERY_GAIN = 80.0
 # with unit-integer scores.
 _TIEBREAK_COEFF = 0.001
 
-# "Infinity-substitute" magnitude for the validity penalty in the
-# ``_where`` variants. Must exceed the maximum possible ``|score|`` so
-# validity always dominates score. With the causal-mask sentinel at
-# -1e6, the old ceiling of 125 no longer applies; 1000 gives a
-# comfortable margin over any realistic score.
-_VALIDITY_LARGE = 1000.0
+# Direct (not gained) logit bonus for valid positions in the simple
+# ``_where`` variants (``attend_argmin_where``, ``attend_argmax_where``,
+# ``attend_mean_where``).  Routed through a dedicated ``d_qk`` column
+# with ``Q = 1.0`` and ``K = ± _VALIDITY_DIRECT``, so the contribution
+# to the logit is literally ``± _VALIDITY_DIRECT`` — not multiplied by
+# ``_QUERY_GAIN``.  Must exceed the one-sided score swing
+# ``_QUERY_GAIN · _MAX_SCORE_ABS = 8 × 120 = 960`` so validity
+# dominates score; ``1000`` buys a small but sufficient margin.
+_VALIDITY_DIRECT = 1000.0
 
-# Maximum ``|score|`` supported by these primitives. With sentinel at
-# -1e6 and ``_QUERY_GAIN = 80``, the worst logit at |score| = 120 is
-# ``80 × (-120) = -9600``, far above -1e6. The old constraint
-# (``gain × score < 1000``) is gone; this ceiling is now just a
-# documentation hint for callers about the tested range.
+# Key-side validity coefficient for ``attend_argmin_valid_unmasked``,
+# which keeps the *multiplicative* (gained) validity encoding because
+# its mask_vector input can accumulate integer values above 1 (see the
+# op's docstring for why).  Under the gain, the effective validity
+# logit contribution is ``_QUERY_GAIN · _VALIDITY_KEY_COEFF = 8000``,
+# giving ``2 · 8000 = 16000`` of validity swing — enough to dominate
+# ``_UNMASKED_PENALTY · max_walls`` for typical max_walls ≤ 15.
+_VALIDITY_KEY_COEFF = 1000.0
+
+# Maximum ``|score|`` supported by these primitives. With gain=8, the
+# worst valid-position logit contribution from score is ``8 × 120 =
+# 960``, under the 1000-unit ``_VALIDITY_DIRECT`` bonus (or well under
+# the 8000-unit gained ``_VALIDITY_KEY_COEFF`` contribution in
+# ``attend_argmin_valid_unmasked``).
 _MAX_SCORE_ABS = 120.0
 
 # Penalty (in *logit* space, not key space) applied by
 # ``attend_argmin_unmasked`` to masked positions. Must exceed
 # ``_QUERY_GAIN * _MAX_SCORE_UNMASKED_ABS`` so a masked position with
 # the best score still loses to an unmasked position with the worst
-# score. With gain=80 and max_score=100: 80×100 = 8000, so 10000
-# gives a comfortable margin.
-_UNMASKED_PENALTY = 10000.0
+# score. With gain=8 and max_score=100: 8×100 = 800, so 1000 gives
+# ~25% margin.
+_UNMASKED_PENALTY = 1000.0
 
 # Maximum ``|score|`` supported by ``attend_argmin_unmasked``.
 _MAX_SCORE_UNMASKED_ABS = 100.0
@@ -103,8 +122,8 @@ _MAX_SCORE_UNMASKED_ABS = 100.0
 # Must exceed ``_QUERY_GAIN · (max_score - min_score)`` so a valid
 # position with the worst score still beats any invalid position with
 # the best score. For ``score ∈ [0, 9]`` that gives ``_QUERY_GAIN · 9
-# = 720``; ``_ABOVE_BONUS = 1000`` buys a comfortable margin.
-_ABOVE_BONUS = 1000.0
+# = 72``; ``_ABOVE_BONUS = 100`` buys a ~40 % margin.
+_ABOVE_BONUS = 100.0
 
 
 def _assert_value_fits(pos_encoding: PosEncoding, value: Node) -> int:
@@ -141,18 +160,66 @@ def _build_selection_attn(
     # slowest cosine component ``pos_enc[j, d_pos - 1]`` is
     # ``cos(j · d[-1])`` which equals ``~1`` for ``j`` up to a few
     # thousand — nearly constant over any realistic sort length. Scaling
-    # it by ``_QUERY_GAIN`` gives a per-position query coefficient close
-    # to 8, which is both large enough that a unit score delta is
-    # decisive (``exp(8) ≈ 3000``) and small enough that our
-    # ``|score| ≤ _MAX_SCORE_ABS`` envelope keeps every valid logit above
-    # the ``CAUSAL_MASK_SENTINEL`` in ``Attn.compute``. Other
-    # columns of Q don't matter because ``K`` has only column 0
-    # populated; we zero them out for clarity.
+    # it by ``_QUERY_GAIN = 8`` makes a unit score delta decisive
+    # (``exp(8) ≈ 3000``) while keeping ``|Q·K|`` in the low hundreds.
+    # Other columns of Q don't matter for this helper because ``K`` has
+    # only column 0 populated; we zero them out for clarity.
     query_matrix = torch.zeros((len(pos_encoding), d_head))
     query_matrix[-1, 0] = _QUERY_GAIN
 
     # Identity pass-through for value. value_matrix embeds value into the
     # first len(value) columns of d_head; output_matrix reads them back.
+    value_matrix = torch.eye(len(value), d_head)
+    output_matrix = torch.eye(d_head, len(value))
+
+    return Attn(
+        query_in=pos_encoding,
+        key_in=key_in,
+        value_in=value,
+        query_matrix=query_matrix,
+        key_matrix=key_matrix,
+        value_matrix=value_matrix,
+        output_matrix=output_matrix,
+    )
+
+
+def _build_where_attn(
+    pos_encoding: PosEncoding,
+    score: Node,
+    validity: Node,
+    value: Node,
+    *,
+    score_sign: float,
+) -> Attn:
+    """Shared construction for ``attend_argmin_where`` / ``attend_argmax_where``.
+
+    ``d_qk`` layout:
+      * col 0: gained score + tiebreak (``Q = _QUERY_GAIN``).
+      * col 1: additive validity (``Q = 1.0``, ``K = ± _VALIDITY_DIRECT``),
+        not multiplied by the gain.
+
+    ``score_sign`` is ``-1`` for argmin (small score → large logit) and
+    ``+1`` for argmax.
+    """
+    d_head = _assert_value_fits(pos_encoding, value)
+    d_pos = pos_encoding.d_pos
+    freq = pos_encoding.slow_sin_freq()
+
+    # key_in row layout: [pos_encoding (d_pos), score (1), validity (1)]
+    key_in = Concatenate([pos_encoding, score, validity])
+
+    # --- Query: col 0 gained (slow-cos · _QUERY_GAIN), col 1 stable 1.0. ---
+    query_matrix = torch.zeros((len(pos_encoding), d_head))
+    query_matrix[d_pos - 1, 0] = _QUERY_GAIN
+    query_matrix[d_pos - 1, 1] = 1.0
+
+    # --- Key: col 0 score+tiebreak, col 1 direct validity. ---
+    key_matrix = torch.zeros((len(key_in), d_head))
+    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq
+    key_matrix[d_pos, 0] = score_sign
+    key_matrix[d_pos + 1, 1] = _VALIDITY_DIRECT
+
+    # --- Value / output pass-through (identity on first len(value) cols). ---
     value_matrix = torch.eye(len(value), d_head)
     output_matrix = torch.eye(d_head, len(value))
 
@@ -176,9 +243,8 @@ def attend_argmin(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
     same convention ``get_prev_value`` uses.
 
     To mask positions you want the attention to ignore, pass a score that
-    is very large at those positions (a few hundred is enough; see
-    ``_VALIDITY_LARGE`` for the scale). For a cleaner valid/invalid API,
-    use :func:`attend_argmin_where` instead.
+    is very large at those positions (a few hundred is enough). For a
+    cleaner valid/invalid API, use :func:`attend_argmin_where` instead.
 
     Compile cost: exactly one vanilla attention head.
 
@@ -251,15 +317,18 @@ def attend_argmin_where(
     position where ``validity`` is true **and** ``score`` is smallest.
 
     ``validity`` follows the usual torchwright boolean convention: +1.0
-    means "valid", −1.0 means "invalid". The logit at key position ``i``
-    is
+    means "valid", −1.0 means "invalid". Validity is routed through a
+    dedicated ``d_qk`` column (``Q = 1.0``, ``K = ± _VALIDITY_DIRECT``)
+    rather than combined with the score column under ``_QUERY_GAIN``,
+    so the logit at key position ``i`` is
 
-        −score[i]  +  _VALIDITY_LARGE · validity[i]  +  _TIEBREAK_COEFF · pos[i]
+        _QUERY_GAIN · (−score[i] + _TIEBREAK_COEFF · pos[i])
+            + _VALIDITY_DIRECT · validity[i]
 
-    Because ``_VALIDITY_LARGE`` is much larger than any reasonable score
-    delta, the softmax always prefers a valid position over an invalid
-    one regardless of their scores; among valid positions, smaller score
-    wins; ties break toward the later position.
+    Because ``_VALIDITY_DIRECT > _QUERY_GAIN · _MAX_SCORE_ABS``, validity
+    dominates score: the softmax always prefers a valid position over an
+    invalid one regardless of their scores; among valid positions,
+    smaller score wins; ties break toward the later position.
 
     **When no position is valid.** The softmax still runs and produces a
     weighted average over all positions — effectively garbage. Callers
@@ -283,19 +352,9 @@ def attend_argmin_where(
     """
     assert len(score) == 1, "attend_argmin_where expects a 1D scalar score"
     assert len(validity) == 1, "attend_argmin_where expects a 1D boolean validity"
-    d_head = _assert_value_fits(pos_encoding, value)
-
-    # key_in = [pos_encoding (d_pos), score (1), validity (1)]
-    # Slow-sin row of pos_encoding carries the linear-in-position tiebreak.
-    d_pos = pos_encoding.d_pos
-    freq = pos_encoding.slow_sin_freq()
-    key_in = Concatenate([pos_encoding, score, validity])
-    key_matrix = torch.zeros((len(key_in), d_head))
-    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq   # latest-valid-position tiebreak
-    key_matrix[d_pos, 0] = -1.0                          # smaller score → larger logit
-    key_matrix[d_pos + 1, 0] = _VALIDITY_LARGE           # validity dominates score
-
-    return _build_selection_attn(pos_encoding, key_in, key_matrix, value)
+    return _build_where_attn(
+        pos_encoding, score, validity, value, score_sign=-1.0,
+    )
 
 
 def attend_argmax_where(
@@ -320,17 +379,9 @@ def attend_argmax_where(
     """
     assert len(score) == 1, "attend_argmax_where expects a 1D scalar score"
     assert len(validity) == 1, "attend_argmax_where expects a 1D boolean validity"
-    d_head = _assert_value_fits(pos_encoding, value)
-
-    d_pos = pos_encoding.d_pos
-    freq = pos_encoding.slow_sin_freq()
-    key_in = Concatenate([pos_encoding, score, validity])
-    key_matrix = torch.zeros((len(key_in), d_head))
-    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq   # latest-valid-position tiebreak
-    key_matrix[d_pos, 0] = 1.0                           # larger score → larger logit
-    key_matrix[d_pos + 1, 0] = _VALIDITY_LARGE           # validity dominates score
-
-    return _build_selection_attn(pos_encoding, key_in, key_matrix, value)
+    return _build_where_attn(
+        pos_encoding, score, validity, value, score_sign=+1.0,
+    )
 
 
 def attend_argmin_above_integer(
@@ -606,23 +657,31 @@ def attend_argmin_valid_unmasked(
     ``attend_argmin_unmasked``'s per-query mask rendezvous. The logit at
     key position ``i`` under query position ``j`` is
 
-        _QUERY_GAIN · (−score[i] + _VALIDITY_LARGE · validity[i]
+        _QUERY_GAIN · (−score[i] + _VALIDITY_KEY_COEFF · validity[i]
                        + _TIEBREAK_COEFF · pos_scalar[i])
-        −_UNMASKED_PENALTY · mask_vector_j[position_onehot_i]
+            − _UNMASKED_PENALTY · mask_vector_j[position_onehot_i]
 
-    Separation (with ``_QUERY_GAIN=80``, ``_VALIDITY_LARGE=1000``,
-    ``_UNMASKED_PENALTY=10000``, ``|score| ≤ 100``):
+    Unlike the simple ``_where`` variants, validity is kept in the
+    *gained* (multiplicative) column rather than an additive one — the
+    caller's mask_vector can accumulate integer values above 1 as the
+    same slot is re-picked, and the multiplicative validity budget
+    (``_QUERY_GAIN · _VALIDITY_KEY_COEFF = 8000``) must dominate
+    ``_UNMASKED_PENALTY · max_walls`` for the masked-valid fallback to
+    keep working.
 
-    * worst valid-unmasked logit ≈ ``80 · (-100 + 1000) = +72000``
-    * best masked-valid logit ≈ ``80 · (+0 + 1000) - 10000 = +70000``
-    * best unmasked-invalid logit ≈ ``80 · (+0 - 1000) = -80000``
-    * masked-invalid is even more negative.
+    Separation (with ``_QUERY_GAIN=8``, ``_VALIDITY_KEY_COEFF=1000``,
+    ``_UNMASKED_PENALTY=1000``, ``|score| ≤ 100`` one-sided):
 
-    Because ``_QUERY_GAIN · _VALIDITY_LARGE = 80000 > _UNMASKED_PENALTY =
-    10000``, validity dominates mask: a masked-valid key still beats an
-    unmasked-invalid key by ~150000 logit units. The softmax thus prefers
-    valid+unmasked, then valid+masked (re-pick of a prior winner, a safe
-    fallback), then anything invalid.
+    * worst valid-unmasked logit ≈ ``8 · (-100 + 1000) = +7200``
+    * valid-masked logit at mask-bit ``k`` ≈ ``8000 − 1000 · k``
+    * worst invalid-unmasked logit ≈ ``8 · (0 − 1000) = -8000``
+
+    Since ``2 · _QUERY_GAIN · _VALIDITY_KEY_COEFF = 16000`` and
+    ``_UNMASKED_PENALTY = 1000``, validity dominates mask up to
+    ``max_walls ≤ 15``: a masked-valid key (bit accumulated up to 15)
+    still beats any invalid key.  For larger ``max_walls`` the caller
+    must either cap accumulation via a saturating mask update or raise
+    ``_VALIDITY_KEY_COEFF``.
 
     **End-of-sort behavior.** When ``N_renderable < max_walls``, after
     all valid keys are picked the attention re-picks the last-picked
@@ -657,8 +716,8 @@ def attend_argmin_valid_unmasked(
     d_pos = pos_encoding.d_pos
     freq = pos_encoding.slow_sin_freq()
     # Layout of d_head:
-    #   col 0:                              score + validity + tiebreak logit
-    #   cols 1 .. n_slots:                  mask · position_onehot dot-product terms
+    #   col 0:                              score + gained validity + tiebreak
+    #   cols 1 .. n_slots:                  mask · position_onehot terms
     #   cols n_slots+1 .. n_slots+d_value:  value pass-through
     d_head = 1 + n_slots + d_value
 
@@ -677,9 +736,9 @@ def attend_argmin_valid_unmasked(
     score_row = d_pos
     validity_row = d_pos + 1
     onehot_start_row = d_pos + 2
-    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq   # latest-position tiebreak
-    key_matrix[score_row, 0] = -1.0                      # smaller score → larger logit
-    key_matrix[validity_row, 0] = _VALIDITY_LARGE        # validity dominates mask
+    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq    # latest-position tiebreak
+    key_matrix[score_row, 0] = -1.0                       # smaller score → larger logit
+    key_matrix[validity_row, 0] = _VALIDITY_KEY_COEFF     # gained validity dominates mask accumulation
     for c in range(n_slots):
         key_matrix[onehot_start_row + c, 1 + c] = 1.0
 
@@ -746,19 +805,21 @@ def attend_mean_where(
     """
     assert len(validity) == 1, "attend_mean_where expects a 1D boolean validity"
 
-    # d_qk = 1: the only scoring column carries the validity bonus.
-    # Q reads from the slowest cosine of pos_encoding (stable ≈ 1).
-    # K reads only validity.  No tiebreak → all valid positions get
-    # the same logit → uniform softmax weights → exact mean.
+    # d_qk = 1: the only column carries the direct validity bonus.
+    # Q reads from the slowest cosine of pos_encoding (stable ≈ 1) —
+    # unscaled, since validity here is a direct logit contribution, not
+    # combined with any gained score.  K reads only validity.  No
+    # tiebreak → all valid positions get the same logit → uniform
+    # softmax weights → exact mean.
     d_qk = 1
     d_v = len(value)
 
     query_matrix = torch.zeros((len(pos_encoding), d_qk))
-    query_matrix[-1, 0] = _QUERY_GAIN
+    query_matrix[-1, 0] = 1.0
 
     # No tiebreak needed, so pos_encoding doesn't appear in key_in.
     key_matrix = torch.zeros((len(validity), d_qk))
-    key_matrix[0, 0] = _VALIDITY_LARGE
+    key_matrix[0, 0] = _VALIDITY_DIRECT
 
     value_matrix = torch.eye(d_v)
     output_matrix = torch.eye(d_v)

@@ -325,23 +325,27 @@ def assert_distinct_across(
 
 
 def assert_score_gap_at_least(
-    score: Node, where: Node, *, margin: float = 0.05,
+    score: Node, where: Node, *, margin: float = 1.0,
 ) -> Node:
     """Assert the two smallest valid ``score`` values differ by at least ``margin``.
 
     Resolvability invariant for ``attend_argmin_unmasked``.  With
-    ``_QUERY_GAIN = 80``, the softmax concentrates ≥99.9% on the lowest
+    ``_QUERY_GAIN = 8``, the softmax concentrates ≥99.9 % on the lowest
     score only when the rank-1 vs rank-2 gap exceeds
-    ``ln(999)/80 ≈ 0.086``.  Pair this assert with the score node
+    ``ln(999) / 8 ≈ 0.864``.  Pair this assert with the score node
     immediately upstream of the argmin to catch precision regressions
     that close the gap below softmax resolution — the failure mode
     behind angle-192 / Mode C.
 
+    The default margin of ``1.0`` matches the integer-score invariant
+    that all current callers uphold (BSP rank, digit, slot index —
+    gaps ≥ 1).  Tighten only if a caller deliberately produces
+    sub-unit score gaps.
+
     Differs from :func:`assert_distinct_across`:
       * checks only the *tightest* pair, not all O(N²) pairs;
-      * uses a tighter default margin (0.05) calibrated to the
-        ``_QUERY_GAIN`` floor and the current 0.1 tiebreak budget in
-        ``_compute_bsp_rank``.
+      * uses a tighter default margin calibrated to the ``_QUERY_GAIN``
+        floor.
 
     Vacuous for <2 valid rows (mask sums to 0 or 1).
     """

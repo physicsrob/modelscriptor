@@ -190,7 +190,7 @@ def _argmin_and_derive(inputs: SortedInputs, max_walls: int):
         inputs.sort_score, inputs.is_wall, margin=0.8,
     )
     checked_score = assert_score_gap_at_least(
-        checked_score, inputs.is_wall, margin=0.5,
+        checked_score, inputs.is_wall, margin=1.0,
     )
 
     # TODO(end-of-sort): when ``N_renderable < max_walls``, after all

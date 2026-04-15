@@ -582,12 +582,13 @@ def test_score_gap_assert_state_on_angle_192_compiled(graph_and_module):
     Semantics have changed from the original Mode C probe: the SORTED
     argmin no longer uses sentinel-encoded non-renderability, so the
     valid set at sort[0] under angle-192 is a *singleton* (south).  The
-    stricter ``assert_score_gap_at_least(margin=0.5)`` check passes via
+    stricter ``assert_score_gap_at_least(margin=1.0)`` check passes via
     its "fewer than 2 valid rows" early-exit — the rank-1/rank-2 gap is
     vacuously satisfied.  The test remains useful as a regression lock:
     if renderability routing regresses and multiple walls are flagged
-    renderable simultaneously, the 0.5 margin on clean integer ranks
-    (1.0 spacing) still leaves plenty of headroom.
+    renderable simultaneously, the 1.0 margin on clean integer ranks
+    (1.0 spacing) is met exactly — any compilation precision loss would
+    fire the assert.
     """
     from torchwright.debug.probe import check_asserts_on_compiled
 
@@ -826,9 +827,12 @@ def test_inspect_sorted_argmin_attention_weights_at_sort2(graph_and_module):
     parallel to the viewing ray, north is behind the player).  The hot-
     case head 0 should therefore concentrate ≈100 % of its mass on the
     south wall's position, and the logit gap between valid (south) and
-    invalid (east/north/west) should be huge — roughly
-    ``2 · _QUERY_GAIN · _VALIDITY_LARGE = 160000``.  No blending is
-    possible by construction.
+    invalid (east/north/west) should be ≈
+    ``2 · _QUERY_GAIN · _VALIDITY_KEY_COEFF`` = 16000 (the gained
+    multiplicative validity encoding used by
+    ``attend_argmin_valid_unmasked`` to tolerate mask-bit accumulation
+    during the end-of-sort fallback).  No blending is possible by
+    construction.
 
     After sort[0] picks south, sort[1..3] degenerate into a re-pick of
     south (the masked-valid fallback — wasteful but safe, documented in
@@ -988,12 +992,13 @@ def test_inspect_sorted_argmin_attention_weights_at_sort2(graph_and_module):
               f"logit={l[k].item():+10.4f}  weight={w[k].item():.6f}")
 
     # --- Validity gap assertions ---
-    # With validity as a first-class signal, south (valid) should win
-    # by ``_QUERY_GAIN · 2 · _VALIDITY_LARGE`` ≈ 160000 logit units over
-    # every invalid wall.  The softmax mass on south should therefore
-    # be indistinguishable from 1.0.
+    # ``attend_argmin_valid_unmasked`` keeps validity in the gained
+    # column, so flipping validity from +1 to −1 shifts the logit by
+    # ``2 · _QUERY_GAIN · _VALIDITY_KEY_COEFF``.  Valid south should
+    # beat invalid walls by ≈ that gap; softmax mass on south should
+    # therefore be indistinguishable from 1.0.
     from torchwright.ops.attention_ops import (
-        _QUERY_GAIN, _VALIDITY_LARGE,
+        _QUERY_GAIN, _VALIDITY_KEY_COEFF,
     )
     south_pos = wall_positions[3]
     l_south = l[south_pos].item()
@@ -1003,13 +1008,13 @@ def test_inspect_sorted_argmin_attention_weights_at_sort2(graph_and_module):
         for i, lbl in enumerate(["east", "north", "west"])
     ]
     min_gap = min(l_south - li for _, li in invalid_logits)
-    expected_gap = 2.0 * _QUERY_GAIN * _VALIDITY_LARGE
+    expected_gap = 2.0 * _QUERY_GAIN * _VALIDITY_KEY_COEFF
     print(f"\nValidity-gap check:")
     print(f"  logit(south, valid) = {l_south:.2f}")
     for lbl, li in invalid_logits:
         print(f"  logit({lbl}, invalid) = {li:.2f}  gap = {l_south - li:.2f}")
     print(f"  min valid/invalid gap = {min_gap:.2f}  "
-          f"(design: 2·_QUERY_GAIN·_VALIDITY_LARGE = {expected_gap:.0f})")
+          f"(design: 2·_QUERY_GAIN·_VALIDITY_KEY_COEFF = {expected_gap:.0f})")
     print(f"  weight(south) = {w_south:.6f}")
 
     assert w_south > 0.999, (
