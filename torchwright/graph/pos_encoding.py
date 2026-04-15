@@ -1,4 +1,5 @@
 from torchwright.graph import Node, Concatenate, Attn
+from torchwright.graph.value_type import NodeValueType
 import torch
 import math
 
@@ -9,6 +10,9 @@ class PosEncoding(Node):
     def __init__(self, d_pos: int):
         self.d_pos = d_pos
         super().__init__(d_pos, [])
+
+    def compute_value_type(self) -> NodeValueType:
+        return NodeValueType.bounded(-1.0, 1.0)
 
     def get_pos_encoding(self, n_pos: int):
         # Compute the positional encodings once in log space.

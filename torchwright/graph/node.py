@@ -1,10 +1,54 @@
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import List, Dict, Optional, Set
 
 import torch
 
+from torchwright.graph.value_type import NodeValueType
+
 global_node_id = 0
+
+
+def _verify_tensor_against_value_type(node: "Node", tensor: torch.Tensor) -> None:
+    """Assert the actual tensor conforms to the node's declared value_type.
+
+    Used by the optional runtime verifier (``TW_VERIFY_VALUE_TYPES``).
+    Raises ``AssertionError`` with a message naming the node on mismatch.
+    """
+    vt = node.value_type
+    if tensor.numel() == 0:
+        return
+    t = tensor.detach()
+    name = f"{node.node_type()}(id={node.node_id}, name='{node.name}')"
+
+    r = vt.value_range
+    actual_lo = float(t.min().item())
+    actual_hi = float(t.max().item())
+    tol = 1e-4
+    if actual_lo < r.lo - tol or actual_hi > r.hi + tol:
+        raise AssertionError(
+            f"{name}: value_range mismatch — declared {r}, "
+            f"observed [{actual_lo}, {actual_hi}]"
+        )
+    if vt.is_integer:
+        diff = (t - t.round()).abs().max().item()
+        if diff > tol:
+            raise AssertionError(
+                f"{name}: declared is_integer but observed max deviation {diff}"
+            )
+    if vt.is_binary:
+        if not torch.all((t.round() == 0) | (t.round() == 1)).item():
+            raise AssertionError(f"{name}: declared is_binary but values outside {{0,1}}")
+    if vt.is_sign:
+        if not torch.all((t.round() == -1) | (t.round() == 1)).item():
+            raise AssertionError(f"{name}: declared is_sign but values outside {{-1,+1}}")
+    if vt.is_one_hot:
+        sums = t.round().sum(dim=-1)
+        if not torch.all(sums == 1).item():
+            raise AssertionError(
+                f"{name}: declared is_one_hot but per-row sum not equal to 1"
+            )
 
 _current_annotation: ContextVar[Optional[str]] = ContextVar(
     "current_annotation", default=None,
@@ -52,6 +96,24 @@ class Node:
     annotation: Optional[str]
     scheduling_predecessors: Set["Node"]
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        original = cls.__dict__.get("compute")
+        if original is None or getattr(original, "_tw_verified", False):
+            return
+
+        def wrapped(self, n_pos, input_values, *args, **kw):
+            result = original(self, n_pos, input_values, *args, **kw)
+            if os.environ.get("TW_VERIFY_VALUE_TYPES") and isinstance(result, torch.Tensor):
+                _verify_tensor_against_value_type(self, result)
+            return result
+
+        wrapped.__name__ = original.__name__
+        wrapped.__qualname__ = original.__qualname__
+        wrapped.__doc__ = original.__doc__
+        wrapped._tw_verified = True
+        cls.compute = wrapped
+
     def __init__(self, d_output: int, inputs: List["Node"], name: str = ""):
         global global_node_id
         self.d_output = d_output
@@ -66,6 +128,21 @@ class Node:
         # ``computed_nodes``.  Empty by default.
         self.scheduling_predecessors: Set["Node"] = set()
         global_node_id += 1
+        self._value_type = self.compute_value_type()
+
+    @property
+    def value_type(self) -> NodeValueType:
+        return self._value_type
+
+    def compute_value_type(self) -> NodeValueType:
+        """Return the static value-type of this node's output.
+
+        Default: ``unknown()`` (fail-closed). Subclasses override to
+        propagate properties from their inputs or declare constants.
+        Called eagerly from ``__init__`` so rule errors surface at graph
+        build time.
+        """
+        return NodeValueType.unknown()
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         raise NotImplementedError()

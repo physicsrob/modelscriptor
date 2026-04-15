@@ -34,6 +34,55 @@ import torch
 
 from torchwright.graph import Node, Concatenate
 from torchwright.graph.misc import Assert, Predicate
+from torchwright.graph.value_type import NodeValueType
+
+
+# ---------------------------------------------------------------------
+# Static contract helpers — the dual of assert_*.
+#
+# ``require_*`` checks a node's inferred ``NodeValueType`` at graph-
+# construction time and raises ``TypeError`` if the claim is missing.
+# Primitives use these to enforce input contracts; the error message
+# points the caller at the matching ``assert_*`` helper that would
+# satisfy it.
+# ---------------------------------------------------------------------
+
+
+def _fmt_require(node: Node, caller: str, expected: str, hint: str) -> str:
+    return (
+        f"{caller} requires {expected} for "
+        f"{node.node_type()}(id={node.node_id}, name={node.name!r}); "
+        f"got value_type={node.value_type}. "
+        f"Wrap the input in `{hint}` upstream if you can guarantee it."
+    )
+
+
+def require_integer(node: Node, caller: str) -> None:
+    if not node.value_type.is_integer:
+        raise TypeError(
+            _fmt_require(node, caller, "integer-valued input", "assert_integer(...)")
+        )
+
+
+def require_binary(node: Node, caller: str) -> None:
+    if not node.value_type.is_binary:
+        raise TypeError(
+            _fmt_require(node, caller, "binary (0/1) input", "assert_01(...)")
+        )
+
+
+def require_sign(node: Node, caller: str) -> None:
+    if not node.value_type.is_sign:
+        raise TypeError(
+            _fmt_require(node, caller, "sign (±1) input", "assert_bool(...)")
+        )
+
+
+def require_one_hot(node: Node, caller: str) -> None:
+    if not node.value_type.is_one_hot:
+        raise TypeError(
+            _fmt_require(node, caller, "one-hot input", "assert_onehot(...)")
+        )
 
 
 def collect_asserts(output_node: Node) -> List[Assert]:
@@ -91,7 +140,36 @@ def assert_in_range(
     return Assert(
         node, predicate,
         message=f"values in [{lo}, {hi}]",
+        claimed_type=NodeValueType.bounded(lo, hi),
     )
+
+
+def assert_integer(node: Node, *, atol: float = 1e-3) -> Node:
+    """Assert every element rounds to an integer within ``atol``.
+
+    Promotes the static ``value_type`` to ``is_integer=True``, preserving
+    the input's existing range (or leaving it unbounded if unknown).
+
+    **Safe placement**: at any point where the caller can guarantee the
+    tensor is numerically integer.  The most common use is
+    score-construction sites upstream of ``attend_argmin_*`` primitives
+    whose ``require_integer(score)`` contract demands this claim.
+    """
+    def predicate(x: torch.Tensor) -> tuple:
+        bad = (x - x.round()).abs() > atol
+        if not bad.any():
+            return True, ""
+        return False, f"expected integer (atol={atol}); {_format_bad(x, bad)}"
+
+    # Preserve the input's known range (rounded to integer endpoints)
+    # if finite; otherwise leave unbounded.
+    r = node.value_type.value_range
+    import math
+    if math.isfinite(r.lo) and math.isfinite(r.hi):
+        claimed = NodeValueType.integer(lo=math.floor(r.lo), hi=math.ceil(r.hi))
+    else:
+        claimed = NodeValueType.integer()
+    return Assert(node, predicate, message="integer-valued", claimed_type=claimed)
 
 
 def assert_bool(node: Node, *, atol: float = 1e-3) -> Node:
@@ -109,7 +187,9 @@ def assert_bool(node: Node, *, atol: float = 1e-3) -> Node:
             return True, ""
         return False, f"expected ±1 (atol={atol}); {_format_bad(x, bad)}"
 
-    return Assert(node, predicate, message="bool (±1)")
+    return Assert(
+        node, predicate, message="bool (±1)", claimed_type=NodeValueType.sign(),
+    )
 
 
 def assert_01(node: Node, *, atol: float = 1e-3) -> Node:
@@ -129,7 +209,9 @@ def assert_01(node: Node, *, atol: float = 1e-3) -> Node:
             return True, ""
         return False, f"expected {{0,1}} (atol={atol}); {_format_bad(x, bad)}"
 
-    return Assert(node, predicate, message="binary (0/1)")
+    return Assert(
+        node, predicate, message="binary (0/1)", claimed_type=NodeValueType.binary(),
+    )
 
 
 def assert_onehot(node: Node, *, atol: float = 1e-3) -> Node:
@@ -163,7 +245,77 @@ def assert_onehot(node: Node, *, atol: float = 1e-3) -> Node:
         )
         return False, f"not one-hot (atol={atol}); {summary}{more}"
 
-    return Assert(node, predicate, message="one-hot")
+    return Assert(
+        node, predicate, message="one-hot", claimed_type=NodeValueType.one_hot(),
+    )
+
+
+def assert_matches_value_type(
+    node: Node, vt: NodeValueType, *, atol: float = 1e-3,
+) -> Node:
+    """Assert the tensor satisfies every property of ``vt`` within ``atol``.
+
+    Used by hard-selection attention primitives to bake a value-type
+    guarantee onto their output: the primitive's Q/K construction makes
+    the softmax near-hard, so the output equals exactly one row of
+    ``value`` (modulo softmax decay) and therefore inherits ``value``'s
+    static type.  The runtime predicate is the safety net that catches
+    cases where the construction doesn't actually deliver what the
+    primitive promised.
+
+    Checks, each with tolerance ``atol``:
+      * ``value_range`` — no element outside [lo - atol, hi + atol]
+      * ``is_integer`` — ``|x - round(x)| <= atol``
+      * ``is_binary`` — rounds to {0, 1}
+      * ``is_sign`` — rounds to {-1, +1}
+      * ``is_one_hot`` — per-row exactly one ≈ 1, rest ≈ 0
+
+    The returned Assert carries ``vt`` as its ``claimed_type`` so
+    downstream static analysis sees the promoted type.
+    """
+    import math
+
+    r = vt.value_range
+
+    def predicate(x: torch.Tensor) -> tuple:
+        if math.isfinite(r.lo) or math.isfinite(r.hi):
+            bad = torch.zeros_like(x, dtype=torch.bool)
+            if math.isfinite(r.lo):
+                bad = bad | (x < r.lo - atol)
+            if math.isfinite(r.hi):
+                bad = bad | (x > r.hi + atol)
+            if bad.any():
+                return False, f"range {r} (atol={atol}); {_format_bad(x, bad)}"
+        if vt.is_integer:
+            bad = (x - x.round()).abs() > atol
+            if bad.any():
+                return False, f"not integer (atol={atol}); {_format_bad(x, bad)}"
+        if vt.is_binary:
+            rounded = x.round()
+            bad = ~((rounded == 0) | (rounded == 1))
+            if bad.any():
+                return False, f"not in {{0,1}} (atol={atol}); {_format_bad(x, bad)}"
+        if vt.is_sign:
+            rounded = x.round()
+            bad = ~((rounded == -1) | (rounded == 1))
+            if bad.any():
+                return False, f"not in {{-1,+1}} (atol={atol}); {_format_bad(x, bad)}"
+        if vt.is_one_hot:
+            if x.ndim != 2:
+                return False, f"one-hot: expected 2D, got shape {tuple(x.shape)}"
+            near_zero = x.abs() <= atol
+            near_one = (x - 1.0).abs() <= atol
+            row_elem_ok = (near_zero | near_one).all(dim=-1)
+            row_sum_ok = (x.sum(dim=-1) - 1.0).abs() <= atol
+            bad_rows = ~(row_elem_ok & row_sum_ok)
+            if bad_rows.any():
+                idx = bad_rows.nonzero(as_tuple=False).flatten().tolist()[:3]
+                return False, f"not one-hot (atol={atol}); rows {idx}"
+        return True, ""
+
+    return Assert(
+        node, predicate, message=f"matches {vt}", claimed_type=vt,
+    )
 
 
 def assert_strictly_less(

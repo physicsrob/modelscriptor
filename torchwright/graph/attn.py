@@ -99,7 +99,6 @@ class Attn(Node):
         self.d_query_in = query_matrix.shape[0]
         self.d_key_in = key_matrix.shape[0]
         self.d_value_in = value_matrix.shape[0]
-        super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
 
         assert key_matrix.shape[1] == self.d_qk
         assert output_matrix.shape[0] == self.d_v
@@ -113,6 +112,7 @@ class Attn(Node):
         self.key_matrix = key_matrix
         self.value_matrix = value_matrix
         self.output_matrix = output_matrix
+        super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         query_in_node, key_in_node, value_in_node = self.inputs

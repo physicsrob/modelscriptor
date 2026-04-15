@@ -53,10 +53,48 @@ threshold) are not expressible in bilinear Q·K. The ``_where`` and
 input rather than synthesising the step function inside the attention op.
 """
 
+import math
+
 import torch
 
 from torchwright.graph import Node, Concatenate, Attn
+from torchwright.graph.asserts import assert_in_range, assert_matches_value_type
 from torchwright.graph.pos_encoding import PosEncoding
+from torchwright.graph.value_type import NodeValueType
+
+
+# Default tolerance for hard-selection output assertions.  At
+# ``_QUERY_GAIN = 8`` the runner-up softmax weight is ``exp(-8) ≈ 3.4e-4``,
+# so contamination of the winning value is at most
+# ``3.4e-4 × value_range_width``.  For typical sort-digit value widths
+# (≤ 10), the observed deviation is ≤ 3e-3; 5e-3 absorbs that plus
+# position-scalar PL fuzz.  Callers producing larger-magnitude values
+# should pass a larger ``atol``.
+_HARD_SELECTION_ATOL = 5e-3
+
+
+def _wrap_hard_selection_output(attn: Attn, value: Node, atol: float = _HARD_SELECTION_ATOL) -> Node:
+    """Bake a value-type guarantee onto a hard-selection primitive's output.
+
+    Hard-selection primitives construct Q/K so that softmax concentrates
+    overwhelmingly on one key per query, and use identity (or identity-
+    embedded) V/O so the selected row passes through unchanged.  Under
+    those preconditions the output equals exactly one row of ``value``,
+    inheriting its full static ``value_type``.
+
+    This helper wraps the Attn in an Assert that (a) promotes the
+    claim statically via ``claimed_type``, and (b) runs a runtime
+    predicate during reference_eval checking each claimed property to
+    within ``atol`` — the safety net that catches construction errors
+    (insufficient gain, score ties, non-identity V/O, etc.).
+
+    If ``value.value_type`` is ``unknown``, skips wrapping (no claim to
+    promote, no predicate to run).
+    """
+    vt = value.value_type
+    if vt == NodeValueType.unknown():
+        return attn
+    return assert_matches_value_type(attn, vt, atol=atol)
 
 
 # Coefficient applied to the slowest-cosine component of the positional
@@ -273,7 +311,8 @@ def attend_argmin(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
     key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq  # latest-position tiebreak
     key_matrix[d_pos, 0] = -1.0                         # smaller score → larger logit
 
-    return _build_selection_attn(pos_encoding, key_in, key_matrix, value)
+    attn = _build_selection_attn(pos_encoding, key_in, key_matrix, value)
+    return _wrap_hard_selection_output(attn, value)
 
 
 def attend_argmax(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
@@ -301,7 +340,8 @@ def attend_argmax(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
     key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq  # latest-position tiebreak
     key_matrix[d_pos, 0] = 1.0                          # larger score → larger logit
 
-    return _build_selection_attn(pos_encoding, key_in, key_matrix, value)
+    attn = _build_selection_attn(pos_encoding, key_in, key_matrix, value)
+    return _wrap_hard_selection_output(attn, value)
 
 
 def attend_argmin_where(
@@ -352,9 +392,10 @@ def attend_argmin_where(
     """
     assert len(score) == 1, "attend_argmin_where expects a 1D scalar score"
     assert len(validity) == 1, "attend_argmin_where expects a 1D boolean validity"
-    return _build_where_attn(
+    attn = _build_where_attn(
         pos_encoding, score, validity, value, score_sign=-1.0,
     )
+    return _wrap_hard_selection_output(attn, value)
 
 
 def attend_argmax_where(
@@ -379,9 +420,10 @@ def attend_argmax_where(
     """
     assert len(score) == 1, "attend_argmax_where expects a 1D scalar score"
     assert len(validity) == 1, "attend_argmax_where expects a 1D boolean validity"
-    return _build_where_attn(
+    attn = _build_where_attn(
         pos_encoding, score, validity, value, score_sign=+1.0,
     )
+    return _wrap_hard_selection_output(attn, value)
 
 
 def attend_argmin_above_integer(
@@ -499,7 +541,7 @@ def attend_argmin_above_integer(
         value_matrix[v, 1 + n_thresholds + v] = 1.0
         output_matrix[1 + n_thresholds + v, v] = 1.0
 
-    return Attn(
+    attn = Attn(
         query_in=query_in,
         key_in=key_in,
         value_in=value,
@@ -508,6 +550,7 @@ def attend_argmin_above_integer(
         value_matrix=value_matrix,
         output_matrix=output_matrix,
     )
+    return _wrap_hard_selection_output(attn, value)
 
 
 def attend_argmin_unmasked(
@@ -632,7 +675,7 @@ def attend_argmin_unmasked(
         value_matrix[v, 1 + n_slots + v] = 1.0
         output_matrix[1 + n_slots + v, v] = 1.0
 
-    return Attn(
+    attn = Attn(
         query_in=query_in,
         key_in=key_in,
         value_in=value,
@@ -641,6 +684,7 @@ def attend_argmin_unmasked(
         value_matrix=value_matrix,
         output_matrix=output_matrix,
     )
+    return _wrap_hard_selection_output(attn, value)
 
 
 def attend_argmin_valid_unmasked(
@@ -749,7 +793,7 @@ def attend_argmin_valid_unmasked(
         value_matrix[v, 1 + n_slots + v] = 1.0
         output_matrix[1 + n_slots + v, v] = 1.0
 
-    return Attn(
+    attn = Attn(
         query_in=query_in,
         key_in=key_in,
         value_in=value,
@@ -758,6 +802,7 @@ def attend_argmin_valid_unmasked(
         value_matrix=value_matrix,
         output_matrix=output_matrix,
     )
+    return _wrap_hard_selection_output(attn, value)
 
 
 def attend_mean_where(
@@ -824,7 +869,7 @@ def attend_mean_where(
     value_matrix = torch.eye(d_v)
     output_matrix = torch.eye(d_v)
 
-    return Attn(
+    attn = Attn(
         query_in=pos_encoding,
         key_in=validity,
         value_in=value,
@@ -833,6 +878,13 @@ def attend_mean_where(
         value_matrix=value_matrix,
         output_matrix=output_matrix,
     )
+    # Mean of values in [lo, hi] stays in [lo, hi] (convex combination),
+    # but integer-ness / binary-ness / one-hot-ness do not survive the
+    # soft mean.  Only promote the range claim.
+    r = value.value_type.value_range
+    if math.isfinite(r.lo) and math.isfinite(r.hi):
+        return assert_in_range(attn, r.lo, r.hi, atol=_HARD_SELECTION_ATOL)
+    return attn
 
 
 def attend_argmax_dot(
@@ -936,7 +988,7 @@ def attend_argmax_dot(
     value_matrix = torch.eye(d_v)
     output_matrix = torch.eye(d_v)
 
-    return Attn(
+    attn = Attn(
         query_in=query_in,
         key_in=key_in,
         value_in=value,
@@ -945,3 +997,4 @@ def attend_argmax_dot(
         value_matrix=value_matrix,
         output_matrix=output_matrix,
     )
+    return _wrap_hard_selection_output(attn, value)

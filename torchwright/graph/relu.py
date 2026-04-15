@@ -1,5 +1,6 @@
 import torch
 from torchwright.graph import Node
+from torchwright.graph.value_type import NodeValueType
 
 
 class ReLU(Node):
@@ -12,3 +13,18 @@ class ReLU(Node):
 
         # Apply ReLU operation
         return torch.clamp(x, min=0.0)
+
+    def compute_value_type(self) -> NodeValueType:
+        t = self.inputs[0].value_type
+        new_range = t.value_range.relu()
+        # sign-valued input ({-1, +1}) maps to binary {0, 1}; binary stays
+        # binary; one-hot-ness is preserved only for already-binary inputs.
+        new_binary = t.is_binary or (t.is_sign and t.is_integer)
+        new_one_hot = t.is_one_hot and t.is_binary
+        return NodeValueType(
+            value_range=new_range,
+            is_integer=t.is_integer,
+            is_binary=new_binary,
+            is_sign=False,
+            is_one_hot=new_one_hot,
+        )
