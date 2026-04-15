@@ -66,7 +66,7 @@ def generate_transformer(
     frames: int = 10,
     fps: int = 10,
     scale: int = 4,
-    d: int = 2048,
+    d: int = 3072,
 ) -> bytes:
     from torchwright.doom.compile import compile_game, step_frame
     from torchwright.doom.map_subset import build_scene_subset
@@ -153,7 +153,7 @@ def main(
     frames: int = 10,
     fps: int = 10,
     scale: int = 4,
-    d: int = 2048,
+    d: int = 3072,
 ):
     # Launch both in parallel
     transformer_call = generate_transformer.spawn(
