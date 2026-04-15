@@ -126,6 +126,7 @@ def build_game_graph(
     turn_speed: int = 4,
     chunk_size: int = 20,
     max_bsp_nodes: int = 48,
+    tex_sample_batch_size: int = 8,
 ) -> Tuple[GameGraphIO, PosEncoding]:
     """Build the walls-as-tokens game graph.
 
@@ -273,6 +274,7 @@ def build_game_graph(
         chunk_size=cs,
         max_coord=max_coord,
         max_walls=max_walls,
+        tex_sample_batch_size=tex_sample_batch_size,
     )
 
     # ---------- Output assembly ----------

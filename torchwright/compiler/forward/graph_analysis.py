@@ -83,6 +83,8 @@ class GraphAnalyzer:
         """Check if all of a node's inputs are available.
 
         Concatenate nodes are transparent — we check their leaf children instead.
+        Scheduling predecessors (set by hint helpers like
+        ``sequential_scope``) also gate readiness but aren't data inputs.
         """
         for inp in node.inputs:
             if isinstance(inp, Concatenate):
@@ -92,6 +94,9 @@ class GraphAnalyzer:
             else:
                 if inp not in available:
                     return False
+        for pred in node.scheduling_predecessors:
+            if pred not in available:
+                return False
         return True
 
     def get_ready_nodes(self, available: Set[Node]) -> Set[Node]:
