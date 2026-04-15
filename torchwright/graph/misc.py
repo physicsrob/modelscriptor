@@ -1,7 +1,16 @@
-from typing import List, Dict, Optional
+from typing import Callable, List, Dict, Optional, Tuple
 from torchwright.graph import Node
 
 import torch
+
+
+# A predicate maps a value tensor to ``(ok, detail)`` where ``detail`` is a
+# short human-readable hint included in the assertion message when ``ok``
+# is False.  Predicates receive the full ``(n_pos, d_output)`` tensor;
+# position-gating (e.g. "only at WALL positions") is the *caller*'s
+# responsibility — wrap the value in ``select(is_wall, ...)`` before
+# asserting so the predicate operates on the already-gated tensor.
+Predicate = Callable[[torch.Tensor], Tuple[bool, str]]
 
 
 class InputNode(Node):
@@ -121,3 +130,44 @@ class ValueLogger(Node):
         x = inp.compute(n_pos, input_values)
         print(f"ValueLogger({self.name}): shape={x.shape} value={x}")
         return x
+
+
+class Assert(Node):
+    """Pass-through node that validates its input's value against a predicate.
+
+    Invisible to the compiler — stripped in ``GraphAnalyzer`` before
+    scheduling, so compiled transformer weights are identical with or
+    without Asserts.  During reference evaluation (``reference_eval``)
+    and compiled-graph probing (``probe_compiled``), runs the predicate
+    on the input value and raises ``AssertionError`` on rejection.
+
+    The raised message incorporates this Assert's ``annotation`` (set by
+    the surrounding ``annotate()`` context manager) plus the predicate's
+    ``detail`` string, so failures pinpoint both the site and the value.
+    """
+
+    def __init__(self, inp: Node, predicate: Predicate, message: str = ""):
+        self.predicate = predicate
+        self.message = message
+        super().__init__(len(inp), [inp])
+
+    def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
+        x = self.inputs[0].compute(n_pos, input_values)
+        self._check(x)
+        return x
+
+    def _check(self, x: torch.Tensor) -> None:
+        """Run the predicate; raise AssertionError with context on failure.
+
+        Shared by ``compute`` (reference-eval path) and ``probe_compiled``
+        (compiled-graph path) so both paths produce identical failure
+        messages.
+        """
+        ok, detail = self.predicate(x)
+        if not ok:
+            site = self.annotation or f"node_{self.node_id}"
+            msg_parts = [f"Assert failed at {site}"]
+            if self.message:
+                msg_parts.append(self.message)
+            msg_parts.append(f"({detail})")
+            raise AssertionError(": ".join(msg_parts[:-1]) + " " + msg_parts[-1])

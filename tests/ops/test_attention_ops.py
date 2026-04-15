@@ -33,6 +33,7 @@ from torchwright.ops.attention_ops import (
     attend_argmax_where,
     attend_argmin_above_integer,
     attend_argmin_unmasked,
+    attend_argmin_valid_unmasked,
     attend_mean_where,
 )
 
@@ -486,6 +487,172 @@ def test_attend_argmin_unmasked_advances_through_all_slots():
     assert torch.allclose(result[1], value_in[1], atol=1e-2), f"pos 1: {result[1]}"
     assert torch.allclose(result[2], value_in[2], atol=1e-2), f"pos 2: {result[2]}"
     assert torch.allclose(result[3], value_in[3], atol=1e-2), f"pos 3: {result[3]}"
+
+
+# ---------------------------------------------------------------------------
+# attend_argmin_valid_unmasked
+# ---------------------------------------------------------------------------
+
+
+def test_attend_argmin_valid_unmasked_all_valid_empty_mask_picks_min():
+    """All keys valid, empty mask — behaves like a plain argmin."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    validity = InputNode("validity", 1)
+    mask = InputNode("mask", 4)
+    onehot = InputNode("onehot", 4)
+    value = InputNode("value", 4)
+    out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
+
+    n_pos = 4
+    score_in = torch.tensor([[5.0], [3.0], [1.0], [4.0]])
+    validity_in = torch.tensor([[1.0], [1.0], [1.0], [1.0]])
+    onehot_in = torch.eye(4, 4)
+    mask_in = torch.zeros(4, 4)
+    value_in = torch.eye(4, 4) * 2.0
+
+    result = _run(
+        out, n_pos, score=score_in, validity=validity_in,
+        mask=mask_in, onehot=onehot_in, value=value_in,
+    )
+    # Argmin over prefixes: pos 0, pos 1, pos 2, pos 2.
+    assert torch.allclose(result[0], value_in[0], atol=1e-2), f"pos 0: {result[0]}"
+    assert torch.allclose(result[1], value_in[1], atol=1e-2), f"pos 1: {result[1]}"
+    assert torch.allclose(result[2], value_in[2], atol=1e-2), f"pos 2: {result[2]}"
+    assert torch.allclose(result[3], value_in[2], atol=1e-2), f"pos 3: {result[3]}"
+
+
+def test_attend_argmin_valid_unmasked_validity_overrides_low_score():
+    """The lowest-score key is invalid — attention picks the next-lowest valid."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    validity = InputNode("validity", 1)
+    mask = InputNode("mask", 4)
+    onehot = InputNode("onehot", 4)
+    value = InputNode("value", 4)
+    out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
+
+    n_pos = 4
+    # pos 2 has lowest score (1.0) but is invalid.  Next-lowest valid = pos 1 (3.0).
+    score_in = torch.tensor([[5.0], [3.0], [1.0], [4.0]])
+    validity_in = torch.tensor([[1.0], [1.0], [-1.0], [1.0]])
+    onehot_in = torch.eye(4, 4)
+    mask_in = torch.zeros(4, 4)
+    value_in = torch.eye(4, 4) * 2.0
+
+    result = _run(
+        out, n_pos, score=score_in, validity=validity_in,
+        mask=mask_in, onehot=onehot_in, value=value_in,
+    )
+    assert torch.allclose(result[1], value_in[1], atol=1e-2), f"pos 1: {result[1]}"
+    assert torch.allclose(result[2], value_in[1], atol=1e-2), f"pos 2: {result[2]}"
+    assert torch.allclose(result[3], value_in[1], atol=1e-2), f"pos 3: {result[3]}"
+
+
+def test_attend_argmin_valid_unmasked_mask_excludes_picked():
+    """All valid, but the min-score slot is masked — expect next-best unmasked."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    validity = InputNode("validity", 1)
+    mask = InputNode("mask", 4)
+    onehot = InputNode("onehot", 4)
+    value = InputNode("value", 4)
+    out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
+
+    n_pos = 4
+    score_in = torch.tensor([[5.0], [3.0], [1.0], [4.0]])
+    validity_in = torch.ones(4, 1)
+    onehot_in = torch.eye(4, 4)
+    # From pos 2 onwards, slot 2 is masked.
+    mask_in = torch.tensor([
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ])
+    value_in = torch.eye(4, 4) * 2.0
+
+    result = _run(
+        out, n_pos, score=score_in, validity=validity_in,
+        mask=mask_in, onehot=onehot_in, value=value_in,
+    )
+    # pos 2: slot 2 masked, min of {0,1} is pos 1 (score 3).
+    # pos 3: {0,1,3} unmasked, min is pos 1 (score 3).
+    assert torch.allclose(result[2], value_in[1], atol=1e-2), f"pos 2: {result[2]}"
+    assert torch.allclose(result[3], value_in[1], atol=1e-2), f"pos 3: {result[3]}"
+
+
+def test_attend_argmin_valid_unmasked_mask_and_validity_combined():
+    """Lowest score is masked, second-lowest invalid — pick third (valid + unmasked)."""
+    pe = _pe()
+    score = InputNode("score", 1)
+    validity = InputNode("validity", 1)
+    mask = InputNode("mask", 4)
+    onehot = InputNode("onehot", 4)
+    value = InputNode("value", 4)
+    out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
+
+    n_pos = 4
+    # Scores: 5 (pos 0), 3 (pos 1), 1 (pos 2), 4 (pos 3).
+    # pos 2 (lowest) is masked; pos 1 (second-lowest) is invalid.
+    # Expect pos 3 (third-lowest, valid, unmasked) at query pos 3.
+    score_in = torch.tensor([[5.0], [3.0], [1.0], [4.0]])
+    validity_in = torch.tensor([[1.0], [-1.0], [1.0], [1.0]])
+    onehot_in = torch.eye(4, 4)
+    mask_in = torch.tensor([
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ])
+    value_in = torch.eye(4, 4) * 2.0
+
+    result = _run(
+        out, n_pos, score=score_in, validity=validity_in,
+        mask=mask_in, onehot=onehot_in, value=value_in,
+    )
+    # pos 3: valid-unmasked set = {0 (s=5), 3 (s=4)}, argmin = pos 3.
+    assert torch.allclose(result[3], value_in[3], atol=1e-2), f"pos 3: {result[3]}"
+
+
+def test_attend_argmin_valid_unmasked_all_valid_masked_repicks_masked():
+    """No valid+unmasked key available — attention falls back to a masked-valid key.
+
+    Documents the wasteful-but-safe end-of-sort behavior: when the whole
+    valid set has been picked, the softmax prefers a masked-valid key
+    over any unmasked-invalid key (validity dominates mask).  The caller
+    gets back one of the previously-picked valid values rather than
+    garbage from an invalid position.
+    """
+    pe = _pe()
+    score = InputNode("score", 1)
+    validity = InputNode("validity", 1)
+    mask = InputNode("mask", 4)
+    onehot = InputNode("onehot", 4)
+    value = InputNode("value", 4)
+    out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
+
+    n_pos = 4
+    # Only pos 1 is valid — and its slot is masked.
+    # Pos 0, 2, 3 are invalid (unmasked).
+    score_in = torch.tensor([[5.0], [3.0], [1.0], [4.0]])
+    validity_in = torch.tensor([[-1.0], [1.0], [-1.0], [-1.0]])
+    onehot_in = torch.eye(4, 4)
+    # Mask bit 1 on from query pos 1 onward (the one valid slot).
+    mask_in = torch.tensor([
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+    ])
+    value_in = torch.eye(4, 4) * 2.0
+
+    result = _run(
+        out, n_pos, score=score_in, validity=validity_in,
+        mask=mask_in, onehot=onehot_in, value=value_in,
+    )
+    # At pos 3, masked-valid (pos 1) must still win over any unmasked-invalid.
+    assert torch.allclose(result[3], value_in[1], atol=1e-2), f"pos 3: {result[3]}"
 
 
 # ---------------------------------------------------------------------------

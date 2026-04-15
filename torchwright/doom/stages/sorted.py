@@ -2,10 +2,11 @@
 
 At each SORTED_WALL token the graph:
 
-1. Runs ``attend_argmin_unmasked`` over WALL positions using the BSP
-   rank as the score, masked by the running ``prev_mask``.  Emits the
-   selected wall's payload (geometry + render precomp + position
-   one-hot) plus the updated mask.
+1. Runs ``attend_argmin_valid_unmasked`` over WALL positions using the
+   BSP rank as the score, gated by the per-wall ``is_renderable`` flag
+   and masked by the running ``prev_mask``.  Emits the selected wall's
+   payload (geometry + render precomp + position one-hot) plus the
+   updated mask.
 2. Derives the selection's **sort rank** — literally the number of
    walls already picked (``sum(prev_mask)``) — which the THINKING
    stage uses as a second-order sort key (walls are picked in BSP
@@ -30,6 +31,11 @@ from dataclasses import dataclass
 import torch
 
 from torchwright.graph import Concatenate, Linear, Node, annotate
+from torchwright.graph.asserts import (
+    assert_distinct_across,
+    assert_picked_from,
+    assert_score_gap_at_least,
+)
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import (
     abs,
@@ -44,7 +50,7 @@ from torchwright.ops.arithmetic_ops import (
     reciprocal,
     subtract,
 )
-from torchwright.ops.attention_ops import attend_argmin_unmasked
+from torchwright.ops.attention_ops import attend_argmin_valid_unmasked
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.logic_ops import cond_gate
 from torchwright.ops.map_select import in_range, select
@@ -66,7 +72,8 @@ from torchwright.doom.wall_payload import (
 @dataclass
 class SortedInputs:
     # WALL-stage outputs (per-WALL-position Nodes read via attention).
-    sort_score: Node        # bsp_rank at WALL positions, sentinel elsewhere
+    sort_score: Node        # clean integer BSP rank at WALL positions
+    is_renderable: Node     # ±1 validity: true iff wall is real + not parallel + in front
     position_onehot: Node
     sort_value: Node
 
@@ -78,8 +85,11 @@ class SortedInputs:
     eos_py: Node
     eos_angle: Node
 
-    # Token-type flag (1.0 at SORTED_WALL positions).
+    # Token-type flags.  ``is_wall`` is consumed only by the attention
+    # assertions (keys-validity) — the argmin itself already ignores
+    # non-WALL positions via their sentinel scores.
     is_sorted: Node
+    is_wall: Node
 
     pos_encoding: PosEncoding
 
@@ -155,13 +165,53 @@ def build_sorted(
 
 
 def _argmin_and_derive(inputs: SortedInputs, max_walls: int):
-    """Pick the nearest unmasked wall + derive sort_rank + gate render data."""
-    selected_sort = attend_argmin_unmasked(
+    """Pick the nearest unmasked wall + derive sort_rank + gate render data.
+
+    Three invariants are asserted around the argmin:
+
+    * ``sort_score`` values at WALL positions must be pairwise distinct
+      (``assert_distinct_across``) — tied ranks would make the softmax
+      blend walls.  Sort scores are clean integer BSP ranks (1.0 gaps),
+      so the 0.8 margin has plenty of headroom.
+    * The two smallest valid scores must differ by at least the
+      softmax-resolvability margin (``assert_score_gap_at_least``).
+      With unit-integer rank spacing the 0.5 margin is comfortably met.
+    * The attention output must match exactly one ``sort_value`` row
+      from a valid (WALL) position (``assert_picked_from``).  Reference
+      math's exact softmax always picks; this assertion is for the
+      compile-side probe, where the piecewise-linear softmax can blend
+      near-ties.
+    """
+    # Pre-attention: scores at WALL positions must be pairwise distinct.
+    checked_score = assert_distinct_across(
+        inputs.sort_score, inputs.is_wall, margin=0.8,
+    )
+    checked_score = assert_score_gap_at_least(
+        checked_score, inputs.is_wall, margin=0.5,
+    )
+
+    # TODO(end-of-sort): when ``N_renderable < max_walls``, after all
+    # renderable walls are picked the masked-valid fallback re-picks the
+    # last-picked wall.  RENDER then overdraws; the host's per-pixel
+    # dedup (``filled[y, c]``) hides the waste.  A principled fix is a
+    # compiled "done" signal that SORTED emits once all renderables are
+    # exhausted, letting downstream stages short-circuit instead of
+    # repeating work.
+    selected_sort = attend_argmin_valid_unmasked(
         pos_encoding=inputs.pos_encoding,
-        score=inputs.sort_score,
+        score=checked_score,
+        validity=inputs.is_renderable,
         mask_vector=inputs.prev_mask,
         position_onehot=inputs.position_onehot,
         value=inputs.sort_value,
+    )
+
+    # Post-attention: result must match exactly one value row from a
+    # WALL position (within atol).  This rarely fires at reference eval
+    # but catches compile-side softmax blending via
+    # ``check_asserts_on_compiled``.
+    selected_sort = assert_picked_from(
+        selected_sort, inputs.sort_value, inputs.is_wall, atol=0.01,
     )
     unpacked = unpack_wall_payload(selected_sort, max_walls)
     sel_wall_data = unpacked.wall_data

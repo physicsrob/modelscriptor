@@ -990,11 +990,15 @@ def _compute_io_layout(
                 target_cols = list(range(in_offset, in_offset + width))
                 overlays[out_node] = (in_node, target_cols)
             else:
-                # Overflow: output after input region, also via delta transfer
-                # (delta transfer from source to overflow cols, subtracting zero)
+                # Overflow: output after input region, also via delta
+                # transfer.  Like the overlay case, the delta layer
+                # subtracts whatever is currently at ``target_cols`` (see
+                # forward/compile.py where ``subtract_cols = target_cols``
+                # unconditionally), so the overflow path does not rely on
+                # the caller zero-initialising the overflow region.
                 output_specs.append((name, overflow_offset, width, out_node))
                 target_cols = list(range(overflow_offset, overflow_offset + width))
-                overlays[out_node] = (None, target_cols)  # None means subtract zero
+                overlays[out_node] = (None, target_cols)
                 overflow_offset += width
 
     return input_specs, output_specs, overlays, d_input
@@ -1343,6 +1347,15 @@ def _compile_headless_legacy(
     trim_heads: bool,
 ) -> CompiledHeadless:
     """Legacy compile_headless implementation using output_node parameter."""
+    # Unwrap Assert nodes at the output root — compilation strips them
+    # from the interior of the graph, but the caller's output_node
+    # reference may still point at one.  Downstream lookups
+    # (residual-stream indices, etc.) must match the compiled graph's
+    # effective terminal node.
+    from torchwright.graph.misc import Assert
+    while isinstance(output_node, Assert):
+        output_node = output_node.inputs[0]
+
     net = forward_compile(
         d=d,
         d_head=d_head,

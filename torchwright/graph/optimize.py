@@ -84,6 +84,12 @@ def fuse_consecutive_linears(
 
         fusions.append((l1, l2))
 
+    # Sort upstream-first so L1→L2 is always processed before L2→L3.
+    # Without this, if set iteration visits L3 before L2, we'd process
+    # (L2,L3) first, leaving L3 depending on L1 — then a second pass
+    # finds a new (L1,L3) pair and reports one extra fusion.
+    fusions.sort(key=lambda pair: pair[0].node_id)
+
     if verbose and fusions:
         print(f"Fusing {len(fusions)} consecutive Linear pairs:")
 

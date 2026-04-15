@@ -25,7 +25,7 @@ class AttnHeadOp:
         "compute_attn", "compute_linear", "compute_add", "cancel", "add_into",
         "delta_transfer"
     ]
-    node: Node
+    node: Optional[Node]
     target_cols: List[int]
     # Primary source columns captured at schedule time.  Meaning depends on
     # op_type:
@@ -303,21 +303,23 @@ def _write_compute_add(
 def _write_cancel(
     attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
 ):
-    """Cancel a node: V=identity, O=-identity. Skip adds x + (-x) = 0.
+    """Cancel target_cols: V=identity, O=-identity. Skip adds x + (-x) = 0.
 
-    Splits across multiple heads for nodes wider than d_head.
+    Splits across multiple heads when wider than d_head.  Used both to
+    zero a dead node's columns before reuse and to clear dirty columns
+    that the caller's initial residual stream may have populated with
+    garbage.
     """
-    node = op.node
     d_head = attn.d_head
-    d_node = len(node)
+    d_width = len(op.target_cols)
 
     pe_idx = rmap.get_indices(pos_encoding)
     node_idx = op.target_cols
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
 
-    for start in range(0, d_node, d_head):
-        end = min(start + d_head, d_node)
+    for start in range(0, d_width, d_head):
+        end = min(start + d_head, d_width)
         chunk_size = end - start
 
         chunk_idx = node_idx[start:end]

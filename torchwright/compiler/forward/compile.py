@@ -57,7 +57,9 @@ def _count_layer_params(
             heads_used += (d_input + d_head - 1) // d_head
         elif op.op_type == "compute_add":
             heads_used += 2 * ((len(op.node) + d_head - 1) // d_head)
-        elif op.op_type in ("cancel", "add_into"):
+        elif op.op_type == "cancel":
+            heads_used += (len(op.target_cols) + d_head - 1) // d_head
+        elif op.op_type == "add_into":
             heads_used += (len(op.node) + d_head - 1) // d_head
 
     slots_used = 0
@@ -124,6 +126,10 @@ def forward_compile(
     """
     # 1. Analyze graph
     graph = GraphAnalyzer(output_node)
+    # GraphAnalyzer may have stripped the output if it was an Assert; use
+    # the effective output from here on so the loop's termination check
+    # matches the graph's actual terminal node.
+    output_node = graph.get_output_node()
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
 
     # Auto-create pos_encoding if needed (required for attention ops)
@@ -137,8 +143,13 @@ def forward_compile(
     net = HeadlessTransformer(d, d_head, pos_encoding, d_hidden=d_hidden)
     residual_map = ResidualStreamMap(d)
     residual_map.allocate(pos_encoding)
+    # pos_encoding + input_nodes are populated by get_input_res_stream at
+    # forward-time, so those cols are guaranteed clean on entry.  Every
+    # other col is dirty until a cancel op clears it.
+    residual_map.mark_clean(residual_map.get_indices(pos_encoding))
     for node in input_nodes:
         residual_map.allocate(node)
+        residual_map.mark_clean(residual_map.get_indices(node))
     computed = set(input_nodes)
 
     # Static sibling-cluster analysis for admission control.  When

@@ -7,10 +7,13 @@ At every WALL token the graph computes, for one wall segment:
   resolution.
 * **BSP rank** ``rank(W) = dot(coeffs_W, side_P_vec) + const_W`` — a
   front-to-back sort key derived from the BSP tree's spatial structure.
-  Walls parallel to the viewing ray (``|sort_den|`` ≈ 0) or behind the
-  player (``num_t`` disagrees in sign with ``den``) get a sentinel so
-  they sort last.  Used as the score by SORTED's
-  ``attend_argmin_unmasked``.
+  A clean integer permutation of ``0..N-1``; used as the score by
+  SORTED's ``attend_argmin_valid_unmasked``.
+* **Renderability flag** ``is_renderable`` — ±1 boolean, true iff this
+  is a real wall token whose central ray is not parallel to the wall
+  and whose intersection is in front of the player.  SORTED's argmin
+  treats non-renderable walls as *invalid keys* rather than folding the
+  concern into the sort score.
 * **Render precomputations** ``sort_den, C, D, E, H_inv`` — the wall
   geometry rotated into the player's angular frame so RENDER only
   needs per-column angle offsets.
@@ -103,6 +106,7 @@ class WallOutputs:
     sort_score: Node        # per-position, fed as ``score`` to SORTED's argmin
     sort_value: Node        # packed payload, fed as ``value`` to SORTED's argmin
     position_onehot: Node   # per-wall one-hot + 0.5 bias, fed to SORTED argmin
+    is_renderable: Node     # ±1 validity signal fed to SORTED's argmin
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +135,7 @@ def build_wall(
         )
 
     with annotate("bsp/rank"):
-        bsp_rank = _compute_bsp_rank(
+        bsp_rank, is_renderable = _compute_bsp_rank(
             inputs, sort_den, sort_num_t, max_bsp_nodes,
         )
 
@@ -151,6 +155,7 @@ def build_wall(
         sort_score=bsp_rank,
         sort_value=sort_value,
         position_onehot=position_onehot,
+        is_renderable=is_renderable,
     )
 
 
@@ -344,8 +349,8 @@ def _compute_bsp_rank(
     sort_den: Node,
     sort_num_t: Node,
     max_bsp_nodes: int,
-) -> Node:
-    """BSP-derived front-to-back sort key.
+):
+    """BSP-derived front-to-back sort key + per-wall renderability flag.
 
         rank(W) = dot(coeffs_W, side_P_vec) + const_W
 
@@ -353,25 +358,18 @@ def _compute_bsp_rank(
     "keep ``coeffs[i]`` where ``side_P[i]=1``, else 0" — implemented per
     element with ``compare + cond_gate``.
 
-    Renderability gate: walls that are parallel to the viewing ray
-    (``|sort_den|`` near zero) or behind the player (``num_t`` disagrees
-    in sign with ``den``) would produce degenerate precomputed values.
-    They get ``bsp_sentinel = 99.0`` so they sort after all renderable
-    walls.  Tie-break among tied sentinels with ``wall_index * 0.1`` so
-    the argmin softmax can concentrate on a single winner instead of
-    averaging across ties.  Non-WALL positions get a slightly higher
-    sentinel (``99.9``) so they always lose to any wall, even an
-    unrenderable one.
+    Renderability: a wall is renderable if it is a real wall token, the
+    central ray is not parallel to it (``|sort_den| > ε``), and the wall
+    is in front of the player (``num_t`` agrees in sign with ``den``).
+    Renderability is returned as a separate ±1 boolean so SORTED's
+    argmin can treat non-renderable walls as *invalid keys* via
+    ``attend_argmin_valid_unmasked`` rather than having to encode them
+    into the sort score with a sentinel. The sort score itself is thus a
+    clean integer rank (BSP-permutation in ``0..N-1``); no tiebreak, no
+    sentinel, no gating.
 
-    Constraints:
-    * Real BSP ranks are a permutation of ``0..N-1`` with ``N ≤
-      max_walls``; sentinels must stay above ``max_walls - 1``.
-    * The tie-break offset ``0.1 * (max_walls-1)`` must stay below
-      ``1.0`` so real-rank spacing (1.0) is preserved — limiting this
-      scheme to ``max_walls ≤ 10``.
-    * Sentinels must stay within ``|score| ≤ 100`` (the
-      ``attend_argmin_unmasked`` bound) so the mask penalty can still
-      override them.
+    Returns:
+        ``(bsp_rank, is_renderable)`` — both per-position ``Node``s.
     """
     # Per-element product: keep coeffs[i] where side_P[i]=1, else 0.
     bsp_products = []
@@ -387,32 +385,17 @@ def _compute_bsp_rank(
         s_bool = compare(s_i, 0.5)
         bsp_products.append(cond_gate(s_bool, c_i))
     bsp_dot = sum_nodes(bsp_products)
-    bsp_rank_raw = add(bsp_dot, inputs.wall_bsp_const)
+    bsp_rank = add(bsp_dot, inputs.wall_bsp_const)
 
-    # Renderability gate: |sort_den| > ε AND num_t × sign(den) > 0.
+    # Renderability: is_wall AND |sort_den| > ε AND num_t × sign(den) > 0.
     abs_sort_den = abs(sort_den)
     is_den_ok = compare(abs_sort_den, 0.05)
     den_sign = compare(sort_den, 0.0)
     adj_num_t = select(den_sign, sort_num_t, negate(sort_num_t))
     is_t_pos = compare(adj_num_t, 0.0)
-    is_wall_renderable = bool_all_true([is_den_ok, is_t_pos])
+    is_renderable = bool_all_true([inputs.is_wall, is_den_ok, is_t_pos])
 
-    bsp_sentinel = create_literal_value(
-        torch.tensor([99.0]), name="bsp_sentinel",
-    )
-    bsp_rank_filtered = select(
-        is_wall_renderable, bsp_rank_raw, bsp_sentinel,
-    )
-    bsp_rank_tiebroken = add(
-        bsp_rank_filtered, multiply_const(inputs.wall_index, 0.1),
-    )
-
-    # Non-wall positions get a strictly higher sentinel so they never
-    # tie with wall_index=0's tiebroken sentinel.
-    nonwall_sentinel = create_literal_value(
-        torch.tensor([99.9]), name="nonwall_sentinel",
-    )
-    return select(inputs.is_wall, bsp_rank_tiebroken, nonwall_sentinel)
+    return bsp_rank, is_renderable
 
 
 def _compute_position_onehot(wall_index: Node, max_walls: int) -> Node:

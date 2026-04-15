@@ -96,6 +96,57 @@ def wall_collision_module():
     )
 
 
+@pytest.fixture(scope="module")
+def wall_sort_value_module():
+    """Compile the packed ``sort_value`` output of build_wall.
+
+    Used to answer the angle-192 diagnostic question: does
+    ``pack_wall_payload(wall_ax, wall_ay, wall_bx, wall_by, ...)``
+    emit clean values at the WALL token's residual-stream slot, or
+    does the WALL stage drift ax/by relative to their host-fed inputs?
+    """
+    pos = create_pos_encoding()
+
+    is_wall = create_input("is_wall", 1)
+    move_cos = create_input("move_cos", 1)
+    move_sin = create_input("move_sin", 1)
+    player_x = create_input("player_x", 1)
+    player_y = create_input("player_y", 1)
+    vel_dx = create_input("vel_dx", 1)
+    vel_dy = create_input("vel_dy", 1)
+    wall_ax = create_input("wall_ax", 1)
+    wall_ay = create_input("wall_ay", 1)
+    wall_bx = create_input("wall_bx", 1)
+    wall_by = create_input("wall_by", 1)
+    wall_index = create_input("wall_index", 1)
+    wall_tex_id = create_input("wall_tex_id", 1)
+    wall_bsp_coeffs = create_input("wall_bsp_coeffs", _MAX_BSP_NODES)
+    wall_bsp_const = create_input("wall_bsp_const", 1)
+    side_P_vec = create_input("side_P_vec", _MAX_BSP_NODES)
+
+    outputs = build_wall(
+        WallInputs(
+            wall_ax=wall_ax, wall_ay=wall_ay,
+            wall_bx=wall_bx, wall_by=wall_by,
+            wall_tex_id=wall_tex_id, wall_index=wall_index,
+            player_x=player_x, player_y=player_y,
+            is_wall=is_wall,
+            vel_dx=vel_dx, vel_dy=vel_dy,
+            move_cos=move_cos, move_sin=move_sin,
+            wall_bsp_coeffs=wall_bsp_coeffs,
+            wall_bsp_const=wall_bsp_const,
+            side_P_vec=side_P_vec,
+        ),
+        config=_tiny_config(),
+        max_walls=_MAX_WALLS,
+        max_coord=_MAX_COORD,
+        max_bsp_nodes=_MAX_BSP_NODES,
+    )
+    return compile_headless(
+        outputs.sort_value, pos, d=1024, d_head=32, max_layers=80, verbose=False,
+    )
+
+
 def _pack(module, values: dict) -> torch.Tensor:
     """Pack ``values`` into the tensor layout the compiled ``module`` expects.
 
@@ -205,6 +256,112 @@ def test_collision_flags_match_reference(wall_collision_module, scenario):
     )
 
 
+@pytest.fixture(scope="module")
+def wall_renderable_module():
+    """Compile just the ``is_renderable`` output of build_wall."""
+    pos = create_pos_encoding()
+
+    is_wall = create_input("is_wall", 1)
+    move_cos = create_input("move_cos", 1)
+    move_sin = create_input("move_sin", 1)
+    player_x = create_input("player_x", 1)
+    player_y = create_input("player_y", 1)
+    vel_dx = create_input("vel_dx", 1)
+    vel_dy = create_input("vel_dy", 1)
+    wall_ax = create_input("wall_ax", 1)
+    wall_ay = create_input("wall_ay", 1)
+    wall_bx = create_input("wall_bx", 1)
+    wall_by = create_input("wall_by", 1)
+    wall_index = create_input("wall_index", 1)
+    wall_tex_id = create_input("wall_tex_id", 1)
+    wall_bsp_coeffs = create_input("wall_bsp_coeffs", _MAX_BSP_NODES)
+    wall_bsp_const = create_input("wall_bsp_const", 1)
+    side_P_vec = create_input("side_P_vec", _MAX_BSP_NODES)
+
+    outputs = build_wall(
+        WallInputs(
+            wall_ax=wall_ax, wall_ay=wall_ay,
+            wall_bx=wall_bx, wall_by=wall_by,
+            wall_tex_id=wall_tex_id, wall_index=wall_index,
+            player_x=player_x, player_y=player_y,
+            is_wall=is_wall,
+            vel_dx=vel_dx, vel_dy=vel_dy,
+            move_cos=move_cos, move_sin=move_sin,
+            wall_bsp_coeffs=wall_bsp_coeffs,
+            wall_bsp_const=wall_bsp_const,
+            side_P_vec=side_P_vec,
+        ),
+        config=_tiny_config(),
+        max_walls=_MAX_WALLS,
+        max_coord=_MAX_COORD,
+        max_bsp_nodes=_MAX_BSP_NODES,
+    )
+    return compile_headless(
+        outputs.is_renderable, pos, d=1024, d_head=16, max_layers=50, verbose=False,
+    )
+
+
+def test_is_renderable_output(wall_renderable_module):
+    """``is_renderable`` is +1 for a head-on wall, -1 for a parallel wall,
+    and -1 at non-WALL token positions.
+    """
+    # Head-on wall (vertical wall in front, player facing +x).
+    head_on = _pack(wall_renderable_module, {
+        "is_wall": 1.0,
+        "player_x": 0.0, "player_y": 0.0,
+        "move_cos": 1.0, "move_sin": 0.0,
+        "vel_dx": 0.0, "vel_dy": 0.0,
+        "wall_ax": 2.0, "wall_ay": -1.0,
+        "wall_bx": 2.0, "wall_by": 1.0,
+        "wall_tex_id": 0.0, "wall_index": 0.0,
+        "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
+        "wall_bsp_const": 0.0,
+        "side_P_vec": [0.0] * _MAX_BSP_NODES,
+    })
+    with torch.no_grad():
+        out = wall_renderable_module(head_on)[0]
+    assert out.item() > 0.5, f"head-on wall should be renderable, got {out.item():+.3f}"
+
+    # Parallel wall (horizontal wall in front, player facing +x).
+    # Wall runs along x-axis in front of player; sort_den ≈ 0.
+    parallel = _pack(wall_renderable_module, {
+        "is_wall": 1.0,
+        "player_x": 0.0, "player_y": 0.0,
+        "move_cos": 1.0, "move_sin": 0.0,
+        "vel_dx": 0.0, "vel_dy": 0.0,
+        "wall_ax": 2.0, "wall_ay": 2.0,
+        "wall_bx": 4.0, "wall_by": 2.0,
+        "wall_tex_id": 0.0, "wall_index": 0.0,
+        "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
+        "wall_bsp_const": 0.0,
+        "side_P_vec": [0.0] * _MAX_BSP_NODES,
+    })
+    with torch.no_grad():
+        out = wall_renderable_module(parallel)[0]
+    assert out.item() < -0.5, (
+        f"parallel wall should be non-renderable, got {out.item():+.3f}"
+    )
+
+    # Non-WALL token position (is_wall=0).
+    non_wall = _pack(wall_renderable_module, {
+        "is_wall": 0.0,
+        "player_x": 0.0, "player_y": 0.0,
+        "move_cos": 1.0, "move_sin": 0.0,
+        "vel_dx": 0.0, "vel_dy": 0.0,
+        "wall_ax": 2.0, "wall_ay": -1.0,
+        "wall_bx": 2.0, "wall_by": 1.0,
+        "wall_tex_id": 0.0, "wall_index": 0.0,
+        "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
+        "wall_bsp_const": 0.0,
+        "side_P_vec": [0.0] * _MAX_BSP_NODES,
+    })
+    with torch.no_grad():
+        out = wall_renderable_module(non_wall)[0]
+    assert out.item() < -0.5, (
+        f"non-WALL position should be non-renderable, got {out.item():+.3f}"
+    )
+
+
 def test_non_wall_positions_always_miss(wall_collision_module):
     """With is_wall=0, all three hit flags should be gated to -1 (miss)."""
     inputs = _pack(wall_collision_module, {
@@ -221,3 +378,74 @@ def test_non_wall_positions_always_miss(wall_collision_module):
             f"{name} should be gated to miss at non-WALL positions, "
             f"got {out[i].item():+.2f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Angle-192 diagnostic — does WALL's sort_value drift ax/by for the north wall?
+# ---------------------------------------------------------------------------
+
+
+def test_sort_value_north_wall_clean_at_angle_192(wall_sort_value_module):
+    """Boiled-down reproduction of the angle-192 render bug.
+
+    At angle=192 (facing south), the observed compiled output at
+    ``sort[2]`` shows the north wall payload as
+    ``[4.86, 5.00, -5.00, 4.86]`` instead of the expected
+    ``[5.00, 5.00, -5.00, 5.00]``.  That's a 0.14 drift on ax and by
+    (both +5) but not on ay (+5) or bx (-5).  Because the SORTED-stage
+    argmin was cleared by the isolated unit test
+    (``test_angle_192_sentinel_ties_clean_pick``), the drift must
+    originate at or before the WALL stage.
+
+    This test compiles just ``build_wall``'s ``sort_value`` output,
+    feeds the north wall's inputs with move_cos=0 / move_sin=-1
+    (angle=192), and checks that wall_ax / wall_ay / wall_bx / wall_by
+    read back clean — i.e., the WALL stage's pack_wall_payload doesn't
+    introduce per-field drift.
+
+    If this test PASSES, the drift is introduced downstream of WALL —
+    most likely in how sort_value is stored in the residual stream and
+    routed to the SORTED stage's attention.  If it FAILS, the WALL
+    stage itself miscomputes one of these fields at angle=192.
+    """
+    # North wall of the synthetic box room: (5, 5) → (-5, 5), wall_index=1.
+    # Player at origin; at DOOM angle=192 (facing south, -y direction),
+    # cos(270°)=0, sin(270°)=-1.
+    inputs = _pack(wall_sort_value_module, {
+        "is_wall": 1.0,
+        "player_x": 0.0, "player_y": 0.0,
+        "move_cos": 0.0, "move_sin": -1.0,
+        "vel_dx": 0.0, "vel_dy": 0.0,
+        "wall_ax": 5.0, "wall_ay": 5.0,
+        "wall_bx": -5.0, "wall_by": 5.0,
+        "wall_tex_id": 1.0, "wall_index": 1.0,
+        "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
+        "wall_bsp_const": 0.0,
+        "side_P_vec": [0.0] * _MAX_BSP_NODES,
+    })
+    with torch.no_grad():
+        out = wall_sort_value_module(inputs)[0]
+
+    # sort_value layout (from wall_payload.pack_wall_payload):
+    #   [0]: wall_ax
+    #   [1]: wall_ay
+    #   [2]: wall_bx
+    #   [3]: wall_by
+    #   [4]: wall_tex_id
+    #   [5..9]: render precomp (sort_den, C, D, E, H_inv)
+    #   [10]: bsp_rank
+    #   [11..11+max_walls-1]: position_onehot
+    got = out[:5].tolist()
+    expected = [5.0, 5.0, -5.0, 5.0, 1.0]
+
+    drifts = [abs(g - e) for g, e in zip(got, expected)]
+    max_drift = max(drifts)
+    assert max_drift < 0.05, (
+        f"WALL-stage sort_value drift at angle=192, north wall:\n"
+        f"  got      = {got}\n"
+        f"  expected = {expected}\n"
+        f"  per-field drift = {drifts}\n"
+        f"If any of ax/by specifically drift (≈0.14) while ay/bx don't,\n"
+        f"that matches the integration-test pattern and confirms the\n"
+        f"WALL stage as the source."
+    )

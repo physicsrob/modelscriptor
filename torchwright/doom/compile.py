@@ -131,6 +131,20 @@ def compile_game(
         max_bsp_nodes=max_bsp_nodes,
     )
 
+    # Collect Assert nodes *before* compile strips them so callers can
+    # later run their predicates against the compiled residual stream
+    # via ``check_asserts_on_compiled`` without rebuilding the graph.
+    from torchwright.graph.asserts import collect_asserts
+    collected_asserts: list = []
+    _seen_ids: set = set()
+    for out_node in list(graph_io.overlaid_outputs.values()) + list(
+        graph_io.overflow_outputs.values()
+    ):
+        for a in collect_asserts(out_node):
+            if a.node_id not in _seen_ids:
+                _seen_ids.add(a.node_id)
+                collected_asserts.append(a)
+
     # Run graph optimizations (Linear fusion)
     if optimize:
         from torchwright.graph.optimize import fuse_consecutive_linears
@@ -179,6 +193,10 @@ def compile_game(
             "max_bsp_nodes": max_bsp_nodes,
             "tex_h": tex_h,
             "overflow_names": list(graph_io.overflow_outputs),
+            # List[Assert] captured pre-strip so callers can run
+            # compiled-side predicate checks via
+            # ``torchwright.debug.probe.check_asserts_on_compiled``.
+            "asserts": collected_asserts,
         },
         d_hidden=d_hidden,
     )
