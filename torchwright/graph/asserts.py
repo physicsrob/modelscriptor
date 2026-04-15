@@ -363,12 +363,16 @@ def assert_strictly_less(
     # The wrapped node is the concat of both; callers want ``b`` back so
     # the subgraph that *used* ``b`` for sentinel ordering still reads
     # natural.  Extract ``b``'s slice via a Linear projection so the
-    # returned node has ``b``'s width and value.
+    # returned node has ``b``'s width and value.  The projection is
+    # value-preserving, so the output inherits ``b``'s static type.
     from torchwright.graph import Linear
     proj = torch.zeros(len(a) + len(b), len(b))
     for i in range(len(b)):
         proj[len(a) + i, i] = 1.0
-    return Linear(wrapped, proj, name="strictly_less_b")
+    projected = Linear(wrapped, proj, name="strictly_less_b")
+    if b.value_type != NodeValueType.unknown():
+        return assert_matches_value_type(projected, b.value_type)
+    return projected
 
 
 def assert_unique_values(
@@ -473,7 +477,10 @@ def assert_distinct_across(
     proj = torch.zeros(d_value + d_where, d_value)
     for i in range(d_value):
         proj[i, i] = 1.0
-    return Linear(wrapped, proj, name="distinct_across_value")
+    projected = Linear(wrapped, proj, name="distinct_across_value")
+    if value.value_type != NodeValueType.unknown():
+        return assert_matches_value_type(projected, value.value_type)
+    return projected
 
 
 def assert_score_gap_at_least(
@@ -535,7 +542,10 @@ def assert_score_gap_at_least(
     proj = torch.zeros(d_value + d_where, d_value)
     for i in range(d_value):
         proj[i, i] = 1.0
-    return Linear(wrapped, proj, name="score_gap_value")
+    projected = Linear(wrapped, proj, name="score_gap_value")
+    if score.value_type != NodeValueType.unknown():
+        return assert_matches_value_type(projected, score.value_type)
+    return projected
 
 
 def assert_picked_from(
@@ -611,4 +621,7 @@ def assert_picked_from(
     proj = torch.zeros(d_r + d_v + d_k, d_r)
     for i in range(d_r):
         proj[i, i] = 1.0
-    return Linear(wrapped, proj, name="picked_from_result")
+    projected = Linear(wrapped, proj, name="picked_from_result")
+    if result.value_type != NodeValueType.unknown():
+        return assert_matches_value_type(projected, result.value_type)
+    return projected

@@ -52,6 +52,7 @@ from typing import List, Tuple
 import torch
 
 from torchwright.graph import Node, Embedding
+from torchwright.graph.asserts import assert_integer
 from torchwright.graph.embedding import Unembedding
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import add_scaled_nodes, compare, negate, sum_nodes
@@ -222,11 +223,14 @@ def create_network_parts(
     # every other position (including emitted output digits after the
     # trigger) is beaten by any real input-digit position in the argmin.
     score_if_digit = add_scaled_nodes(10.0, digit_scalar, 1.0, digit_index)
-    score = select(
+    # ``10 * digit + digit_index`` and the sentinel are integer by
+    # construction; select's PL-encoded arithmetic adds FP fuzz, so
+    # re-declare the invariant for attend_argmin_unmasked's contract.
+    score = assert_integer(select(
         is_input_digit,
         score_if_digit,
         create_literal_value(torch.tensor([_NON_DIGIT_SCORE])),
-    )
+    ))
 
     # --- Unrolled selection sort ---
     # mask_k is a width-MAX_INPUT {0, 1} vector whose value at every
