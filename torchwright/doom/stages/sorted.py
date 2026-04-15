@@ -25,6 +25,7 @@ Downstream consumers:
   sort_feedback field that closes the autoregressive sort loop.
 """
 
+import builtins
 import math
 from dataclasses import dataclass
 
@@ -48,7 +49,6 @@ from torchwright.ops.arithmetic_ops import (
     min as min_node,
     multiply_2d,
     multiply_const,
-    piecewise_linear,
     piecewise_linear_2d,
     reciprocal,
     subtract,
@@ -480,12 +480,21 @@ def _rotate_into_player_frame(cos_p: Node, sin_p: Node, dx: Node, dy: Node, suff
     return cross, dot
 
 
-# Atan breakpoints with extended range outside ``±20`` so saturated dots
-# don't produce column drift.  Matches main's tuned table.
-_ATAN_BP_VIS = [
-    -100, -20, -10, -5, -3, -2, -1.5, -1, -0.75, -0.5,
-    -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 10, 20, 100,
+# Breakpoint grid for the front-facing ``(cross, |dot|) → col_front``
+# lookup in ``_endpoint_to_column``.  Focused tightly on the *active*
+# region — (cross, dot) pairs whose projected column lands inside
+# ``[-2, W+2]``.  Outside that region the output saturates against the
+# clamp inside the fn, so the piecewise_linear_2d's built-in edge
+# extension (hold grid-edge value for out-of-grid inputs) gives the
+# right answer with zero additional hyperplanes.  The dot axis is
+# positive-only; the behind-flip is a single select on ``sign(dot)``
+# after the lookup.
+_COL_FOLD_BP_CROSS = [
+    -2.0, -1.5, -1.0, -0.75, -0.5, -0.25, -0.1,
+    0.0,
+    0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0,
 ]
+_COL_FOLD_BP_DOT_ABS = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
 
 
 def _endpoint_to_column(
@@ -493,33 +502,68 @@ def _endpoint_to_column(
 ) -> Node:
     """Convert ``(cross, dot)`` to a signed screen column.
 
-    For ``dot > 0`` the point is in front: column is ``atan(cross/dot) *
-    (W/fov_rad) + W/2``.  For ``dot < 0`` (behind the player) the
-    naive tangent wraps, so we flip: the behind-column reflection is
-    ``W - col_pos``.  The flip is applied via ``select(dot_sign, ...)``
-    after the main chain so the sign compare parallelizes with it.
+    Front case uses a fused ``piecewise_linear_2d(cross, |dot|)`` lookup
+    that replaces the prior ``reciprocal → multiply_2d →
+    piecewise_linear(atan)`` chain.  The behind case (``dot < 0``) is a
+    single select on ``sign(dot)`` afterwards, reflecting the column
+    across screen centre just like the prior code did — keeping it out
+    of the piecewise avoids the steep atan discontinuity at ``dot = 0``
+    that otherwise ruins the least-squares fit of the fused table.
+
+    The fused front lookup is clamped inside the fn so the
+    least-squares sees a bounded target function.  The grid is tight
+    on the active region only; for (cross, |dot|) pairs outside the
+    grid the piecewise holds edge values, which already sit at the
+    clamp limits — no hyperplane budget spent on trivial constants.
+
+    Motivation: the old chain compounded three discretisations; its
+    ``multiply_2d`` at ``step=0.5`` drove ~0.06 absolute error in
+    ``tan``, which atan's ~40 col/tan-unit slope near zero amplified
+    into ~1-col drift at oblique angles.  One well-conditioned 2D
+    table avoids the cascade.
     """
-    fov_rad = float(fov) * math.pi / 128.0
-    col_from_tan_scale = float(W) / fov_rad
-    half_W = float(W) / 2.0
     col_lo, col_hi = -2.0, float(W + 2)
+    fov_rad = float(fov) * math.pi / 128.0
+    col_scale = float(W) / fov_rad
+    half_W = float(W) / 2.0
 
-    def _atan_clamped(t: float) -> float:
-        return max(col_lo, min(col_hi, math.atan(t) * col_from_tan_scale + half_W))
+    def _col_front_of(cr: float, dt_abs: float) -> float:
+        # Clamp inside the fn so the least-squares sees a bounded
+        # target — the alternative (unclamped atan, final clamp after
+        # the select) drifts further from the clamped boundary because
+        # the piecewise fit tries to track values that go well past the
+        # screen edges.
+        col = math.atan(cr / dt_abs) * col_scale + half_W
+        return builtins.max(col_lo, builtins.min(col_hi, col))
 
-    max_inv = 1.0 / 0.1  # reciprocal's max output when clamp floor is 0.1
+    # Clamp the piecewise's inputs to the grid bounds — piecewise_linear_2d's
+    # extrapolation outside the grid is ill-behaved, but any
+    # ``(cross, |dot|)`` that would have projected to a column outside
+    # ``[-2, W+2]`` already maps to a clamped boundary value inside the
+    # grid, so clamping the inputs is lossless.
+    bp_cross_lo = _COL_FOLD_BP_CROSS[0]
+    bp_cross_hi = _COL_FOLD_BP_CROSS[-1]
+    bp_dot_lo = _COL_FOLD_BP_DOT_ABS[0]
+    bp_dot_hi = _COL_FOLD_BP_DOT_ABS[-1]
 
-    dot_sign = compare(dot, 0.0)                      # parallel with chain below
-    dot_clamped = clamp(abs(dot), 0.1, 2.0 * max_coord)
-    inv_dot = reciprocal(dot_clamped, min_value=0.1, max_value=2.0 * max_coord)
-    tan_signed = multiply_2d(
-        cross, inv_dot,
-        max_abs1=max_coord, max_abs2=max_inv,
-        step1=0.5, step2=0.5, min2=0.0,
+    dot_sign = compare(dot, 0.0)
+    abs_dot = abs(dot)
+    cross_clamped = clamp(cross, bp_cross_lo, bp_cross_hi)
+    dot_pos = clamp(abs_dot, bp_dot_lo, bp_dot_hi)
+
+    col_front = piecewise_linear_2d(
+        cross_clamped, dot_pos,
+        _COL_FOLD_BP_CROSS, _COL_FOLD_BP_DOT_ABS,
+        _col_front_of,
+        name=f"col_front_{suffix}",
     )
-    col_pos = piecewise_linear(tan_signed, _ATAN_BP_VIS, _atan_clamped, name=f"col_{suffix}")
-    col_neg = Linear(
-        col_pos, torch.tensor([[-1.0]]),
-        torch.tensor([float(W)]), name=f"col_{suffix}_neg",
+
+    # Behind-flip: ``col_back = W − col_front`` (reflection across
+    # centre), matching the prior implementation.
+    col_back = Linear(
+        col_front, torch.tensor([[-1.0]]),
+        torch.tensor([float(W)]), name=f"col_{suffix}_back",
     )
-    return select(dot_sign, col_pos, col_neg)
+    col_final = select(dot_sign, col_front, col_back)
+
+    return clamp(col_final, col_lo, col_hi)
