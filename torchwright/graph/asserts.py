@@ -324,6 +324,64 @@ def assert_distinct_across(
     return Linear(wrapped, proj, name="distinct_across_value")
 
 
+def assert_score_gap_at_least(
+    score: Node, where: Node, *, margin: float = 0.05,
+) -> Node:
+    """Assert the two smallest valid ``score`` values differ by at least ``margin``.
+
+    Resolvability invariant for ``attend_argmin_unmasked``.  With
+    ``_QUERY_GAIN = 80``, the softmax concentrates ≥99.9% on the lowest
+    score only when the rank-1 vs rank-2 gap exceeds
+    ``ln(999)/80 ≈ 0.086``.  Pair this assert with the score node
+    immediately upstream of the argmin to catch precision regressions
+    that close the gap below softmax resolution — the failure mode
+    behind angle-192 / Mode C.
+
+    Differs from :func:`assert_distinct_across`:
+      * checks only the *tightest* pair, not all O(N²) pairs;
+      * uses a tighter default margin (0.05) calibrated to the
+        ``_QUERY_GAIN`` floor and the current 0.1 tiebreak budget in
+        ``_compute_bsp_rank``.
+
+    Vacuous for <2 valid rows (mask sums to 0 or 1).
+    """
+    d_value = len(score)
+    d_where = len(where)
+
+    def predicate(x: torch.Tensor) -> tuple:
+        val = x[:, :d_value]
+        valid = x[:, d_value:d_value + d_where]
+        if d_where == 1:
+            mask = valid.squeeze(-1) > 0.5
+        else:
+            mask = (valid > 0.5).any(dim=-1)
+        rows = val[mask]
+        if rows.shape[0] < 2:
+            return True, ""
+        flat = rows.squeeze(-1) if d_value == 1 else rows.min(dim=-1).values
+        sorted_scores, order = torch.sort(flat)
+        gap = (sorted_scores[1] - sorted_scores[0]).item()
+        if gap >= margin:
+            return True, ""
+        i, j = order[0].item(), order[1].item()
+        return False, (
+            f"min-gap {gap:.5f} < margin={margin}; "
+            f"rank-1 row [{i}]={sorted_scores[0].item():.5f}, "
+            f"rank-2 row [{j}]={sorted_scores[1].item():.5f}"
+        )
+
+    composite = Concatenate([score, where])
+    wrapped = Assert(
+        composite, predicate,
+        message=f"score_gap_at_least (margin={margin})",
+    )
+    from torchwright.graph import Linear
+    proj = torch.zeros(d_value + d_where, d_value)
+    for i in range(d_value):
+        proj[i, i] = 1.0
+    return Linear(wrapped, proj, name="score_gap_value")
+
+
 def assert_picked_from(
     result: Node, values: Node, keys: Node, *, atol: float = 1e-2,
 ) -> Node:
