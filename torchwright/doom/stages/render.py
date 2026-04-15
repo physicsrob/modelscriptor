@@ -49,7 +49,6 @@ from torchwright.ops.arithmetic_ops import (
     bool_to_01,
     clamp,
     compare,
-    floor_int,
     multiply_const,
     piecewise_linear,
     piecewise_linear_2d,
@@ -319,12 +318,24 @@ def _compute_texture_column(
     *,
     max_coord: float, tex_w: int,
 ) -> Node:
-    """u-coordinate = ``(D + E*tan(offset)) / (den/cos)``, mapped to column index.
+    """Texture column index via thermometer comparison (no division).
 
-    Known approximation: the final ratio goes through ``piecewise_linear_2d``
-    with a ``n/d`` lambda, which interpolates division bilinearly over a
-    grid — division isn't bilinear, so this drifts in the middle of each
-    grid cell.  Tracked by ``test_render.py::test_texture_column_division_known_bug``.
+    Instead of computing ``u = abs_nuc / abs_den`` — which requires a
+    piecewise-linear approximation of division whose error at the critical
+    boundary ``u = 0.5`` can flip the tex_col — we determine tex_col as
+    a count:
+
+        tex_col = |{k ∈ 1..tex_w-1 : tex_w · abs_nuc ≥ k · abs_den}|
+
+    Both ``tex_w · abs_nuc`` and ``k · abs_den`` are exact linear scalings
+    (``multiply_const``), so the subtraction carries no approximation error
+    beyond what is already in ``abs_nuc`` and ``abs_den_over_cos``.
+
+    Threshold ``−0.5`` instead of 0: the exact boundary (diff = 0,
+    i.e. u = k/tex_w) counts as TRUE, matching ``floor_int``'s behavior of
+    returning ``k`` when its input equals ``k`` exactly.  For the box room
+    (tex_w=8, |den|=10) the minimum margin per comparison is ≈ 0.48 —
+    far above the comparison transition half-width of 0.05.
     """
     E_tan = piecewise_linear_2d(
         fb_E, tan_o, DIFF_BP, tan_val_bp,
@@ -333,18 +344,21 @@ def _compute_texture_column(
     num_u_over_cos = add(fb_D, E_tan)
     abs_nuc = abs(num_u_over_cos)
 
-    doc_max = 2.5 * max_coord
-    doc_bp = [doc_max * i / 15 for i in range(16)]
+    # Scale abs_nuc by tex_w once (exact).
+    nuc_scaled = multiply_const(abs_nuc, float(tex_w))
 
-    u_raw = piecewise_linear_2d(
-        abs_nuc, abs_den_over_cos,
-        doc_bp, doc_bp,
-        lambda n, d: n / d if d > 0.01 else 0.0,
-        name="u_ratio",
-    )
-    tex_col_float = multiply_const(u_raw, float(tex_w))
-    tex_col_clamped = clamp(tex_col_float, 0.0, float(tex_w) - 0.5)
-    return floor_int(tex_col_clamped, 0, tex_w - 1)
+    # Threshold slightly below 0 so exact-boundary case counts as TRUE.
+    _THRESH = -0.5
+    bits = []
+    for k in range(1, tex_w):
+        k_den = multiply_const(abs_den_over_cos, float(k))
+        diff = subtract(nuc_scaled, k_den)
+        bits.append(bool_to_01(compare(diff, _THRESH)))
+
+    result = bits[0]
+    for b in bits[1:]:
+        result = add(result, b)
+    return result
 
 
 def _attend_to_texture_column(
