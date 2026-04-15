@@ -313,9 +313,9 @@ class LayerScheduler:
                 n_heads = self._heads_for_linear(node)
                 compute_candidates.append(("compute_linear", node, n_heads))
         # Deferred Adds: neither input is dead, so we can't use add_into.
-        # Instead, copy both inputs to fresh columns via two groups of heads.
+        # Instead, copy both inputs to fresh columns via attention heads.
         for node in deferred_adds:
-            n_heads = 2 * self._heads_for_node(node)
+            n_heads = self._heads_for_add(node)
             compute_candidates.append(("compute_add", node, n_heads))
 
         # Sort: Attn first; under column pressure prefer nodes that free columns,
@@ -831,6 +831,20 @@ class LayerScheduler:
     def _heads_for_node(self, node: Node) -> int:
         """Number of attention heads needed to copy a node's output."""
         return (len(node) + self.d_head - 1) // self.d_head
+
+    def _heads_for_add(self, node: Node) -> int:
+        """Number of attention heads needed for a compute_add op.
+
+        When 2 * chunk_size <= d_head, both inputs share one combined head.
+        Otherwise each input needs its own head.
+        """
+        d_output = len(node)
+        d_head = self.d_head
+        total = 0
+        for start in range(0, d_output, d_head):
+            chunk_size = min(start + d_head, d_output) - start
+            total += 1 if 2 * chunk_size <= d_head else 2
+        return total
 
     def _heads_for_linear(self, node: Linear) -> int:
         """Number of attention heads needed for a standalone Linear."""
