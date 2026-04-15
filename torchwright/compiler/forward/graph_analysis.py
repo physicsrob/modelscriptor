@@ -12,6 +12,7 @@ from torchwright.graph import (
     PosEncoding,
     Embedding,
 )
+from torchwright.graph.value_type import tightened_with
 
 
 class GraphAnalyzer:
@@ -65,6 +66,17 @@ class GraphAnalyzer:
             while isinstance(node, Assert):
                 node = node.inputs[0]
             return node
+
+        # Transfer each Assert's ``claimed_type`` onto the node it wraps,
+        # so downstream graph analysis that runs after stripping still
+        # sees the strengthened type.  Iterate deepest-to-shallowest so
+        # nested Assert chains compose their claims onto the innermost
+        # non-Assert node.
+        for a in asserts:
+            if a.claimed_type is None:
+                continue
+            target = unwrap(a)
+            target._value_type = tightened_with(target.value_type, a.claimed_type)
 
         for node in pre_strip_nodes:
             if isinstance(node, Assert):

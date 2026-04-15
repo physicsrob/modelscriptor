@@ -199,6 +199,36 @@ def linear_output_range(input_range: Range, matrix, bias=None) -> Range:
     return Range(float(mins.min().item()), float(maxs.max().item()))
 
 
+def tightened_with(a: NodeValueType, b: NodeValueType) -> NodeValueType:
+    """Combine two claims into the strictest type both admit.
+
+    Ranges are intersected; structural claims are OR-ed (either side's
+    ``True`` survives).  Range is further tightened to the invariant
+    constraints implied by the OR-ed claims (e.g. ``is_binary`` forces
+    range ⊆ [0, 1]).
+
+    Used by the compiler's Assert-strip pass to transfer an Assert's
+    ``claimed_type`` onto the node it wrapped, so downstream analysis
+    that runs after stripping still sees the strengthened type.
+    """
+    r = a.value_range.intersect(b.value_range)
+    is_int = a.is_integer or b.is_integer
+    is_bin = a.is_binary or b.is_binary
+    is_sgn = a.is_sign or b.is_sign
+    is_onehot = a.is_one_hot or b.is_one_hot
+    if is_bin:
+        r = r.intersect(Range(0.0, 1.0))
+    if is_sgn:
+        r = r.intersect(Range(-1.0, 1.0))
+    return NodeValueType(
+        value_range=r,
+        is_integer=is_int,
+        is_binary=is_bin,
+        is_sign=is_sgn,
+        is_one_hot=is_onehot,
+    )
+
+
 def intersect_element_props(a: NodeValueType, b: NodeValueType) -> NodeValueType:
     """Meet of element-level properties: kept only if both sides have them.
 
