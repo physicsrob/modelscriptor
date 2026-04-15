@@ -44,7 +44,10 @@ from torchwright.ops.arithmetic_ops import (
     add_scaled_nodes,
     clamp,
     compare,
+    max as max_node,
+    min as min_node,
     multiply_2d,
+    multiply_const,
     piecewise_linear,
     piecewise_linear_2d,
     reciprocal,
@@ -255,22 +258,33 @@ def _compute_visibility_columns(
 ):
     """Columns subtended by the selected wall from the player's pose.
 
-    Wall endpoints A, B are translated into the player's frame, then
-    ``tan(angle) = cross / dot`` is mapped to a screen column via the
-    camera's FOV.  Returns ``(vis_lo, vis_hi)`` as floats already
-    clamped to ``[-2, W+2]`` by the piecewise-linear atan step.
+    Implements DOOM-style view-frustum clipping: the wall segment
+    ``AB`` is clipped in the player's (dot, cross) frame against the
+    two FOV-boundary half-planes
 
-    Optimized tangent pipeline (6 sequential MLP sublayers per endpoint):
-    ``abs(dot) → clamp(0.1, 2·max_coord) → reciprocal → multiply_2d(cross,
-    inv) → atan_clamped → select(sign, col, W - col)``.  Key structural
-    wins versus the naïve pipeline:
+        f_L = sin(½·fov)·dot − cos(½·fov)·cross ≥ 0  (left boundary)
+        f_R = sin(½·fov)·dot + cos(½·fov)·cross ≥ 0  (right boundary)
 
-    * ``clamp(abs(.))`` subsumes compare+select (saves 1 sublayer).
-    * ``multiply_2d`` subsumes signed_multiply for the cross*inv product.
-    * The piecewise-linear atan fuses column scaling + column clamping
-      into one step.
-    * Sign handling is applied after atan so ``compare(dot, 0)`` runs in
-      parallel with the main chain instead of serially.
+    Their intersection is the FOV cone (and automatically requires
+    ``dot > 0``, since ``f_L + f_R = 2·sin(½·fov)·dot``).  The clipped
+    segment's endpoints are then projected to screen columns via the
+    standard ``atan(cross/dot)·(W/fov) + W/2`` mapping.  If the
+    segment misses the cone entirely, ``vis_lo == vis_hi`` marks an
+    empty range.
+
+    **Why clip rather than project-endpoints-and-clamp:** endpoint
+    projection cannot distinguish two geometrically different cases
+    when the segment crosses the viewing plane (one endpoint
+    ``dot > 0``, the other ``dot < 0``):
+
+    * wall's visible portion actually crosses the FOV interior, OR
+    * wall's visible portion skirts around the FOV off-screen.
+
+    Both scenarios project the endpoints to the same clamp edges but
+    should yield opposite vis-ranges (full-screen vs. empty).  Proper
+    clipping — what DOOM's ``R_ClipWallSegment`` does — has the
+    information to produce the right answer because it works with the
+    segment's interior, not just its endpoints.
     """
     W = config.screen_width
     fov = config.fov_columns
@@ -290,17 +304,159 @@ def _compute_visibility_columns(
     cross_a, dot_a = _rotate_into_player_frame(sort_cos, sort_sin, dax, day, "a")
     cross_b, dot_b = _rotate_into_player_frame(sort_cos, sort_sin, dbx, dby, "b")
 
-    col_a_c = _endpoint_to_column(
-        cross_a, dot_a, W=W, fov=fov, max_coord=max_coord, suffix="a",
+    fov_rad = float(fov) * math.pi / 128.0
+    half_fov_rad = fov_rad / 2.0
+    sin_hf = math.sin(half_fov_rad)
+    cos_hf = math.cos(half_fov_rad)
+
+    # FOV-boundary evaluations at the two endpoints.
+    f_L_a = add_scaled_nodes(sin_hf, dot_a, -cos_hf, cross_a)
+    f_L_b = add_scaled_nodes(sin_hf, dot_b, -cos_hf, cross_b)
+    f_R_a = add_scaled_nodes(sin_hf, dot_a,  cos_hf, cross_a)
+    f_R_b = add_scaled_nodes(sin_hf, dot_b,  cos_hf, cross_b)
+
+    max_f_mag = (sin_hf + cos_hf) * max_coord    # bound on |f_*|
+    max_denom = 2.0 * max_f_mag                  # bound on |f_A − f_B|
+
+    t_lo_L, t_hi_L = _plane_clip_contribs(
+        f_L_a, f_L_b, max_denom=max_denom, max_f_mag=max_f_mag, suffix="L",
     )
-    col_b_c = _endpoint_to_column(
-        cross_b, dot_b, W=W, fov=fov, max_coord=max_coord, suffix="b",
+    t_lo_R, t_hi_R = _plane_clip_contribs(
+        f_R_a, f_R_b, max_denom=max_denom, max_f_mag=max_f_mag, suffix="R",
     )
 
-    a_lt_b = compare(subtract(col_b_c, col_a_c), 0.0)
-    vis_lo = select(a_lt_b, col_a_c, col_b_c)
-    vis_hi = select(a_lt_b, col_b_c, col_a_c)
+    zero_lit = create_literal_value(torch.tensor([0.0]), name="t_zero")
+    one_lit  = create_literal_value(torch.tensor([1.0]), name="t_one")
+
+    # t_lo = max(0, t_lo_L, t_lo_R), t_hi = min(1, t_hi_L, t_hi_R).
+    # Use the ``(a±b ± |a-b|)/2`` max/min so we don't compound
+    # compare+select transition-width errors across nested ops.
+    t_lo = max_node(max_node(zero_lit, t_lo_L), t_lo_R)
+    t_hi = min_node(min_node(one_lit,  t_hi_L), t_hi_R)
+
+    # Segment fully outside FOV iff t_lo > t_hi.  Scale so the compare
+    # saturates even when the range is "just barely" empty/non-empty.
+    _COMPARE_SCALE_EMPTY = 100.0
+    is_empty = compare(
+        multiply_const(subtract(t_lo, t_hi), _COMPARE_SCALE_EMPTY), 0.0,
+    )
+
+    # ---- Project the clipped endpoints to screen cols ------------------
+    # We don't need to interpolate A + t·(B−A) in (dot, cross) and then
+    # project.  Observation: whenever an endpoint gets clipped, it ends
+    # up on a known FOV boundary, whose screen col is known to be 0 or W
+    # by construction (the boundary rays are at ±½·fov from forward,
+    # which map to col=0 and col=W exactly).  So we only project the
+    # original endpoints (for the case they're already inside the cone)
+    # and for the clipped case just pick 0 or W.
+    W_lit = create_literal_value(torch.tensor([float(W)]), name="col_W")
+
+    col_A_interior = _endpoint_to_column(
+        cross_a, dot_a, W=W, fov=fov, max_coord=max_coord, suffix="a_int",
+    )
+    col_B_interior = _endpoint_to_column(
+        cross_b, dot_b, W=W, fov=fov, max_coord=max_coord, suffix="b_int",
+    )
+
+    # Which side of the cone clipped A?  L contribution won → col=W (left
+    # screen edge).  R contribution won → col=0 (right edge).
+    #
+    # Scale the t-difference before compare so the ±1 saturation is clean
+    # when contributions are close (e.g., t_lo_L=0 vs t_lo_R=0.09).  The
+    # compare's built-in ramp width is ~1/step_sharpness ≈ 0.1 in input
+    # units, which is too wide when t values naturally cluster near
+    # [0, 1] boundaries.  Scaling by 100 shrinks the ramp to ~0.001 in
+    # t-space — tight enough that real differences always saturate.
+    _COMPARE_SCALE = 100.0
+
+    a_inside_L = compare(f_L_a, 0.0)
+    a_inside_R = compare(f_R_a, 0.0)
+    a_clipped_on_L = compare(
+        multiply_const(subtract(t_lo_L, t_lo_R), _COMPARE_SCALE), 0.0,
+    )
+    col_A_boundary = select(a_clipped_on_L, W_lit, zero_lit)
+    col_A = select(
+        a_inside_L,
+        select(a_inside_R, col_A_interior, col_A_boundary),
+        col_A_boundary,
+    )
+
+    # B is clipped by whichever plane it *exits* first (smaller t_hi).
+    b_inside_L = compare(f_L_b, 0.0)
+    b_inside_R = compare(f_R_b, 0.0)
+    b_clipped_on_L = compare(
+        multiply_const(subtract(t_hi_R, t_hi_L), _COMPARE_SCALE), 0.0,
+    )
+    col_B_boundary = select(b_clipped_on_L, W_lit, zero_lit)
+    col_B = select(
+        b_inside_L,
+        select(b_inside_R, col_B_interior, col_B_boundary),
+        col_B_boundary,
+    )
+
+    vis_lo_visible = min_node(col_A, col_B)
+    vis_hi_visible = max_node(col_A, col_B)
+
+    # On empty segment, collapse to the right-edge sentinel so the
+    # render stage reads zero-width cover and skips the wall.
+    sentinel = create_literal_value(
+        torch.tensor([float(W + 2)]), name="vis_empty_sentinel",
+    )
+    vis_lo = select(is_empty, sentinel, vis_lo_visible)
+    vis_hi = select(is_empty, sentinel, vis_hi_visible)
+
     return vis_lo, vis_hi
+
+
+def _plane_clip_contribs(
+    f_a: Node, f_b: Node, *, max_denom: float, max_f_mag: float, suffix: str,
+) -> tuple[Node, Node]:
+    """Per-plane contributions ``(t_lo_contrib, t_hi_contrib)`` for clipping
+    a segment against a half-plane ``f(p) ≥ 0``.
+
+    The crossing parameter is ``t* = f_A / (f_A − f_B)``.  The visible
+    sub-range along the segment is::
+
+        t_lo_contrib = 0   if A is inside (f_A ≥ 0) else t*
+        t_hi_contrib = 1   if B is inside (f_B ≥ 0) else t*
+
+    Combined with the ``max(0, …)`` / ``min(1, …)`` aggregation across
+    both FOV planes, this correctly yields:
+
+    * both endpoints inside this plane → ``[0, 1]`` (unconstrained).
+    * both outside → ``[t*, t*]``; t* lies outside ``[0, 1]`` because a
+      linear ``f`` is monotone along the segment, so aggregation forces
+      ``t_lo > t_hi`` and the segment is rejected.
+    * A inside, B outside → ``[0, t*]``.
+    * A outside, B inside → ``[t*, 1]``.
+    """
+    denom = subtract(f_a, f_b)
+    denom_pos = compare(denom, 0.0)
+    denom_abs = clamp(abs(denom), 0.1, max_denom)
+    inv_denom_abs = reciprocal(
+        denom_abs, min_value=0.1, max_value=max_denom, step=0.1,
+    )
+    max_inv = 1.0 / 0.1  # upper bound on |inv_denom_abs|
+
+    # t_star (signed) = f_a / denom.
+    # Compute |t_star| via multiply_2d and flip sign based on denom.
+    t_star_pos = multiply_2d(
+        f_a, inv_denom_abs,
+        max_abs1=max_f_mag, max_abs2=max_inv,
+        step1=0.5, step2=0.5, min2=0.0,
+        name=f"t_star_pos_{suffix}",
+    )
+    t_star_neg = multiply_const(t_star_pos, -1.0)
+    t_star = select(denom_pos, t_star_pos, t_star_neg)
+
+    zero_lit = create_literal_value(torch.tensor([0.0]), name=f"t_zero_{suffix}")
+    one_lit  = create_literal_value(torch.tensor([1.0]), name=f"t_one_{suffix}")
+    a_inside = compare(f_a, 0.0)
+    b_inside = compare(f_b, 0.0)
+
+    t_lo_contrib = select(a_inside, zero_lit, t_star)
+    t_hi_contrib = select(b_inside, one_lit,  t_star)
+    return t_lo_contrib, t_hi_contrib
 
 
 def _rotate_into_player_frame(cos_p: Node, sin_p: Node, dx: Node, dy: Node, suffix: str):

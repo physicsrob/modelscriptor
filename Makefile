@@ -39,6 +39,18 @@ test:
 test-logs:
 	@tail -f /tmp/torchwright-test.log
 
+.PHONY: test-local
+test-local:
+	@if [ -z "$(FILE)" ]; then \
+		echo "Error: FILE=<path> is required for test-local." >&2 ; \
+		echo "       test-local runs pytest on the local machine and must target" >&2 ; \
+		echo "       a single file to avoid accidentally running the whole suite" >&2 ; \
+		echo "       (which belongs on Modal via 'make test')." >&2 ; \
+		echo "Example: make test-local FILE=tests/graph/test_embedding.py" >&2 ; \
+		exit 2 ; \
+	fi
+	uv run pytest $(FILE) $(ARGS)
+
 .PHONY: graph-stats
 graph-stats:
 	uv run python graph_stats.py $(ARGS)

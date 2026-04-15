@@ -43,6 +43,7 @@ from torchwright.doom.wad import (
     Subsector,
     Vertex,
 )
+from tests._utils.image_compare import compare_images
 from torchwright.reference_renderer.render import render_frame
 from torchwright.reference_renderer.textures import default_texture_atlas
 from torchwright.reference_renderer.trig import generate_trig_table
@@ -264,6 +265,12 @@ class TestBspIntegration:
         (brick/stone/stripe/checker), so a wrong-wall sort error —
         e.g. always selecting the east wall regardless of direction —
         creates a large pixel error vs. the reference renderer.
+
+        Uses ``compare_images`` with a 1-pixel spatial tolerance:
+        1-pixel texel-seam jitter (e.g. the u=0.5 boundary at angle 192)
+        is accepted; wrong-wall selection or wrong-texture errors
+        remain caught because their colors don't exist in the 3×3
+        reference neighborhood.
         """
         config = _small_config()
         state = GameState(x=0.0, y=0.0, angle=angle, move_speed=0.3, turn_speed=4)
@@ -273,11 +280,8 @@ class TestBspIntegration:
             state.x, state.y, angle, subset.segments, config,
             textures=subset.textures,
         )
-        max_err = np.abs(frame - ref).max()
-        assert max_err < 0.35, (
-            f"angle={angle}: max pixel error {max_err:.3f} exceeds 0.35 — "
-            "likely wrong wall selected by BSP sort"
-        )
+        result = compare_images(frame, ref)
+        result.assert_matches()
 
     def test_second_frame_renders(self, module, subset) -> None:
         """Calling step_frame twice in a row must produce a valid second
@@ -311,12 +315,12 @@ class TestBspIntegration:
         )
 
     def test_matches_reference_render(self, module, subset) -> None:
-        """Compiled output is close to the reference renderer's frame.
+        """Compiled output matches the reference renderer's frame.
 
         The BSP rank sort should produce the same visual output as the
-        reference renderer (which uses per-column closest-hit).  Some
-        numerical error is expected (fp32 accumulation, piecewise-
-        linear approximations).
+        reference renderer (which uses per-column closest-hit).  One-
+        pixel rasterization jitter is expected and tolerated by
+        ``compare_images``; anything larger is a real divergence.
         """
         config = _small_config()
         state = GameState(x=0.0, y=0.0, angle=0, move_speed=0.3, turn_speed=4)
@@ -329,10 +333,7 @@ class TestBspIntegration:
                 col, 0.0, 0.0, 0, subset.segments, config,
                 textures=subset.textures,
             )
-        max_err = np.abs(frame - ref).max()
-        assert max_err < 0.35, (
-            f"compiled render diverges from reference: max_err={max_err:.3f}"
-        )
+        compare_images(frame, ref).assert_matches()
 
 
 # ---------------------------------------------------------------------------

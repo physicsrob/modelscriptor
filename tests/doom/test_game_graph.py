@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from tests._utils.image_compare import compare_images
 from torchwright.doom.compile import compile_game, step_frame
 from torchwright.doom.game import GameState, update_state
 from torchwright.doom.input import PlayerInput
@@ -84,13 +85,7 @@ class TestGameGraph:
 
         assert frame.max() > 0.1, "frame appears blank"
 
-        max_err = np.abs(frame - ref).max()
-        mean_err = np.abs(frame - ref).mean()
-        print(f"\nbox room: max_err={max_err:.3f}, mean_err={mean_err:.3f}")
-
-        assert max_err < 0.35, (
-            f"max pixel error {max_err:.3f} exceeds 0.35 (mean {mean_err:.3f})"
-        )
+        compare_images(frame, ref).assert_matches()
 
     def test_game_logic_angle_update(self, module, box_room):
         """Verify that the START token's game logic updates the player
@@ -126,10 +121,7 @@ class TestGameGraph:
         frame, _ = step_frame(module, state, inputs, subset, config, textures=textures)
         ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
 
-        max_err = np.abs(frame - ref).max()
-        assert max_err < 0.35, (
-            f"angle={angle}: max pixel error {max_err:.3f} exceeds 0.35"
-        )
+        compare_images(frame, ref).assert_matches()
 
     @pytest.mark.parametrize("angle", [20, 45, 100, 160, 210])
     def test_renders_oblique_angle(self, module, box_room, angle):
@@ -144,12 +136,7 @@ class TestGameGraph:
         frame, _ = step_frame(module, state, inputs, subset, config, textures=textures)
         ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
 
-        max_err = np.abs(frame - ref).max()
-        mean_err = np.abs(frame - ref).mean()
-        print(f"\n  oblique angle={angle}: max_err={max_err:.3f}, mean_err={mean_err:.3f}")
-        assert max_err < 0.45, (
-            f"angle={angle}: max pixel error {max_err:.3f} exceeds 0.45"
-        )
+        compare_images(frame, ref).assert_matches()
 
     @pytest.mark.parametrize("px,py,angle", [
         (3.0, 2.0, 20),    # near corner, looking diagonally
@@ -170,13 +157,7 @@ class TestGameGraph:
         frame, _ = step_frame(module, state, inputs, subset, config, textures=textures)
         ref = _ref_frame(px, py, angle, segs, config, textures)
 
-        max_err = np.abs(frame - ref).max()
-        mean_err = np.abs(frame - ref).mean()
-        print(f"\n  off-center ({px},{py}) angle={angle}: "
-              f"max_err={max_err:.3f}, mean_err={mean_err:.3f}")
-        assert max_err < 0.35, (
-            f"({px},{py}) angle={angle}: max pixel error {max_err:.3f} exceeds 0.35"
-        )
+        compare_images(frame, ref).assert_matches()
 
     # ── Collision detection tests ──────────────────────────────────
 
