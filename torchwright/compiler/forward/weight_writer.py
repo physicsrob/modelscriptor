@@ -240,9 +240,14 @@ def _write_compute_add(
     """Compute Add(a, b) by copying both inputs to fresh columns via attention.
 
     Used when neither input is dead (so add_into can't reuse columns).
-    Allocates new output columns and uses two groups of attention heads:
-    one to copy a, one to copy b. Since attention heads are additive,
-    the result in the output columns is 0 + a + b = a + b.
+    Allocates new output columns and uses attention heads to copy both inputs.
+    Since attention heads are additive, the result in the output columns is
+    0 + a + b = a + b.
+
+    When 2 * chunk_size <= d_head, both inputs are combined into a single
+    head: a0 maps into head dims [0:cs] and a1 into [cs:2cs], with the
+    output matrix summing both contributions to the same output columns.
+    Otherwise falls back to one head per input.
     """
     node = op.node
     assert isinstance(node, Add)
@@ -255,33 +260,39 @@ def _write_compute_add(
     o_idx = op.target_cols
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
 
-    # Copy each input to the output columns via separate heads.
-    for input_node in [a0, a1]:
-        v_idx = rmap.resolve_indices(input_node)
-        for start in range(0, d_output, d_head):
-            end = min(start + d_head, d_output)
-            chunk_size = end - start
+    v_idx_a = rmap.resolve_indices(a0)
+    v_idx_b = rmap.resolve_indices(a1)
 
-            v_chunk_idx = v_idx[start:end]
-            o_chunk_idx = o_idx[start:end]
+    for start in range(0, d_output, d_head):
+        end = min(start + d_head, d_output)
+        chunk_size = end - start
+        o_chunk_idx = o_idx[start:end]
 
-            v_mat = torch.eye(chunk_size, d_head)
-            o_mat = torch.eye(d_head, chunk_size)
-
+        if 2 * chunk_size <= d_head:
+            # Both inputs fit in a single head.
+            # a0 occupies head dims [0:cs], a1 occupies [cs:2*cs].
+            # Output matrix sums both into the same output columns.
+            combined_v_idx = v_idx_a[start:end] + v_idx_b[start:end]
+            v_mat = torch.eye(2 * chunk_size, d_head)
+            o_mat = torch.zeros(d_head, chunk_size)
+            o_mat[:chunk_size, :chunk_size] = torch.eye(chunk_size)
+            o_mat[chunk_size:2 * chunk_size, :chunk_size] = torch.eye(chunk_size)
             head = _allocate_head(attn)
             _scatter_attn_head(
-                attn,
-                head,
-                pe_idx,
-                pe_idx,
-                v_chunk_idx,
-                o_chunk_idx,
-                q_mat,
-                k_mat,
-                v_mat,
-                o_mat,
-                d_head,
+                attn, head, pe_idx, pe_idx, combined_v_idx, o_chunk_idx,
+                q_mat, k_mat, v_mat, o_mat, d_head,
             )
+        else:
+            # Too wide to combine — one head per input.
+            for v_idx_x in [v_idx_a, v_idx_b]:
+                v_chunk_idx = v_idx_x[start:end]
+                v_mat = torch.eye(chunk_size, d_head)
+                o_mat = torch.eye(d_head, chunk_size)
+                head = _allocate_head(attn)
+                _scatter_attn_head(
+                    attn, head, pe_idx, pe_idx, v_chunk_idx, o_chunk_idx,
+                    q_mat, k_mat, v_mat, o_mat, d_head,
+                )
 
 
 def _write_cancel(
@@ -399,9 +410,10 @@ def _write_delta_transfer(
 
     This enables overlaid I/O where the output replaces the input in-place.
 
-    Uses two groups of attention heads:
-    - Group 1: Copy source_cols to target_cols with +1 coefficient
-    - Group 2: Copy subtract_cols to target_cols with -1 coefficient
+    When 2 * chunk_size <= d_head, source (+1) and subtract (-1) are combined
+    into a single head: source maps into head dims [0:cs] with +1 output
+    coefficients, subtract into [cs:2*cs] with -1 output coefficients.
+    Otherwise falls back to one head per group.
 
     Net effect: target_cols += source - subtract
     """
@@ -417,57 +429,39 @@ def _write_delta_transfer(
     pe_idx = rmap.get_indices(pos_encoding)
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
 
-    # Group 1: +1 coefficient (copy source to target)
     for start in range(0, d_width, d_head):
         end = min(start + d_head, d_width)
         chunk_size = end - start
-
-        v_chunk_idx = op.source_cols[start:end]
         o_chunk_idx = op.target_cols[start:end]
 
-        v_mat = torch.eye(chunk_size, d_head)
-        o_mat = torch.eye(d_head, chunk_size)  # +1 coefficient
-
-        head = _allocate_head(attn)
-        _scatter_attn_head(
-            attn,
-            head,
-            pe_idx,
-            pe_idx,
-            v_chunk_idx,
-            o_chunk_idx,
-            q_mat,
-            k_mat,
-            v_mat,
-            o_mat,
-            d_head,
-        )
-
-    # Group 2: -1 coefficient (subtract subtract_cols from target)
-    for start in range(0, d_width, d_head):
-        end = min(start + d_head, d_width)
-        chunk_size = end - start
-
-        v_chunk_idx = op.subtract_cols[start:end]
-        o_chunk_idx = op.target_cols[start:end]
-
-        v_mat = torch.eye(chunk_size, d_head)
-        o_mat = -torch.eye(d_head, chunk_size)  # -1 coefficient
-
-        head = _allocate_head(attn)
-        _scatter_attn_head(
-            attn,
-            head,
-            pe_idx,
-            pe_idx,
-            v_chunk_idx,
-            o_chunk_idx,
-            q_mat,
-            k_mat,
-            v_mat,
-            o_mat,
-            d_head,
-        )
+        if 2 * chunk_size <= d_head:
+            # Combine source (+1) and subtract (-1) into a single head.
+            # source occupies head dims [0:cs] with +1, subtract [cs:2*cs] with -1.
+            combined_v_idx = op.source_cols[start:end] + op.subtract_cols[start:end]
+            v_mat = torch.eye(2 * chunk_size, d_head)
+            o_mat = torch.zeros(d_head, chunk_size)
+            o_mat[:chunk_size, :chunk_size] = torch.eye(chunk_size)         # +1
+            o_mat[chunk_size:2 * chunk_size, :chunk_size] = -torch.eye(chunk_size)  # -1
+            head = _allocate_head(attn)
+            _scatter_attn_head(
+                attn, head, pe_idx, pe_idx, combined_v_idx, o_chunk_idx,
+                q_mat, k_mat, v_mat, o_mat, d_head,
+            )
+        else:
+            # Too wide to combine — one head per group.
+            v_mat = torch.eye(chunk_size, d_head)
+            o_mat = torch.eye(d_head, chunk_size)  # +1 coefficient
+            head = _allocate_head(attn)
+            _scatter_attn_head(
+                attn, head, pe_idx, pe_idx, op.source_cols[start:end], o_chunk_idx,
+                q_mat, k_mat, v_mat, o_mat, d_head,
+            )
+            o_mat = -torch.eye(d_head, chunk_size)  # -1 coefficient
+            head = _allocate_head(attn)
+            _scatter_attn_head(
+                attn, head, pe_idx, pe_idx, op.subtract_cols[start:end], o_chunk_idx,
+                q_mat, k_mat, v_mat, o_mat, d_head,
+            )
 
 
 # ---------------------------------------------------------------------------
