@@ -638,31 +638,55 @@ def piecewise_linear_2d(
 
         return create_literal_value(torch.tensor([bias_val]))
 
-    # Build L -> ReLU -> L weight matrices
-    d_hidden = len(active) if active else 1
-    assert d_hidden <= d_max, (
-        f"piecewise_linear_2d needs {d_hidden} neurons but d_max={d_max}. "
-        f"Use coarser breakpoints or raise d_max."
-    )
-    input_proj = torch.zeros(d_hidden, 2)
-    input_bias = torch.zeros(d_hidden)
-    output_proj = torch.zeros(d_hidden, 1)
-    output_bias = torch.tensor([bias_val])
-
-    for k, ((a, b, c), w) in enumerate(active):
-        input_proj[k, 0] = a
-        input_proj[k, 1] = b
-        input_bias[k] = c
-        output_proj[k, 0] = w
-
-    result = linear_relu_linear(
-        input_node=inp,
-        input_proj=input_proj,
-        input_bias=input_bias,
-        output_proj=output_proj,
-        output_bias=output_bias,
-        name=name,
-    )
+    # Build L -> ReLU -> L weight matrices, chunking across sublayers if
+    # the active neuron count exceeds d_max.  Each chunk is an independent
+    # linear_relu_linear that contributes a partial sum of ReLU terms; the
+    # constant bias_val is carried by the first chunk only.
+    if not active:
+        # Degenerate placeholder: bias_val needs a carrier, but all ReLU
+        # weights are zero.  One dead neuron keeps the shape valid.
+        input_proj = torch.zeros(1, 2)
+        input_bias = torch.zeros(1)
+        output_proj = torch.zeros(1, 1)
+        result = linear_relu_linear(
+            input_node=inp,
+            input_proj=input_proj,
+            input_bias=input_bias,
+            output_proj=output_proj,
+            output_bias=torch.tensor([bias_val]),
+            name=name,
+        )
+    else:
+        chunks = []
+        multi = len(active) > d_max
+        for chunk_start in range(0, len(active), d_max):
+            chunk = active[chunk_start : chunk_start + d_max]
+            d = len(chunk)
+            input_proj = torch.zeros(d, 2)
+            input_bias = torch.zeros(d)
+            output_proj = torch.zeros(d, 1)
+            for k, ((a, b, c), w) in enumerate(chunk):
+                input_proj[k, 0] = a
+                input_proj[k, 1] = b
+                input_bias[k] = c
+                output_proj[k, 0] = w
+            ob = (
+                torch.tensor([bias_val]) if chunk_start == 0 else torch.zeros(1)
+            )
+            chunk_name = (
+                f"{name}_{chunk_start}_{chunk_start + d}" if multi else name
+            )
+            chunks.append(
+                linear_relu_linear(
+                    input_node=inp,
+                    input_proj=input_proj,
+                    input_bias=input_bias,
+                    output_proj=output_proj,
+                    output_bias=ob,
+                    name=chunk_name,
+                )
+            )
+        result = chunks[0] if len(chunks) == 1 else sum_nodes(chunks)
 
     # Add base linear term (sx*x + sy*y) — free (Linear node).
     if _builtin_abs(base_sx) > 1e-10 or _builtin_abs(base_sy) > 1e-10:

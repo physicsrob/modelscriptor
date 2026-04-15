@@ -41,8 +41,9 @@ from torchwright.compiler.residual_assignment import (
     ResidualStreamState,
 )
 from torchwright.compiler.transformer import HeadlessTransformer
+from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import Concatenate, Node
-from torchwright.graph.misc import InputNode, LiteralValue, Placeholder
+from torchwright.graph.misc import Assert, InputNode, LiteralValue, Placeholder
 from torchwright.graph.pos_encoding import PosEncoding
 
 
@@ -83,8 +84,12 @@ def reference_eval(
     # only patch classes actually in use.  Walking by class lets us
     # restore every patch in a tight finally block even if compute()
     # raises mid-run.
-    graph = GraphAnalyzer(output_node)
-    classes_in_graph = {type(n) for n in graph.get_all_nodes()}
+    #
+    # We walk via ``get_ancestor_nodes`` rather than ``GraphAnalyzer``
+    # because ``GraphAnalyzer`` strips ``Assert`` nodes in-place — the
+    # oracle pass must still see them so their predicates fire.
+    all_nodes = get_ancestor_nodes({output_node})
+    classes_in_graph = {type(n) for n in all_nodes}
 
     def _make_cached(orig_compute):
         def wrapped(self, n_pos_arg, input_values_arg):
@@ -403,3 +408,71 @@ def probe_graph(
     return probe_compiled(
         compiled, output_node, input_values, n_pos, atol=atol,
     )
+
+
+# ---------------------------------------------------------------------------
+# Compiled-side Assert checks
+# ---------------------------------------------------------------------------
+
+
+def check_asserts_on_compiled(
+    compiled: CompiledHeadless,
+    asserts: List[Assert],
+    input_values: Dict[str, torch.Tensor],
+    n_pos: int,
+) -> None:
+    """Run each Assert's predicate against the compiled transformer's residual stream.
+
+    Complements the reference-eval check (which runs predicates as
+    ``Assert.compute`` is called during the oracle walk).  Here we run
+    the same predicates against the *compiled* values of each Assert's
+    input node — catching invariants that reference math satisfies but
+    compiled approximations violate.
+
+    ``asserts`` must have been collected via
+    ``torchwright.graph.asserts.collect_asserts(output_node)`` **before**
+    ``compile_headless`` was called, since compilation strips Asserts
+    from the graph.
+
+    Raises ``AssertionError`` on the first violation, with the same
+    annotation-tagged message format as ``Assert.compute``.  Asserts
+    whose input nodes have no residual assignment (e.g. pure-literal
+    subgraphs) are silently skipped — they have no compiled value to
+    check.
+    """
+    if not asserts:
+        return
+
+    net: HeadlessTransformer = compiled._net
+    ra = net.residual_assignment
+    assert ra is not None, "compiled module has no residual_assignment"
+
+    res_stream = compiled._build_res_stream(
+        _inputs_from_dict(compiled, input_values, n_pos), past_len=0,
+    )
+    _, all_states = net.forward(res_stream, return_states=True)
+
+    state_tensor: Dict[ResidualStreamState, Tuple[torch.Tensor, str]] = {}
+    for key, (state, tensor) in all_states.items():
+        state_tensor[state] = (tensor, key)
+
+    ordered_states: List[ResidualStreamState] = []
+    for layer in net.layers:
+        if layer.mlp.out_state in ra.mapping:
+            ordered_states.append(layer.mlp.out_state)
+    if net.layers[-1].mlp.out_state not in ordered_states:
+        ordered_states.append(net.layers[-1].mlp.out_state)
+
+    for assert_node in asserts:
+        target = assert_node.inputs[0]
+        state = _first_state_with(target, ra, ordered_states)
+        if state is None:
+            continue  # no residual assignment — can't check on compiled.
+        tensor_pair = state_tensor.get(state)
+        if tensor_pair is None:
+            continue
+        res_tensor, _ = tensor_pair
+        compiled_val = _extract_compiled_value(target, ra, state, res_tensor)
+        if compiled_val is None:
+            continue
+        assert_node._check(compiled_val)

@@ -51,6 +51,52 @@ def _build_residual_stream(
     return res
 
 
+def _make_op(rmap: ResidualStreamMap, op_type: str, node, target_cols, **kwargs):
+    """Construct an AttnHeadOp with source_cols captured from ``rmap``.
+
+    The weight-writer requires source_cols to be populated at op-construction
+    time (see weight_writer.AttnHeadOp docstring).  This helper resolves
+    the right source indices for each op type so tests can be terse.
+    """
+    if op_type == "compute_attn":
+        q_in, k_in, v_in = node.inputs
+        kwargs.setdefault("q_source_cols", rmap.resolve_indices(q_in))
+        kwargs.setdefault("k_source_cols", rmap.resolve_indices(k_in))
+        kwargs.setdefault("source_cols", rmap.resolve_indices(v_in))
+    elif op_type == "compute_linear":
+        kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
+    elif op_type == "compute_add":
+        a0, a1 = node.inputs
+        kwargs.setdefault("source_cols", rmap.resolve_indices(a0))
+        kwargs.setdefault("source_cols_b", rmap.resolve_indices(a1))
+    elif op_type == "add_into":
+        # Caller must specify which input is live via kwargs['source_cols']
+        # or we infer: whichever is currently allocated.
+        if "source_cols" not in kwargs:
+            a0, a1 = node.inputs
+            if rmap.is_allocated(a0) or isinstance(a0, Concatenate):
+                kwargs["source_cols"] = rmap.resolve_indices(a0)
+            else:
+                kwargs["source_cols"] = rmap.resolve_indices(a1)
+    return AttnHeadOp(op_type=op_type, node=node, target_cols=target_cols, **kwargs)
+
+
+def _make_mlp_op(rmap: ResidualStreamMap, op_type: str, node, target_cols,
+                 mlp_slots=None, **kwargs):
+    """Construct an MLPOp with source_cols captured from ``rmap``."""
+    if mlp_slots is None:
+        mlp_slots = []
+    if op_type == "compute_relu":
+        # node is L2; L1's input is the actual source
+        l2 = node
+        l1 = l2.inputs[0].inputs[0]
+        kwargs.setdefault("source_cols", rmap.resolve_indices(l1.inputs[0]))
+    elif op_type == "compute_standalone_relu":
+        kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
+    return MLPOp(op_type=op_type, node=node, target_cols=target_cols,
+                 mlp_slots=mlp_slots, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Sanity check
 # ---------------------------------------------------------------------------
@@ -94,7 +140,7 @@ def test_attn_compute():
     out_cols = rmap.allocate(attn_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
-    op = AttnHeadOp(op_type="compute_attn", node=attn_node, target_cols=out_cols)
+    op = _make_op(rmap, "compute_attn", attn_node, out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -133,7 +179,7 @@ def test_attn_compute_small_d_head():
     out_cols = rmap.allocate(attn_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
-    op = AttnHeadOp(op_type="compute_attn", node=attn_node, target_cols=out_cols)
+    op = _make_op(rmap, "compute_attn", attn_node, out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -162,7 +208,7 @@ def test_attn_compute_shared_inputs():
     out_cols = rmap.allocate(attn_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
-    op = AttnHeadOp(op_type="compute_attn", node=attn_node, target_cols=out_cols)
+    op = _make_op(rmap, "compute_attn", attn_node, out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -192,7 +238,7 @@ def test_attn_compute_multiposition():
     out_cols = rmap.allocate(attn_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
-    op = AttnHeadOp(op_type="compute_attn", node=attn_node, target_cols=out_cols)
+    op = _make_op(rmap, "compute_attn", attn_node, out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -244,7 +290,7 @@ def test_linear_zero_bias():
     out_cols = rmap.allocate(linear_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
-    op = AttnHeadOp(op_type="compute_linear", node=linear_node, target_cols=out_cols)
+    op = _make_op(rmap, "compute_linear", linear_node, out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -283,7 +329,7 @@ def test_linear_large_input():
     out_cols = rmap.allocate(linear_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
-    op = AttnHeadOp(op_type="compute_linear", node=linear_node, target_cols=out_cols)
+    op = _make_op(rmap, "compute_linear", linear_node, out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -314,7 +360,7 @@ def test_linear_different_dims():
     out_cols = rmap.allocate(linear_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
-    op = AttnHeadOp(op_type="compute_linear", node=linear_node, target_cols=out_cols)
+    op = _make_op(rmap, "compute_linear", linear_node, out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -410,7 +456,7 @@ def test_add_into():
     rmap.reassign(a, add_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
-    op = AttnHeadOp(op_type="add_into", node=add_node, target_cols=a_cols)
+    op = _make_op(rmap, "add_into", add_node, a_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -451,7 +497,7 @@ def test_add_into_dead_at_inputs1():
     rmap.reassign(dead, add_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
-    op = AttnHeadOp(op_type="add_into", node=add_node, target_cols=dead_cols)
+    op = _make_op(rmap, "add_into", add_node, dead_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -489,7 +535,7 @@ def test_compute_add():
     out_cols = rmap.allocate(add_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
-    op = AttnHeadOp(op_type="compute_add", node=add_node, target_cols=out_cols)
+    op = _make_op(rmap, "compute_add", add_node, out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -521,7 +567,7 @@ def test_compute_add_wide():
     out_cols = rmap.allocate(add_node)
 
     layer = TransformerLayer(d_wide, D_HEAD, pos)
-    op = AttnHeadOp(op_type="compute_add", node=add_node, target_cols=out_cols)
+    op = _make_op(rmap, "compute_add", add_node, out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -566,9 +612,7 @@ def test_mlp_relu_chain():
     mlp_slots = list(range(0, 8))  # 8 internal MLP slots for the 8-dim intermediate
 
     layer = TransformerLayer(D, D_HEAD)
-    op = MLPOp(
-        op_type="compute_relu", node=l2, target_cols=out_cols, mlp_slots=mlp_slots
-    )
+    op = _make_mlp_op(rmap, "compute_relu", l2, out_cols, mlp_slots=mlp_slots)
     write_mlp_sublayer(layer, [op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -606,18 +650,10 @@ def test_mlp_relu_chain_multiple():
 
     layer = TransformerLayer(D, D_HEAD)
     ops = [
-        MLPOp(
-            op_type="compute_relu",
-            node=l1b,
-            target_cols=out1_cols,
-            mlp_slots=list(range(0, 6)),
-        ),
-        MLPOp(
-            op_type="compute_relu",
-            node=l2b,
-            target_cols=out2_cols,
-            mlp_slots=list(range(6, 11)),
-        ),
+        _make_mlp_op(rmap, "compute_relu", l1b, out1_cols,
+                     mlp_slots=list(range(0, 6))),
+        _make_mlp_op(rmap, "compute_relu", l2b, out2_cols,
+                     mlp_slots=list(range(6, 11))),
     ]
     write_mlp_sublayer(layer, ops, rmap)
     layer.to(device_mod.get_device(verbose=False))
@@ -651,12 +687,8 @@ def test_mlp_standalone_relu():
     mlp_slots = list(range(0, 4))  # 4 slots for 4-dim ReLU
 
     layer = TransformerLayer(D, D_HEAD)
-    op = MLPOp(
-        op_type="compute_standalone_relu",
-        node=relu_node,
-        target_cols=out_cols,
-        mlp_slots=mlp_slots,
-    )
+    op = _make_mlp_op(rmap, "compute_standalone_relu", relu_node, out_cols,
+                      mlp_slots=mlp_slots)
     write_mlp_sublayer(layer, [op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -690,12 +722,8 @@ def test_mlp_standalone_relu_preserves_input():
     mlp_slots = list(range(0, 4))
 
     layer = TransformerLayer(D, D_HEAD)
-    op = MLPOp(
-        op_type="compute_standalone_relu",
-        node=relu_node,
-        target_cols=out_cols,
-        mlp_slots=mlp_slots,
-    )
+    op = _make_mlp_op(rmap, "compute_standalone_relu", relu_node, out_cols,
+                      mlp_slots=mlp_slots)
     write_mlp_sublayer(layer, [op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -766,9 +794,7 @@ def test_biased_linear_split():
     layer = TransformerLayer(D, D_HEAD, pos)
 
     # Attention writes Wx (zero-bias part)
-    attn_op = AttnHeadOp(
-        op_type="compute_linear", node=linear_node, target_cols=out_cols
-    )
+    attn_op = _make_op(rmap, "compute_linear", linear_node, out_cols)
     write_attn_sublayer(layer, [attn_op], rmap, pos)
 
     # MLP adds bias
@@ -818,7 +844,7 @@ def test_non_contiguous_columns():
     assert set(rmap.get_indices(x)) & set(out_cols) == set()
 
     layer = TransformerLayer(D, D_HEAD, pos)
-    op = AttnHeadOp(op_type="compute_linear", node=linear_node, target_cols=out_cols)
+    op = _make_op(rmap, "compute_linear", linear_node, out_cols)
     write_attn_sublayer(layer, [op], rmap, pos)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -860,9 +886,7 @@ def test_mixed_layer():
     layer = TransformerLayer(D, D_HEAD, pos)
 
     # Write attention ops
-    attn_op = AttnHeadOp(
-        op_type="compute_linear", node=lin_attn, target_cols=attn_out_cols
-    )
+    attn_op = _make_op(rmap, "compute_linear", lin_attn, attn_out_cols)
     write_attn_sublayer(layer, [attn_op], rmap, pos)
 
     # Write MLP ops

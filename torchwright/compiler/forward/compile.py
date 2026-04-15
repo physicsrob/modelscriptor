@@ -15,6 +15,9 @@ from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.scheduler import LayerScheduler
+from torchwright.compiler.forward.sibling_clusters import (
+    SiblingClusterAnalyzer,
+)
 from torchwright.compiler.forward.weight_writer import (
     AttnHeadOp,
     MLPOp,
@@ -54,7 +57,9 @@ def _count_layer_params(
             heads_used += (d_input + d_head - 1) // d_head
         elif op.op_type == "compute_add":
             heads_used += 2 * ((len(op.node) + d_head - 1) // d_head)
-        elif op.op_type in ("cancel", "add_into"):
+        elif op.op_type == "cancel":
+            heads_used += (len(op.target_cols) + d_head - 1) // d_head
+        elif op.op_type == "add_into":
             heads_used += (len(op.node) + d_head - 1) // d_head
 
     slots_used = 0
@@ -79,6 +84,13 @@ def forward_compile(
     device: Optional[str] = "auto",
     on_layer_compiled: Optional[Callable[[int, TransformerLayer], None]] = None,
     d_hidden: Optional[int] = None,
+    on_node_scheduled: Optional[Callable[[Node, int], None]] = None,
+    trim_heads: bool = True,
+    overlays: Optional[dict] = None,
+    admission_control: bool = False,
+    admission_budget_fraction: float = 0.4,
+    admission_min_chains: int = 4,
+    admission_min_peak_width: int = 32,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -102,6 +114,11 @@ def forward_compile(
             state objects (``layer.attn.in_state`` / ``layer.mlp.out_state``)
             stay valid regardless and are consumed later when building
             ``residual_assignment``.
+        overlays: Optional dict mapping output_node -> (input_node, target_cols)
+            for delta transfer. When provided, a final layer is added that
+            transfers each output's value to the specified target columns
+            via delta: target += (output - target). This enables overlaid
+            I/O where output replaces input in-place.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -109,6 +126,10 @@ def forward_compile(
     """
     # 1. Analyze graph
     graph = GraphAnalyzer(output_node)
+    # GraphAnalyzer may have stripped the output if it was an Assert; use
+    # the effective output from here on so the loop's termination check
+    # matches the graph's actual terminal node.
+    output_node = graph.get_output_node()
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
 
     # Auto-create pos_encoding if needed (required for attention ops)
@@ -122,10 +143,38 @@ def forward_compile(
     net = HeadlessTransformer(d, d_head, pos_encoding, d_hidden=d_hidden)
     residual_map = ResidualStreamMap(d)
     residual_map.allocate(pos_encoding)
+    # pos_encoding + input_nodes are populated by get_input_res_stream at
+    # forward-time, so those cols are guaranteed clean on entry.  Every
+    # other col is dirty until a cancel op clears it.
+    residual_map.mark_clean(residual_map.get_indices(pos_encoding))
     for node in input_nodes:
         residual_map.allocate(node)
+        residual_map.mark_clean(residual_map.get_indices(node))
     computed = set(input_nodes)
-    scheduler = LayerScheduler(graph, d, d_head, pos_encoding, d_hidden=d_hidden)
+
+    # Static sibling-cluster analysis for admission control.  When
+    # disabled or no clusters are found, the scheduler behaves exactly
+    # as it did before admission control was added.
+    clusters = None
+    if admission_control:
+        cluster_analyzer = SiblingClusterAnalyzer(
+            graph,
+            min_chains=admission_min_chains,
+            min_peak_width=admission_min_peak_width,
+        )
+        clusters = cluster_analyzer.analyze()
+        if verbose and not clusters.is_empty():
+            print(
+                f"  Admission control: {len(clusters.clusters)} cluster(s), "
+                f"{sum(len(c.chains) for c in clusters.clusters.values())} "
+                f"total chains"
+            )
+
+    scheduler = LayerScheduler(
+        graph, d, d_head, pos_encoding, d_hidden=d_hidden,
+        clusters=clusters,
+        admission_budget_fraction=admission_budget_fraction,
+    )
 
     # Save input indices before scheduling (scheduling may free/reassign them)
     input_indices: dict[Node, list[int]] = {
@@ -172,6 +221,7 @@ def forward_compile(
         if output_node in computed:
             break
 
+        prev_computed = set(computed) if on_node_scheduled else None
         occupied_before = d - residual_map.get_free_count()
 
         t_layer_start = time.perf_counter()
@@ -198,6 +248,10 @@ def forward_compile(
             if isinstance(node, Concatenate) and node not in computed:
                 if all(leaf in computed for leaf in flatten_concat_nodes([node])):
                     computed.add(node)
+
+        if on_node_scheduled is not None:
+            for node in computed - prev_computed:
+                on_node_scheduled(node, i)
 
         layer_params = _count_layer_params(attn_ops, mlp_ops, d, d_head)
         total_params += layer_params
@@ -250,6 +304,30 @@ def forward_compile(
             f"{total_layer_time:.2f}s total layer time"
         )
 
+    # 3b. Delta transfer layer for overlaid I/O
+    # When overlays is provided, add a final layer that transfers each output
+    # value to the input's columns via delta: target += (output - target).
+    if overlays:
+        delta_layer = net.add_layer(append=True)
+        delta_ops = []
+        for out_node, (in_node, target_cols) in overlays.items():
+            # Source columns: where the output value was computed
+            source_cols = residual_map.get_indices(out_node)
+            # Subtract columns: same as target (the input columns)
+            subtract_cols = target_cols
+            delta_ops.append(AttnHeadOp(
+                op_type="delta_transfer",
+                node=out_node,
+                target_cols=target_cols,
+                source_cols=source_cols,
+                subtract_cols=subtract_cols,
+            ))
+        write_attn_sublayer(delta_layer, delta_ops, residual_map, pos_encoding)
+        if verbose:
+            print(f"  Delta transfer layer: {len(delta_ops)} overlays")
+        if on_layer_compiled is not None:
+            on_layer_compiled(len(net.layers) - 1, delta_layer)
+
     # Ensure at least one layer exists for ResidualAssignment states.
     # If compile produced zero layers (trivial graph), run the callback on
     # the placeholder too so every layer in net.layers is consistently in
@@ -282,6 +360,10 @@ def forward_compile(
     else:
         ra.assign(out_state, output_node, residual_map.get_indices(output_node))
     net.residual_assignment = ra
+
+    if trim_heads:
+        for layer in net.layers:
+            layer.attn.attn.trim_unused_heads()
 
     if device == "auto":
         net.to(get_device(verbose=verbose))

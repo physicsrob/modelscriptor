@@ -1,10 +1,11 @@
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from torchwright.compiler.components.component import Component
 from torchwright.graph import PosEncoding
-from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
+from torchwright.graph.attn import CAUSAL_MASK_SENTINEL  # kept for compat
 
 
 class AttnLayerComponent(Component):
@@ -38,21 +39,24 @@ class AttnLayerComponent(Component):
     def forward(self, inp: torch.Tensor):
         # inp shape (n_pos, d)
         assert inp.shape[1] == self.d
-        n_pos = inp.shape[0]
 
         # All heads in parallel via batched ops
         Q = torch.einsum('pd,hdk->hpk', inp, self.query_matrix)
         K = torch.einsum('pd,hdk->hpk', inp, self.key_matrix)
         V = torch.einsum('pd,hdk->hpk', inp, self.value_matrix)
 
-        attn_logits = torch.bmm(Q, K.transpose(1, 2))  # (n_heads, n_pos, n_pos)
-        mask = torch.triu(torch.ones(n_pos, n_pos, device=inp.device), diagonal=1).bool()
-        attn_logits.masked_fill_(mask.unsqueeze(0), CAUSAL_MASK_SENTINEL)
-        attn = torch.softmax(attn_logits, dim=2)
+        # Fused attention kernel.  scale=1.0 preserves the raw dot-product
+        # magnitude that all attention weights were compiled against (no
+        # 1/sqrt(d_head) rescaling).  is_causal=True applies the standard
+        # upper-triangular mask for causal prefill.
+        # Shape: (n_heads, n_pos, d_head) → unsqueeze batch → squeeze back.
+        weighted = F.scaled_dot_product_attention(
+            Q.unsqueeze(0), K.unsqueeze(0), V.unsqueeze(0),
+            is_causal=True,
+            scale=1.0,
+        ).squeeze(0)  # (n_heads, n_pos, d_head)
 
-        weighted = torch.bmm(attn, V)  # (n_heads, n_pos, d_head)
         output = torch.einsum('hpk,hkd->pd', weighted, self.output_matrix)
-
         return output
 
     def forward_cached(
@@ -83,18 +87,36 @@ class AttnLayerComponent(Component):
         n_new = inp.shape[0]
         n_total = K.shape[1]
 
-        attn_logits = torch.bmm(Q, K.transpose(1, 2))  # (n_heads, n_new, n_total)
-        mask = torch.triu(
-            torch.ones(n_new, n_total, device=inp.device),
-            diagonal=n_total - n_new + 1,
-        ).bool()
-        attn_logits.masked_fill_(mask.unsqueeze(0), CAUSAL_MASK_SENTINEL)
-        attn = torch.softmax(attn_logits, dim=2)
+        # is_causal=True  → pure prefill (no past): local indices == absolute
+        #                   positions; upper-triangular mask is correct.
+        # is_causal=False → decode (has past): all K entries are strictly in
+        #                   the past relative to Q; no future positions to mask.
+        # scale=1.0 preserves the raw dot-product magnitudes that all attention
+        # weights were compiled against (no 1/sqrt(d_head) rescaling).
+        weighted = F.scaled_dot_product_attention(
+            Q.unsqueeze(0), K.unsqueeze(0), V.unsqueeze(0),
+            is_causal=(n_new == n_total),
+            scale=1.0,
+        ).squeeze(0)  # (n_heads, n_new, d_head)
 
-        weighted = torch.bmm(attn, V)  # (n_heads, n_new, d_head)
         output = torch.einsum('hpk,hkd->pd', weighted, self.output_matrix)
 
         return output, (K, V)
+
+    def trim_unused_heads(self):
+        """Remove trailing unused (all-zero) heads after compilation.
+
+        Heads are allocated contiguously from index 0, so slicing
+        [:used_heads] is safe.  Keeps at least 1 head to avoid
+        degenerate empty-tensor shapes in downstream ops.
+        """
+        n = max(self.used_heads, 1)
+        if n < self.n_heads:
+            self.query_matrix = self.query_matrix[:n].contiguous()
+            self.key_matrix = self.key_matrix[:n].contiguous()
+            self.value_matrix = self.value_matrix[:n].contiguous()
+            self.output_matrix = self.output_matrix[:n].contiguous()
+            self.n_heads = n
 
     def num_params(self) -> int:
         return (

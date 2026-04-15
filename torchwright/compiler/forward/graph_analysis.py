@@ -5,6 +5,7 @@ from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import (
     Node,
+    Assert,
     Concatenate,
     LiteralValue,
     InputNode,
@@ -14,9 +15,21 @@ from torchwright.graph import (
 
 
 class GraphAnalyzer:
-    """Pre-computes graph metadata needed by the forward compiler scheduler."""
+    """Pre-computes graph metadata needed by the forward compiler scheduler.
+
+    Assert nodes are stripped (in-place) during initialization so they
+    don't show up in the scheduled graph — they're a reference-eval and
+    probe-compiled concern, not a compiled-weights concern.
+    """
 
     def __init__(self, output_node: Node):
+        # Strip Assert nodes in-place so scheduler/weight_writer/compile
+        # see a graph without them.  Reference-eval callers that run
+        # *before* GraphAnalyzer still see Asserts and fire their
+        # predicates as expected.
+        self._stripped_asserts: List[Assert] = []
+        output_node = self._strip_asserts(output_node)
+
         self._output_node = output_node
         self._all_nodes = get_ancestor_nodes({output_node})
 
@@ -29,6 +42,54 @@ class GraphAnalyzer:
         self._topo_order = self._build_topo_order()
         self._critical_path: Dict[Node, int] = {}
         self._compute_critical_paths()
+
+    def _strip_asserts(self, output_node: Node) -> Node:
+        """Mutate the graph in-place to remove Assert pass-through nodes.
+
+        Rewires every consumer of an Assert to point at the Assert's
+        underlying input.  If ``output_node`` itself is an Assert (or a
+        chain of them), follow the chain to the real output and return
+        that.  The stripped Assert nodes are recorded on
+        ``self._stripped_asserts`` so ``probe_compiled`` can find them
+        after compile.
+
+        Idempotent: if called on an already-stripped graph, finds
+        nothing to do and returns the same output.
+        """
+        pre_strip_nodes = get_ancestor_nodes({output_node})
+        asserts = [n for n in pre_strip_nodes if isinstance(n, Assert)]
+        if not asserts:
+            return output_node
+
+        def unwrap(node: Node) -> Node:
+            while isinstance(node, Assert):
+                node = node.inputs[0]
+            return node
+
+        for node in pre_strip_nodes:
+            if isinstance(node, Assert):
+                continue
+            for i, inp in enumerate(node.inputs):
+                if isinstance(inp, Assert):
+                    node.inputs[i] = unwrap(inp)
+
+        self._stripped_asserts.extend(asserts)
+        return unwrap(output_node)
+
+    def get_stripped_asserts(self) -> List[Assert]:
+        """Return the Assert nodes removed during initialization."""
+        return list(self._stripped_asserts)
+
+    def get_output_node(self) -> Node:
+        """Return the effective output node after Assert stripping.
+
+        Differs from the ``output_node`` the caller passed in only when
+        that node was itself an Assert — in which case this returns the
+        Assert's underlying input.  Callers that track whether the
+        root's value has been computed should consult this method
+        rather than their original reference.
+        """
+        return self._output_node
 
     def _build_topo_order(self) -> List[Node]:
         """Kahn's algorithm — returns nodes with inputs before dependents."""
@@ -83,6 +144,8 @@ class GraphAnalyzer:
         """Check if all of a node's inputs are available.
 
         Concatenate nodes are transparent — we check their leaf children instead.
+        Scheduling predecessors (set by hint helpers like
+        ``sequential_scope``) also gate readiness but aren't data inputs.
         """
         for inp in node.inputs:
             if isinstance(inp, Concatenate):
@@ -92,6 +155,9 @@ class GraphAnalyzer:
             else:
                 if inp not in available:
                     return False
+        for pred in node.scheduling_predecessors:
+            if pred not in available:
+                return False
         return True
 
     def get_ready_nodes(self, available: Set[Node]) -> Set[Node]:

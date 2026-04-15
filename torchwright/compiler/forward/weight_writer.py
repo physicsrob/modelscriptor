@@ -22,10 +22,26 @@ from torchwright.graph.relu import ReLU
 @dataclass
 class AttnHeadOp:
     op_type: Literal[
-        "compute_attn", "compute_linear", "compute_add", "cancel", "add_into"
+        "compute_attn", "compute_linear", "compute_add", "cancel", "add_into",
+        "delta_transfer"
     ]
-    node: Node
+    node: Optional[Node]
     target_cols: List[int]
+    # Primary source columns captured at schedule time.  Meaning depends on
+    # op_type:
+    #   compute_attn: V input columns
+    #   compute_linear: input columns
+    #   compute_add: first addend's columns
+    #   add_into: live addend's columns
+    #   delta_transfer: source columns (where the output value is)
+    source_cols: List[int] = None
+    # compute_add: second addend's columns.
+    source_cols_b: List[int] = None
+    # compute_attn: Q and K input columns (V is in source_cols).
+    q_source_cols: List[int] = None
+    k_source_cols: List[int] = None
+    # delta_transfer: subtract columns (same as target for overlay).
+    subtract_cols: List[int] = None
 
 
 @dataclass
@@ -39,6 +55,9 @@ class MLPOp:
     node: Node
     target_cols: List[int]
     mlp_slots: List[int] = field(default_factory=list)
+    # Input columns captured at schedule time.  Used by compute_relu
+    # (l1's input) and compute_standalone_relu (relu's input).
+    source_cols: List[int] = None
 
 
 def write_attn_sublayer(
@@ -61,6 +80,8 @@ def write_attn_sublayer(
             _write_compute_add(attn, op, residual_map, pos_encoding)
         elif op.op_type == "add_into":
             _write_add_into(attn, op, residual_map, pos_encoding)
+        elif op.op_type == "delta_transfer":
+            _write_delta_transfer(attn, op, residual_map, pos_encoding)
         else:
             raise ValueError(f"Unknown attn op_type: {op.op_type}")
 
@@ -129,10 +150,12 @@ def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
     node = op.node
     assert isinstance(node, Attn)
 
-    query_in, key_in, value_in = node.inputs
-    q_idx = rmap.resolve_indices(query_in)
-    k_idx = rmap.resolve_indices(key_in)
-    v_idx = rmap.resolve_indices(value_in)
+    assert op.q_source_cols is not None, "compute_attn requires q_source_cols"
+    assert op.k_source_cols is not None, "compute_attn requires k_source_cols"
+    assert op.source_cols is not None, "compute_attn requires source_cols (V)"
+    q_idx = op.q_source_cols
+    k_idx = op.k_source_cols
+    v_idx = op.source_cols
     o_idx = op.target_cols
 
     layer_d_head = attn.d_head
@@ -193,8 +216,9 @@ def _write_compute_linear(
     d_head = attn.d_head
     d_input = len(input_node)
 
+    assert op.source_cols is not None, "compute_linear requires source_cols"
     pe_idx = rmap.get_indices(pos_encoding)
-    v_idx = rmap.resolve_indices(input_node)  # resolves through Concatenate
+    v_idx = op.source_cols
     o_idx = op.target_cols
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
@@ -233,68 +257,81 @@ def _write_compute_add(
     """Compute Add(a, b) by copying both inputs to fresh columns via attention.
 
     Used when neither input is dead (so add_into can't reuse columns).
-    Allocates new output columns and uses two groups of attention heads:
-    one to copy a, one to copy b. Since attention heads are additive,
-    the result in the output columns is 0 + a + b = a + b.
+    Allocates new output columns and uses attention heads to copy both inputs.
+    Since attention heads are additive, the result in the output columns is
+    0 + a + b = a + b.
+
+    When 2 * chunk_size <= d_head, both inputs are combined into a single
+    head: a0 maps into head dims [0:cs] and a1 into [cs:2cs], with the
+    output matrix summing both contributions to the same output columns.
+    Otherwise falls back to one head per input.
     """
     node = op.node
     assert isinstance(node, Add)
+    assert op.source_cols is not None, "compute_add requires source_cols"
+    assert op.source_cols_b is not None, "compute_add requires source_cols_b"
 
-    a0, a1 = node.inputs
     d_head = attn.d_head
     d_output = len(node)
-
     pe_idx = rmap.get_indices(pos_encoding)
     o_idx = op.target_cols
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
 
-    # Copy each input to the output columns via separate heads.
-    for input_node in [a0, a1]:
-        v_idx = rmap.resolve_indices(input_node)
-        for start in range(0, d_output, d_head):
-            end = min(start + d_head, d_output)
-            chunk_size = end - start
+    v_idx_a = op.source_cols
+    v_idx_b = op.source_cols_b
 
-            v_chunk_idx = v_idx[start:end]
-            o_chunk_idx = o_idx[start:end]
+    for start in range(0, d_output, d_head):
+        end = min(start + d_head, d_output)
+        chunk_size = end - start
+        o_chunk_idx = o_idx[start:end]
 
-            v_mat = torch.eye(chunk_size, d_head)
-            o_mat = torch.eye(d_head, chunk_size)
-
+        if 2 * chunk_size <= d_head:
+            # Both inputs fit in a single head.
+            # a0 occupies head dims [0:cs], a1 occupies [cs:2*cs].
+            # Output matrix sums both into the same output columns.
+            combined_v_idx = v_idx_a[start:end] + v_idx_b[start:end]
+            v_mat = torch.eye(2 * chunk_size, d_head)
+            o_mat = torch.zeros(d_head, chunk_size)
+            o_mat[:chunk_size, :chunk_size] = torch.eye(chunk_size)
+            o_mat[chunk_size:2 * chunk_size, :chunk_size] = torch.eye(chunk_size)
             head = _allocate_head(attn)
             _scatter_attn_head(
-                attn,
-                head,
-                pe_idx,
-                pe_idx,
-                v_chunk_idx,
-                o_chunk_idx,
-                q_mat,
-                k_mat,
-                v_mat,
-                o_mat,
-                d_head,
+                attn, head, pe_idx, pe_idx, combined_v_idx, o_chunk_idx,
+                q_mat, k_mat, v_mat, o_mat, d_head,
             )
+        else:
+            # Too wide to combine — one head per input.
+            for v_idx_x in [v_idx_a, v_idx_b]:
+                v_chunk_idx = v_idx_x[start:end]
+                v_mat = torch.eye(chunk_size, d_head)
+                o_mat = torch.eye(d_head, chunk_size)
+                head = _allocate_head(attn)
+                _scatter_attn_head(
+                    attn, head, pe_idx, pe_idx, v_chunk_idx, o_chunk_idx,
+                    q_mat, k_mat, v_mat, o_mat, d_head,
+                )
 
 
 def _write_cancel(
     attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
 ):
-    """Cancel a node: V=identity, O=-identity. Skip adds x + (-x) = 0.
+    """Cancel target_cols: V=identity, O=-identity. Skip adds x + (-x) = 0.
 
-    Splits across multiple heads for nodes wider than d_head.
+    Splits across multiple heads when wider than d_head.  Used both to
+    zero a dead node's columns before reuse and to clear dirty columns
+    that the caller's initial residual stream may have populated with
+    garbage.
     """
-    node = op.node
     d_head = attn.d_head
-    d_node = len(node)
+    d_width = len(op.target_cols)
 
     pe_idx = rmap.get_indices(pos_encoding)
     node_idx = op.target_cols
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
 
-    for start in range(0, d_node, d_head):
-        end = min(start + d_head, d_node)
+    for start in range(0, d_width, d_head):
+        end = min(start + d_head, d_width)
         chunk_size = end - start
 
         chunk_idx = node_idx[start:end]
@@ -331,20 +368,12 @@ def _write_add_into(
     node = op.node
     assert isinstance(node, Add)
 
-    # Determine which input is live (still has values in the residual stream).
-    # After scheduler's reassign, the dead addend is no longer individually
-    # allocated. The live addend is either a regular allocated node or a
-    # Concatenate (whose children are allocated).
-    a0, a1 = node.inputs
-    if rmap.is_allocated(a0) or isinstance(a0, Concatenate):
-        live_addend = a0
-    else:
-        live_addend = a1
+    assert op.source_cols is not None, "add_into requires source_cols (live addend)"
     d_head = attn.d_head
-    d_live = len(live_addend)
+    v_idx = op.source_cols  # live addend cols, captured at schedule time
+    d_live = len(v_idx)
 
     pe_idx = rmap.get_indices(pos_encoding)
-    v_idx = rmap.resolve_indices(live_addend)  # resolves through Concatenate
     o_idx = op.target_cols  # dead addend's columns
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
@@ -375,6 +404,75 @@ def _write_add_into(
         )
 
 
+def _write_delta_transfer(
+    attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
+):
+    """Transfer (source - subtract) to target columns via attention.
+
+    This operation computes: target_cols += (source_cols - subtract_cols)
+
+    After the skip connection, if target_cols originally held the same value
+    as subtract_cols (i.e., the input value), then:
+        result = original + (source - subtract)
+               = subtract + (source - subtract)
+               = source
+
+    This enables overlaid I/O where the output replaces the input in-place.
+
+    When 2 * chunk_size <= d_head, source (+1) and subtract (-1) are combined
+    into a single head: source maps into head dims [0:cs] with +1 output
+    coefficients, subtract into [cs:2*cs] with -1 output coefficients.
+    Otherwise falls back to one head per group.
+
+    Net effect: target_cols += source - subtract
+    """
+    assert op.source_cols is not None, "delta_transfer requires source_cols"
+    assert op.subtract_cols is not None, "delta_transfer requires subtract_cols"
+
+    d_head = attn.d_head
+    d_width = len(op.target_cols)
+
+    assert len(op.source_cols) == d_width
+    assert len(op.subtract_cols) == d_width
+
+    pe_idx = rmap.get_indices(pos_encoding)
+    q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
+
+    for start in range(0, d_width, d_head):
+        end = min(start + d_head, d_width)
+        chunk_size = end - start
+        o_chunk_idx = op.target_cols[start:end]
+
+        if 2 * chunk_size <= d_head:
+            # Combine source (+1) and subtract (-1) into a single head.
+            # source occupies head dims [0:cs] with +1, subtract [cs:2*cs] with -1.
+            combined_v_idx = op.source_cols[start:end] + op.subtract_cols[start:end]
+            v_mat = torch.eye(2 * chunk_size, d_head)
+            o_mat = torch.zeros(d_head, chunk_size)
+            o_mat[:chunk_size, :chunk_size] = torch.eye(chunk_size)         # +1
+            o_mat[chunk_size:2 * chunk_size, :chunk_size] = -torch.eye(chunk_size)  # -1
+            head = _allocate_head(attn)
+            _scatter_attn_head(
+                attn, head, pe_idx, pe_idx, combined_v_idx, o_chunk_idx,
+                q_mat, k_mat, v_mat, o_mat, d_head,
+            )
+        else:
+            # Too wide to combine — one head per group.
+            v_mat = torch.eye(chunk_size, d_head)
+            o_mat = torch.eye(d_head, chunk_size)  # +1 coefficient
+            head = _allocate_head(attn)
+            _scatter_attn_head(
+                attn, head, pe_idx, pe_idx, op.source_cols[start:end], o_chunk_idx,
+                q_mat, k_mat, v_mat, o_mat, d_head,
+            )
+            o_mat = -torch.eye(d_head, chunk_size)  # -1 coefficient
+            head = _allocate_head(attn)
+            _scatter_attn_head(
+                attn, head, pe_idx, pe_idx, op.subtract_cols[start:end], o_chunk_idx,
+                q_mat, k_mat, v_mat, o_mat, d_head,
+            )
+
+
 # ---------------------------------------------------------------------------
 # MLP operations
 # ---------------------------------------------------------------------------
@@ -396,8 +494,9 @@ def _write_compute_relu(
     l1_node = relu_node.inputs[0]
     assert isinstance(l1_node, Linear)
 
+    assert op.source_cols is not None, "compute_relu requires source_cols"
     input_node = l1_node.inputs[0]
-    in_idx = rmap.resolve_indices(input_node)
+    in_idx = op.source_cols
     mlp_slots = op.mlp_slots
     out_idx = op.target_cols
 
@@ -474,8 +573,9 @@ def _write_compute_standalone_relu(
     relu_node = op.node
     assert isinstance(relu_node, ReLU)
 
+    assert op.source_cols is not None, "compute_standalone_relu requires source_cols"
     input_node = relu_node.inputs[0]
-    in_idx = rmap.resolve_indices(input_node)
+    in_idx = op.source_cols
     mlp_slots = op.mlp_slots
     out_idx = op.target_cols
 

@@ -13,6 +13,7 @@ import torch
 
 from torchwright.graph import Concatenate, Linear, Node, annotate
 from torchwright.graph.misc import LiteralValue
+from torchwright.graph.scheduling_hints import sequential_scope
 from torchwright.ops.arithmetic_ops import (
     abs,
     add,
@@ -640,9 +641,6 @@ def _column_fill(
     H = config.screen_height
     if rows_per_patch is None:
         rows_per_patch = H
-    assert H % rows_per_patch == 0, (
-        f"screen_height {H} must be divisible by rows_per_patch {rows_per_patch}"
-    )
     if patch_row_start is None:
         patch_row_start = LiteralValue(torch.tensor([0.0]), name="patch_row_start_0")
 
@@ -685,6 +683,7 @@ def _textured_column_fill(
     max_coord: float = 20.0,
     patch_row_start: Optional[Node] = None,
     rows_per_patch: Optional[int] = None,
+    tex_sample_batch_size: int = 8,
 ) -> Node:
     """Fill a screen column with textured wall and solid floor/ceiling.
 
@@ -741,9 +740,6 @@ def _textured_column_fill(
     H = config.screen_height
     if rows_per_patch is None:
         rows_per_patch = H
-    assert H % rows_per_patch == 0, (
-        f"screen_height {H} must be divisible by rows_per_patch {rows_per_patch}"
-    )
     if patch_row_start is None:
         patch_row_start = LiteralValue(torch.tensor([0.0]), name="patch_row_start_0")
 
@@ -803,8 +799,7 @@ def _textured_column_fill(
         step=0.5,
     )
 
-    row_rgbs: List[Node] = []
-    for y_idx in range(rows_per_patch):
+    def _build_tex_row(y_idx: int) -> Node:
         with annotate("tex_sample"):
             # bin_f = base_product + (y_idx + 0.5) * per_row_step
             # This is a free Linear: 1 × base_product + (y_idx+0.5) × per_row_step
@@ -820,7 +815,19 @@ def _textured_column_fill(
             row_rgb = dynamic_extract(
                 tex_column_colors, tex_row_idx, tex_height, 3,
             )
-            row_rgbs.append(row_rgb)
+            return row_rgb
+
+    # Each iteration pins ~192 cols (via the masked intermediate inside
+    # dynamic_extract).  Without gating, the scheduler admits ~7 rows
+    # concurrently and stalls on a residual-pressure plateau (see
+    # optimization_guide §7).  ``sequential_scope`` wires scheduling
+    # deps so at most ``tex_sample_batch_size`` rows are in flight at
+    # once, keeping peak residual usage within budget.
+    row_rgbs: List[Node] = sequential_scope(
+        [lambda y_idx=y_idx: _build_tex_row(y_idx)
+         for y_idx in range(rows_per_patch)],
+        batch_size=tex_sample_batch_size,
+    )
 
     textured_wall = Concatenate(row_rgbs)
 
@@ -848,6 +855,7 @@ def build_textured_rendering_pipeline(
     max_coord: float = 20.0,
     patch_row_start: Optional[Node] = None,
     rows_per_patch: Optional[int] = None,
+    tex_sample_batch_size: int = 8,
 ) -> Node:
     """Build a textured rendering pipeline.
 
@@ -1008,6 +1016,7 @@ def build_textured_rendering_pipeline(
         max_coord=max_coord,
         patch_row_start=patch_row_start,
         rows_per_patch=rows_per_patch,
+        tex_sample_batch_size=tex_sample_batch_size,
     )
 
 

@@ -7,11 +7,12 @@ lists for the weight writer.
 Mutates residual_map (allocate, free, reassign) and computed_nodes (add).
 """
 
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.compiler.forward.sibling_clusters import SiblingClusters
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
@@ -42,6 +43,8 @@ class LayerScheduler:
         d_head: int,
         pos_encoding: PosEncoding,
         d_hidden: Optional[int] = None,
+        clusters: Optional[SiblingClusters] = None,
+        admission_budget_fraction: float = 0.4,
     ):
         self.graph = graph
         self.d = d
@@ -49,6 +52,16 @@ class LayerScheduler:
         self.d_head = d_head
         self.n_heads = d // d_head
         self.pos_encoding = pos_encoding
+
+        # Admission control state (see _is_admissible).  When clusters
+        # is None or empty, admission is disabled and the scheduler
+        # behaves as it did before this feature.
+        self._clusters = clusters
+        self._admission_budget_fraction = admission_budget_fraction
+        self._in_flight: Dict[int, Set[int]] = {}
+        if clusters is not None:
+            for cluster_id in clusters.clusters:
+                self._in_flight[cluster_id] = set()
 
     def schedule_layer(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
@@ -68,6 +81,46 @@ class LayerScheduler:
         Returns:
             ``(attn_ops, mlp_ops, biased_linears)`` lists for the weight writer.
         """
+        # Admission-control bookkeeping for this call.
+        self._admission_deferred = False
+        self._admission_bypass = False
+
+        attn_ops, mlp_ops, biased_linears, had_schedulable = (
+            self._schedule_layer_inner(residual_map, computed_nodes)
+        )
+
+        # Deadlock guard: if admission deferred every compute candidate and
+        # nothing else was schedulable, retry with admission bypassed.  This
+        # is only safe when no state was mutated (no free_adds, no cancels,
+        # no placements) — all of those append to attn_ops, so the
+        # emptiness check is sufficient.
+        if (
+            not attn_ops
+            and not mlp_ops
+            and self._admission_deferred
+        ):
+            self._admission_bypass = True
+            attn_ops, mlp_ops, biased_linears, had_schedulable = (
+                self._schedule_layer_inner(residual_map, computed_nodes)
+            )
+
+        # Progress check: raise only if nothing got placed despite ready
+        # work existing (true deadlock).  Moved out of the inner function
+        # so the admission retry runs first.
+        if not attn_ops and not mlp_ops and had_schedulable:
+            remaining = self.graph.get_all_nodes() - computed_nodes
+            remaining = {n for n in remaining if not isinstance(n, Concatenate)}
+            if remaining:
+                raise RuntimeError(
+                    f"No progress: {len(remaining)} nodes remaining, "
+                    f"{residual_map.get_free_count()} free columns"
+                )
+
+        return attn_ops, mlp_ops, biased_linears
+
+    def _schedule_layer_inner(
+        self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
+    ) -> Tuple[List[AttnHeadOp], List[MLPOp], List[Node], bool]:
         # --- 1. Classify ready nodes ---
         all_ready = self.graph.get_ready_nodes(computed_nodes)
 
@@ -102,9 +155,21 @@ class LayerScheduler:
             bool(ready) or bool(free_adds) or bool(deferred_adds) or bool(chains)
         )
 
+        # Collect nodes that pending MLP chains will read directly from
+        # the residual stream.  The chain's l1 is simulated inside
+        # linear1 using its input's cols, so eager-freeing in the attn
+        # sublayer must not cancel those inputs.
+        chain_protected: Set[Node] = set()
+        for l1, _relu, _l2, _d_hidden, _exclusive in chains:
+            chain_protected.add(l1.inputs[0])
+
         # --- 2. Attention sublayer ---
-        attn_ops, biased_linears = self._schedule_attn_sublayer(
-            ready, dead, free_adds, deferred_adds, residual_map, computed_nodes
+        (
+            attn_ops, biased_linears, heads_used,
+            cancel_cols, cancel_cols_set, cancel_heads,
+        ) = self._schedule_attn_sublayer(
+            ready, dead, free_adds, deferred_adds, residual_map, computed_nodes,
+            chain_protected,
         )
 
         # --- 2.5. Re-check readiness after attention ---
@@ -130,35 +195,76 @@ class LayerScheduler:
         chains.extend(new_chains)
 
         # --- 3. MLP sublayer ---
-        mlp_ops = self._schedule_mlp_sublayer(
-            ready, chains, biased_linears, residual_map, computed_nodes
+        # Dirty target cols for MLP writes are folded into the same
+        # batched cancel op that lives in the attention sublayer.  We
+        # thread the shared batch state through.
+        mlp_ops, cancel_cols, cancel_cols_set, cancel_heads, heads_used = (
+            self._schedule_mlp_sublayer(
+                ready, chains, biased_linears, residual_map, computed_nodes,
+                cancel_cols, cancel_cols_set, cancel_heads, heads_used,
+            )
         )
 
-        # --- 4. Progress check ---
-        # Only raise if there were ready/schedulable nodes but nothing got scheduled
-        # (actual deadlock). If nothing was ready, the caller just needs to provide
-        # more inputs or call again after state changes.
-        if not attn_ops and not mlp_ops and had_schedulable:
-            remaining = self.graph.get_all_nodes() - computed_nodes
-            remaining = {n for n in remaining if not isinstance(n, Concatenate)}
-            if remaining:
-                raise RuntimeError(
-                    f"No progress: {len(remaining)} nodes remaining, "
-                    f"{residual_map.get_free_count()} free columns"
-                )
+        # Emit the single batched cancel op at the end of the attention
+        # sublayer.  Order within the sublayer is irrelevant (all heads
+        # run in parallel and sum into the residual stream), so it's
+        # fine to append after compute ops.
+        if cancel_cols:
+            attn_ops.append(AttnHeadOp("cancel", None, cancel_cols))
 
-        return attn_ops, mlp_ops, biased_linears
+        # Caller (schedule_layer) handles the progress check after the
+        # admission-retry pass.
+        return attn_ops, mlp_ops, biased_linears, had_schedulable
 
     # ------------------------------------------------------------------
     # Attention sublayer
     # ------------------------------------------------------------------
 
     def _schedule_attn_sublayer(
-        self, ready, dead, free_adds, deferred_adds, residual_map, computed_nodes
+        self, ready, dead, free_adds, deferred_adds, residual_map, computed_nodes,
+        chain_protected=frozenset(),
     ):
         attn_ops = []
         biased_linears = []
         heads_used = 0
+
+        # All cancellations in this layer (dead-node cancels + dirty-col
+        # cancels from fresh allocations) are batched into a single
+        # AttnHeadOp("cancel", None, cancel_cols) emitted at the end.
+        # Coalescing matters: one cancel head can zero d_head cols, so
+        # scattering one cancel op per write-site burns heads that would
+        # otherwise be shared.  ``heads_used`` tracks main-op heads
+        # *plus* the current batched-cancel cost (ceil(|cancel_cols|/d_head)).
+        cancel_cols: list[int] = []
+        cancel_cols_set: set[int] = set()
+        cancel_heads = 0
+
+        def try_add_cancel(new_cols):
+            """Try to add ``new_cols`` to the pending cancel batch.
+
+            Returns ``(additions, delta_heads)`` if the merged cancel fits
+            in the remaining head budget; ``None`` otherwise.  ``additions``
+            is the subset of ``new_cols`` not already in the batch.
+            Does NOT commit — the caller decides whether to keep or
+            discard.
+            """
+            additions = [c for c in new_cols if c not in cancel_cols_set]
+            if not additions:
+                return [], 0
+            new_total = len(cancel_cols) + len(additions)
+            new_heads = (new_total + self.d_head - 1) // self.d_head
+            delta = new_heads - cancel_heads
+            if heads_used + delta > self.n_heads:
+                return None
+            return additions, delta
+
+        def commit_cancel(additions, delta):
+            nonlocal heads_used, cancel_heads
+            if additions:
+                cancel_cols.extend(additions)
+                cancel_cols_set.update(additions)
+                cancel_heads += delta
+                heads_used += delta
 
         # 2a. Free Adds (highest priority — no allocation needed)
         # Snapshot computed_nodes so dead-for-add checks are consistent across
@@ -179,7 +285,11 @@ class LayerScheduler:
             if heads_used + n_heads > self.n_heads:
                 continue
             target_cols = residual_map.get_indices(dead_addend)
-            attn_ops.append(AttnHeadOp("add_into", add_node, target_cols))
+            live_source_cols = residual_map.resolve_indices(live_addend)
+            attn_ops.append(AttnHeadOp(
+                "add_into", add_node, target_cols,
+                source_cols=live_source_cols,
+            ))
             residual_map.reassign(dead_addend, add_node)
             computed_nodes.add(add_node)
             add_into_live_addends.add(live_addend)
@@ -191,13 +301,21 @@ class LayerScheduler:
             if isinstance(node, Attn):
                 n_heads = (node.d_v + self.d_head - 1) // self.d_head
                 compute_candidates.append(("compute_attn", node, n_heads))
-            elif isinstance(node, Linear) and not isinstance(node.inputs[0], ReLU):
+            elif isinstance(node, Linear):
+                inp = node.inputs[0]
+                # Skip Linears whose ReLU input isn't yet computed — these will
+                # be scheduled as L->R->L chains in the MLP sublayer.  But if
+                # the ReLU IS computed (e.g., L1 was scheduled earlier due to
+                # fanout, then ReLU scheduled standalone), we can schedule L2
+                # as a standalone Linear reading from the ReLU's residual slot.
+                if isinstance(inp, ReLU) and inp not in computed_nodes:
+                    continue
                 n_heads = self._heads_for_linear(node)
                 compute_candidates.append(("compute_linear", node, n_heads))
         # Deferred Adds: neither input is dead, so we can't use add_into.
-        # Instead, copy both inputs to fresh columns via two groups of heads.
+        # Instead, copy both inputs to fresh columns via attention heads.
         for node in deferred_adds:
-            n_heads = 2 * self._heads_for_node(node)
+            n_heads = self._heads_for_add(node)
             compute_candidates.append(("compute_add", node, n_heads))
 
         # Sort: Attn first; under column pressure prefer nodes that free columns,
@@ -231,30 +349,93 @@ class LayerScheduler:
         for op_type, node, n_heads_needed in compute_candidates:
             if heads_used + n_heads_needed > self.n_heads:
                 continue
+            if not self._is_admissible(node):
+                self._admission_deferred = True
+                continue
             target_cols = self._try_allocate(node, residual_map)
 
-            # Promotion: cancel dead nodes to free space
+            # Promotion: cancel dead nodes to free space.  The dead
+            # node's cols are added to the batched cancel set.
             while (
                 target_cols is None
                 and cancel_candidates
                 and heads_used + n_heads_needed < self.n_heads
             ):
-                cn = cancel_candidates.pop(0)
-                cn_heads = (len(cn) + self.d_head - 1) // self.d_head
-                if heads_used + n_heads_needed + cn_heads > self.n_heads:
-                    continue
-                attn_ops.append(AttnHeadOp("cancel", cn, residual_map.get_indices(cn)))
+                cn = cancel_candidates[0]
+                cn_cols = residual_map.get_indices(cn)
+                result = try_add_cancel(cn_cols)
+                if result is None:
+                    break
+                additions, delta = result
+                if heads_used + n_heads_needed + delta > self.n_heads:
+                    break
+                cancel_candidates.pop(0)
+                commit_cancel(additions, delta)
+                residual_map.mark_clean(cn_cols)
                 residual_map.free(cn)
-                heads_used += cn_heads
                 target_cols = self._try_allocate(node, residual_map)
 
             if target_cols is None:
                 continue
 
-            attn_ops.append(AttnHeadOp(op_type, node, target_cols))
+            # Dirty-col cancel budget: fresh cols from the initial pool
+            # are dirty until cleared; cols recycled from a previously
+            # cancelled node are already clean.
+            dirty = residual_map.dirty_subset(target_cols)
+            add_result = try_add_cancel(dirty) if dirty else ([], 0)
+            if add_result is None:
+                residual_map.free(node)
+                continue
+            additions, delta = add_result
+            if heads_used + n_heads_needed + delta > self.n_heads:
+                residual_map.free(node)
+                continue
+
+            # Capture source columns at schedule time.  This lets the
+            # weight-writer read sources from the op directly, so later
+            # free() mutations of residual_map don't orphan this op's
+            # lookups — a precondition for same-layer eager-freeing.
+            op = AttnHeadOp(op_type, node, target_cols)
+            if op_type == "compute_linear":
+                op.source_cols = residual_map.resolve_indices(node.inputs[0])
+            elif op_type == "compute_attn":
+                q_in, k_in, v_in = node.inputs
+                op.q_source_cols = residual_map.resolve_indices(q_in)
+                op.k_source_cols = residual_map.resolve_indices(k_in)
+                op.source_cols = residual_map.resolve_indices(v_in)
+            elif op_type == "compute_add":
+                a0, a1 = node.inputs
+                op.source_cols = residual_map.resolve_indices(a0)
+                op.source_cols_b = residual_map.resolve_indices(a1)
+            attn_ops.append(op)
             heads_used += n_heads_needed
+            commit_cancel(additions, delta)
+            if dirty:
+                residual_map.mark_clean(dirty)
             computed_nodes.add(node)
             ready.discard(node)
+            self._mark_scheduled(node)
+
+            # Eager-freeing: scheduling ``node`` may have just made one
+            # of its inputs freshly dead.  Surface those to
+            # ``cancel_candidates`` so subsequent compute iterations can
+            # promote-cancel them instead of aborting on a full residual
+            # stream.  Safe because sources for the just-appended op were
+            # captured on ``op`` above, so weight-writer lookups don't
+            # depend on the input staying in residual_map.
+            already_pending = set(cancel_candidates)
+            for fresh in self._freshly_dead_inputs(node, computed_nodes, residual_map):
+                if fresh in add_into_live_addends or fresh in already_pending:
+                    continue
+                # Pending MLP chains simulate their l1 inside linear1
+                # using the chain-input's residual cols.  Don't cancel
+                # those inputs mid-layer even if the graph-level
+                # consumer was just placed.
+                if fresh in chain_protected:
+                    continue
+                cancel_candidates.append(fresh)
+                already_pending.add(fresh)
+            cancel_candidates.sort(key=lambda n: -len(n))
 
             if (
                 op_type == "compute_linear"
@@ -263,26 +444,68 @@ class LayerScheduler:
             ):
                 biased_linears.append(node)
 
-        # 2e. Remaining cancellations
+        # 2e. Remaining cancellations — try to fold remaining dead cols
+        # into the same batch.
         for cn in cancel_candidates:
-            cn_heads = (len(cn) + self.d_head - 1) // self.d_head
-            if heads_used + cn_heads > self.n_heads:
+            cn_cols = residual_map.get_indices(cn)
+            result = try_add_cancel(cn_cols)
+            if result is None:
                 continue
-            attn_ops.append(AttnHeadOp("cancel", cn, residual_map.get_indices(cn)))
+            additions, delta = result
+            commit_cancel(additions, delta)
+            residual_map.mark_clean(cn_cols)
             residual_map.free(cn)
-            heads_used += cn_heads
 
-        return attn_ops, biased_linears
+        # Expose the batched cancel state to the MLP sublayer so it can
+        # extend the same batch with dirty MLP target cols.
+        return (
+            attn_ops, biased_linears, heads_used,
+            cancel_cols, cancel_cols_set, cancel_heads,
+        )
 
     # ------------------------------------------------------------------
     # MLP sublayer
     # ------------------------------------------------------------------
 
     def _schedule_mlp_sublayer(
-        self, ready, chains, biased_linears, residual_map, computed_nodes
+        self, ready, chains, biased_linears, residual_map, computed_nodes,
+        cancel_cols, cancel_cols_set, cancel_heads, heads_used,
     ):
         mlp_ops = []
         next_slot = 0
+
+        def try_add_cancel(new_cols):
+            """Try to fold ``new_cols`` into the shared batched cancel.
+            Returns (additions, delta_heads) or None if over budget."""
+            additions = [c for c in new_cols if c not in cancel_cols_set]
+            if not additions:
+                return [], 0
+            new_total = len(cancel_cols) + len(additions)
+            new_heads = (new_total + self.d_head - 1) // self.d_head
+            delta = new_heads - cancel_heads
+            if heads_used + delta > self.n_heads:
+                return None
+            return additions, delta
+
+        def commit_cancel(additions, delta):
+            nonlocal heads_used, cancel_heads
+            if additions:
+                cancel_cols.extend(additions)
+                cancel_cols_set.update(additions)
+                cancel_heads += delta
+                heads_used += delta
+
+        def fits_cancel(target_cols):
+            """Return (ok, additions, delta) for cancelling target_cols'
+            dirty subset.  Does NOT commit."""
+            dirty = residual_map.dirty_subset(target_cols)
+            if not dirty:
+                return True, [], 0
+            result = try_add_cancel(dirty)
+            if result is None:
+                return False, [], 0
+            additions, delta = result
+            return True, additions, delta
 
         # 3a. L->R->L chains
         under_pressure = residual_map.get_free_count() < self.d // 4
@@ -301,13 +524,36 @@ class LayerScheduler:
         for l1, relu, l2, d_hidden, exclusive in chains:
             if next_slot + d_hidden > self.d_hidden:
                 continue
+            if not self._is_admissible(l2):
+                self._admission_deferred = True
+                continue
             target_cols = self._try_allocate(l2, residual_map)
             if target_cols is None:
                 continue
+            ok, additions, delta = fits_cancel(target_cols)
+            if not ok:
+                residual_map.free(l2)
+                continue
             mlp_slots = list(range(next_slot, next_slot + d_hidden))
             next_slot += d_hidden
-            mlp_ops.append(MLPOp("compute_relu", l2, target_cols, mlp_slots))
+            input_cols = residual_map.resolve_indices(l1.inputs[0])
+            mlp_ops.append(MLPOp(
+                "compute_relu", l2, target_cols, mlp_slots,
+                source_cols=input_cols,
+            ))
+            commit_cancel(additions, delta)
+            dirty = residual_map.dirty_subset(target_cols)
+            if dirty:
+                residual_map.mark_clean(dirty)
             computed_nodes.update({l1, relu, l2})
+            # Mark the chain-representative (l2) as scheduled — that's
+            # the node that appears in node_to_chain when the cluster
+            # analyzer classifies an MLP chain's output as the branch
+            # terminal.  l1 and relu may also be in the chain, but
+            # terminal detection relies on the direct join input.
+            self._mark_scheduled(l2)
+            self._mark_scheduled(l1)
+            self._mark_scheduled(relu)
 
             # L1 with fanout: also allocate L1 in residual stream
             if not exclusive and not residual_map.is_allocated(l1):
@@ -331,15 +577,29 @@ class LayerScheduler:
             d_relu = len(node)
             if next_slot + d_relu > self.d_hidden:
                 continue
+            if not self._is_admissible(node):
+                self._admission_deferred = True
+                continue
             target_cols = self._try_allocate(node, residual_map)
             if target_cols is None:
                 continue
+            ok, additions, delta = fits_cancel(target_cols)
+            if not ok:
+                residual_map.free(node)
+                continue
             mlp_slots = list(range(next_slot, next_slot + d_relu))
             next_slot += d_relu
-            mlp_ops.append(
-                MLPOp("compute_standalone_relu", node, target_cols, mlp_slots)
-            )
+            input_cols = residual_map.resolve_indices(node.inputs[0])
+            mlp_ops.append(MLPOp(
+                "compute_standalone_relu", node, target_cols, mlp_slots,
+                source_cols=input_cols,
+            ))
+            commit_cancel(additions, delta)
+            dirty = residual_map.dirty_subset(target_cols)
+            if dirty:
+                residual_map.mark_clean(dirty)
             computed_nodes.add(node)
+            self._mark_scheduled(node)
 
         # 3c. LiteralValues (no slot cost)
         constants = sorted(
@@ -347,18 +607,32 @@ class LayerScheduler:
             key=self._critical_path_key,
         )
         for node in constants:
+            if not self._is_admissible(node):
+                self._admission_deferred = True
+                continue
             target_cols = self._try_allocate(node, residual_map)
             if target_cols is None:
                 continue
+            ok, additions, delta = fits_cancel(target_cols)
+            if not ok:
+                residual_map.free(node)
+                continue
             mlp_ops.append(MLPOp("compute_literal_value", node, target_cols, []))
+            commit_cancel(additions, delta)
+            dirty = residual_map.dirty_subset(target_cols)
+            if dirty:
+                residual_map.mark_clean(dirty)
             computed_nodes.add(node)
+            self._mark_scheduled(node)
 
         # 3d. Bias writes for biased Linears scheduled in attention sublayer
+        # Biased Linear target cols were already cancelled when the Linear
+        # was scheduled in the attention sublayer, so no extra cancel here.
         for node in biased_linears:
             target_cols = residual_map.get_indices(node)
             mlp_ops.append(MLPOp("compute_bias", node, target_cols, []))
 
-        return mlp_ops
+        return mlp_ops, cancel_cols, cancel_cols_set, cancel_heads, heads_used
 
     # ------------------------------------------------------------------
     # Chain detection
@@ -501,6 +775,45 @@ class LayerScheduler:
         effective = self._get_effective_consumers(addend)
         return (effective - {add_node}).issubset(computed_nodes)
 
+    def _freshly_dead_inputs(
+        self,
+        node: Node,
+        computed_nodes: Set[Node],
+        residual_map: ResidualStreamMap,
+    ) -> List[Node]:
+        """Inputs of ``node`` that are now dead because ``node`` just got placed.
+
+        Walks through ``Concatenate`` inputs since Concatenate nodes aren't
+        residual-stream-allocated.  Returns only leaves currently allocated
+        whose effective consumers are all in ``computed_nodes``.
+        """
+        result: List[Node] = []
+        seen: Set[Node] = set()
+        stack: List[Node] = list(node.inputs)
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if isinstance(cur, Concatenate):
+                stack.extend(cur.inputs)
+                continue
+            if cur is self.pos_encoding:
+                continue
+            if not residual_map.is_allocated(cur):
+                continue
+            if self.graph.is_input_node(cur):
+                # Graph source nodes (InputNode, Embedding, LiteralValue,
+                # PosEncoding) must stay in the residual stream so
+                # callers can read their values via the compiled model's
+                # snapshot-based lookup.  Existing dead-node cancellation
+                # also leaves them alone until a later layer, so eager-
+                # freeing must respect the same invariant.
+                continue
+            if self._get_effective_consumers(cur).issubset(computed_nodes):
+                result.append(cur)
+        return result
+
     def _find_dead_nodes(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
     ) -> List[Node]:
@@ -519,6 +832,20 @@ class LayerScheduler:
         """Number of attention heads needed to copy a node's output."""
         return (len(node) + self.d_head - 1) // self.d_head
 
+    def _heads_for_add(self, node: Node) -> int:
+        """Number of attention heads needed for a compute_add op.
+
+        When 2 * chunk_size <= d_head, both inputs share one combined head.
+        Otherwise each input needs its own head.
+        """
+        d_output = len(node)
+        d_head = self.d_head
+        total = 0
+        for start in range(0, d_output, d_head):
+            chunk_size = min(start + d_head, d_output) - start
+            total += 1 if 2 * chunk_size <= d_head else 2
+        return total
+
     def _heads_for_linear(self, node: Linear) -> int:
         """Number of attention heads needed for a standalone Linear."""
         d_input = len(node.inputs[0])
@@ -536,3 +863,93 @@ class LayerScheduler:
 
     def _critical_path_key(self, node: Node):
         return -self.graph.get_critical_path_length(node)
+
+    # ------------------------------------------------------------------
+    # Admission control (sibling-cluster-based gating)
+    # ------------------------------------------------------------------
+    #
+    # The scheduler is otherwise fully greedy: if ``N`` sibling chains
+    # in a cluster are simultaneously ready, it admits as many as
+    # capacity allows.  That creates a residual-pressure plateau (see
+    # optimization_guide §7) because each admitted chain pins its wide
+    # intermediates until its terminal is placed.
+    #
+    # Admission control caps the number of *not-yet-in-flight* chains
+    # per cluster so that projected peak residual occupancy stays
+    # within a configurable budget.  A chain is "in flight" from the
+    # moment any of its exclusive nodes is scheduled until its
+    # terminal is placed.  Once in flight, the chain is always
+    # admitted — we never leave work half-scheduled.
+
+    def _chain_of(self, node: Node) -> Optional[Tuple[int, int]]:
+        if self._clusters is None:
+            return None
+        return self._clusters.node_to_chain.get(node)
+
+    def _is_admissible(self, node: Node) -> bool:
+        """True if ``node`` can be scheduled under the admission budget.
+
+        Nodes outside any sibling cluster are always admissible.  A
+        node in a cluster is admissible if the chain it belongs to is
+        already in flight, or if admitting a fresh chain would keep
+        projected residual occupancy for this cluster within
+        ``admission_budget_fraction * d``.
+
+        When ``self._admission_bypass`` is set (deadlock guard), admits
+        everything — see :meth:`schedule_layer`.
+        """
+        if getattr(self, "_admission_bypass", False):
+            return True
+        key = self._chain_of(node)
+        if key is None:
+            return True
+        cluster_id, chain_id = key
+        in_flight = self._in_flight.get(cluster_id, set())
+        if chain_id in in_flight:
+            return True
+        cluster = self._clusters.clusters[cluster_id]
+        projected = (len(in_flight) + 1) * cluster.peak_chain_width
+        budget = int(self._admission_budget_fraction * self.d)
+        return projected <= budget
+
+    def _mark_scheduled(self, node: Node) -> None:
+        """Update in-flight bookkeeping after a node is placed.
+
+        Scheduling any exclusive node marks the chain in flight.
+        Scheduling the chain's terminal marks the chain completed.
+        """
+        if self._clusters is None:
+            return
+        key = self._clusters.node_to_chain.get(node)
+        if key is None:
+            return
+        cluster_id, chain_id = key
+        self._in_flight.setdefault(cluster_id, set()).add(chain_id)
+
+        term_key = self._clusters.terminal_to_chain.get(node)
+        if term_key is not None:
+            t_cluster_id, t_chain_id = term_key
+            in_flight = self._in_flight.get(t_cluster_id)
+            if in_flight is not None:
+                in_flight.discard(t_chain_id)
+
+    def _filter_admissible(
+        self, candidates: List, node_getter=lambda t: t[1]
+    ) -> Tuple[List, List]:
+        """Partition candidates into (admissible, deferred).
+
+        Accepts a list of tuples/nodes and a ``node_getter`` to extract
+        the underlying Node for the admission check.  Returns the same
+        structure, not just nodes, so callers can preserve extra
+        metadata (op-type, heads count) without rewrapping.
+        """
+        if self._clusters is None or not self._clusters.clusters:
+            return candidates, []
+        admissible = []
+        deferred = []
+        for c in candidates:
+            if self._is_admissible(node_getter(c)):
+                admissible.append(c)
+            else:
+                deferred.append(c)
+        return admissible, deferred

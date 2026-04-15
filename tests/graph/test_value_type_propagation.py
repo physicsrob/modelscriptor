@@ -6,9 +6,7 @@ primary guard against soundness bugs.
 """
 
 import math
-import os
 
-import pytest
 import torch
 
 from torchwright.graph import (
@@ -32,7 +30,7 @@ from torchwright.graph.misc import Placeholder
 
 
 def test_input_node_is_unknown():
-    n = InputNode("x", d_output=4)
+    n = InputNode("x", 4)
     assert n.value_type == NodeValueType.unknown()
 
 
@@ -147,7 +145,7 @@ def test_linear_non_integer_matrix_drops_integer():
 
 
 def test_linear_unbounded_input_gives_unbounded_output():
-    inp = InputNode("x", d_output=2)
+    inp = InputNode("x", 2)
     W = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     lin = Linear(inp, W)
     vt = lin.value_type
@@ -188,84 +186,23 @@ def test_value_logger_passes_through():
     assert vl.value_type == inp.value_type
 
 
-# --- Attn default vs declared --------------------------------------
+# --- Attn default is unknown (claims come via Assert wrappers) -----
 
 
-def test_attn_default_uses_value_range_through_v_o():
+def test_attn_default_value_type_is_unknown():
+    # Attention outputs are soft; the graph-level Attn node makes no
+    # structural claim by default.  Primitives that produce hard
+    # selection wrap their Attn output in assert_matches_value_type
+    # to stake a claim; see tests/graph/test_asserts.py.
     pe = PosEncoding(d_pos=8)
-    value = LiteralValue(torch.tensor([2.0, 3.0]))  # range [2, 3]
-    query_matrix = torch.zeros(8, 4)
-    key_matrix = torch.zeros(8, 4)
-    value_matrix = torch.eye(2, 4)
-    output_matrix = torch.eye(4, 2)
+    value = LiteralValue(torch.tensor([2.0, 3.0]))
     attn = Attn(
         query_in=pe,
         key_in=pe,
         value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=value_matrix,
-        output_matrix=output_matrix,
+        query_matrix=torch.eye(8, 2),
+        key_matrix=torch.eye(8, 2),
+        value_matrix=torch.eye(2),
+        output_matrix=torch.eye(2),
     )
-    vt = attn.value_type
-    # Over-approximated via V then O matrix interval arithmetic: zero-
-    # padding columns in V pull the low bound down to 0, and the O
-    # projection preserves that.  Still a sound superset of [2, 3].
-    assert vt.value_range.contains(Range(2.0, 3.0))
-    # No other properties declared without an explicit declaration.
-    assert not vt.is_integer
-
-
-@pytest.fixture
-def verify_value_types_env():
-    prior = os.environ.get("TW_VERIFY_VALUE_TYPES")
-    os.environ["TW_VERIFY_VALUE_TYPES"] = "1"
-    try:
-        yield
-    finally:
-        if prior is None:
-            os.environ.pop("TW_VERIFY_VALUE_TYPES", None)
-        else:
-            os.environ["TW_VERIFY_VALUE_TYPES"] = prior
-
-
-def test_runtime_verifier_passes_on_consistent_graph(verify_value_types_env):
-    inp = LiteralValue(torch.tensor([1.0, 2.0, 3.0]))
-    r = ReLU(inp)
-    out = r.compute(n_pos=2, input_values={})
-    assert out.shape == (2, 3)
-
-
-def test_runtime_verifier_rejects_bad_declaration(verify_value_types_env):
-    pe = PosEncoding(d_pos=8)
-    value = LiteralValue(torch.tensor([0.5, 0.7]))  # non-integer
-    liar = NodeValueType.integer(0, 1)  # falsely claims integer
-    attn = Attn(
-        query_in=pe,
-        key_in=pe,
-        value_in=value,
-        query_matrix=torch.zeros(8, 4),
-        key_matrix=torch.zeros(8, 4),
-        value_matrix=torch.eye(2, 4),
-        output_matrix=torch.eye(4, 2),
-        declared_output_type=liar,
-    )
-    with pytest.raises(AssertionError):
-        attn.compute(n_pos=3, input_values={})
-
-
-def test_attn_declared_output_type_wins():
-    pe = PosEncoding(d_pos=8)
-    value = LiteralValue(torch.tensor([0.0, 1.0, 2.0, 3.0]))
-    declared = NodeValueType.integer(0, 3)
-    attn = Attn(
-        query_in=pe,
-        key_in=pe,
-        value_in=value,
-        query_matrix=torch.zeros(8, 4),
-        key_matrix=torch.zeros(8, 4),
-        value_matrix=torch.eye(4, 4),
-        output_matrix=torch.eye(4, 4),
-        declared_output_type=declared,
-    )
-    assert attn.value_type == declared
+    assert attn.value_type == NodeValueType.unknown()

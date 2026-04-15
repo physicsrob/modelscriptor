@@ -4,7 +4,9 @@ from .value_type import NodeValueType, Range
 from .attn import Attn
 from .embedding import Embedding
 from .linear import Linear
-from .misc import InputNode, Concatenate, Add, LiteralValue, ValueLogger
+from .misc import (
+    Add, Assert, Concatenate, InputNode, LiteralValue, Predicate, ValueLogger,
+)
 from .pos_encoding import PosEncoding
 from .relu import ReLU
 from .asserts import require_integer, require_binary, require_sign, require_one_hot
