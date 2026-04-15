@@ -1,5 +1,12 @@
+from functools import reduce
 from typing import List, Dict, Optional
 from torchwright.graph import Node
+from torchwright.graph.value_type import (
+    NodeValueType,
+    Range,
+    intersect_element_props,
+    is_integer_tensor,
+)
 
 import torch
 
@@ -31,6 +38,14 @@ class Concatenate(Node):
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         return torch.cat([x.compute(n_pos, input_values) for x in self.inputs], dim=-1)
 
+    def compute_value_type(self) -> NodeValueType:
+        if not self.inputs:
+            return NodeValueType.unknown()
+        return reduce(
+            intersect_element_props,
+            (inp.value_type for inp in self.inputs),
+        )
+
     def flatten_inputs(self: Node) -> List[Node]:
         # Flatten concatenation and return the list of nodes
         inputs = []
@@ -49,6 +64,13 @@ class Add(Node):
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         input1, input2 = self.inputs
         return input1.compute(n_pos, input_values) + input2.compute(n_pos, input_values)
+
+    def compute_value_type(self) -> NodeValueType:
+        a, b = self.inputs[0].value_type, self.inputs[1].value_type
+        return NodeValueType(
+            value_range=a.value_range + b.value_range,
+            is_integer=a.is_integer and b.is_integer,
+        )
 
     def other_input(self, node: Node):
         if self.inputs[0] == node:
@@ -69,6 +91,25 @@ class LiteralValue(Node):
         x = self.value.unsqueeze(0).expand(n_pos, -1)
         assert x.shape == (n_pos, len(self))
         return x
+
+    def compute_value_type(self) -> NodeValueType:
+        v = self.value
+        if v.numel() == 0:
+            return NodeValueType.unknown()
+        lo = float(v.min().item())
+        hi = float(v.max().item())
+        is_int = is_integer_tensor(v)
+        is_bin = is_int and lo >= 0.0 and hi <= 1.0
+        is_sgn = is_int and lo >= -1.0 and hi <= 1.0 and not is_bin
+        # one-hot: exactly one element is 1, rest are 0 (binary vector with sum == 1)
+        is_one_hot = is_bin and bool(v.sum().eq(1).item())
+        return NodeValueType(
+            value_range=Range(lo, hi),
+            is_integer=is_int,
+            is_binary=is_bin,
+            is_sign=is_sgn,
+            is_one_hot=is_one_hot,
+        )
 
     def is_zero(self):
         return self.value.eq(0).all()
@@ -100,3 +141,6 @@ class ValueLogger(Node):
         x = inp.compute(n_pos, input_values)
         print(f"ValueLogger({self.name}): shape={x.shape} value={x}")
         return x
+
+    def compute_value_type(self) -> NodeValueType:
+        return self.inputs[0].value_type

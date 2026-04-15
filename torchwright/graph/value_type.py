@@ -161,6 +161,44 @@ class NodeValueType:
         return replace(self, is_one_hot=False)
 
 
+def is_integer_tensor(t) -> bool:
+    """True iff every element of ``t`` equals its rounded value.
+
+    Tolerates ``None`` by returning ``False`` (callers treat
+    missing biases as "unknown" and skip the integer claim).
+    """
+    import torch
+
+    if t is None:
+        return False
+    if not isinstance(t, torch.Tensor):
+        return False
+    if t.numel() == 0:
+        return True
+    return bool(torch.all(t == t.round()).item())
+
+
+def linear_output_range(input_range: Range, matrix, bias=None) -> Range:
+    """Interval range of ``x @ matrix + bias`` given ``x`` elements ∈ input_range.
+
+    Returns the union over output columns of each column's interval
+    (per-scalar range). Unbounded input ⇒ unbounded output.
+    """
+    import torch
+
+    if not input_range.is_finite():
+        return Range.unbounded()
+    m = matrix
+    lo_prod = input_range.lo * m
+    hi_prod = input_range.hi * m
+    mins = torch.minimum(lo_prod, hi_prod).sum(dim=0)
+    maxs = torch.maximum(lo_prod, hi_prod).sum(dim=0)
+    if bias is not None:
+        mins = mins + bias
+        maxs = maxs + bias
+    return Range(float(mins.min().item()), float(maxs.max().item()))
+
+
 def intersect_element_props(a: NodeValueType, b: NodeValueType) -> NodeValueType:
     """Meet of element-level properties: kept only if both sides have them.
 

@@ -1,5 +1,8 @@
+from typing import Optional
+
 import torch
 from torchwright.graph import Node
+from torchwright.graph.value_type import NodeValueType, linear_output_range
 
 # Causal mask sentinel: future positions are filled with this value before
 # softmax.  Must be large enough that no valid logit ever falls below it,
@@ -39,13 +42,13 @@ class Attn(Node):
         key_matrix: torch.Tensor,
         value_matrix: torch.Tensor,
         output_matrix: torch.Tensor,
+        declared_output_type: Optional[NodeValueType] = None,
     ):
         self.d_qk = query_matrix.shape[1]
         self.d_v = value_matrix.shape[1]
         self.d_query_in = query_matrix.shape[0]
         self.d_key_in = key_matrix.shape[0]
         self.d_value_in = value_matrix.shape[0]
-        super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
 
         assert key_matrix.shape[1] == self.d_qk
         assert output_matrix.shape[0] == self.d_v
@@ -54,6 +57,21 @@ class Attn(Node):
         self.key_matrix = key_matrix
         self.value_matrix = value_matrix
         self.output_matrix = output_matrix
+        # Stashed for compute_value_type (runs inside super().__init__).
+        self._declared_output_type = declared_output_type
+        super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
+
+    def compute_value_type(self) -> NodeValueType:
+        if self._declared_output_type is not None:
+            return self._declared_output_type
+        # Weak default: attention is a convex combination of
+        # ``value_in @ V`` vectors, so the post-attention range is a
+        # subset of that. Then multiply by O for the final output range.
+        value_in = self.inputs[2]
+        v_range = value_in.value_type.value_range
+        v_after_vm = linear_output_range(v_range, self.value_matrix)
+        out_range = linear_output_range(v_after_vm, self.output_matrix)
+        return NodeValueType(value_range=out_range)
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         query_in_node, key_in_node, value_in_node = self.inputs
