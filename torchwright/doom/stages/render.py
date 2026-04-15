@@ -147,6 +147,7 @@ def build_render(
     chunk_size: int,
     max_coord: float,
     max_walls: int,
+    tex_sample_batch_size: int = 8,
 ) -> RenderOutputs:
     H = config.screen_height
     W = config.screen_width
@@ -192,6 +193,7 @@ def build_render(
             wall_top, wall_bottom, wall_height, tex_column_colors,
             render_chunk_start=inputs.render_chunk_start,
             config=config, tex_h=tex_h, chunk_size=cs, max_coord=max_coord,
+            tex_sample_batch_size=tex_sample_batch_size,
         )
 
     with annotate("render/state_transitions"):
@@ -414,6 +416,7 @@ def _chunk_fill(
     tex_h: int,
     chunk_size: int,
     max_coord: float,
+    tex_sample_batch_size: int = 8,
 ):
     """Determine active_start, chunk_length, and paint the chunk's pixels."""
     H = config.screen_height
@@ -434,6 +437,7 @@ def _chunk_fill(
         wall_top, wall_bottom, wall_height,
         tex_column_colors, tex_h, config, max_coord=max_coord,
         patch_row_start=active_start, rows_per_patch=chunk_size,
+        tex_sample_batch_size=tex_sample_batch_size,
     )
     return active_start, chunk_length, pixels
 

@@ -1,5 +1,42 @@
 # TODO
 
+## fp16 inference for Flash Attention
+
+The render decode loop runs at ~35ms/step (GPU-bound). The bottleneck is SDPA
+over long sequences (~800 positions): each step attends over an 800×800-ish
+matrix using PyTorch's materialized ("math") softmax kernel.
+
+**Why the math kernel is used:** PyTorch's SDPA dispatcher only enables Flash
+Attention for fp16/bf16 inputs. All model weights and activations are currently
+fp32, so every SDPA call falls back to the materialized kernel regardless of
+whether an `attn_mask` is provided.
+
+**The opportunity:** Casting weights and activations to fp16 at inference time
+(e.g., `.half()` on `CompiledHeadless._net`) would let SDPA dispatch to Flash
+Attention on A100. Flash Attention is O(N) in memory and substantially faster
+for long sequences — potentially 3–5× faster SDPA, which could bring decode
+from ~35ms to ~15–20ms per step.
+
+The dynamic decode path (`forward_cached`, `is_causal=False`, no explicit mask)
+already satisfies all Flash Attention preconditions except dtype. The static
+KV cache path (added in this branch) uses a float `attn_mask` and would need
+to switch to a boolean mask or be dropped in favour of the dynamic path.
+
+**Risk:** Weights are compiled in fp32 and encode precise numerical thresholds
+(comparison results, attention argmin/argmax patterns). fp16 has ~3 significant
+decimal digits vs ~7 for fp32. It's unknown whether the compiled logic survives
+the precision loss without correctness failures. A test that compares fp32 vs
+fp16 `step_frame` outputs would answer this.
+
+**Suggested experiment:**
+1. `module._net.to(torch.float16)` after `compile_game()`
+2. Cast inputs to fp16 in `_build_res_stream`
+3. Run `make walkthrough ARGS="--frames 5"` and compare to fp32 reference
+4. If pixel errors are within tolerance, fp16 is viable
+
+Files: `torchwright/compiler/export.py` (`_build_res_stream`, `CompiledHeadless`),
+`torchwright/compiler/components/attn.py` (weights), `torchwright/doom/compile.py`
+
 ## Move ceiling/floor into the transformer
 
 The host currently decides ceiling vs floor per pixel (`ceil if y < center_y

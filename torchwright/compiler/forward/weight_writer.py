@@ -27,9 +27,20 @@ class AttnHeadOp:
     ]
     node: Optional[Node]
     target_cols: List[int]
-    # For delta_transfer: source columns (where the output value is)
+    # Primary source columns captured at schedule time.  Meaning depends on
+    # op_type:
+    #   compute_attn: V input columns
+    #   compute_linear: input columns
+    #   compute_add: first addend's columns
+    #   add_into: live addend's columns
+    #   delta_transfer: source columns (where the output value is)
     source_cols: List[int] = None
-    # For delta_transfer: subtract columns (same as target for overlay)
+    # compute_add: second addend's columns.
+    source_cols_b: List[int] = None
+    # compute_attn: Q and K input columns (V is in source_cols).
+    q_source_cols: List[int] = None
+    k_source_cols: List[int] = None
+    # delta_transfer: subtract columns (same as target for overlay).
     subtract_cols: List[int] = None
 
 
@@ -44,6 +55,9 @@ class MLPOp:
     node: Node
     target_cols: List[int]
     mlp_slots: List[int] = field(default_factory=list)
+    # Input columns captured at schedule time.  Used by compute_relu
+    # (l1's input) and compute_standalone_relu (relu's input).
+    source_cols: List[int] = None
 
 
 def write_attn_sublayer(
@@ -136,10 +150,12 @@ def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
     node = op.node
     assert isinstance(node, Attn)
 
-    query_in, key_in, value_in = node.inputs
-    q_idx = rmap.resolve_indices(query_in)
-    k_idx = rmap.resolve_indices(key_in)
-    v_idx = rmap.resolve_indices(value_in)
+    assert op.q_source_cols is not None, "compute_attn requires q_source_cols"
+    assert op.k_source_cols is not None, "compute_attn requires k_source_cols"
+    assert op.source_cols is not None, "compute_attn requires source_cols (V)"
+    q_idx = op.q_source_cols
+    k_idx = op.k_source_cols
+    v_idx = op.source_cols
     o_idx = op.target_cols
 
     layer_d_head = attn.d_head
@@ -200,8 +216,9 @@ def _write_compute_linear(
     d_head = attn.d_head
     d_input = len(input_node)
 
+    assert op.source_cols is not None, "compute_linear requires source_cols"
     pe_idx = rmap.get_indices(pos_encoding)
-    v_idx = rmap.resolve_indices(input_node)  # resolves through Concatenate
+    v_idx = op.source_cols
     o_idx = op.target_cols
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
@@ -251,17 +268,17 @@ def _write_compute_add(
     """
     node = op.node
     assert isinstance(node, Add)
+    assert op.source_cols is not None, "compute_add requires source_cols"
+    assert op.source_cols_b is not None, "compute_add requires source_cols_b"
 
-    a0, a1 = node.inputs
     d_head = attn.d_head
     d_output = len(node)
-
     pe_idx = rmap.get_indices(pos_encoding)
     o_idx = op.target_cols
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
 
-    v_idx_a = rmap.resolve_indices(a0)
-    v_idx_b = rmap.resolve_indices(a1)
+    v_idx_a = op.source_cols
+    v_idx_b = op.source_cols_b
 
     for start in range(0, d_output, d_head):
         end = min(start + d_head, d_output)
@@ -351,20 +368,12 @@ def _write_add_into(
     node = op.node
     assert isinstance(node, Add)
 
-    # Determine which input is live (still has values in the residual stream).
-    # After scheduler's reassign, the dead addend is no longer individually
-    # allocated. The live addend is either a regular allocated node or a
-    # Concatenate (whose children are allocated).
-    a0, a1 = node.inputs
-    if rmap.is_allocated(a0) or isinstance(a0, Concatenate):
-        live_addend = a0
-    else:
-        live_addend = a1
+    assert op.source_cols is not None, "add_into requires source_cols (live addend)"
     d_head = attn.d_head
-    d_live = len(live_addend)
+    v_idx = op.source_cols  # live addend cols, captured at schedule time
+    d_live = len(v_idx)
 
     pe_idx = rmap.get_indices(pos_encoding)
-    v_idx = rmap.resolve_indices(live_addend)  # resolves through Concatenate
     o_idx = op.target_cols  # dead addend's columns
 
     q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
@@ -485,8 +494,9 @@ def _write_compute_relu(
     l1_node = relu_node.inputs[0]
     assert isinstance(l1_node, Linear)
 
+    assert op.source_cols is not None, "compute_relu requires source_cols"
     input_node = l1_node.inputs[0]
-    in_idx = rmap.resolve_indices(input_node)
+    in_idx = op.source_cols
     mlp_slots = op.mlp_slots
     out_idx = op.target_cols
 
@@ -563,8 +573,9 @@ def _write_compute_standalone_relu(
     relu_node = op.node
     assert isinstance(relu_node, ReLU)
 
+    assert op.source_cols is not None, "compute_standalone_relu requires source_cols"
     input_node = relu_node.inputs[0]
-    in_idx = rmap.resolve_indices(input_node)
+    in_idx = op.source_cols
     mlp_slots = op.mlp_slots
     out_idx = op.target_cols
 

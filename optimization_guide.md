@@ -330,6 +330,113 @@ Lifetime matters:
   with different natural lifetimes pins all of them until the concat
   is consumed.
 
+### When pressure becomes a plateau
+
+The most damaging shape: **N parallel chains feeding a common
+Concatenate**, where each chain has a wide intermediate that's much
+wider than the chain's terminal output. Classic example: an unrolled
+loop where each iteration computes a one-hot select and produces a
+narrow result (DOOM's tex_sample loop produced a 192-col `masked_i`
+intermediate per row, then narrowed to 3 cols).
+
+The scheduler is greedy. With N independent chains all simultaneously
+ready, it admits as many as fit. Each in-flight chain pins its wide
+intermediate until the chain's terminal places. If `K` chains are
+in flight, residual occupancy hits `K × peak_intermediate_width`. If
+that exceeds the pressure threshold, the scheduler enters a long
+plateau: 95–99% occupancy, low ops/layer, MLP packing collapses, and
+compiled N inflates well beyond DAG critical path.
+
+**How to recognise this pattern:**
+
+- `make graph-stats` shows DAG critical path much shorter than
+  compiled `N`.
+- Verbose compile log shows a long stretch of high-occupancy layers
+  with low op counts.
+- `modal_inspect_residual.py` (or its local variant) breaks per-layer
+  occupancy down by annotation; one annotation will dominate the
+  plateau (e.g., `render/column_fill/tex_sample` was 63% of the
+  plateau for DOOM at d=2048).
+
+### Lever: `sequential_scope` for parallel chains
+
+`torchwright.graph.scheduling_hints.sequential_scope(factories,
+batch_size=K)` calls each factory in order, identifies per-iteration
+node sets via creation-order ID ranges, and wires synthetic scheduling
+predecessors: iteration `i`'s entry nodes wait until iteration
+`i - K`'s terminal is in `computed_nodes`. The scheduler honours these
+via `GraphAnalyzer.is_ready` — they're not data inputs, so compute
+semantics are unchanged, only ordering.
+
+Effect: at most `K` chains are in flight concurrently. Tune `K` so
+peak residual occupancy from in-flight chains stays well below the
+pressure threshold.
+
+```python
+from torchwright.graph.scheduling_hints import sequential_scope
+
+row_rgbs = sequential_scope(
+    [lambda y_idx=y_idx: _build_tex_row(y_idx)
+     for y_idx in range(rows_per_patch)],
+    batch_size=8,
+)
+```
+
+**Tuning K — empirical scaling on DOOM:**
+
+| Setup                       | Optimal `K` | Compiled N |
+|-----------------------------|-------------|------------|
+| `d=2048`, `chunk_size=20`   | 8           | 51         |
+| `d=4096`, `chunk_size=100`  | 16          | 63         |
+
+`K` scales roughly linearly with `d`, since the binding constraint is
+fitting `K × peak_intermediate_width` into available residual budget.
+A reasonable default heuristic: `K ≈ d / (4 × peak_intermediate_width)`,
+but always sweep — the optimum has a sharp basin.
+
+**Knobs that matter for tuning:**
+
+- **`d`** — sets total residual budget. Larger `d` ⇒ optimal `K` rises
+  linearly.
+- **`peak_intermediate_width`** — the largest live width per chain.
+  This is graph-structure-dependent; for tex_sample it was 192 (the
+  `masked_i` intermediate inside `dynamic_extract`).
+- **`chunk_size` / number of chains** — the loop unroll count. More
+  chains means the plateau lasts longer if not gated, but the optimal
+  `K` is determined by peak width, not chain count.
+- **Other plateau contributors** — any cols pinned by *non-cluster*
+  work during the same layers narrows the budget available for
+  in-flight chains. Use the per-annotation occupancy breakdown to
+  estimate this.
+
+**Footgun: `K` too close to the natural in-flight count.** A hint
+that's too loose disables the scheduler's organic backpressure
+(greedy-admit-with-cancel) without adding effective gating. The
+scheduler trusts the constraint, admits up to `K` chains in parallel,
+and can deadlock when the wide intermediates won't fit. Concretely on
+DOOM at `d=4096`, `chunk_size=100`: `K ≥ 50` raised
+`RuntimeError: No progress`. Without `sequential_scope`, the same
+graph compiles (slowly) because greedy admission only commits as many
+as fit. Rule: pick `K` well below the count the scheduler would
+naturally settle at — the sweet spot is in the
+"prevent-plateau-but-keep-some-parallelism" middle, not near the
+unconstrained ceiling.
+
+**Footgun: `K = 1` (fully serial).** Forces every chain through one at
+a time, multiplying the chain's depth by the number of iterations.
+For DOOM this nearly tripled compiled N (130 layers vs 81 unbatched).
+
+**When `sequential_scope` is the right lever:**
+
+- The graph has ≥4 parallel chains feeding a Concatenate (or similar
+  N-way join).
+- Chain peak width × N exceeds residual budget.
+- Per-annotation instrumentation confirms the cluster is the dominant
+  plateau pinner (≥50% of pinned cols).
+
+If only one of these holds, `sequential_scope` may not help or may
+hurt — do the measurement first.
+
 ---
 
 ## 8. Graph-level fusion pass
@@ -484,6 +591,22 @@ with a constant) and recompile. The delta in compiled layer count
 tells you how much depth the subsystem actually contributed — often
 more than its allocated-params share suggests.
 
+### Per-layer per-annotation occupancy probe
+
+When the verbose compile log shows a residual-occupancy plateau (many
+consecutive layers at 90%+), figure out *which subsystem* is pinning
+columns before reaching for any heuristic tweak. The pattern: monkey-
+patch `write_mlp_sublayer` to snapshot
+`residual_map._node_to_indices` after each layer, then group by
+`node.annotation` and report avg cols per annotation across plateau
+layers. See `modal_inspect_residual.py` for a working template.
+
+A plateau dominated (≥50%) by one annotation means
+`sequential_scope` on that subsystem is the right lever (see §7). A
+plateau spread across many annotations means the lever is elsewhere
+— likely critical-path shortening or graph restructuring of the
+biggest contributor.
+
 ---
 
 ## 12. Summary principles
@@ -512,6 +635,13 @@ more than its allocated-params share suggests.
 8. **Bound everything as tightly as possible.** `signed_multiply`,
    `reciprocal`, and the piecewise ops scale width AND precision with
    their input bounds.
+9. **N parallel chains feeding a join can plateau the residual stream.**
+   When per-annotation occupancy probes confirm one cluster pins
+   ≥50% of plateau cols, `sequential_scope(factories, batch_size=K)`
+   gates concurrency. Tune `K` so `K × peak_intermediate_width` stays
+   well under residual budget; expect the optimum to scale linearly
+   with `d`. Avoid `K` near the unconstrained in-flight count — it
+   disables the scheduler's organic backpressure and can deadlock.
 
 If a cost decision isn't obvious: open `compiler/forward/scheduler.py`
 and read it. Zero hidden state, every placement decision is local.

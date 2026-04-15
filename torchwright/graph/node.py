@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 
 import torch
 
@@ -50,6 +50,7 @@ class Node:
     node_id: int
     name: str
     annotation: Optional[str]
+    scheduling_predecessors: Set["Node"]
 
     def __init__(self, d_output: int, inputs: List["Node"], name: str = ""):
         global global_node_id
@@ -58,6 +59,12 @@ class Node:
         self.node_id = global_node_id
         self.name = name
         self.annotation = _current_annotation.get()
+        # Scheduling-only predecessors (not data inputs).  Populated by
+        # ``torchwright.graph.scheduling_hints.sequential_scope`` and
+        # similar helpers; honored by ``GraphAnalyzer.is_ready`` so the
+        # node isn't scheduled until every listed predecessor is in
+        # ``computed_nodes``.  Empty by default.
+        self.scheduling_predecessors: Set["Node"] = set()
         global_node_id += 1
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
