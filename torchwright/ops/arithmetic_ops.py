@@ -549,31 +549,28 @@ def piecewise_linear_2d(
     inp = Concatenate([inp1, inp2])
 
     # ---------------------------------------------------------------
-    # Strategy: solve for ReLU output weights via least-squares.
+    # Strategy: solve for ReLU output weights via constrained
+    # least-squares.
     #
-    # We place ReLU hyperplanes at:
-    #   - Cell diagonals: one per cell (i,j), passing through the
-    #     antidiagonal vertices (x_{i+1}, y_j) and (x_i, y_{j+1}).
-    #   - Vertical edges at each interior x-breakpoint.
-    #   - Horizontal edges at each interior y-breakpoint.
-    #   - 4 boundary clamping planes.
-    #
-    # The output is: f(x,y) = bias + sx*x + sy*y + Σ w_k * ReLU(...)
-    #
-    # We solve for [bias, sx, sy, w_1..w_K] by enforcing f = values
-    # at every grid point.  This correctly handles uniform grids where
-    # multiple cell diagonals share the same hyperplane.
-    # ---------------------------------------------------------------
-
-    # Build list of hyperplane coefficients: hidden_k = ReLU(a*x + b*y + c)
-    #
-    # We use four families of hyperplanes to ensure the arrangement is
-    # rich enough to represent any piecewise-affine function on the grid:
+    # Hyperplane family (4 directions through every grid vertex):
     #   1. Vertical:   x = x_i
     #   2. Horizontal: y = y_j
-    #   3. Sum:        x + y = x_i + y_j  (for all vertex pairs)
-    #   4. Difference:  x - y = x_i - y_j  (for all vertex pairs)
-    # Duplicates are removed.  Boundary clamping planes are added last.
+    #   3. Sum:        x + y = x_i + y_j
+    #   4. Difference: x - y = x_i - y_j
+    #
+    # On non-uniform grids the sum/diff families expand to O(n1·n2)
+    # distinct lines, making the system heavily underdetermined (more
+    # hyperplanes than vertex constraints).  pinv's min-L2-norm
+    # solution then packs large cancelling ReLU weights that agree at
+    # vertices but oscillate across cell interiors.
+    #
+    # Fix: constrained least-squares.  Vertex values are enforced as
+    # hard equality constraints (preserving exact interpolation at
+    # grid points).  Interior sample points — fn evaluated at several
+    # points per cell — provide a soft objective that pins down the
+    # free DOF in the nullspace of the vertex system, eliminating the
+    # oscillation.
+    # ---------------------------------------------------------------
 
     seen: set = set()
     hyperplanes: list = []  # (a, b, c) tuples
@@ -584,13 +581,11 @@ def piecewise_linear_2d(
             seen.add(key)
             hyperplanes.append((a, b, c))
 
-    # Vertical and horizontal at all breakpoints (not just interior)
     for i in range(n1):
         _add(1.0, 0.0, -breakpoints1[i])
     for j in range(n2):
         _add(0.0, 1.0, -breakpoints2[j])
 
-    # x + y = const and x - y = const at all grid vertices
     for i in range(n1):
         for j in range(n2):
             _add(1.0, 1.0, -(breakpoints1[i] + breakpoints2[j]))
@@ -598,25 +593,87 @@ def piecewise_linear_2d(
 
     K = len(hyperplanes)
 
-    # Solve for [bias, sx, sy, w_1, ..., w_K] at grid points
-    N = n1 * n2
-    A = torch.zeros(N, 3 + K)
-    b_vec = torch.zeros(N)
+    # -- Vectorized design-matrix builder (float64) --
+    a_arr = torch.tensor([h[0] for h in hyperplanes], dtype=torch.float64)
+    b_arr = torch.tensor([h[1] for h in hyperplanes], dtype=torch.float64)
+    c_arr = torch.tensor([h[2] for h in hyperplanes], dtype=torch.float64)
 
-    for i in range(n1):
-        for j in range(n2):
-            idx = i * n2 + j
-            xi = breakpoints1[i]
-            yj = breakpoints2[j]
-            A[idx, 0] = 1.0  # bias
-            A[idx, 1] = xi  # sx * x
-            A[idx, 2] = yj  # sy * y
-            for k, (a, b, c) in enumerate(hyperplanes):
-                A[idx, 3 + k] = builtins.max(0.0, a * xi + b * yj + c)
-            b_vec[idx] = values[i][j]
+    def _design(xs: list, ys: list) -> torch.Tensor:
+        xt = torch.tensor(xs, dtype=torch.float64)
+        yt = torch.tensor(ys, dtype=torch.float64)
+        M = torch.zeros(len(xs), 3 + K, dtype=torch.float64)
+        M[:, 0] = 1.0
+        M[:, 1] = xt
+        M[:, 2] = yt
+        M[:, 3:] = torch.clamp(
+            a_arr.unsqueeze(0) * xt.unsqueeze(1)
+            + b_arr.unsqueeze(0) * yt.unsqueeze(1)
+            + c_arr.unsqueeze(0),
+            min=0.0,
+        )
+        return M
 
-    # Solve in float64 for numerical stability, then convert back.
-    solution = (torch.linalg.pinv(A.double()) @ b_vec.double()).float()
+    # Vertex constraints (hard equality).
+    xs_v = [breakpoints1[i] for i in range(n1) for _ in range(n2)]
+    ys_v = [breakpoints2[j] for _ in range(n1) for j in range(n2)]
+    bv = torch.tensor(
+        [values[i][j] for i in range(n1) for j in range(n2)],
+        dtype=torch.float64,
+    )
+    A_v = _design(xs_v, ys_v)
+
+    # Interior sample constraints (soft, resolved in nullspace).
+    # 4 points per cell, spread to cover both triangles of the SW-NE
+    # triangulation.  fn is evaluated at these points to get the true
+    # target — this is what pins down the nullspace DOF.
+    _OFFSETS = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)]
+    xs_int: list = []
+    ys_int: list = []
+    vals_int: list = []
+    for i in range(n1 - 1):
+        for j in range(n2 - 1):
+            xi, xi1 = breakpoints1[i], breakpoints1[i + 1]
+            yj, yj1 = breakpoints2[j], breakpoints2[j + 1]
+            for u, v in _OFFSETS:
+                x = xi + u * (xi1 - xi)
+                y = yj + v * (yj1 - yj)
+                xs_int.append(x)
+                ys_int.append(y)
+                vals_int.append(float(fn(x, y)))
+
+    # Constrained least-squares via nullspace parameterization:
+    #   x_part = vertex-exact particular solution (min-norm)
+    #   N_basis = nullspace of A_v
+    #   z = argmin ||A_int · (x_part + N_basis · z) - b_int||²
+    #   solution = x_part + N_basis · z
+    x_part = torch.linalg.pinv(A_v) @ bv
+
+    if xs_int:
+        _U, S, Vh = torch.linalg.svd(A_v, full_matrices=True)
+        tol = S.max().item() * 1e-10 if S.numel() else 0.0
+        rank = int((S > tol).sum().item())
+        N_basis = Vh[rank:].T  # (3+K, nulldim)
+
+        if N_basis.shape[1] > 0:
+            A_int = _design(xs_int, ys_int)
+            b_int = torch.tensor(vals_int, dtype=torch.float64)
+            A_red = A_int @ N_basis
+            b_red = b_int - A_int @ x_part
+            # Tikhonov-regularized solve: penalize large z to prevent
+            # the nullspace solve from exploding when A_red is
+            # ill-conditioned (some nullspace directions are nearly
+            # invisible to the interior samples).
+            AtA = A_red.T @ A_red
+            lam = AtA.diag().max().item() * 1e-6
+            z = torch.linalg.solve(
+                AtA + lam * torch.eye(AtA.shape[0], dtype=torch.float64),
+                A_red.T @ b_red,
+            )
+            solution = (x_part + N_basis @ z).float()
+        else:
+            solution = x_part.float()
+    else:
+        solution = x_part.float()
 
     bias_val = solution[0].item()
     base_sx = solution[1].item()
