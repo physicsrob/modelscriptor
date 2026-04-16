@@ -120,6 +120,12 @@ the walkthrough GIF.
 All flags (`--width`, `--height`, `--fps`, `--scale`, `--d`, `--d-head`,
 `--rows-per-patch`, `--tex-size`) are passed through via `ARGS=`.
 
+## Critical Rules
+
+- NEVER pipe `make walkthrough` through `tail`, `head`, or any other
+  output-truncating filter.  The user always wants to see the full
+  output.
+
 # Doctrine
 
 The DOOM renderer project has a recurring failure mode: ship a
