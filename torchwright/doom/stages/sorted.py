@@ -1,35 +1,27 @@
 """SORTED stage: autoregressive argmin sort over WALL positions.
 
-At each SORTED_WALL token the graph:
-
-1. Runs ``attend_argmin_valid_unmasked`` over WALL positions using the
-   BSP rank as the score, gated by the per-wall ``is_renderable`` flag
-   and masked by the running ``prev_mask``.  Emits the selected wall's
-   payload (geometry + render precomp + visibility columns + position
-   one-hot) plus the updated mask.
-2. Derives the selection's **sort rank** — literally the number of
-   walls already picked (``sum(prev_mask)``) — which the THINKING
-   stage uses as a second-order sort key (walls are picked in BSP
-   order, so sort_rank == front-to-back index).
+At each SORTED_WALL token the graph runs
+``attend_argmin_valid_unmasked`` over WALL positions using the BSP rank
+as the score, gated by the per-wall ``is_renderable`` flag and masked
+by the running ``prev_mask``.  Emits the selected wall's payload
+(geometry + render precomp + visibility columns + position one-hot)
+plus the updated mask.
 
 Visibility column computation (``vis_lo``, ``vis_hi``) lives in the
 WALL stage and travels through the payload — SORTED just unpacks it.
 
 Downstream consumers:
 
-* **THINKING** uses ``sort_rank`` as score, ``sort_rank_onehot`` as
-  position key, and ``[gated_render_data, vis_lo, vis_hi,
-  sort_rank_onehot]`` as value — one atomic attention pick per wall.
+* **THINKING** uses ``sel_bsp_rank`` (from the payload) as score and
+  ``sel_onehot`` (wall-index one-hot) as position key.
 * **Orchestrator output** packs ``[E8_SORTED_WALL, sel_wall_data,
-  sort_rank, vis_lo, vis_hi, sel_onehot, updated_mask]`` into the
+  sel_bsp_rank, vis_lo, vis_hi, sel_onehot, updated_mask]`` into the
   sort_feedback field that closes the autoregressive sort loop.
 """
 
 from dataclasses import dataclass
 
-import torch
-
-from torchwright.graph import Concatenate, Linear, Node, annotate
+from torchwright.graph import Concatenate, Node, annotate
 from torchwright.graph.asserts import (
     assert_01,
     assert_distinct_across,
@@ -38,15 +30,9 @@ from torchwright.graph.asserts import (
     assert_score_gap_at_least,
 )
 from torchwright.graph.pos_encoding import PosEncoding
-from torchwright.ops.arithmetic_ops import (
-    add,
-    add_const,
-    add_scaled_nodes,
-)
+from torchwright.ops.arithmetic_ops import add
 from torchwright.ops.attention_ops import attend_argmin_valid_unmasked
-from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.logic_ops import cond_gate
-from torchwright.ops.map_select import in_range, select
 
 from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.wall_payload import (
@@ -88,11 +74,9 @@ class SortedOutputs:
     sel_onehot: Node          # per-position position_onehot of picked wall
     updated_mask: Node        # prev_mask + sel_onehot, fed back by host
 
-    # Sort rank: number of walls already picked (== 0 on the first pick,
-    # == max_walls-1 on the last).  sort_rank_onehot one-hot-encodes it
-    # for downstream attention.
-    sort_rank: Node
-    sort_rank_onehot: Node
+    # BSP rank of the selected wall — used by THINKING as the score
+    # for its own argmin (picks walls in front-to-back order).
+    sel_bsp_rank: Node
 
     # Visibility column range on screen (floats, already clamped to
     # ``[-2, W+2]`` by the atan piecewise).
@@ -120,8 +104,7 @@ def build_sorted(
             sel_onehot,
             updated_mask,
             gated_render_data,
-            sort_rank,
-            sort_rank_onehot,
+            sel_bsp_rank,
             vis_lo,
             vis_hi,
         ) = _argmin_and_derive(inputs, max_walls)
@@ -130,8 +113,7 @@ def build_sorted(
         sel_wall_data=sel_wall_data,
         sel_onehot=sel_onehot,
         updated_mask=updated_mask,
-        sort_rank=sort_rank,
-        sort_rank_onehot=sort_rank_onehot,
+        sel_bsp_rank=sel_bsp_rank,
         vis_lo=vis_lo,
         vis_hi=vis_hi,
         gated_render_data=gated_render_data,
@@ -144,7 +126,7 @@ def build_sorted(
 
 
 def _argmin_and_derive(inputs: SortedInputs, max_walls: int):
-    """Pick the nearest unmasked wall + derive sort_rank + gate render data.
+    """Pick the nearest unmasked wall + gate render data.
 
     Three invariants are asserted around the argmin:
 
@@ -195,6 +177,7 @@ def _argmin_and_derive(inputs: SortedInputs, max_walls: int):
     unpacked = unpack_wall_payload(selected_sort, max_walls)
     sel_wall_data = unpacked.wall_data
     sel_render = unpacked.render_data
+    sel_bsp_rank = unpacked.bsp_rank
     sel_onehot = unpacked.onehot
     sel_tex_id = extract_geometry_field(sel_wall_data, "tex_id")
     updated_mask = add(inputs.prev_mask, sel_onehot)
@@ -208,20 +191,7 @@ def _argmin_and_derive(inputs: SortedInputs, max_walls: int):
         inputs.is_sorted, Concatenate([sel_render, sel_tex_id])
     )
 
-    # sort_rank = sum of prev_mask bits.  At the k-th SORTED token in the
-    # autoregressive loop, k walls are already masked, so sort_rank == k.
-    # Implement with a constant-weight Linear (reduce-sum).
-    sort_rank = Linear(
-        inputs.prev_mask, torch.ones(max_walls, 1), name="sort_rank",
-    )
-
-    # One-hot encoding of sort_rank for THINKING's position key.
-    sort_rank_p1 = add_const(sort_rank, 1.0)
-    sr_onehot_bool = in_range(sort_rank, sort_rank_p1, max_walls)
-    ones_oh = create_literal_value(torch.ones(max_walls), name="sr_ones")
-    sort_rank_onehot = add_scaled_nodes(0.5, sr_onehot_bool, 0.5, ones_oh)
-
     return (
         sel_wall_data, sel_onehot, updated_mask, gated_render_data,
-        sort_rank, sort_rank_onehot, vis_lo, vis_hi,
+        sel_bsp_rank, vis_lo, vis_hi,
     )

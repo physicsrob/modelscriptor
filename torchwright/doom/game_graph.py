@@ -233,8 +233,8 @@ def build_game_graph(
     # ---------- THINKING ----------
     thinking_out = build_thinking(
         ThinkingInputs(
-            sort_rank=sorted_out.sort_rank,
-            sort_rank_onehot=sorted_out.sort_rank_onehot,
+            sel_bsp_rank=sorted_out.sel_bsp_rank,
+            sel_onehot=sorted_out.sel_onehot,
             gated_render_data=sorted_out.gated_render_data,
             vis_lo=sorted_out.vis_lo,
             vis_hi=sorted_out.vis_hi,
@@ -442,7 +442,7 @@ def _assemble_output(
         sort_feedback_out = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="sort_type"),
             sorted_out.sel_wall_data,
-            sorted_out.sort_rank,
+            sorted_out.sel_bsp_rank,
             sorted_out.vis_lo,
             sorted_out.vis_hi,
             sorted_out.sel_onehot,

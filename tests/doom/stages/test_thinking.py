@@ -2,11 +2,11 @@
 
 At each THINKING token the graph picks the next wall to render via
 ``attend_argmin_unmasked`` over SORTED positions.  The score is the
-per-SORTED ``sort_rank`` (the BSP front-to-back index produced by the
+per-SORTED ``sel_bsp_rank`` (the BSP front-to-back index produced by the
 sort loop); the mask is the running ``render_mask``.  Output ``t_*``
 fields carry the picked wall's render-precompute plus visibility bounds.
 
-These tests feed a sequence of SORTED tokens (with hand-set sort_ranks
+These tests feed a sequence of SORTED tokens (with hand-set sel_bsp_ranks
 and render_data) plus one THINKING receiver and verify that the
 picked wall matches the lowest-rank unmasked entry.
 """
@@ -33,8 +33,8 @@ def thinking_module():
     gated_render_data is 6-wide: [sort_den, C, D, E, H_inv, tex_id].
     """
     pos = create_pos_encoding()
-    sort_rank = create_input("sort_rank", 1)
-    sort_rank_onehot = create_input("sort_rank_onehot", _MAX_WALLS)
+    sel_bsp_rank = create_input("sel_bsp_rank", 1)
+    sel_onehot = create_input("sel_onehot", _MAX_WALLS)
     gated_render_data = create_input("gated_render_data", 6)
     vis_lo = create_input("vis_lo", 1)
     vis_hi = create_input("vis_hi", 1)
@@ -43,8 +43,8 @@ def thinking_module():
 
     out = build_thinking(
         ThinkingInputs(
-            sort_rank=sort_rank,
-            sort_rank_onehot=sort_rank_onehot,
+            sel_bsp_rank=sel_bsp_rank,
+            sel_onehot=sel_onehot,
             gated_render_data=gated_render_data,
             vis_lo=vis_lo, vis_hi=vis_hi,
             render_mask=render_mask,
@@ -75,19 +75,19 @@ def _pack(module, rows: list[dict]) -> torch.Tensor:
 
 
 def _onehot(i: int, n: int) -> List[float]:
-    """0.5-biased one-hot (matches sort_rank_onehot bias)."""
+    """0.5-biased one-hot (matches sel_onehot bias)."""
     return [1.0 if k == i else 0.5 for k in range(n)]
 
 
 def _sorted_row(rank: int, tex_id: float, render_mask: List[float]) -> dict:
-    """A SORTED_WALL row with a specific sort_rank + identifiable render data.
+    """A SORTED_WALL row with a specific sel_bsp_rank + identifiable render data.
 
     The gated_render_data is filled with ``[rank, rank, rank, rank, rank, tex_id]``
     so we can read back the picked wall's rank via t_sort_den (or any of C/D/E/H_inv).
     """
     return {
-        "sort_rank": float(rank),
-        "sort_rank_onehot": _onehot(rank, _MAX_WALLS),
+        "sel_bsp_rank": float(rank),
+        "sel_onehot": _onehot(rank, _MAX_WALLS),
         "gated_render_data": [
             float(rank), float(rank), float(rank), float(rank), float(rank),
             tex_id,
@@ -106,8 +106,8 @@ def _thinking_row(render_mask: List[float]) -> dict:
     out of the attention inputs; only render_mask matters at this row.
     """
     return {
-        "sort_rank": 99.0,
-        "sort_rank_onehot": [0.5] * _MAX_WALLS,
+        "sel_bsp_rank": 99.0,
+        "sel_onehot": [0.5] * _MAX_WALLS,
         "gated_render_data": [0.0] * 6,
         "vis_lo": 0.0, "vis_hi": 0.0,
         "render_mask": render_mask,
@@ -135,8 +135,8 @@ def _thinking_row(render_mask: List[float]) -> dict:
 def test_thinking_picks_lowest_unmasked_rank(
     thinking_module, render_mask, expected_rank,
 ):
-    """attend_argmin_unmasked must pick the SORTED with lowest unmasked sort_rank."""
-    # Four SORTED positions with sort_ranks 0..3, each carrying its own
+    """attend_argmin_unmasked must pick the SORTED with lowest unmasked sel_bsp_rank."""
+    # Four SORTED positions with sel_bsp_ranks 0..3, each carrying its own
     # identifiable render data.
     sorted_rows = [
         _sorted_row(rank=i, tex_id=float(i), render_mask=render_mask)
