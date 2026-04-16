@@ -37,8 +37,22 @@ class ResidualStreamMap:
                 f"only {len(self._free)} free of {self.d}"
             )
         indices = sorted(list(self._free)[:n])
+        already_owned = {
+            c: owner
+            for owner, cols in self._node_to_indices.items()
+            for c in cols
+            if c in set(indices)
+        }
+        if already_owned:
+            raise AssertionError(
+                f"ResidualStreamMap.allocate({node!r}, {n} cols): "
+                f"free set proposed columns already owned: "
+                f"{ {c: repr(o) for c, o in list(already_owned.items())[:4]} }. "
+                f"d={self.d}."
+            )
         self._free -= set(indices)
         self._node_to_indices[node] = indices
+        self._check_invariants(f"allocate({node!r}, {n} cols)")
         return indices
 
     def free(self, node: Node):
@@ -46,12 +60,14 @@ class ResidualStreamMap:
             raise KeyError(f"Node {node} is not allocated")
         self._free |= set(self._node_to_indices[node])
         del self._node_to_indices[node]
+        self._check_invariants(f"free({node!r})")
 
     def reassign(self, old_node: Node, new_node: Node):
         if old_node not in self._node_to_indices:
             raise KeyError(f"Node {old_node} is not allocated")
         indices = self._node_to_indices.pop(old_node)
         self._node_to_indices[new_node] = indices
+        self._check_invariants(f"reassign({old_node!r} -> {new_node!r})")
 
     def get_indices(self, node: Node) -> List[int]:
         return self._node_to_indices[node]
@@ -87,6 +103,48 @@ class ResidualStreamMap:
 
     def get_allocated_nodes(self) -> Set[Node]:
         return set(self._node_to_indices.keys())
+
+    def _check_invariants(self, where: str) -> None:
+        """Assert allocator state is self-consistent.
+
+        Invariants (all must hold after any successful mutation):
+          1. Pairwise disjointness: no two nodes share a column.
+          2. free ∩ allocated == ∅.
+          3. free ∪ allocated == {0 .. d-1}.
+
+        Called at the end of every mutator (allocate/free/reassign) so a
+        corrupted state is surfaced at the *source* rather than the next
+        unrelated get_indices lookup.
+        """
+        seen: Dict[int, Node] = {}
+        for node, cols in self._node_to_indices.items():
+            for c in cols:
+                if c in seen:
+                    other = seen[c]
+                    raise AssertionError(
+                        f"ResidualStreamMap invariant violated after {where}: "
+                        f"column {c} assigned to both {node!r} "
+                        f"(cols={cols}) and {other!r} "
+                        f"(cols={self._node_to_indices[other]}). d={self.d}."
+                    )
+                seen[c] = node
+        overlap = self._free & seen.keys()
+        if overlap:
+            ov = sorted(overlap)
+            raise AssertionError(
+                f"ResidualStreamMap invariant violated after {where}: "
+                f"columns {ov[:8]} are both free and allocated (e.g. "
+                f"{ {c: repr(seen[c]) for c in ov[:3]} }). d={self.d}."
+            )
+        total = self._free | seen.keys()
+        if total != set(range(self.d)):
+            missing = sorted(set(range(self.d)) - total)
+            raise AssertionError(
+                f"ResidualStreamMap invariant violated after {where}: "
+                f"columns {missing[:8]} are neither free nor allocated. "
+                f"d={self.d}, free={len(self._free)}, "
+                f"allocated={len(seen)}."
+            )
 
     def build_residual_assignment(
         self,
