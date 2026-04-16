@@ -64,3 +64,16 @@ walkthrough:
 	uv run modal run modal_walkthrough.py $(ARGS)
 	xdg-open walkthrough.gif
 	xdg-open reference.gif
+
+.PHONY: modal-run
+modal-run:
+	@if [ -z "$(MODULE)$(SCRIPT)" ]; then \
+	    echo "Error: MODULE=<dotted.name> or SCRIPT=<path> required." >&2 ; \
+	    echo "Example: make modal-run MODULE=scripts.investigate_phase_e" >&2 ; \
+	    exit 2 ; \
+	fi
+	uv run modal run modal_run.py \
+	    $(if $(MODULE),--module $(MODULE)) \
+	    $(if $(SCRIPT),--script $(SCRIPT)) \
+	    $(if $(ARGS),--args "$(ARGS)") \
+	    $(if $(CPU_ONLY),--cpu-only)

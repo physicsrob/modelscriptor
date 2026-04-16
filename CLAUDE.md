@@ -184,6 +184,48 @@ All flags (`--width`, `--height`, `--fps`, `--scale`, `--d`, `--d-head`,
   output-truncating filter.  The user always wants to see the full
   output.
 
+# Running scripts on GPU
+
+**If a script needs a GPU, run it on Modal via `make modal-run`.**
+Never write a new `modal_*.py` file just to run a script remotely —
+that is the Modal equivalent of the ad-hoc `/tmp/` scripts D8 warns
+against.
+
+    # Run a committed module (preferred)
+    make modal-run MODULE=scripts.investigate_phase_e
+
+    # Pass args through
+    make modal-run MODULE=scripts.foo ARGS="--input bar"
+
+    # Run an arbitrary file
+    make modal-run SCRIPT=path/to/one_shot.py
+
+    # CPU-only shard (no GPU reservation)
+    make modal-run MODULE=scripts.some_cpu_job CPU_ONLY=1
+
+## When NOT to use modal-run
+
+- **Tests** — use `make test`.  Its sharding + mutex + log-file
+  plumbing is not reproduced by `modal-run`.
+- **Walkthrough renders** — use `make walkthrough`.  It syncs GIF
+  bytes back to the local working tree, which `modal-run` does not
+  do.
+- **Scripts that produce local artifacts** (GIFs, JSON files under
+  `docs/`, etc.).  `modal-run` captures stdout/stderr only; anything
+  the script writes to disk stays on the Modal worker.  If your
+  script needs artifact sync-back, that is the *only* acceptable
+  reason to add a new purpose-built `modal_*.py` entrypoint — and
+  when you do, import the image from `modal_image.py` rather than
+  duplicating it.
+
+## Critical rules
+
+- NEVER write a new `modal_*.py` at the repo root just to run a
+  one-off investigation.  Put the script under `scripts/` (or
+  `tests/` if it's really a test) and run it via `make modal-run`.
+- NEVER duplicate the Modal image definition.  Import `IMAGE` from
+  `modal_image.py`.
+
 # Doctrine
 
 The DOOM renderer project has a recurring failure mode: ship a
@@ -383,6 +425,10 @@ re-runnable, and don't accumulate institutional knowledge.
 - **Adversarial integration coverage:**
   `tests/doom/test_game_graph.py`.  [TBD: link to the parametric
   sweep section once Plan 4 lands.]
+- **Running a committed script on a GPU:** `make modal-run
+  MODULE=<dotted.name>` (see *Running scripts on GPU* above).
+  Writing a new `modal_*.py` at the repo root to run a
+  one-off is banned by the same rule that bans `/tmp/` probes.
 
 **Why.** `tests/doom/test_mode_c_probe.py` started life as an
 ad-hoc probe and grew to 1000+ lines hard-coded to `angle=192`.
