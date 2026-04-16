@@ -617,6 +617,11 @@ class LayerScheduler:
             if not ok:
                 residual_map.free(node)
                 continue
+            assert len(target_cols) == len(node) == node.value.numel(), (
+                f"Literal allocation width mismatch for {node!r}: "
+                f"target_cols={len(target_cols)}, len(node)={len(node)}, "
+                f"value.numel()={node.value.numel()}."
+            )
             mlp_ops.append(MLPOp("compute_literal_value", node, target_cols, []))
             commit_cancel(additions, delta)
             dirty = residual_map.dirty_subset(target_cols)
