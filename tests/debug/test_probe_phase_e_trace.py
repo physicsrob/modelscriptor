@@ -1,16 +1,16 @@
-"""Phase E demo trace — exercise the harness against the formerly-xfailed
+"""Phase E demo trace — exercise the harness against the still-xfailed
 ``(px=3, py=2, angle=20)`` scene in ``box_room``.
 
 This test demonstrates :mod:`torchwright.debug.probe` against the
 Phase E regression that motivated the de-risking initiative.  The
-original symptom was a deterministic ``-_ABOVE_BONUS`` (== -1000)
-landing in the ``sel_bsp_rank`` residual columns at ``sort[0]``;
-commit ``a979f69`` (the sum_nodes-thermometer refactor, 100→70 layers)
-collaterally fixed the underlying precision loss so the sentinel no
-longer surfaces on main.  That leaves the xfail at
-``test_renders_off_center_oblique[3.0-2.0-20]`` in
-``XPASS(strict)=fail`` state — a follow-up cleanup that belongs to
-plan 6, out of scope here.
+symptom at the time Phase E landed was a deterministic
+``-_ABOVE_BONUS`` (== -1000) landing in the ``sel_bsp_rank`` residual
+columns at ``sort[0]``.  Post-a979f69 (the sum_nodes-thermometer
+refactor, 100→70 layers) the SENTINEL VALUE shifted (current raw
+sel_bsp_rank at this scene is ≈ -1171.875, not -1000), but the
+**underlying bug is not fixed** — the attention still fails to
+concentrate on a WALL position.  See
+``docs/postmortems/phase_e_xfail.md`` for the plan-6 investigation.
 
 What this test still buys:
 
@@ -18,10 +18,17 @@ What this test still buys:
    (``compile_game``-equivalent, ``d=2048``, ``d_head=32``) and scene
    that triggered the original regression.
 2. It prints a per-layer trace of ``sel_bsp_rank`` at ``sort[0]`` so
-   humans (and future regression triage) can see the actual value
-   trajectory — the same kind of output plan 6 will need.
-3. It sentinel-probes for ``-_ABOVE_BONUS`` and records whether it
-   surfaces; today it must not, which lock-steps the fix in place.
+   humans (and future regression triage) can see the post-sentinel
+   trajectory.
+
+**Note on scope.** This test only checks that the ``-_ABOVE_BONUS ==
+-1000`` sentinel does not appear.  Because SORTED's
+``select(sort_done, 99, raw)`` replaces raw sel_bsp_rank with 99 on
+exhausted steps, the post-select value here is 99 and the sentinel
+probe vacuously passes.  A stronger regression test — asserting the
+attention softmax concentrates on a WALL position, or that raw
+sel_bsp_rank lies in ``[0, max_walls-1]`` — is tracked as a follow-up
+in the post-mortem.
 """
 
 import pytest
@@ -215,18 +222,19 @@ def _build_prefill(module, subset, *, px: float, py: float, angle: float):
     return torch.cat(rows, dim=0)
 
 
-def test_sel_bsp_rank_trace_at_sort0_formerly_phase_e_scene(compiled_box_room):
-    """Trace ``sel_bsp_rank`` across layers at ``sort[0]`` for scene
+def test_sel_bsp_rank_trace_at_sort0_phase_e_scene(compiled_box_room):
+    """Trace post-sentinel ``sel_bsp_rank`` at ``sort[0]`` for scene
     (px=3, py=2, angle=20) in ``box_room`` using the harness's
     :func:`probe_layer_diff`.
 
-    Demonstrates the full cached-decode probe path (past_len + past_kvs)
-    on the exact compile config of the Phase E xfail.  The sentinel
-    probe for ``-_ABOVE_BONUS`` must NOT fire today — commit a979f69
-    collaterally fixed the underlying precision loss — and the assertion
-    here locks that in: any future regression that re-surfaces -1000 in
-    ``sel_bsp_rank`` breaks this test immediately, with the layer index
-    printed in the trace above.
+    Demonstrates the full cached-decode probe path (past_len +
+    past_kvs) on the exact compile config of the Phase E xfail.  The
+    ``-_ABOVE_BONUS`` == -1000 sentinel probe passes vacuously because
+    SORTED's ``select(sort_done, 99, raw)`` maps the current bogus raw
+    value (≈ -1171.875, not exactly -1000) to 99 before it reaches
+    this node.  A raw-value trace that would catch the actual bug
+    lives in ``scripts/investigate_phase_e.py``; see the post-mortem
+    at ``docs/postmortems/phase_e_xfail.md``.
     """
     graph_io, module, subset, _textures = compiled_box_room
     sel_bsp_rank = _find_sel_bsp_rank(graph_io)
@@ -284,9 +292,11 @@ def test_sel_bsp_rank_trace_at_sort0_formerly_phase_e_scene(compiled_box_room):
         )
 
     assert report.first_sentinel_layer is None, (
-        f"regression: -_ABOVE_BONUS (= {-_ABOVE_BONUS}) resurfaced in "
-        f"sel_bsp_rank at layer {report.first_sentinel_layer} — Phase E "
-        f"is back.  Inspect the printed trace above for the first layer "
-        f"where the value crossed the sentinel tolerance; that's the "
-        f"locus of the precision regression."
+        f"post-sentinel sel_bsp_rank contains the exact value "
+        f"-_ABOVE_BONUS ({-_ABOVE_BONUS}) — the sort_done → 99 replacement "
+        f"has regressed, or the attention's raw output produced -1000 "
+        f"(currently ≈ -1171.875).  Inspect the trace above for the first "
+        f"layer where the value crossed the sentinel tolerance; that's "
+        f"the locus of the regression.  Note this test does NOT catch "
+        f"the Phase E xfail itself — see the post-mortem."
     )
