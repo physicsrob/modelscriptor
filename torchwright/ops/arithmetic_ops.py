@@ -774,11 +774,58 @@ def multiply_2d(
         breakpoints2 = [lo2 + i * step2 for i in range(n2)]
         breakpoints2[-1] = max_abs2  # pin endpoint
 
-    result = piecewise_linear_2d(
-        inp1, inp2, breakpoints1, breakpoints2,
-        lambda a, b: a * b,
-        d_max=d_max, name=name,
-    )
+    # --- Normalize both axes to [0, 1] with a common step ---
+    #
+    # piecewise_linear_2d places ReLU hyperplanes at x+y=const and
+    # x−y=const through every grid vertex.  On a square grid (equal step
+    # on both axes), these collapse to O(n) distinct lines.  When the
+    # steps differ the sums/differences are all distinct → O(n²)
+    # hyperplanes, which can exceed the MLP width budget.
+    #
+    # Affine-mapping both axes to [0, 1] with a common breakpoint count
+    # guarantees equal step → diagonal collapse → O(n) hyperplanes.
+    # The mapping is done by two free Linear nodes; the product
+    # fn(u, v) = (lo₁ + range₁·u)·(lo₂ + range₂·v) is passed to
+    # piecewise_linear_2d so the output is mathematically identical.
+    lo1_f = float(breakpoints1[0])
+    hi1_f = float(breakpoints1[-1])
+    lo2_f = float(breakpoints2[0])
+    hi2_f = float(breakpoints2[-1])
+    range1 = hi1_f - lo1_f
+    range2 = hi2_f - lo2_f
+
+    if range1 < 1e-12 or range2 < 1e-12:
+        result = piecewise_linear_2d(
+            inp1, inp2, breakpoints1, breakpoints2,
+            lambda a, b: a * b,
+            d_max=d_max, name=name,
+        )
+    else:
+        n = builtins.max(len(breakpoints1), len(breakpoints2))
+        bp_unit = [i / (n - 1) for i in range(n)]
+        bp_unit[-1] = 1.0
+
+        inp1_norm = Linear(
+            inp1,
+            torch.tensor([[1.0 / range1]]),
+            torch.tensor([-lo1_f / range1]),
+            name=f"{name}_norm1",
+        )
+        inp2_norm = Linear(
+            inp2,
+            torch.tensor([[1.0 / range2]]),
+            torch.tensor([-lo2_f / range2]),
+            name=f"{name}_norm2",
+        )
+
+        def _product_normalized(u: float, v: float) -> float:
+            return (lo1_f + range1 * u) * (lo2_f + range2 * v)
+
+        result = piecewise_linear_2d(
+            inp1_norm, inp2_norm, bp_unit, bp_unit,
+            _product_normalized,
+            d_max=d_max, name=name,
+        )
 
     if max_abs_output is not None:
         result = clamp(result, -max_abs_output, max_abs_output)
