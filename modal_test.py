@@ -34,6 +34,9 @@ app = modal.App("torchwright-test", image=image)
 _HEAVY_FILES = [
     "tests/doom/test_game_graph.py",
     "tests/doom/test_wall_selection.py",
+    "tests/doom/test_bsp_rank_integration.py",
+    "tests/doom/test_mode_c_probe.py",
+    "tests/doom/test_tex_col.py",
 ]
 
 _MEDIUM_FILES = [

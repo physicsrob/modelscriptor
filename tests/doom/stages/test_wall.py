@@ -43,7 +43,9 @@ _MAX_BSP_NODES = 4
 
 @pytest.fixture(scope="module")
 def wall_collision_module():
-    """Compile just the collision-flag outputs of build_wall.
+    """Compile collision flags and is_renderable from build_wall in one module.
+
+    Output layout: [hit_full, hit_x, hit_y, is_renderable].
 
     BSP inputs are passed in but their contribution doesn't reach the
     collision outputs, so they won't actually be surfaced as ancestors
@@ -90,6 +92,7 @@ def wall_collision_module():
         outputs.collision.hit_full,
         outputs.collision.hit_x,
         outputs.collision.hit_y,
+        outputs.is_renderable,
     ])
     return compile_headless(
         out, pos, d=1024, d_head=16, max_layers=50, verbose=False,
@@ -152,11 +155,14 @@ def _pack(module, values: dict) -> torch.Tensor:
 
     compile_headless only surfaces inputs that are ancestors of the output
     node — so the shape depends on which outputs we compiled.  Reading
-    ``module._input_specs`` gives us the canonical order.
+    ``module._input_specs`` gives us the canonical order.  Inputs not
+    present in ``values`` default to zero.
     """
     d_input = max(s + w for _, s, w in module._input_specs)
     row = torch.zeros(1, d_input, dtype=torch.float32)
     for name, start, width in module._input_specs:
+        if name not in values:
+            continue
         row[0, start:start + width] = torch.tensor(
             values[name], dtype=torch.float32,
         ).reshape(width)
@@ -256,57 +262,12 @@ def test_collision_flags_match_reference(wall_collision_module, scenario):
     )
 
 
-@pytest.fixture(scope="module")
-def wall_renderable_module():
-    """Compile just the ``is_renderable`` output of build_wall."""
-    pos = create_pos_encoding()
-
-    is_wall = create_input("is_wall", 1)
-    move_cos = create_input("move_cos", 1)
-    move_sin = create_input("move_sin", 1)
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    vel_dx = create_input("vel_dx", 1)
-    vel_dy = create_input("vel_dy", 1)
-    wall_ax = create_input("wall_ax", 1)
-    wall_ay = create_input("wall_ay", 1)
-    wall_bx = create_input("wall_bx", 1)
-    wall_by = create_input("wall_by", 1)
-    wall_index = create_input("wall_index", 1)
-    wall_tex_id = create_input("wall_tex_id", 1)
-    wall_bsp_coeffs = create_input("wall_bsp_coeffs", _MAX_BSP_NODES)
-    wall_bsp_const = create_input("wall_bsp_const", 1)
-    side_P_vec = create_input("side_P_vec", _MAX_BSP_NODES)
-
-    outputs = build_wall(
-        WallInputs(
-            wall_ax=wall_ax, wall_ay=wall_ay,
-            wall_bx=wall_bx, wall_by=wall_by,
-            wall_tex_id=wall_tex_id, wall_index=wall_index,
-            player_x=player_x, player_y=player_y,
-            is_wall=is_wall,
-            vel_dx=vel_dx, vel_dy=vel_dy,
-            move_cos=move_cos, move_sin=move_sin,
-            wall_bsp_coeffs=wall_bsp_coeffs,
-            wall_bsp_const=wall_bsp_const,
-            side_P_vec=side_P_vec,
-        ),
-        config=_tiny_config(),
-        max_walls=_MAX_WALLS,
-        max_coord=_MAX_COORD,
-        max_bsp_nodes=_MAX_BSP_NODES,
-    )
-    return compile_headless(
-        outputs.is_renderable, pos, d=1024, d_head=16, max_layers=50, verbose=False,
-    )
-
-
-def test_is_renderable_output(wall_renderable_module):
+def test_is_renderable_output(wall_collision_module):
     """``is_renderable`` is +1 for a head-on wall, -1 for a parallel wall,
     and -1 at non-WALL token positions.
     """
     # Head-on wall (vertical wall in front, player facing +x).
-    head_on = _pack(wall_renderable_module, {
+    head_on = _pack(wall_collision_module, {
         "is_wall": 1.0,
         "player_x": 0.0, "player_y": 0.0,
         "move_cos": 1.0, "move_sin": 0.0,
@@ -319,12 +280,12 @@ def test_is_renderable_output(wall_renderable_module):
         "side_P_vec": [0.0] * _MAX_BSP_NODES,
     })
     with torch.no_grad():
-        out = wall_renderable_module(head_on)[0]
-    assert out.item() > 0.5, f"head-on wall should be renderable, got {out.item():+.3f}"
+        out = wall_collision_module(head_on)[0]
+    assert out[3].item() > 0.5, f"head-on wall should be renderable, got {out[3].item():+.3f}"
 
     # Parallel wall (horizontal wall in front, player facing +x).
     # Wall runs along x-axis in front of player; sort_den ≈ 0.
-    parallel = _pack(wall_renderable_module, {
+    parallel = _pack(wall_collision_module, {
         "is_wall": 1.0,
         "player_x": 0.0, "player_y": 0.0,
         "move_cos": 1.0, "move_sin": 0.0,
@@ -337,13 +298,13 @@ def test_is_renderable_output(wall_renderable_module):
         "side_P_vec": [0.0] * _MAX_BSP_NODES,
     })
     with torch.no_grad():
-        out = wall_renderable_module(parallel)[0]
-    assert out.item() < -0.5, (
-        f"parallel wall should be non-renderable, got {out.item():+.3f}"
+        out = wall_collision_module(parallel)[0]
+    assert out[3].item() < -0.5, (
+        f"parallel wall should be non-renderable, got {out[3].item():+.3f}"
     )
 
     # Non-WALL token position (is_wall=0).
-    non_wall = _pack(wall_renderable_module, {
+    non_wall = _pack(wall_collision_module, {
         "is_wall": 0.0,
         "player_x": 0.0, "player_y": 0.0,
         "move_cos": 1.0, "move_sin": 0.0,
@@ -356,9 +317,9 @@ def test_is_renderable_output(wall_renderable_module):
         "side_P_vec": [0.0] * _MAX_BSP_NODES,
     })
     with torch.no_grad():
-        out = wall_renderable_module(non_wall)[0]
-    assert out.item() < -0.5, (
-        f"non-WALL position should be non-renderable, got {out.item():+.3f}"
+        out = wall_collision_module(non_wall)[0]
+    assert out[3].item() < -0.5, (
+        f"non-WALL position should be non-renderable, got {out[3].item():+.3f}"
     )
 
 
