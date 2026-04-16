@@ -786,6 +786,160 @@ def multiply_2d(
     return result
 
 
+def low_rank_2d(
+    inp1: Node,
+    inp2: Node,
+    breakpoints1: List[float],
+    breakpoints2: List[float],
+    fn,
+    rank: int,
+    multiply_steps_per_axis: int = 20,
+    max_abs_output: Optional[float] = None,
+    d_max: int = 1024,
+    name: str = "low_rank_2d",
+) -> Node:
+    """Evaluate a 2D function via rank-K separable approximation.
+
+    Samples ``fn`` at every grid vertex, SVD-truncates the value matrix
+    to rank *K*, and emits the approximation as a sum of ``K`` separable
+    rank-1 terms::
+
+        f(x, y) ≈ Σ_{k=1..K} U_k(x) · V_k(y)
+
+    where ``U_k`` and ``V_k`` are 1-D piecewise-linear interpolants of
+    the scaled left/right singular vectors.  The output is the
+    SVD-optimal rank-K fit in Frobenius norm — in particular, the
+    worst-cell error is bounded above by ``σ_{K+1}`` (the first
+    truncated singular value), which is deterministic and computable at
+    compile time.
+
+    **When to prefer over** :func:`piecewise_linear_2d`:
+
+    * The grid is non-uniform (``piecewise_linear_2d``'s least-squares
+      solve oscillates in cell interiors on non-uniform grids).
+    * The function has low effective rank.  Products ``x·y`` are rank-1
+      exactly, so K=1 is lossless.  Smooth functions like ``atan(x/y)``
+      typically need K=2–3 for ~1% precision.
+    * You want a compile-time error bound that isn't dependent on the
+      pinv condition number.
+
+    **Cost:** 2 MLP sublayers:
+
+    * Sublayer 1: two 1D piecewise-linear lookups (one per axis), each
+      with vector-valued output of width *K*.  ``~(n1 + n2)`` neurons
+      total, independent of *K* (channels share ReLUs).
+    * Sublayer 2: *K* scalar multiplications via :func:`multiply_2d` on
+      uniform bounded grids (where the pinv issue doesn't bite).
+
+    Args:
+        inp1: 1-D scalar node.
+        inp2: 1-D scalar node.
+        breakpoints1: Strictly ascending x-coordinates (length n1 ≥ 2).
+        breakpoints2: Strictly ascending y-coordinates (length n2 ≥ 2).
+        fn: ``fn(x, y) -> float`` evaluated at each grid vertex.
+        rank: Number of separable terms *K* in the decomposition.
+            Clamped to ``min(n1, n2)``.  Compile time scales linearly
+            with *K*; pick the smallest *K* that meets your tolerance.
+        multiply_steps_per_axis: Grid resolution of each inner
+            :func:`multiply_2d` call (uniform breakpoints).  20 gives
+            typical ~1% multiply precision.
+        max_abs_output: If set, clamp the sum to
+            ``[−max_abs_output, max_abs_output]`` (one extra sublayer).
+        d_max: Maximum neurons per MLP sublayer.
+        name: Debug label prefix.
+
+    Returns:
+        1-D scalar node containing the rank-K approximation.
+    """
+    assert len(inp1) == 1, "inp1 must be a 1D scalar node"
+    assert len(inp2) == 1, "inp2 must be a 1D scalar node"
+    n1 = len(breakpoints1)
+    n2 = len(breakpoints2)
+    assert n1 >= 2 and n2 >= 2, "Need >= 2 breakpoints per axis"
+    assert rank >= 1, "rank must be >= 1"
+    assert all(
+        breakpoints1[i] < breakpoints1[i + 1] for i in range(n1 - 1)
+    ), "breakpoints1 must be strictly ascending"
+    assert all(
+        breakpoints2[i] < breakpoints2[i + 1] for i in range(n2 - 1)
+    ), "breakpoints2 must be strictly ascending"
+
+    K = builtins.min(rank, builtins.min(n1, n2))
+
+    V = torch.zeros(n1, n2, dtype=torch.float64)
+    for i, xi in enumerate(breakpoints1):
+        for j, yj in enumerate(breakpoints2):
+            V[i, j] = float(fn(xi, yj))
+
+    U_full, S_full, Vh_full = torch.linalg.svd(V, full_matrices=False)
+
+    U_k = U_full[:, :K]  # (n1, K)
+    S_k = S_full[:K]
+    Vh_k = Vh_full[:K, :]  # (K, n2)
+
+    # Absorb √σ into each factor so both U_scaled and V_scaled have
+    # comparable magnitudes — makes the downstream multiply grid easy
+    # to bound.
+    sqrt_S = torch.sqrt(S_k)
+    U_scaled = (U_k * sqrt_S.unsqueeze(0)).tolist()  # (n1, K)
+    V_scaled = (Vh_k * sqrt_S.unsqueeze(1)).tolist()  # (K, n2)
+
+    # Map breakpoint → vector of K component values for piecewise_linear's
+    # vector-fn interface.  Float-equality dict lookup works because
+    # piecewise_linear iterates the exact same breakpoint floats.
+    u_by_bp = {breakpoints1[i]: U_scaled[i] for i in range(n1)}
+    v_by_bp = {breakpoints2[j]: [V_scaled[k][j] for k in range(K)] for j in range(n2)}
+
+    u_vec = piecewise_linear(
+        inp1, breakpoints1, lambda x: u_by_bp[x],
+        d_max=d_max, name=f"{name}_u_vec",
+    )
+    v_vec = piecewise_linear(
+        inp2, breakpoints2, lambda y: v_by_bp[y],
+        d_max=d_max, name=f"{name}_v_vec",
+    )
+
+    # Per-component amplitude bounds (used to size the multiply grid).
+    u_abs_max = [builtins.max(_builtin_abs(U_scaled[i][k]) for i in range(n1))
+                 for k in range(K)]
+    v_abs_max = [builtins.max(_builtin_abs(V_scaled[k][j]) for j in range(n2))
+                 for k in range(K)]
+
+    products: list = []
+    for k in range(K):
+        proj_u = torch.zeros(K, 1)
+        proj_u[k, 0] = 1.0
+        u_k = Linear(u_vec, proj_u, name=f"{name}_u{k}")
+
+        proj_v = torch.zeros(K, 1)
+        proj_v[k, 0] = 1.0
+        v_k = Linear(v_vec, proj_v, name=f"{name}_v{k}")
+
+        # Pad 5% around the empirical max so the input lands strictly
+        # inside the multiply's interpolation grid.  Floor at 1e-6 so
+        # a degenerate all-zero component doesn't produce step=0.
+        u_bound = builtins.max(u_abs_max[k] * 1.05, 1e-6)
+        v_bound = builtins.max(v_abs_max[k] * 1.05, 1e-6)
+        step_u = u_bound / builtins.max(multiply_steps_per_axis // 2, 1)
+        step_v = v_bound / builtins.max(multiply_steps_per_axis // 2, 1)
+
+        products.append(
+            multiply_2d(
+                u_k, v_k,
+                max_abs1=u_bound, max_abs2=v_bound,
+                step1=step_u, step2=step_v,
+                d_max=d_max, name=f"{name}_prod{k}",
+            )
+        )
+
+    result = products[0] if len(products) == 1 else sum_nodes(products)
+
+    if max_abs_output is not None:
+        result = clamp(result, -max_abs_output, max_abs_output)
+
+    return result
+
+
 def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) -> Node:
     """Compute x² via piecewise-linear interpolation.
 

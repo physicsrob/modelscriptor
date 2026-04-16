@@ -9,6 +9,7 @@ from torchwright.ops.arithmetic_ops import (
     compare,
     concat,
     linear_bin_index,
+    low_rank_2d,
     max,
     min,
     floor_int,
