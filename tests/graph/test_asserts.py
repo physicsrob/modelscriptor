@@ -507,55 +507,15 @@ def test_picked_from_returns_result_width():
     assert len(wrapped) == 4
 
 
-def test_picked_from_compiled_fires_on_blend():
-    """Compile-side check fires when the compiled softmax blends two close scores.
-
-    Build an ``attend_argmin_unmasked`` over four key positions whose
-    scores are very close (0.0, 0.01, 0.02, 0.03).  With
-    ``match_gain=10`` (deliberately low) the compiled piecewise-linear
-    softmax can't concentrate on one key, producing a blend.  At
-    reference eval, the same graph runs the exact softmax via
-    ``torch.softmax`` and concentrates correctly on the argmin (key 0).
-    The assert fires only under compile.
-    """
-    from torchwright.ops.attention_ops import attend_argmin_unmasked
-
-    pos = create_pos_encoding()
-    # Per-position inputs.  Values are (n_pos, 2) so each key carries a
-    # distinct identifier that a blend wouldn't reproduce.
-    score = create_input("score", 1)
-    position_onehot = create_input("position_onehot", 4)
-    mask = create_input("mask", 4)
-    values_node = create_input("values_node", 2)
-    keys = create_input("keys", 1)
-
-    picked = attend_argmin_unmasked(
-        pos_encoding=pos,
-        score=score,
-        mask_vector=mask,
-        position_onehot=position_onehot,
-        value=values_node,
-    )
-    # Assert the pick is a single value row (within a tight atol that
-    # a blended midpoint can't satisfy).
-    wrapped = assert_picked_from(picked, values_node, keys, atol=1e-2)
-    asserts = collect_asserts(wrapped)
-
-    # 5 positions: 4 candidate keys + 1 query (which also participates
-    # as a key with high score so it loses).
-    input_values = {
-        "score":            torch.tensor([[0.0], [0.01], [0.02], [0.03], [99.0]]),
-        "position_onehot":  torch.eye(4)[[0, 1, 2, 3]].tolist() + [[0.0, 0.0, 0.0, 0.0]],
-        "mask":             torch.zeros(5, 4),
-        "values_node":      torch.tensor([
-            [1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0], [0.0, 0.0],
-        ]),
-        "keys":             torch.tensor([[1.0], [1.0], [1.0], [1.0], [0.0]]),
-    }
-    input_values["position_onehot"] = torch.tensor(input_values["position_onehot"])
-
-    mod = compile_headless(
-        wrapped, pos, d=512, d_head=32, max_layers=30, verbose=False,
-    )
-    with pytest.raises(AssertionError, match=r"doesn't match any value row"):
-        check_asserts_on_compiled(mod, asserts, input_values, n_pos=5)
+# NOTE: an end-to-end ``test_picked_from_compiled_fires_on_blend`` used
+# to live here.  It deliberately constructed sub-unit-gap fractional
+# scores (0.0, 0.01, 0.02, 0.03) on attend_argmin_unmasked to force a
+# compile-side softmax blend that assert_picked_from would catch.  With
+# attend_*'s require_integer contract enforced at graph construction,
+# that scenario is now rejected upstream and can't be built — the
+# blending it tested is no longer reachable through normal API usage.
+#
+# assert_picked_from's predicate is still covered by the unit tests
+# above (accepts_clean_pick, rejects_blend, rejects_no_valid_keys,
+# accepts_duplicate_valid_values), and its production usage is
+# exercised by torchwright/doom/stages/sorted.py + tests/doom/.

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import torch
 
 from torchwright.graph import Node, annotate
+from torchwright.graph.asserts import assert_integer, assert_onehot
 from torchwright.ops.arithmetic_ops import (
     abs,
     add,
@@ -385,7 +386,7 @@ def _compute_bsp_rank(
         s_bool = compare(s_i, 0.5)
         bsp_products.append(cond_gate(s_bool, c_i))
     bsp_dot = sum_nodes(bsp_products)
-    bsp_rank = add(bsp_dot, inputs.wall_bsp_const)
+    bsp_rank = assert_integer(add(bsp_dot, inputs.wall_bsp_const))
 
     # Renderability: is_wall AND |sort_den| > ε AND num_t × sign(den) > 0.
     abs_sort_den = abs(sort_den)
@@ -403,4 +404,4 @@ def _compute_position_onehot(wall_index: Node, max_walls: int) -> Node:
     wall_index_p1 = add_const(wall_index, 1.0)
     onehot_bool = in_range(wall_index, wall_index_p1, max_walls)
     ones_oh = create_literal_value(torch.ones(max_walls), name="ones_oh")
-    return add_scaled_nodes(0.5, onehot_bool, 0.5, ones_oh)
+    return assert_onehot(add_scaled_nodes(0.5, onehot_bool, 0.5, ones_oh))

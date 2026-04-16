@@ -24,6 +24,7 @@ by the attention's softmax (values at non-SORTED positions are zero).
 from dataclasses import dataclass
 
 from torchwright.graph import Concatenate, Node, annotate
+from torchwright.graph.asserts import assert_01, assert_integer, assert_onehot
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.attention_ops import attend_argmin_unmasked
 from torchwright.ops.inout_nodes import create_literal_value
@@ -90,15 +91,17 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
         render_sentinel = create_literal_value(
             torch.tensor([99.0]), name="render_sentinel",
         )
-        render_score = select(inputs.is_sorted, inputs.sort_rank, render_sentinel)
+        render_score = assert_integer(
+            select(inputs.is_sorted, inputs.sort_rank, render_sentinel)
+        )
 
         # Position key: sort_rank_onehot at SORTED, zeros elsewhere.
         z_mw = create_literal_value(
             torch.zeros(max_walls), name="z_mw_thinking",
         )
-        render_position_onehot = select(
+        render_position_onehot = assert_onehot(select(
             inputs.is_sorted, inputs.sort_rank_onehot, z_mw,
-        )
+        ))
 
         # Value: render data + col bounds + one-hot for downstream mask update.
         render_value = Concatenate([
@@ -112,7 +115,7 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
         selected_render = attend_argmin_unmasked(
             pos_encoding=inputs.pos_encoding,
             score=render_score,
-            mask_vector=inputs.render_mask,
+            mask_vector=assert_01(inputs.render_mask),
             position_onehot=render_position_onehot,
             value=render_value_gated,
         )

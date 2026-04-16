@@ -132,6 +132,16 @@ def forward_compile(
     output_node = graph.get_output_node()
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
 
+    # Unwrap any Assert keys in the overlays dict that were stripped above.
+    if overlays:
+        from torchwright.graph.misc import Assert
+        unwrapped: dict = {}
+        for k, v in overlays.items():
+            while isinstance(k, Assert):
+                k = k.inputs[0]
+            unwrapped[k] = v
+        overlays = unwrapped
+
     # Auto-create pos_encoding if needed (required for attention ops)
     if pos_encoding is None:
         pos_encoding = PosEncoding(d_pos=d_head)
@@ -360,6 +370,7 @@ def forward_compile(
     else:
         ra.assign(out_state, output_node, residual_map.get_indices(output_node))
     net.residual_assignment = ra
+    net.assert_aliases = graph.get_assert_aliases()
 
     if trim_heads:
         for layer in net.layers:

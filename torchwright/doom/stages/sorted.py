@@ -33,7 +33,9 @@ import torch
 
 from torchwright.graph import Concatenate, Linear, Node, annotate
 from torchwright.graph.asserts import (
+    assert_01,
     assert_distinct_across,
+    assert_onehot,
     assert_picked_from,
     assert_score_gap_at_least,
 )
@@ -205,8 +207,8 @@ def _argmin_and_derive(inputs: SortedInputs, max_walls: int):
         pos_encoding=inputs.pos_encoding,
         score=checked_score,
         validity=inputs.is_renderable,
-        mask_vector=inputs.prev_mask,
-        position_onehot=inputs.position_onehot,
+        mask_vector=assert_01(inputs.prev_mask),
+        position_onehot=assert_onehot(inputs.position_onehot),
         value=inputs.sort_value,
     )
 

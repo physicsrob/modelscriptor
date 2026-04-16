@@ -1,6 +1,8 @@
 from typing import List
 
 from torchwright.graph import Node, Add, Concatenate
+from torchwright.graph.asserts import assert_matches_value_type
+from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 import torch
@@ -88,13 +90,14 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     input_bias = 1.0 / speed - vector @ vector
     output_proj = torch.tensor([[2.0 * speed]])
     output_bias = torch.tensor([-1.0])
-    return linear_relu_linear(
+    result = linear_relu_linear(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,
         output_proj=output_proj,
         output_bias=output_bias,
     )
+    return assert_matches_value_type(result, NodeValueType.sign())
 
 
 def cond_add_vector(
@@ -145,6 +148,21 @@ def cond_add_vector(
     )
 
 
+def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
+    if not cond.value_type.is_sign:
+        return NodeValueType.unknown()
+    vt = inp.value_type
+    r = vt.value_range
+    out_range = Range(min(0.0, r.lo), max(0.0, r.hi))
+    if vt.is_binary:
+        return NodeValueType(
+            value_range=out_range, is_integer=True, is_binary=True,
+        )
+    if vt.is_integer:
+        return NodeValueType(value_range=out_range, is_integer=True)
+    return NodeValueType.unknown()
+
+
 def cond_gate(cond: Node, inp: Node) -> Node:
     """
     Gates the value of a node based on a condition. If the condition is true,
@@ -182,7 +200,7 @@ def cond_gate(cond: Node, inp: Node) -> Node:
         output_proj[b, j] = 1.0
 
     x = Concatenate([cond, inp])
-    return linear_relu_linear(
+    result = linear_relu_linear(
         input_node=x,
         input_proj=input_proj,
         input_bias=input_bias,
@@ -190,3 +208,8 @@ def cond_gate(cond: Node, inp: Node) -> Node:
         output_bias=output_bias,
         name="cond_gate",
     )
+
+    vt = _cond_gate_output_type(cond, inp)
+    if vt != NodeValueType.unknown():
+        result = assert_matches_value_type(result, vt)
+    return result

@@ -25,6 +25,7 @@ A few things worth knowing before reading the assertions:
 import torch
 
 from torchwright.graph import InputNode, PosEncoding
+from torchwright.graph.asserts import assert_01, assert_integer, assert_onehot
 from torchwright.ops.attention_ops import (
     attend_argmin,
     attend_argmax,
@@ -55,7 +56,7 @@ def _run(out_node, n_pos, **inputs):
 def test_attend_argmin_happy_path():
     """Unique scores — argmin lands on the single minimum position."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     value = InputNode("value", 4)
     out = attend_argmin(pe, score, value)
 
@@ -82,16 +83,16 @@ def test_attend_argmin_happy_path():
 def test_attend_argmin_scalar_value():
     """Width-1 value — smoke test with small unique scores."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     value = InputNode("value", 1)
     out = attend_argmin(pe, score, value)
 
     n_pos = 3
-    score_in = torch.tensor([[2.0], [0.5], [5.0]])
+    score_in = torch.tensor([[2.0], [1.0], [5.0]])
     value_in = torch.tensor([[10.0], [20.0], [30.0]])
 
     result = _run(out, n_pos, score=score_in, value=value_in)
-    # pos 0 → value[0]=10. pos 1 → value[1]=20 (min 0.5). pos 2 → value[1]=20.
+    # pos 0 → value[0]=10. pos 1 → value[1]=20 (min 1.0). pos 2 → value[1]=20.
     assert abs(result[0].item() - 10.0) < 0.1
     assert abs(result[1].item() - 20.0) < 0.1
     assert abs(result[2].item() - 20.0) < 0.1
@@ -100,7 +101,7 @@ def test_attend_argmin_scalar_value():
 def test_attend_argmin_negative_scores():
     """argmin works with negative scores too (they're larger in -score space)."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     value = InputNode("value", 3)
     out = attend_argmin(pe, score, value)
 
@@ -123,7 +124,7 @@ def test_attend_argmin_negative_scores():
 def test_attend_argmax_happy_path():
     """Unique scores — argmax lands on the single maximum position."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     value = InputNode("value", 4)
     out = attend_argmax(pe, score, value)
 
@@ -148,7 +149,7 @@ def test_attend_argmax_happy_path():
 def test_attend_argmax_dual_of_argmin():
     """``attend_argmax(score)`` equals ``attend_argmin(-score)``."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     value = InputNode("value", 3)
     out_max = attend_argmax(pe, score, value)
 
@@ -171,16 +172,16 @@ def test_attend_argmax_dual_of_argmin():
 def test_attend_argmin_where_mask_overrides_score():
     """A valid high score beats an invalid low score."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
     value = InputNode("value", 4)
     out = attend_argmin_where(pe, score, validity, value)
 
     n_pos = 4
-    # Position 1 has the lowest score (0.1) but is invalid.
+    # Position 1 has the lowest score (0) but is invalid.
     # Position 2 has score 1.0 and is valid.
     # Position 3 has score 2.0 and is valid.
-    score_in = torch.tensor([[5.0], [0.1], [1.0], [2.0]])
+    score_in = torch.tensor([[5.0], [0.0], [1.0], [2.0]])
     validity_in = torch.tensor([[-1.0], [-1.0], [1.0], [1.0]])
     value_in = torch.eye(4, 4)
 
@@ -193,7 +194,7 @@ def test_attend_argmin_where_mask_overrides_score():
 def test_attend_argmin_where_single_valid_wins_any_score():
     """A single valid position is selected regardless of other scores."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
     value = InputNode("value", 4)
     out = attend_argmin_where(pe, score, validity, value)
@@ -201,7 +202,7 @@ def test_attend_argmin_where_single_valid_wins_any_score():
     n_pos = 4
     # Only position 1 is valid, and it has a moderate score (kept under
     # _MAX_SCORE_ABS = 120 so its logit stays above the causal mask).
-    score_in = torch.tensor([[0.0], [50.0], [0.5], [0.2]])
+    score_in = torch.tensor([[0.0], [50.0], [1.0], [2.0]])
     validity_in = torch.tensor([[-1.0], [1.0], [-1.0], [-1.0]])
     value_in = torch.eye(4, 4)
 
@@ -216,7 +217,7 @@ def test_attend_argmin_where_single_valid_wins_any_score():
 def test_attend_argmin_where_advances_with_mask():
     """As more positions become valid over time, the selection advances."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
     value = InputNode("value", 4)
     out = attend_argmin_where(pe, score, validity, value)
@@ -246,7 +247,7 @@ def test_attend_argmin_where_advances_with_mask():
 def test_attend_argmax_where_mask_overrides_score():
     """A valid low score beats an invalid high score."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
     value = InputNode("value", 4)
     out = attend_argmax_where(pe, score, validity, value)
@@ -265,14 +266,14 @@ def test_attend_argmax_where_mask_overrides_score():
 def test_attend_argmax_where_single_valid_wins_any_score():
     """A single valid position is selected even with a tiny score."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
     value = InputNode("value", 4)
     out = attend_argmax_where(pe, score, validity, value)
 
     n_pos = 4
     # Only pos 2 is valid; other positions have higher but invalid scores.
-    score_in = torch.tensor([[50.0], [40.0], [0.5], [30.0]])
+    score_in = torch.tensor([[50.0], [40.0], [1.0], [30.0]])
     validity_in = torch.tensor([[-1.0], [-1.0], [1.0], [-1.0]])
     value_in = torch.eye(4, 4)
 
@@ -289,9 +290,9 @@ def test_attend_argmax_where_single_valid_wins_any_score():
 def test_attend_argmin_unmasked_empty_mask_picks_min_score():
     """With an all-zero mask, this degenerates to a plain argmin."""
     pe = _pe()
-    score = InputNode("score", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    score = assert_integer(InputNode("score", 1))
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_unmasked(pe, score, mask, onehot, value)
 
@@ -318,9 +319,9 @@ def test_attend_argmin_unmasked_empty_mask_picks_min_score():
 def test_attend_argmin_unmasked_skips_masked_index():
     """Masking a specific input slot skips it in favour of the next-best."""
     pe = _pe()
-    score = InputNode("score", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    score = assert_integer(InputNode("score", 1))
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_unmasked(pe, score, mask, onehot, value)
 
@@ -367,7 +368,7 @@ def test_attend_argmin_above_integer_picks_smallest_above_threshold():
     """At each query position, pick the smallest score strictly above the
     threshold indicated by the one-hot query."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     indicators = InputNode("indicators", 10)
     threshold_onehot = InputNode("threshold_onehot", 10)
     value = InputNode("value", 4)
@@ -412,7 +413,7 @@ def test_attend_argmin_above_integer_threshold_varies_per_query():
     """The one-hot threshold can differ per query position, giving
     different selections at each."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     indicators = InputNode("indicators", 10)
     threshold_onehot = InputNode("threshold_onehot", 10)
     value = InputNode("value", 4)
@@ -453,9 +454,9 @@ def test_attend_argmin_above_integer_threshold_varies_per_query():
 def test_attend_argmin_unmasked_advances_through_all_slots():
     """Simulate selection sort: each step masks the previous winner."""
     pe = _pe()
-    score = InputNode("score", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    score = assert_integer(InputNode("score", 1))
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_unmasked(pe, score, mask, onehot, value)
 
@@ -497,10 +498,10 @@ def test_attend_argmin_unmasked_advances_through_all_slots():
 def test_attend_argmin_valid_unmasked_all_valid_empty_mask_picks_min():
     """All keys valid, empty mask — behaves like a plain argmin."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
 
@@ -525,10 +526,10 @@ def test_attend_argmin_valid_unmasked_all_valid_empty_mask_picks_min():
 def test_attend_argmin_valid_unmasked_validity_overrides_low_score():
     """The lowest-score key is invalid — attention picks the next-lowest valid."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
 
@@ -552,10 +553,10 @@ def test_attend_argmin_valid_unmasked_validity_overrides_low_score():
 def test_attend_argmin_valid_unmasked_mask_excludes_picked():
     """All valid, but the min-score slot is masked — expect next-best unmasked."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
 
@@ -585,10 +586,10 @@ def test_attend_argmin_valid_unmasked_mask_excludes_picked():
 def test_attend_argmin_valid_unmasked_mask_and_validity_combined():
     """Lowest score is masked, second-lowest invalid — pick third (valid + unmasked)."""
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
 
@@ -625,10 +626,10 @@ def test_attend_argmin_valid_unmasked_all_valid_masked_repicks_masked():
     garbage from an invalid position.
     """
     pe = _pe()
-    score = InputNode("score", 1)
+    score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
 

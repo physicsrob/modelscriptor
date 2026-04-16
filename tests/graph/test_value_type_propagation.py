@@ -206,3 +206,157 @@ def test_attn_default_value_type_is_unknown():
         output_matrix=torch.eye(2),
     )
     assert attn.value_type == NodeValueType.unknown()
+
+
+# --- Op propagation rules ----------------------------------------
+
+
+def test_compare_default_is_sign():
+    from torchwright.ops.arithmetic_ops import compare
+    inp = LiteralValue(torch.tensor([3.0]))
+    out = compare(inp, 2.0)
+    assert out.value_type.is_sign
+
+
+def test_compare_01_levels_is_binary():
+    from torchwright.ops.arithmetic_ops import compare
+    inp = LiteralValue(torch.tensor([3.0]))
+    out = compare(inp, 2.0, true_level=1.0, false_level=0.0)
+    assert out.value_type.is_binary
+
+
+def test_compare_arbitrary_integer_levels():
+    from torchwright.ops.arithmetic_ops import compare
+    inp = LiteralValue(torch.tensor([3.0]))
+    out = compare(inp, 2.0, true_level=5.0, false_level=-3.0)
+    vt = out.value_type
+    assert vt.is_integer
+    assert vt.value_range == Range(-3.0, 5.0)
+
+
+def test_compare_float_levels_no_propagation():
+    from torchwright.ops.arithmetic_ops import compare
+    inp = LiteralValue(torch.tensor([3.0]))
+    out = compare(inp, 2.0, true_level=0.5, false_level=-0.5)
+    assert not out.value_type.is_integer
+
+
+def test_equals_vector_is_sign():
+    from torchwright.ops.logic_ops import equals_vector
+    inp = LiteralValue(torch.tensor([1.0, 0.0, 0.0]))
+    out = equals_vector(inp, torch.tensor([1.0, 0.0, 0.0]))
+    assert out.value_type.is_sign
+
+
+def test_select_sign_cond_integer_branches():
+    from torchwright.ops.map_select import select
+    from torchwright.graph.asserts import assert_bool
+    cond = assert_bool(LiteralValue(torch.tensor([1.0])))
+    a = LiteralValue(torch.tensor([2.0, 3.0]))
+    b = LiteralValue(torch.tensor([5.0, 7.0]))
+    out = select(cond, a, b)
+    vt = out.value_type
+    assert vt.is_integer
+    assert vt.value_range.lo == 2.0
+    assert vt.value_range.hi == 7.0
+
+
+def test_select_sign_cond_binary_branches():
+    from torchwright.ops.map_select import select
+    from torchwright.graph.asserts import assert_bool
+    cond = assert_bool(LiteralValue(torch.tensor([1.0])))
+    a = LiteralValue(torch.tensor([0.0, 1.0]))
+    b = LiteralValue(torch.tensor([1.0, 0.0]))
+    out = select(cond, a, b)
+    assert out.value_type.is_binary
+
+
+def test_select_sign_cond_onehot_branches():
+    from torchwright.ops.map_select import select
+    from torchwright.graph.asserts import assert_bool
+    cond = assert_bool(LiteralValue(torch.tensor([1.0])))
+    a = LiteralValue(torch.tensor([1.0, 0.0, 0.0]))
+    b = LiteralValue(torch.tensor([0.0, 1.0, 0.0]))
+    out = select(cond, a, b)
+    assert out.value_type.is_one_hot
+
+
+def test_select_unknown_cond_no_propagation():
+    from torchwright.ops.map_select import select
+    cond = InputNode("cond", 1)
+    a = LiteralValue(torch.tensor([2.0, 3.0]))
+    b = LiteralValue(torch.tensor([5.0, 7.0]))
+    out = select(cond, a, b)
+    assert not out.value_type.is_integer
+
+
+def test_cond_gate_sign_cond_integer_inp():
+    from torchwright.ops.logic_ops import cond_gate
+    from torchwright.graph.asserts import assert_bool
+    cond = assert_bool(LiteralValue(torch.tensor([1.0])))
+    inp = LiteralValue(torch.tensor([3.0, 5.0]))
+    out = cond_gate(cond, inp)
+    vt = out.value_type
+    assert vt.is_integer
+    assert vt.value_range.lo == 0.0
+    assert vt.value_range.hi == 5.0
+
+
+def test_cond_gate_sign_cond_binary_inp():
+    from torchwright.ops.logic_ops import cond_gate
+    from torchwright.graph.asserts import assert_bool
+    cond = assert_bool(LiteralValue(torch.tensor([1.0])))
+    inp = LiteralValue(torch.tensor([0.0, 1.0]))
+    out = cond_gate(cond, inp)
+    assert out.value_type.is_binary
+
+
+def test_cond_gate_unknown_cond_no_propagation():
+    from torchwright.ops.logic_ops import cond_gate
+    cond = InputNode("cond", 1)
+    inp = LiteralValue(torch.tensor([3.0, 5.0]))
+    out = cond_gate(cond, inp)
+    assert not out.value_type.is_integer
+
+
+# --- Phase 3: in_range, map_to_table, floor/ceil ----------------
+
+
+def test_in_range_is_sign():
+    from torchwright.ops.map_select import in_range
+    lower = LiteralValue(torch.tensor([1.0]))
+    upper = LiteralValue(torch.tensor([3.0]))
+    out = in_range(lower, upper, 5)
+    assert out.value_type.is_sign
+
+
+def test_floor_int_is_integer():
+    from torchwright.ops.arithmetic_ops import floor_int
+    from torchwright.graph.asserts import assert_in_range
+    inp = assert_in_range(LiteralValue(torch.tensor([2.5])), 0.0, 10.0)
+    out = floor_int(inp, 0, 10)
+    vt = out.value_type
+    assert vt.is_integer
+    assert vt.value_range.lo == 0.0
+    assert vt.value_range.hi == 10.0
+
+
+def test_ceil_int_is_integer():
+    from torchwright.ops.arithmetic_ops import ceil_int
+    from torchwright.graph.asserts import assert_in_range
+    inp = assert_in_range(LiteralValue(torch.tensor([2.5])), 0.0, 10.0)
+    out = ceil_int(inp, 0, 10)
+    vt = out.value_type
+    assert vt.is_integer
+
+
+def test_thermometer_floor_div_is_integer():
+    from torchwright.ops.arithmetic_ops import thermometer_floor_div
+    inp = LiteralValue(torch.tensor([35.0]))
+    out = thermometer_floor_div(inp, 10, 100)
+    vt = out.value_type
+    assert vt.is_integer
+    assert vt.value_range.lo == 0.0
+    assert vt.value_range.hi == 10.0
+
+

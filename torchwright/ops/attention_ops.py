@@ -58,7 +58,13 @@ import math
 import torch
 
 from torchwright.graph import Node, Concatenate, Attn
-from torchwright.graph.asserts import assert_in_range, assert_matches_value_type
+from torchwright.graph.asserts import (
+    assert_in_range,
+    assert_matches_value_type,
+    require_binary,
+    require_integer,
+    require_one_hot,
+)
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.value_type import NodeValueType
 
@@ -300,6 +306,7 @@ def attend_argmin(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
         :func:`attend_argmax`, :func:`attend_argmin_where`.
     """
     assert len(score) == 1, "attend_argmin expects a 1D scalar score node"
+    require_integer(score, "attend_argmin")
     d_head = _assert_value_fits(pos_encoding, value)
 
     # key_in = [pos_encoding (d_pos), score (1)]
@@ -331,6 +338,7 @@ def attend_argmax(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
         argmax-of-``score`` key position within the causal window.
     """
     assert len(score) == 1, "attend_argmax expects a 1D scalar score node"
+    require_integer(score, "attend_argmax")
     d_head = _assert_value_fits(pos_encoding, value)
 
     d_pos = pos_encoding.d_pos
@@ -391,6 +399,7 @@ def attend_argmin_where(
         :func:`attend_argmax_where` — maximum-score dual.
     """
     assert len(score) == 1, "attend_argmin_where expects a 1D scalar score"
+    require_integer(score, "attend_argmin_where")
     assert len(validity) == 1, "attend_argmin_where expects a 1D boolean validity"
     attn = _build_where_attn(
         pos_encoding, score, validity, value, score_sign=-1.0,
@@ -419,6 +428,7 @@ def attend_argmax_where(
         Attn node of width ``len(value)``.
     """
     assert len(score) == 1, "attend_argmax_where expects a 1D scalar score"
+    require_integer(score, "attend_argmax_where")
     assert len(validity) == 1, "attend_argmax_where expects a 1D boolean validity"
     attn = _build_where_attn(
         pos_encoding, score, validity, value, score_sign=+1.0,
@@ -496,6 +506,7 @@ def attend_argmin_above_integer(
         Attn node of width ``len(value)``.
     """
     assert len(score) == 1, "attend_argmin_above_integer expects a 1D scalar score"
+    require_integer(score, "attend_argmin_above_integer")
     assert len(indicators_above) == len(threshold_onehot), (
         "indicators_above and threshold_onehot must have the same width "
         f"(got {len(indicators_above)} and {len(threshold_onehot)})"
@@ -631,6 +642,9 @@ def attend_argmin_unmasked(
         unmasked argmin-of-``score`` position within the causal window.
     """
     assert len(score) == 1, "attend_argmin_unmasked expects a 1D scalar score"
+    require_integer(score, "attend_argmin_unmasked")
+    require_binary(mask_vector, "attend_argmin_unmasked")
+    require_one_hot(position_onehot, "attend_argmin_unmasked")
     assert len(mask_vector) == len(position_onehot), (
         "mask_vector and position_onehot must have the same width "
         f"(got {len(mask_vector)} and {len(position_onehot)})"
@@ -748,9 +762,12 @@ def attend_argmin_valid_unmasked(
         Attn node of width ``len(value)``.
     """
     assert len(score) == 1, "attend_argmin_valid_unmasked expects a 1D scalar score"
+    require_integer(score, "attend_argmin_valid_unmasked")
     assert len(validity) == 1, (
         "attend_argmin_valid_unmasked expects a 1D boolean validity"
     )
+    require_binary(mask_vector, "attend_argmin_valid_unmasked")
+    require_one_hot(position_onehot, "attend_argmin_valid_unmasked")
     assert len(mask_vector) == len(position_onehot), (
         "mask_vector and position_onehot must have the same width "
         f"(got {len(mask_vector)} and {len(position_onehot)})"
