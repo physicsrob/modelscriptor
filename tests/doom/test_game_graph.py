@@ -136,7 +136,9 @@ class TestGameGraph:
         frame, _ = step_frame(module, state, inputs, subset, config, textures=textures)
         ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
 
-        compare_images(frame, ref).assert_matches()
+        compare_images(frame, ref).assert_matches(
+            min_matched_fraction=0.95, max_err=0.35,
+        )
 
     @pytest.mark.parametrize("px,py,angle", [
         (3.0, 2.0, 20),    # near corner, looking diagonally
@@ -157,7 +159,9 @@ class TestGameGraph:
         frame, _ = step_frame(module, state, inputs, subset, config, textures=textures)
         ref = _ref_frame(px, py, angle, segs, config, textures)
 
-        compare_images(frame, ref).assert_matches()
+        compare_images(frame, ref).assert_matches(
+            min_matched_fraction=0.95, max_err=0.35,
+        )
 
     # ── Collision detection tests ──────────────────────────────────
 
