@@ -24,6 +24,11 @@ def bool_any_true(inp_list: List[Node]) -> Node:
 
     Returns:
         Node: Output node that is True if any input nodes are true, otherwise False.
+
+    .. noise-footer::
+
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit a979f69. See docs/numerical_noise.md.
     """
     # Strategy:
     # Convert all the values to 1.0 if they're > 0.0 and 0.0 otherwise
@@ -47,6 +52,11 @@ def bool_all_true(inp_list: List[Node]) -> Node:
 
     Returns:
         Node: Output node that is True if all input nodes are true, otherwise False.
+
+    .. noise-footer::
+
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit a979f69. See docs/numerical_noise.md.
     """
     return compare(
         sum_nodes(inp_list),
@@ -65,6 +75,11 @@ def bool_not(inp: Node) -> Node:
 
     Returns:
         Node: Output node that is 1.0 if the input node is false, and -1.0 if the input node is true.
+
+    .. noise-footer::
+
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit a979f69. See docs/numerical_noise.md.
     """
     return compare(inp, thresh=0.0, true_level=-1.0, false_level=1.0)
 
@@ -79,6 +94,11 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
 
     Returns:
         Node: Node with the result of the comparison.
+
+    .. noise-footer::
+
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit a979f69. See docs/numerical_noise.md.
     """
     # If value1 == c, result is 1
     # else result is -1
@@ -185,6 +205,11 @@ def cond_gate(cond: Node, inp: Node) -> Node:
 
     Returns:
         Node: Output node after applying the gate based on condition.
+
+    .. noise-footer::
+
+       Max error: 3.052e-05 abs, 0.00399 rel over 4096 samples;
+       measured at commit a979f69. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
 

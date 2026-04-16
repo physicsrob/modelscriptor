@@ -55,6 +55,10 @@ test-local:
 graph-stats:
 	uv run python graph_stats.py $(ARGS)
 
+.PHONY: measure-noise
+measure-noise:
+	uv run python -m scripts.measure_op_noise $(ARGS)
+
 .PHONY: walkthrough
 walkthrough:
 	uv run modal run modal_walkthrough.py $(ARGS)

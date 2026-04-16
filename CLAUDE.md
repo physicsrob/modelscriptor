@@ -96,6 +96,64 @@ Tests calling `compile_game()` are expensive (~17s to compile, ~2s per
    The default is `"auto"` which uses GPU when available.  Forcing CPU will
    make inference ~8x slower.
 
+# Numerical noise
+
+Every approximate op in `torchwright/ops/` is measured against its exact-math
+reference and the numbers are committed alongside the code. `docs/op_noise_data.json`
+is the canonical source; `docs/numerical_noise.md` and the per-op docstring
+footers are **generated** from that JSON. Never edit them by hand.
+
+Commentary on the measurements — which numbers are by design, which deserve
+investigation, and which DOOM call-sites each distribution covers — lives in
+`docs/numerical_noise_findings.md`. That file is **hand-written and is
+Claude's responsibility to keep current**. The measurement pipeline does not
+regenerate it and the consistency test does not enforce it; synthesizing
+findings from the raw numbers is an interpretive task that belongs to the
+agent running the workflow, not to the script.
+
+Specifically, whenever you run `make measure-noise` — whether because you
+added an op, edited one, or widened a distribution — you must:
+
+1. Diff the new `docs/op_noise_data.json` against the previous commit.
+2. For each material change (number grew, rank order of distributions
+   changed, a finding-worthy input emerged), either update the corresponding
+   entry in `docs/numerical_noise_findings.md` or add a new one.
+3. Remove findings that no longer apply (e.g., if a bound is tightened and
+   the previously-flagged number is now within expectations).
+4. Keep the call-site cross-reference table in sync when you add, rename, or
+   remove a `doom_*` distribution.
+
+Regenerate the auto-artefacts with:
+
+    make measure-noise
+
+**Any change to a piecewise op's implementation, breakpoint grid, or
+`step_sharpness` requires a re-measurement before you commit.** The
+consistency test only verifies that JSON, markdown, and footers agree with
+each other — it cannot tell that the numbers were measured against old code.
+Skipping `make measure-noise` after editing an op leaves stale numbers in the
+docstring and markdown with a commit SHA that no longer matches HEAD.
+
+Workflow when you change a piecewise op's implementation or breakpoint grid:
+
+1. Run `make measure-noise` to regenerate the JSON, markdown, and docstring
+   footers at the new commit.
+2. Review the diff in `docs/op_noise_data.json` and update
+   `docs/numerical_noise_findings.md` to reflect anything newly surprising
+   or newly resolved.
+3. `git diff docs/ torchwright/ops/` — the only auto-generated changes
+   should be noise numbers and commit SHAs; the findings-doc changes are
+   yours.
+4. Commit.
+
+The consistency test `tests/docs/test_numerical_noise_consistency.py` fails in
+CI if the three artefacts drift out of sync. The error message points back to
+`make measure-noise`.
+
+To add a new op, append a `TargetOp(...)` to `_target_ops()` in
+`scripts/measure_op_noise.py`. See the "Adding a new op" section at the end
+of `docs/numerical_noise.md` for the full pattern.
+
 # Walkthrough
 
 ## Rendering a Walkthrough
