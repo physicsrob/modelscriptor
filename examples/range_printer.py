@@ -20,7 +20,7 @@ from typing import Tuple
 import torch
 
 from torchwright.graph import Concatenate, Linear, Node
-from torchwright.graph.asserts import assert_integer
+from torchwright.graph.asserts import assert_01, assert_integer, assert_onehot
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.spherical_codes import index_to_vector
 from torchwright.ops.arithmetic_ops import (
@@ -92,15 +92,13 @@ def build_range_printer_graph(
     sentinel = create_literal_value(
         torch.tensor([_SENTINEL_SCORE]), name="sentinel",
     )
-    # Both branches are integer-valued by construction; select's
-    # PL-encoded arithmetic adds FP fuzz, so re-declare the invariant.
     score = assert_integer(select(is_item, item_index, sentinel))
 
     # --- Position one-hot ({0,1}, width max_items) ---------------------
     item_index_p1 = add_const(item_index, 1.0)
     onehot_bool = in_range(item_index, item_index_p1, max_items)
     ones_oh = create_literal_value(torch.ones(max_items), name="ones_oh")
-    position_onehot = add_scaled_nodes(0.5, onehot_bool, 0.5, ones_oh)
+    position_onehot = assert_onehot(add_scaled_nodes(0.5, onehot_bool, 0.5, ones_oh))
 
     # --- Value to retrieve from selected item --------------------------
     item_value = Concatenate([range_lo, range_hi, position_onehot])
@@ -110,7 +108,7 @@ def build_range_printer_graph(
     selected = attend_argmin_unmasked(
         pos_encoding=pos_encoding,
         score=score,
-        mask_vector=print_mask,
+        mask_vector=assert_01(print_mask),
         position_onehot=position_onehot,
         value=item_value,
     )

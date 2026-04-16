@@ -2,6 +2,8 @@ from torchwright.graph import Node, Concatenate
 from typing import List, Dict
 import torch
 
+from torchwright.graph.asserts import assert_matches_value_type
+from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import (
     big_offset,
     step_sharpness,
@@ -78,6 +80,28 @@ def switch(conditions: List[Node], values: List[Node]) -> Node:
     return sum_nodes([cond_gate(c, v) for c, v in zip(conditions, values)])
 
 
+def _select_output_type(
+    cond: Node, true_node: Node, false_node: Node,
+) -> NodeValueType:
+    if not cond.value_type.is_sign:
+        return NodeValueType.unknown()
+    tv = true_node.value_type
+    fv = false_node.value_type
+    r = tv.value_range.union(fv.value_range)
+    is_int = tv.is_integer and fv.is_integer
+    is_bin = tv.is_binary and fv.is_binary
+    is_onehot = tv.is_one_hot and fv.is_one_hot
+    if is_onehot:
+        return NodeValueType(
+            value_range=r, is_integer=True, is_binary=True, is_one_hot=True,
+        )
+    if is_bin:
+        return NodeValueType(value_range=r, is_integer=True, is_binary=True)
+    if is_int:
+        return NodeValueType(value_range=r, is_integer=True)
+    return NodeValueType.unknown()
+
+
 def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     """
     Outputs one of two nodes based on a boolean condition.
@@ -115,7 +139,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
         output_proj[b, j] = 1.0
 
     x = Concatenate([cond, true_node, false_node])
-    return linear_relu_linear(
+    result = linear_relu_linear(
         input_node=x,
         input_proj=input_proj,
         input_bias=input_bias,
@@ -123,6 +147,11 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
         output_bias=output_bias,
         name="select",
     )
+
+    vt = _select_output_type(cond, true_node, false_node)
+    if vt != NodeValueType.unknown():
+        result = assert_matches_value_type(result, vt)
+    return result
 
 
 def in_range(lower: Node, upper: Node, n_slots: int) -> Node:

@@ -61,7 +61,9 @@ from torchwright.graph import Node, Concatenate, Attn
 from torchwright.graph.asserts import (
     assert_in_range,
     assert_matches_value_type,
+    require_binary,
     require_integer,
+    require_one_hot,
 )
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.value_type import NodeValueType
@@ -641,6 +643,8 @@ def attend_argmin_unmasked(
     """
     assert len(score) == 1, "attend_argmin_unmasked expects a 1D scalar score"
     require_integer(score, "attend_argmin_unmasked")
+    require_binary(mask_vector, "attend_argmin_unmasked")
+    require_one_hot(position_onehot, "attend_argmin_unmasked")
     assert len(mask_vector) == len(position_onehot), (
         "mask_vector and position_onehot must have the same width "
         f"(got {len(mask_vector)} and {len(position_onehot)})"
@@ -762,6 +766,8 @@ def attend_argmin_valid_unmasked(
     assert len(validity) == 1, (
         "attend_argmin_valid_unmasked expects a 1D boolean validity"
     )
+    require_binary(mask_vector, "attend_argmin_valid_unmasked")
+    require_one_hot(position_onehot, "attend_argmin_valid_unmasked")
     assert len(mask_vector) == len(position_onehot), (
         "mask_vector and position_onehot must have the same width "
         f"(got {len(mask_vector)} and {len(position_onehot)})"

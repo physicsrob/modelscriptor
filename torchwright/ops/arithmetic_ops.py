@@ -4,7 +4,9 @@ from typing import List, Optional, Tuple
 from torchwright.graph import Node, Add, Concatenate, Linear
 import torch
 
+from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.relu import ReLU
+from torchwright.graph.value_type import NodeValueType
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 from torchwright.ops.const import step_sharpness
@@ -270,6 +272,21 @@ def abs(inp: Node) -> Node:
 # ---------------------------------------------------------------------------
 
 
+def _compare_output_type(true_level: float, false_level: float) -> NodeValueType:
+    lo = builtins.min(true_level, false_level)
+    hi = builtins.max(true_level, false_level)
+    is_int = (true_level == round(true_level)) and (false_level == round(false_level))
+    is_bin = is_int and lo == 0.0 and hi == 1.0
+    is_sgn = is_int and lo == -1.0 and hi == 1.0
+    if is_bin:
+        return NodeValueType.binary()
+    if is_sgn:
+        return NodeValueType.sign()
+    if is_int:
+        return NodeValueType.integer(lo=lo, hi=hi)
+    return NodeValueType.unknown()
+
+
 def compare(
     inp: Node, thresh: float, true_level: float = 1.0, false_level: float = -1.0
 ) -> Node:
@@ -301,13 +318,18 @@ def compare(
     output_proj = torch.tensor([[true_level - false_level], [false_level - true_level]])
     output_bias = false_level * torch.ones(1)
 
-    return linear_relu_linear(
+    result = linear_relu_linear(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,
         output_proj=output_proj,
         output_bias=output_bias,
     )
+
+    vt = _compare_output_type(true_level, false_level)
+    if vt != NodeValueType.unknown():
+        result = assert_matches_value_type(result, vt)
+    return result
 
 
 # ---------------------------------------------------------------------------

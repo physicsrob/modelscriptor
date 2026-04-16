@@ -52,7 +52,7 @@ from typing import List, Tuple
 import torch
 
 from torchwright.graph import Node, Embedding
-from torchwright.graph.asserts import assert_integer
+from torchwright.graph.asserts import assert_01, assert_integer, assert_onehot
 from torchwright.graph.embedding import Unembedding
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import add_scaled_nodes, compare, negate, sum_nodes
@@ -211,21 +211,18 @@ def create_network_parts(
         create_literal_value(torch.tensor([1.0])),
     )
     position_onehot_bool = in_range(digit_index, digit_index_plus_one, max_input)
-    position_onehot = add_scaled_nodes(
+    position_onehot = assert_onehot(add_scaled_nodes(
         0.5,
         position_onehot_bool,
         0.5,
         create_literal_value(torch.ones(max_input)),
-    )
+    ))
 
     # score: 10 * digit + digit_index at *input* digit positions,
     # sentinel elsewhere. Valid range [0, 99]; sentinel 100 guarantees
     # every other position (including emitted output digits after the
     # trigger) is beaten by any real input-digit position in the argmin.
     score_if_digit = add_scaled_nodes(10.0, digit_scalar, 1.0, digit_index)
-    # ``10 * digit + digit_index`` and the sentinel are integer by
-    # construction; select's PL-encoded arithmetic adds FP fuzz, so
-    # re-declare the invariant for attend_argmin_unmasked's contract.
     score = assert_integer(select(
         is_input_digit,
         score_if_digit,
@@ -257,8 +254,7 @@ def create_network_parts(
             value=embedding,
         )
         seq.append(selected_digit_embed)
-        # Elementwise max of two {0, 1} vectors is the bitwise OR.
-        mask_k = elementwise_max(mask_k, selection_onehot)
+        mask_k = assert_01(elementwise_max(mask_k, selection_onehot))
 
     output_node = _emit_by_slot_index(
         pos_encoding,

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 import torch
 
 from torchwright.graph import Node, annotate
-from torchwright.graph.asserts import assert_integer
+from torchwright.graph.asserts import assert_integer, assert_onehot
 from torchwright.ops.arithmetic_ops import (
     abs,
     add,
@@ -404,4 +404,4 @@ def _compute_position_onehot(wall_index: Node, max_walls: int) -> Node:
     wall_index_p1 = add_const(wall_index, 1.0)
     onehot_bool = in_range(wall_index, wall_index_p1, max_walls)
     ones_oh = create_literal_value(torch.ones(max_walls), name="ones_oh")
-    return add_scaled_nodes(0.5, onehot_bool, 0.5, ones_oh)
+    return assert_onehot(add_scaled_nodes(0.5, onehot_bool, 0.5, ones_oh))

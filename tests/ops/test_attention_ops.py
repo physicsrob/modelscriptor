@@ -25,7 +25,7 @@ A few things worth knowing before reading the assertions:
 import torch
 
 from torchwright.graph import InputNode, PosEncoding
-from torchwright.graph.asserts import assert_integer
+from torchwright.graph.asserts import assert_01, assert_integer, assert_onehot
 from torchwright.ops.attention_ops import (
     attend_argmin,
     attend_argmax,
@@ -291,8 +291,8 @@ def test_attend_argmin_unmasked_empty_mask_picks_min_score():
     """With an all-zero mask, this degenerates to a plain argmin."""
     pe = _pe()
     score = assert_integer(InputNode("score", 1))
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_unmasked(pe, score, mask, onehot, value)
 
@@ -320,8 +320,8 @@ def test_attend_argmin_unmasked_skips_masked_index():
     """Masking a specific input slot skips it in favour of the next-best."""
     pe = _pe()
     score = assert_integer(InputNode("score", 1))
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_unmasked(pe, score, mask, onehot, value)
 
@@ -455,8 +455,8 @@ def test_attend_argmin_unmasked_advances_through_all_slots():
     """Simulate selection sort: each step masks the previous winner."""
     pe = _pe()
     score = assert_integer(InputNode("score", 1))
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_unmasked(pe, score, mask, onehot, value)
 
@@ -500,8 +500,8 @@ def test_attend_argmin_valid_unmasked_all_valid_empty_mask_picks_min():
     pe = _pe()
     score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
 
@@ -528,8 +528,8 @@ def test_attend_argmin_valid_unmasked_validity_overrides_low_score():
     pe = _pe()
     score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
 
@@ -555,8 +555,8 @@ def test_attend_argmin_valid_unmasked_mask_excludes_picked():
     pe = _pe()
     score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
 
@@ -588,8 +588,8 @@ def test_attend_argmin_valid_unmasked_mask_and_validity_combined():
     pe = _pe()
     score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
 
@@ -628,8 +628,8 @@ def test_attend_argmin_valid_unmasked_all_valid_masked_repicks_masked():
     pe = _pe()
     score = assert_integer(InputNode("score", 1))
     validity = InputNode("validity", 1)
-    mask = InputNode("mask", 4)
-    onehot = InputNode("onehot", 4)
+    mask = assert_01(InputNode("mask", 4))
+    onehot = assert_onehot(InputNode("onehot", 4))
     value = InputNode("value", 4)
     out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
 
