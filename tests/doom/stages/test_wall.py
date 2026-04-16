@@ -395,7 +395,8 @@ def test_sort_value_north_wall_clean_at_angle_192(wall_sort_value_module):
     #   [4]: wall_tex_id
     #   [5..9]: render precomp (sort_den, C, D, E, H_inv)
     #   [10]: bsp_rank
-    #   [11..11+max_walls-1]: position_onehot
+    #   [11..12]: visibility columns (vis_lo, vis_hi)
+    #   [13..13+max_walls-1]: position_onehot
     got = out[:5].tolist()
     expected = [5.0, 5.0, -5.0, 5.0, 1.0]
 

@@ -158,6 +158,28 @@ def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
     v_idx = op.source_cols
     o_idx = op.target_cols
 
+    q_in, k_in, v_in = node.inputs
+    assert len(q_idx) == len(q_in), (
+        f"compute_attn Q row-width mismatch for {node!r}: "
+        f"q_source_cols len={len(q_idx)} but Q input {q_in!r} has "
+        f"width {len(q_in)}. "
+        f"Likely a Concatenate-resolution bug."
+    )
+    assert len(k_idx) == len(k_in), (
+        f"compute_attn K row-width mismatch for {node!r}: "
+        f"k_source_cols len={len(k_idx)} but K input {k_in!r} has "
+        f"width {len(k_in)}."
+    )
+    assert len(v_idx) == len(v_in), (
+        f"compute_attn V row-width mismatch for {node!r}: "
+        f"source_cols len={len(v_idx)} but V input {v_in!r} has "
+        f"width {len(v_in)}."
+    )
+    assert len(o_idx) == node.d_output, (
+        f"compute_attn O col-width mismatch for {node!r}: "
+        f"target_cols len={len(o_idx)} but node.d_output={node.d_output}."
+    )
+
     layer_d_head = attn.d_head
 
     assert layer_d_head >= node.d_qk, (
@@ -544,18 +566,30 @@ def _write_compute_literal_value(mlp, op: MLPOp):
     """Write a constant value via MLP output bias."""
     node = op.node
     assert isinstance(node, LiteralValue)
+    assert len(op.target_cols) == node.value.numel(), (
+        f"Literal truncation would drop values from {node!r}: "
+        f"value.numel()={node.value.numel()}, "
+        f"target_cols len={len(op.target_cols)}. "
+        f"Slicing would silently lose trailing entries — compiler bug."
+    )
     cols_t = torch.as_tensor(op.target_cols, dtype=torch.long)
     target_dtype = mlp.linear2.output_bias.dtype
-    mlp.linear2.output_bias[cols_t] = node.value[: len(op.target_cols)].to(target_dtype)
+    mlp.linear2.output_bias[cols_t] = node.value.to(target_dtype)
 
 
 def _write_compute_bias(mlp, op: MLPOp):
     """Add bias to MLP output bias (for biased Linear split)."""
     node = op.node
     assert isinstance(node, Linear)
+    assert len(op.target_cols) == node.output_bias.numel(), (
+        f"Bias truncation would drop values from {node!r}: "
+        f"output_bias.numel()={node.output_bias.numel()}, "
+        f"target_cols len={len(op.target_cols)}. "
+        f"Slicing would silently lose trailing entries — compiler bug."
+    )
     cols_t = torch.as_tensor(op.target_cols, dtype=torch.long)
     target_dtype = mlp.linear2.output_bias.dtype
-    mlp.linear2.output_bias[cols_t] += node.output_bias[: len(op.target_cols)].to(target_dtype)
+    mlp.linear2.output_bias[cols_t] += node.output_bias.to(target_dtype)
 
 
 def _write_compute_standalone_relu(

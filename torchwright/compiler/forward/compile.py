@@ -5,8 +5,9 @@ Produces a HeadlessTransformer that can compute the output node's value
 given input values.
 """
 
+import os
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Set
 
 import torch
 
@@ -30,6 +31,61 @@ from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Node, Linear, Concatenate
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
+
+
+def _effective_consumers(
+    graph: GraphAnalyzer, node: Node
+) -> Set[Node]:
+    """Walk through Concatenate consumers transparently.
+
+    Mirrors ``LayerScheduler._get_effective_consumers``: a Concatenate is
+    not a real consumer — its own consumers are.  Terminal Concatenates
+    (output nodes) are kept so their leaves never get freed.
+    """
+    result: Set[Node] = set()
+    for consumer in graph.get_consumers(node):
+        if isinstance(consumer, Concatenate):
+            downstream = _effective_consumers(graph, consumer)
+            if downstream:
+                result |= downstream
+            else:
+                result.add(consumer)
+        else:
+            result.add(consumer)
+    return result
+
+
+def _verify_end_of_layer_liveness(
+    graph: GraphAnalyzer,
+    residual_map,
+    computed: Set[Node],
+    layer_idx: int,
+) -> None:
+    """Invariant A (cross-layer): every node with uncomputed effective
+    consumers must still be allocated in the residual map.
+
+    Gated behind ``TW_COMPILER_VERIFY=1`` because the O(|nodes|·fanout)
+    walk is noticeable on large compiles.  When enabled, surfaces a
+    freed-too-early node at the end of the layer where it was freed
+    rather than later at a consumer's KeyError.
+    """
+    for node in graph.get_all_nodes():
+        if isinstance(node, Concatenate):
+            continue
+        if node not in computed:
+            continue
+        uncomputed = _effective_consumers(graph, node) - computed
+        if not uncomputed:
+            continue
+        if residual_map.is_allocated(node):
+            continue
+        sample = [repr(c) for c in list(uncomputed)[:3]]
+        raise AssertionError(
+            f"End-of-layer {layer_idx} liveness violation: {node!r} has "
+            f"{len(uncomputed)} uncomputed consumer(s) "
+            f"(e.g. {sample}) but is not allocated in residual_map. "
+            f"free_count={residual_map.get_free_count()}."
+        )
 
 
 def _count_layer_params(
@@ -158,6 +214,8 @@ def forward_compile(
     # other col is dirty until a cancel op clears it.
     residual_map.mark_clean(residual_map.get_indices(pos_encoding))
     for node in input_nodes:
+        if node is pos_encoding:
+            continue
         residual_map.allocate(node)
         residual_map.mark_clean(residual_map.get_indices(node))
     computed = set(input_nodes)
@@ -258,6 +316,9 @@ def forward_compile(
             if isinstance(node, Concatenate) and node not in computed:
                 if all(leaf in computed for leaf in flatten_concat_nodes([node])):
                     computed.add(node)
+
+        if os.environ.get("TW_COMPILER_VERIFY"):
+            _verify_end_of_layer_liveness(graph, residual_map, computed, i)
 
         if on_node_scheduled is not None:
             for node in computed - prev_computed:

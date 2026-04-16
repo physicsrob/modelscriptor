@@ -8,8 +8,8 @@ column drift in ``_compute_visibility_columns`` (frustum clip +
 endpoint projection) rather than something downstream in the render
 pipeline.
 
-For each failing scene we reconstruct the exact SORTED input the
-integration test produces — player state + one wall — compile the
+For each failing scene we reconstruct the exact WALL-stage input
+the integration test produces — player state + one wall — compile the
 visibility-column subgraph, and compare the compiled ``(vis_lo,
 vis_hi)`` against an exact Python oracle that implements the same
 frustum clip + ``atan(cross/dot)`` projection.
@@ -32,7 +32,7 @@ from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig
 
-from torchwright.doom.stages.sorted import _compute_visibility_columns
+from torchwright.doom.stages.wall import _compute_visibility_columns
 
 
 _MAX_COORD = 20.0
@@ -54,19 +54,27 @@ def _config() -> RenderConfig:
 def vis_module():
     """Compile just the visibility-columns subgraph.
 
-    ``sel_wall_data`` is packed as the 5-wide ``[ax, ay, bx, by, tex_id]``
-    block the SORTED stage extracts via ``extract_geometry_field``.
-    Player state (``eos_px``, ``eos_py``, ``eos_angle``) comes in as
-    three 1-wide scalars.
+    Wall geometry (``wall_ax``, ``wall_ay``, etc.) and player state
+    (``player_x``, ``player_y``, ``move_cos``, ``move_sin``) are fed
+    as 1-wide scalars.  ``is_renderable`` is set to +1 (valid) so the
+    cond_gate passes through the raw columns.
     """
     pos = create_pos_encoding()
-    sel_wall_data = create_input("sel_wall_data", 5)
-    eos_px = create_input("eos_px", 1)
-    eos_py = create_input("eos_py", 1)
-    eos_angle = create_input("eos_angle", 1)
+    wall_ax = create_input("wall_ax", 1)
+    wall_ay = create_input("wall_ay", 1)
+    wall_bx = create_input("wall_bx", 1)
+    wall_by = create_input("wall_by", 1)
+    player_x = create_input("player_x", 1)
+    player_y = create_input("player_y", 1)
+    move_cos = create_input("move_cos", 1)
+    move_sin = create_input("move_sin", 1)
+    is_renderable = create_input("is_renderable", 1)
 
     vis_lo, vis_hi = _compute_visibility_columns(
-        sel_wall_data, eos_px, eos_py, eos_angle,
+        wall_ax, wall_ay, wall_bx, wall_by,
+        player_x, player_y,
+        move_cos, move_sin,
+        is_renderable,
         config=_config(), max_coord=_MAX_COORD,
     )
     output = Concatenate([vis_lo, vis_hi])
@@ -221,14 +229,18 @@ def test_visibility_columns_match_oracle(vis_module, name, px, py, angle, wall):
     0.3 columns — tight enough to catch the 1-col drift class but loose
     enough to tolerate the known piecewise_linear_2d pinv residual."""
     ax, ay, bx, by = wall
-    sel_wall_data = [ax, ay, bx, by, 0.0]
+    trig = generate_trig_table()
+    cos_p = float(trig[angle % 256, 0])
+    sin_p = float(trig[angle % 256, 1])
     row = {
-        "sel_wall_data": sel_wall_data,
-        "eos_px": px, "eos_py": py, "eos_angle": float(angle),
+        "wall_ax": ax, "wall_ay": ay, "wall_bx": bx, "wall_by": by,
+        "player_x": px, "player_y": py,
+        "move_cos": cos_p, "move_sin": sin_p,
+        "is_renderable": 1.0,
     }
     # compile_headless wants at least 2 positions for the sequence to be
     # non-degenerate; the probe reads from position 0.
-    pad = {k: (v if k != "sel_wall_data" else [0.0] * 5) for k, v in row.items()}
+    pad = {k: 0.0 for k in row}
     inputs = _pack(vis_module, [row, pad])
     with torch.no_grad():
         out = vis_module(inputs)

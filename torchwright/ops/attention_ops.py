@@ -165,9 +165,15 @@ _MAX_SCORE_UNMASKED_ABS = 100.0
 # query_matrix entries rather than through the slow-cosine multiplier).
 # Must exceed ``_QUERY_GAIN · (max_score - min_score)`` so a valid
 # position with the worst score still beats any invalid position with
-# the best score. For ``score ∈ [0, 9]`` that gives ``_QUERY_GAIN · 9
-# = 72``; ``_ABOVE_BONUS = 100`` buys a ~40 % margin.
-_ABOVE_BONUS = 100.0
+# the best score.
+#
+# For ``score ∈ [0, 9]`` (the sort_digits toy) a bonus of 100 buys
+# ~40% margin.  For production use with piecewise-linear softmax under
+# residual-stream noise, 1000 matches _VALIDITY_DIRECT's headroom —
+# both route directly through the logit (not through the slow-cosine
+# gain) and both need to dominate noise from competing attention
+# values in the compiled residual.
+_ABOVE_BONUS = 1000.0
 
 
 def _assert_value_fits(pos_encoding: PosEncoding, value: Node) -> int:

@@ -22,7 +22,7 @@ from torchwright.compiler.export import compile_headless
 from torchwright.graph import Concatenate
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
-from torchwright.doom.stages.sorted import _endpoint_to_column
+from torchwright.doom.stages.wall import _endpoint_to_column
 
 
 _MAX_COORD = 10.0
