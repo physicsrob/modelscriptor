@@ -811,6 +811,7 @@ def _textured_column_fill(
             clamped_bin_f = clamp(bin_f, 0.0, float(tex_height) - 0.5)
             tex_row_idx = floor_int(
                 clamped_bin_f, min_value=0, max_value=tex_height - 1,
+                sharpness=100,
             )
             row_rgb = dynamic_extract(
                 tex_column_colors, tex_row_idx, tex_height, 3,

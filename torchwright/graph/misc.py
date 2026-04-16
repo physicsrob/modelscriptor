@@ -96,10 +96,12 @@ class Add(Node):
         return input1.compute(n_pos, input_values) + input2.compute(n_pos, input_values)
 
     def compute_value_type(self) -> NodeValueType:
+        from torchwright.graph.value_type import _min_guarantee
+
         a, b = self.inputs[0].value_type, self.inputs[1].value_type
         return NodeValueType(
             value_range=a.value_range + b.value_range,
-            is_integer=a.is_integer and b.is_integer,
+            is_integer=_min_guarantee(a.is_integer, b.is_integer),
         )
 
     def other_input(self, node: Node):
@@ -123,16 +125,18 @@ class LiteralValue(Node):
         return x
 
     def compute_value_type(self) -> NodeValueType:
+        from torchwright.graph.value_type import Guarantee
+
         v = self.value
         if v.numel() == 0:
             return NodeValueType.unknown()
         lo = float(v.min().item())
         hi = float(v.max().item())
-        is_int = is_integer_tensor(v)
-        is_bin = is_int and lo >= 0.0 and hi <= 1.0
-        is_sgn = is_int and lo >= -1.0 and hi <= 1.0 and not is_bin
+        is_int = Guarantee.ALWAYS if is_integer_tensor(v) else False
+        is_bin = Guarantee.ALWAYS if (is_int and lo >= 0.0 and hi <= 1.0) else False
+        is_sgn = Guarantee.ALWAYS if (is_int and lo >= -1.0 and hi <= 1.0 and not is_bin) else False
         # one-hot: exactly one element is 1, rest are 0 (binary vector with sum == 1)
-        is_one_hot = is_bin and bool(v.sum().eq(1).item())
+        is_one_hot = Guarantee.ALWAYS if (is_bin and bool(v.sum().eq(1).item())) else False
         return NodeValueType(
             value_range=Range(lo, hi),
             is_integer=is_int,

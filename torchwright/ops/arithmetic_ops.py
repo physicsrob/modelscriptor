@@ -273,17 +273,20 @@ def abs(inp: Node) -> Node:
 
 
 def _compare_output_type(true_level: float, false_level: float) -> NodeValueType:
+    from torchwright.graph.value_type import Guarantee
+
     lo = builtins.min(true_level, false_level)
     hi = builtins.max(true_level, false_level)
     is_int = (true_level == round(true_level)) and (false_level == round(false_level))
     is_bin = is_int and lo == 0.0 and hi == 1.0
     is_sgn = is_int and lo == -1.0 and hi == 1.0
+    g = Guarantee.APPROXIMATE
     if is_bin:
-        return NodeValueType.binary()
+        return NodeValueType.binary(guarantee=g)
     if is_sgn:
-        return NodeValueType.sign()
+        return NodeValueType.sign(guarantee=g)
     if is_int:
-        return NodeValueType.integer(lo=lo, hi=hi)
+        return NodeValueType.integer(lo=lo, hi=hi, guarantee=g)
     return NodeValueType.unknown()
 
 
@@ -1196,8 +1199,10 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
         input_scale=step_sharpness,
         name="thermometer_floor_div",
     )
+    from torchwright.graph.value_type import Guarantee
+
     return assert_matches_value_type(
-        result, NodeValueType.integer(lo=0, hi=n),
+        result, NodeValueType.integer(lo=0, hi=n, guarantee=Guarantee.APPROXIMATE),
     )
 
 
@@ -1471,11 +1476,16 @@ def reciprocal(
     )
 
 
-def floor_int(inp: Node, min_value: int, max_value: int) -> Node:
+def floor_int(
+    inp: Node,
+    min_value: int,
+    max_value: int,
+    sharpness: Optional[float] = None,
+) -> Node:
     """Compute floor(x) for a continuous-valued scalar input.
 
     Places a steep ramp at each integer boundary ``k`` spanning
-    ``[k - eps, k]`` (where ``eps = 1 / step_sharpness``).  The flat
+    ``[k - eps, k]`` (where ``eps = 1 / sharpness``).  The flat
     zone between ramps covers ``[k, k + 1 - eps]`` — the natural home
     of floating-point scalars like ``0.5`` or ``k + 0.3`` — so
     float inputs well inside a bin produce exact integer output.
@@ -1491,17 +1501,22 @@ def floor_int(inp: Node, min_value: int, max_value: int) -> Node:
     where the output is an interpolated intermediate value.  If a
     caller is passing inputs that are specifically near integer
     boundaries, either clamp/round upstream, shift by ``0.5 - eps/2``
-    to move the boundary into the flat zone, or raise
-    ``step_sharpness`` at the cost of MLP sublayer precision.
+    to move the boundary into the flat zone, or raise ``sharpness``
+    to narrow the ramp at the cost of MLP sublayer precision.
 
     Args:
         inp: 1D scalar node with value in [min_value, max_value].
         min_value: Lower bound (integer).
         max_value: Upper bound (integer).
+        sharpness: Override the global ``step_sharpness`` for this op.
+            Higher values narrow the ramp zone (e.g. 100 gives a
+            0.01-wide ramp vs. the default 10 which gives 0.1).
 
     Returns:
         1D scalar node containing floor(x).
     """
+    from torchwright.graph.value_type import Guarantee
+
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
 
@@ -1515,7 +1530,8 @@ def floor_int(inp: Node, min_value: int, max_value: int) -> Node:
     # integers, and floor(k - delta) = k-1 for delta > eps.
     import math as _math
 
-    eps = 1.0 / step_sharpness
+    s = sharpness if sharpness is not None else step_sharpness
+    eps = 1.0 / s
     breakpoints = [float(min_value) - eps]
     for k in range(min_value + 1, max_value + 1):
         breakpoints.extend([float(k) - eps, float(k)])
@@ -1527,11 +1543,11 @@ def floor_int(inp: Node, min_value: int, max_value: int) -> Node:
         inp,
         breakpoints,
         lambda x: builtins.max(lo, builtins.min(hi, float(_math.floor(x)))),
-        input_scale=step_sharpness,
+        input_scale=s,
         name="floor_int",
     )
     return assert_matches_value_type(
-        result, NodeValueType.integer(lo=min_value, hi=max_value),
+        result, NodeValueType.integer(lo=min_value, hi=max_value, guarantee=Guarantee.APPROXIMATE),
     )
 
 

@@ -54,7 +54,8 @@ class Linear(Node):
         inp_t = self.inputs[0].value_type
         weights_int = is_integer_tensor(self.output_matrix)
         bias_int = is_integer_tensor(self.output_bias)
-        is_int = inp_t.is_integer and weights_int and bias_int
+        # Preserve the input's guarantee level when weights and bias are integer.
+        is_int = inp_t.is_integer if (weights_int and bias_int) else False
         out_range = linear_output_range(
             inp_t.value_range, self.output_matrix, self.output_bias
         )

@@ -62,12 +62,14 @@ class Embedding(Node):
         return result
 
     def compute_value_type(self) -> NodeValueType:
+        from torchwright.graph.value_type import Guarantee
+
         t = self.table
         if t.numel() == 0:
             return NodeValueType.unknown()
         return NodeValueType(
             value_range=Range(float(t.min().item()), float(t.max().item())),
-            is_integer=is_integer_tensor(t),
+            is_integer=Guarantee.ALWAYS if is_integer_tensor(t) else False,
         )
 
     def num_params(self):
