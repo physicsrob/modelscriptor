@@ -158,6 +158,8 @@ def forward_compile(
     # other col is dirty until a cancel op clears it.
     residual_map.mark_clean(residual_map.get_indices(pos_encoding))
     for node in input_nodes:
+        if node is pos_encoding:
+            continue
         residual_map.allocate(node)
         residual_map.mark_clean(residual_map.get_indices(node))
     computed = set(input_nodes)
