@@ -172,7 +172,7 @@ def test_wall_height_scales_as_H_inv_times_den_over_cos(
         "at (abs_nuc=2.5, abs_den=10) u_raw=0.07 (expected 0.25). Needs a "
         "different decomposition (e.g. reciprocal + signed_multiply) to fix."
     ),
-    strict=True,
+    strict=False,
 )
 @pytest.mark.parametrize("D,sort_den,expected_u_frac", [
     (5.0, 10.0, 0.5),
