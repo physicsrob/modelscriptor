@@ -97,7 +97,9 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
         output_proj=output_proj,
         output_bias=output_bias,
     )
-    return assert_matches_value_type(result, NodeValueType.sign())
+    from torchwright.graph.value_type import Guarantee
+
+    return assert_matches_value_type(result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE))
 
 
 def cond_add_vector(
@@ -149,17 +151,26 @@ def cond_add_vector(
 
 
 def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
+    from torchwright.graph.value_type import _min_guarantee
+
     if not cond.value_type.is_sign:
         return NodeValueType.unknown()
     vt = inp.value_type
     r = vt.value_range
     out_range = Range(min(0.0, r.lo), max(0.0, r.hi))
+    # An approximate condition demotes the output guarantee level.
+    cond_g = cond.value_type.is_sign
     if vt.is_binary:
         return NodeValueType(
-            value_range=out_range, is_integer=True, is_binary=True,
+            value_range=out_range,
+            is_integer=_min_guarantee(cond_g, vt.is_integer),
+            is_binary=_min_guarantee(cond_g, vt.is_binary),
         )
     if vt.is_integer:
-        return NodeValueType(value_range=out_range, is_integer=True)
+        return NodeValueType(
+            value_range=out_range,
+            is_integer=_min_guarantee(cond_g, vt.is_integer),
+        )
     return NodeValueType.unknown()
 
 

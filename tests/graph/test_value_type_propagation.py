@@ -360,3 +360,58 @@ def test_thermometer_floor_div_is_integer():
     assert vt.value_range.hi == 10.0
 
 
+# --- Guarantee level propagation ----------------------------------------
+
+
+def test_compare_output_is_approximate():
+    from torchwright.graph.value_type import Guarantee
+    from torchwright.ops.arithmetic_ops import compare
+    inp = LiteralValue(torch.tensor([5.0]))
+    out = compare(inp, 3.0)
+    assert out.value_type.is_sign is Guarantee.APPROXIMATE
+
+
+def test_floor_int_is_approximate():
+    from torchwright.graph.value_type import Guarantee
+    from torchwright.ops.arithmetic_ops import floor_int
+    from torchwright.graph.asserts import assert_in_range
+    inp = assert_in_range(LiteralValue(torch.tensor([2.5])), 0.0, 10.0)
+    out = floor_int(inp, 0, 10)
+    assert out.value_type.is_integer is Guarantee.APPROXIMATE
+
+
+def test_select_approximate_cond_demotes_output():
+    from torchwright.graph.value_type import Guarantee
+    from torchwright.ops.arithmetic_ops import compare
+    from torchwright.ops.map_select import select
+    cond = compare(LiteralValue(torch.tensor([5.0])), 3.0)
+    a = LiteralValue(torch.tensor([1.0]))
+    b = LiteralValue(torch.tensor([2.0]))
+    out = select(cond, a, b)
+    # cond is APPROXIMATE sign, both branches are ALWAYS integer
+    # → output is APPROXIMATE integer
+    assert out.value_type.is_integer is Guarantee.APPROXIMATE
+
+
+def test_linear_preserves_approximate():
+    from torchwright.graph.value_type import Guarantee
+    from torchwright.ops.arithmetic_ops import floor_int
+    from torchwright.graph.asserts import assert_in_range
+    inp = assert_in_range(LiteralValue(torch.tensor([2.5])), 0.0, 10.0)
+    idx = floor_int(inp, 0, 10)
+    # Linear with integer weights preserves the input's guarantee level
+    out = Linear(idx, torch.tensor([[1.0]]), torch.tensor([0.0]))
+    assert out.value_type.is_integer is Guarantee.APPROXIMATE
+
+
+def test_add_always_plus_approximate_gives_approximate():
+    from torchwright.graph.value_type import Guarantee
+    from torchwright.ops.arithmetic_ops import floor_int
+    from torchwright.graph.asserts import assert_in_range
+    a = LiteralValue(torch.tensor([3.0]))  # ALWAYS integer
+    inp = assert_in_range(LiteralValue(torch.tensor([2.5])), 0.0, 10.0)
+    b = floor_int(inp, 0, 10)  # APPROXIMATE integer
+    out = Add(a, b)
+    assert out.value_type.is_integer is Guarantee.APPROXIMATE
+
+

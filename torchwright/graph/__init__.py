@@ -1,5 +1,5 @@
 from .node import Node, annotate
-from .value_type import NodeValueType, Range
+from .value_type import Guarantee, NodeValueType, Range
 
 from .attn import Attn
 from .embedding import Embedding

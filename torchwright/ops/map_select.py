@@ -83,22 +83,26 @@ def switch(conditions: List[Node], values: List[Node]) -> Node:
 def _select_output_type(
     cond: Node, true_node: Node, false_node: Node,
 ) -> NodeValueType:
+    from torchwright.graph.value_type import _min_guarantee
+
     if not cond.value_type.is_sign:
         return NodeValueType.unknown()
     tv = true_node.value_type
     fv = false_node.value_type
     r = tv.value_range.union(fv.value_range)
-    is_int = tv.is_integer and fv.is_integer
-    is_bin = tv.is_binary and fv.is_binary
-    is_onehot = tv.is_one_hot and fv.is_one_hot
+    # An approximate condition demotes the output guarantee level.
+    cond_g = cond.value_type.is_sign
+    is_int = _min_guarantee(cond_g, _min_guarantee(tv.is_integer, fv.is_integer))
+    is_bin = _min_guarantee(cond_g, _min_guarantee(tv.is_binary, fv.is_binary))
+    is_onehot = _min_guarantee(cond_g, _min_guarantee(tv.is_one_hot, fv.is_one_hot))
     if is_onehot:
         return NodeValueType(
-            value_range=r, is_integer=True, is_binary=True, is_one_hot=True,
+            value_range=r, is_integer=is_int, is_binary=is_bin, is_one_hot=is_onehot,
         )
     if is_bin:
-        return NodeValueType(value_range=r, is_integer=True, is_binary=True)
+        return NodeValueType(value_range=r, is_integer=is_int, is_binary=is_bin)
     if is_int:
-        return NodeValueType(value_range=r, is_integer=True)
+        return NodeValueType(value_range=r, is_integer=is_int)
     return NodeValueType.unknown()
 
 
@@ -223,7 +227,9 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
         output_bias=output_bias,
         name="in_range",
     )
-    return assert_matches_value_type(result, NodeValueType.sign())
+    from torchwright.graph.value_type import Guarantee
+
+    return assert_matches_value_type(result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE))
 
 
 def dynamic_extract(

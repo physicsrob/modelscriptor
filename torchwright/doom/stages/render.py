@@ -53,6 +53,7 @@ from torchwright.ops.arithmetic_ops import (
     piecewise_linear,
     piecewise_linear_2d,
     subtract,
+    sum_nodes,
     thermometer_floor_div,
 )
 from torchwright.ops.attention_ops import attend_argmax_dot
@@ -357,10 +358,7 @@ def _compute_texture_column(
         diff = subtract(nuc_scaled, k_den)
         bits.append(bool_to_01(compare(diff, _THRESH)))
 
-    result = bits[0]
-    for b in bits[1:]:
-        result = add(result, b)
-    return result
+    return sum_nodes(bits)
 
 
 def _attend_to_texture_column(

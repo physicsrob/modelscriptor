@@ -14,13 +14,24 @@ def _verify_tensor_against_value_type(node: "Node", tensor: torch.Tensor) -> Non
     """Assert the actual tensor conforms to the node's declared value_type.
 
     Used by the optional runtime verifier (``TW_VERIFY_VALUE_TYPES``).
-    Raises ``AssertionError`` with a message naming the node on mismatch.
+    For ``Guarantee.ALWAYS`` properties, violations raise.
+    For ``Guarantee.APPROXIMATE`` properties, violations warn to stderr.
     """
+    import sys
+
+    from torchwright.graph.value_type import Guarantee
+
     vt = node.value_type
     if tensor.numel() == 0:
         return
     t = tensor.detach()
     name = f"{node.node_type()}(id={node.node_id}, name='{node.name}')"
+
+    def _report(prop: str, msg: str, level: "Guarantee | bool") -> None:
+        if level is Guarantee.APPROXIMATE:
+            print(f"WARNING: approximate {prop} transition-zone hit: {msg}", file=sys.stderr)
+        else:
+            raise AssertionError(msg)
 
     r = vt.value_range
     actual_lo = float(t.min().item())
@@ -34,21 +45,25 @@ def _verify_tensor_against_value_type(node: "Node", tensor: torch.Tensor) -> Non
     if vt.is_integer:
         diff = (t - t.round()).abs().max().item()
         if diff > tol:
-            raise AssertionError(
-                f"{name}: declared is_integer but observed max deviation {diff}"
-            )
+            _report("integer",
+                    f"{name}: declared is_integer but observed max deviation {diff}",
+                    vt.is_integer)
     if vt.is_binary:
         if not torch.all((t.round() == 0) | (t.round() == 1)).item():
-            raise AssertionError(f"{name}: declared is_binary but values outside {{0,1}}")
+            _report("binary",
+                    f"{name}: declared is_binary but values outside {{0,1}}",
+                    vt.is_binary)
     if vt.is_sign:
         if not torch.all((t.round() == -1) | (t.round() == 1)).item():
-            raise AssertionError(f"{name}: declared is_sign but values outside {{-1,+1}}")
+            _report("sign",
+                    f"{name}: declared is_sign but values outside {{-1,+1}}",
+                    vt.is_sign)
     if vt.is_one_hot:
         sums = t.round().sum(dim=-1)
         if not torch.all(sums == 1).item():
-            raise AssertionError(
-                f"{name}: declared is_one_hot but per-row sum not equal to 1"
-            )
+            _report("one-hot",
+                    f"{name}: declared is_one_hot but per-row sum not equal to 1",
+                    vt.is_one_hot)
 
 _current_annotation: ContextVar[Optional[str]] = ContextVar(
     "current_annotation", default=None,
