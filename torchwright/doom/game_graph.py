@@ -223,6 +223,7 @@ def build_game_graph(
             position_onehot=wall_out.position_onehot,
             sort_value=wall_out.sort_value,
             prev_mask=fb_fields["prev_mask"],
+            prev_bsp_rank=fb_fields["prev_bsp_rank"],
             is_sorted=tf["is_sorted"],
             is_wall=tf["is_wall"],
             pos_encoding=pos_encoding,
@@ -342,6 +343,9 @@ def _create_inputs(
 
     # Feedback field layout (must stay in sync with _assemble_output).
     fields: Dict[str, Node] = {
+        "prev_bsp_rank": extract_from(
+            sort_feedback, d_sort_out, 8 + 5, 1, "prev_bsp_rank",
+        ),
         "prev_mask": extract_from(
             sort_feedback, d_sort_out, 8 + 5 + 3 + max_walls, max_walls, "prev_mask",
         ),
@@ -450,13 +454,18 @@ def _assemble_output(
         ])
 
         # EOS seeds the sort loop with a SORTED_WALL-type vector plus
-        # resolved player pose.  The rest of the layout is zero-padded
-        # since no wall has been picked yet.
+        # resolved player pose.  The sel_bsp_rank slot (offset 13) is
+        # initialized to -1 so the first SORTED step sees
+        # prev_bsp_rank=-1 < any valid BSP rank → sort_done=-1 (active).
         eos_sort_seed = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="eos_sort_seed"),
             eos_out.resolved_x, eos_out.resolved_y, input_out.new_angle,
+            create_literal_value(torch.zeros(2), name="eos_sort_pad1"),
             create_literal_value(
-                torch.zeros(2 + 3 + 2 * max_walls), name="eos_sort_pad",
+                torch.tensor([-1.0]), name="eos_prev_bsp_rank",
+            ),
+            create_literal_value(
+                torch.zeros(2 + 2 * max_walls), name="eos_sort_pad2",
             ),
         ])
 

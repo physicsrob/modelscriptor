@@ -30,7 +30,7 @@ from torchwright.graph.asserts import (
     assert_score_gap_at_least,
 )
 from torchwright.graph.pos_encoding import PosEncoding
-from torchwright.ops.arithmetic_ops import add
+from torchwright.ops.arithmetic_ops import add, compare, subtract
 from torchwright.ops.attention_ops import attend_argmin_valid_unmasked
 from torchwright.ops.logic_ops import cond_gate
 
@@ -58,6 +58,12 @@ class SortedInputs:
     # Host-fed running mask of already-picked walls.
     prev_mask: Node
 
+    # BSP rank selected at the previous SORTED step (scalar, initialized
+    # to -1 at the EOS seed).  Used to detect sort exhaustion: when the
+    # masked-valid fallback re-picks the same wall, sel_bsp_rank <=
+    # prev_bsp_rank.
+    prev_bsp_rank: Node
+
     # Token-type flags.  ``is_wall`` is consumed only by the attention
     # assertions (keys-validity) — the argmin itself already ignores
     # non-WALL positions via their sentinel scores.
@@ -77,6 +83,11 @@ class SortedOutputs:
     # BSP rank of the selected wall — used by THINKING as the score
     # for its own argmin (picks walls in front-to-back order).
     sel_bsp_rank: Node
+
+    # Sort exhaustion flag: +1 when sel_bsp_rank <= prev_bsp_rank
+    # (the masked-valid fallback re-picked the same or earlier wall),
+    # -1 when the sort is still making progress.
+    sort_done: Node
 
     # Visibility column range on screen (floats, already clamped to
     # ``[-2, W+2]`` by the atan piecewise).
@@ -105,6 +116,7 @@ def build_sorted(
             updated_mask,
             gated_render_data,
             sel_bsp_rank,
+            sort_done,
             vis_lo,
             vis_hi,
         ) = _argmin_and_derive(inputs, max_walls)
@@ -114,6 +126,7 @@ def build_sorted(
         sel_onehot=sel_onehot,
         updated_mask=updated_mask,
         sel_bsp_rank=sel_bsp_rank,
+        sort_done=sort_done,
         vis_lo=vis_lo,
         vis_hi=vis_hi,
         gated_render_data=gated_render_data,
@@ -151,13 +164,6 @@ def _argmin_and_derive(inputs: SortedInputs, max_walls: int):
         checked_score, inputs.is_wall, margin=1.0,
     )
 
-    # TODO(end-of-sort): when ``N_renderable < max_walls``, after all
-    # renderable walls are picked the masked-valid fallback re-picks the
-    # last-picked wall.  RENDER then overdraws; the host's per-pixel
-    # dedup (``filled[y, c]``) hides the waste.  A principled fix is a
-    # compiled "done" signal that SORTED emits once all renderables are
-    # exhausted, letting downstream stages short-circuit instead of
-    # repeating work.
     selected_sort = attend_argmin_valid_unmasked(
         pos_encoding=inputs.pos_encoding,
         score=checked_score,
@@ -186,6 +192,13 @@ def _argmin_and_derive(inputs: SortedInputs, max_walls: int):
     vis_lo = extract_from(unpacked.vis_cols, VISIBILITY_WIDTH, 0, 1, "vis_lo")
     vis_hi = extract_from(unpacked.vis_cols, VISIBILITY_WIDTH, 1, 1, "vis_hi")
 
+    # Sort exhaustion: when the masked-valid fallback re-picks the same
+    # wall (sel_bsp_rank <= prev_bsp_rank), the sort has exhausted all
+    # renderable walls.  BSP ranks are unique integers with strictly
+    # increasing picks, so equality means re-pick.  The -0.5 threshold
+    # cleanly separates the integer cases (diff=0 → done, diff=-1 → active).
+    sort_done = compare(subtract(inputs.prev_bsp_rank, sel_bsp_rank), -0.5)
+
     # Gate so non-SORTED positions contribute 0 to THINKING's attention.
     gated_render_data = cond_gate(
         inputs.is_sorted, Concatenate([sel_render, sel_tex_id])
@@ -193,5 +206,5 @@ def _argmin_and_derive(inputs: SortedInputs, max_walls: int):
 
     return (
         sel_wall_data, sel_onehot, updated_mask, gated_render_data,
-        sel_bsp_rank, vis_lo, vis_hi,
+        sel_bsp_rank, sort_done, vis_lo, vis_hi,
     )

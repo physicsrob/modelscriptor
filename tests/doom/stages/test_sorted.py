@@ -39,6 +39,7 @@ def sorted_module():
     position_onehot = assert_onehot(create_input("position_onehot", _MAX_WALLS))
     sort_value = create_input("sort_value", payload_w)
     prev_mask = assert_01(create_input("prev_mask", _MAX_WALLS))
+    prev_bsp_rank = create_input("prev_bsp_rank", 1)
     is_sorted = create_input("is_sorted", 1)
     is_wall = create_input("is_wall", 1)
 
@@ -49,6 +50,7 @@ def sorted_module():
             position_onehot=position_onehot,
             sort_value=sort_value,
             prev_mask=prev_mask,
+            prev_bsp_rank=prev_bsp_rank,
             is_sorted=is_sorted,
             is_wall=is_wall,
             pos_encoding=pos,
@@ -120,6 +122,7 @@ def test_argmin_picks_lowest_unmasked(sorted_module, scores, prev_mask, expected
                 center_dist=0.0, onehot=_onehot(i, _MAX_WALLS),
             ),
             "prev_mask": prev_mask,
+            "prev_bsp_rank": -1.0,
             "is_sorted": 0.0,
             "is_wall": 1.0,
         })
@@ -130,6 +133,7 @@ def test_argmin_picks_lowest_unmasked(sorted_module, scores, prev_mask, expected
         "position_onehot": [0.5] * _MAX_WALLS,
         "sort_value": [0.0] * (13 + _MAX_WALLS),
         "prev_mask": prev_mask,
+        "prev_bsp_rank": -1.0,
         "is_sorted": 1.0,
         "is_wall": 0.0,
     }
@@ -185,6 +189,7 @@ def test_angle_192_validity_excludes_invalid_clean_pick(sorted_module):
                 center_dist=0.0, onehot=pure_onehot(i, _MAX_WALLS),
             ),
             "prev_mask": prev_mask,
+            "prev_bsp_rank": -1.0,
             "is_sorted": 0.0,
             "is_wall": 1.0,
         })
@@ -195,6 +200,7 @@ def test_angle_192_validity_excludes_invalid_clean_pick(sorted_module):
         "position_onehot": pure_onehot(0, _MAX_WALLS),
         "sort_value": [0.0] * (13 + _MAX_WALLS),
         "prev_mask": prev_mask,
+        "prev_bsp_rank": -1.0,
         "is_sorted": 1.0,
         "is_wall": 0.0,
     }
@@ -231,6 +237,7 @@ def test_updated_mask_adds_selected_wall(sorted_module):
                 center_dist=0.0, onehot=_onehot(i, _MAX_WALLS),
             ),
             "prev_mask": prev_mask,
+            "prev_bsp_rank": -1.0,
             "is_sorted": 0.0,
             "is_wall": 1.0,
         })
@@ -240,6 +247,7 @@ def test_updated_mask_adds_selected_wall(sorted_module):
         "position_onehot": [0.5] * _MAX_WALLS,
         "sort_value": [0.0] * (13 + _MAX_WALLS),
         "prev_mask": prev_mask,
+        "prev_bsp_rank": -1.0,
         "is_sorted": 1.0,
         "is_wall": 0.0,
     }

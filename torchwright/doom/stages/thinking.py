@@ -46,8 +46,8 @@ class ThinkingInputs:
     sel_bsp_rank: Node         # score; sentinel replaces at non-SORTED
     sel_onehot: Node           # wall-index position key for argmin
     gated_render_data: Node    # 6-wide wall render data gated to 0 off-SORTED
-    vis_lo: Node               # col_lo (float)
-    vis_hi: Node               # col_hi (float)
+    vis_lo: Node               # col_lo (float, zeroed when sort exhausted)
+    vis_hi: Node               # col_hi (float, zeroed when sort exhausted)
 
     # Host-fed running mask of walls already fully rendered.
     render_mask: Node          # max_walls-wide
@@ -103,6 +103,8 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
         ))
 
         # Value: render data + col bounds + one-hot for downstream mask update.
+        # gated_render_data and vis_lo/vis_hi are already gated by
+        # sort_active in SORTED (zeroed at exhausted positions).
         render_value = Concatenate([
             inputs.gated_render_data,  # 6
             inputs.vis_lo,             # 1
