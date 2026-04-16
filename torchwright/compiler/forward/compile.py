@@ -370,6 +370,7 @@ def forward_compile(
     else:
         ra.assign(out_state, output_node, residual_map.get_indices(output_node))
     net.residual_assignment = ra
+    net.assert_aliases = graph.get_assert_aliases()
 
     if trim_heads:
         for layer in net.layers:

@@ -931,12 +931,15 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     def _staircase(x):
         return float(sum(1 for k in range(1, n + 1) if x > k * divisor - 0.5))
 
-    return piecewise_linear(
+    result = piecewise_linear(
         inp,
         breakpoints,
         _staircase,
         input_scale=step_sharpness,
         name="thermometer_floor_div",
+    )
+    return assert_matches_value_type(
+        result, NodeValueType.integer(lo=0, hi=n),
     )
 
 
@@ -1262,12 +1265,15 @@ def floor_int(inp: Node, min_value: int, max_value: int) -> Node:
 
     lo, hi = float(min_value), float(max_value)
 
-    return piecewise_linear(
+    result = piecewise_linear(
         inp,
         breakpoints,
         lambda x: builtins.max(lo, builtins.min(hi, float(_math.floor(x)))),
         input_scale=step_sharpness,
         name="floor_int",
+    )
+    return assert_matches_value_type(
+        result, NodeValueType.integer(lo=min_value, hi=max_value),
     )
 
 

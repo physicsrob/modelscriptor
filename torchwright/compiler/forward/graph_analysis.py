@@ -29,6 +29,7 @@ class GraphAnalyzer:
         # *before* GraphAnalyzer still see Asserts and fire their
         # predicates as expected.
         self._stripped_asserts: List[Assert] = []
+        self._assert_aliases: Dict[Assert, Node] = {}
         output_node = self._strip_asserts(output_node)
 
         self._output_node = output_node
@@ -86,11 +87,17 @@ class GraphAnalyzer:
                     node.inputs[i] = unwrap(inp)
 
         self._stripped_asserts.extend(asserts)
+        for a in asserts:
+            self._assert_aliases[a] = unwrap(a)
         return unwrap(output_node)
 
     def get_stripped_asserts(self) -> List[Assert]:
         """Return the Assert nodes removed during initialization."""
         return list(self._stripped_asserts)
+
+    def get_assert_aliases(self) -> Dict[Assert, Node]:
+        """Return mapping from stripped Assert nodes to their underlying targets."""
+        return dict(self._assert_aliases)
 
     def get_output_node(self) -> Node:
         """Return the effective output node after Assert stripping.

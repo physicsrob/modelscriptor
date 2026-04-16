@@ -172,4 +172,8 @@ class HeadlessTransformer:
         for node in self.residual_assignment.get_nodes(out_state):
             indices = self.residual_assignment.get_node_indices(out_state, node)
             result[node] = res[:, indices]
+        if hasattr(self, 'assert_aliases'):
+            for assert_node, target in self.assert_aliases.items():
+                if target in result and assert_node not in result:
+                    result[assert_node] = result[target]
         return result

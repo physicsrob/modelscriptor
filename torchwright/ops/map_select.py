@@ -215,7 +215,7 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
         output_proj[base + 3, i] = 2.0
         # output_bias[i] = -1.0 (already set)
 
-    return linear_relu_linear(
+    result = linear_relu_linear(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,
@@ -223,6 +223,7 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
         output_bias=output_bias,
         name="in_range",
     )
+    return assert_matches_value_type(result, NodeValueType.sign())
 
 
 def dynamic_extract(
