@@ -452,6 +452,11 @@ def _assemble_output(
             sorted_out.sel_onehot,
             sorted_out.updated_mask,
         ])
+        assert len(sort_feedback_out) == d_sort_out, (
+            f"sort_feedback_out width {len(sort_feedback_out)} != d_sort_out "
+            f"{d_sort_out}; keep _assemble_output's Concatenate and "
+            f"_create_inputs's d_sort_out formula in sync."
+        )
 
         # EOS seeds the sort loop with a SORTED_WALL-type vector plus
         # resolved player pose.  The sel_bsp_rank slot (offset 13) is
@@ -468,6 +473,10 @@ def _assemble_output(
                 torch.zeros(2 + 2 * max_walls), name="eos_sort_pad2",
             ),
         ])
+        assert len(eos_sort_seed) == d_sort_out, (
+            f"eos_sort_seed width {len(eos_sort_seed)} != d_sort_out "
+            f"{d_sort_out}; pad widths must match sort_feedback_out layout."
+        )
 
         # Next token type per source:
         #   THINKING → E8_RENDER (start rendering the picked wall)

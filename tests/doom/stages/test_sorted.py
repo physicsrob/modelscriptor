@@ -220,6 +220,124 @@ def test_angle_192_validity_excludes_invalid_clean_pick(sorted_module):
     assert abs(sel_tex - 3.0) < tol, f"sel_tex={sel_tex:+.4f} (expected 3.0)"
 
 
+@pytest.fixture(scope="module")
+def sort_done_module():
+    """Compile a SORTED variant exposing ``sel_bsp_rank`` and ``sort_done``.
+
+    Output layout: ``[sel_bsp_rank (1), sort_done (1)]``.
+    """
+    from torchwright.doom.wall_payload import payload_width
+
+    pos = create_pos_encoding()
+    payload_w = payload_width(_MAX_WALLS)
+
+    sort_score = assert_integer(create_input("sort_score", 1))
+    is_renderable = create_input("is_renderable", 1)
+    position_onehot = assert_onehot(create_input("position_onehot", _MAX_WALLS))
+    sort_value = create_input("sort_value", payload_w)
+    prev_mask = assert_01(create_input("prev_mask", _MAX_WALLS))
+    prev_bsp_rank = create_input("prev_bsp_rank", 1)
+    is_sorted = create_input("is_sorted", 1)
+    is_wall = create_input("is_wall", 1)
+
+    out = build_sorted(
+        SortedInputs(
+            sort_score=sort_score,
+            is_renderable=is_renderable,
+            position_onehot=position_onehot,
+            sort_value=sort_value,
+            prev_mask=prev_mask,
+            prev_bsp_rank=prev_bsp_rank,
+            is_sorted=is_sorted,
+            is_wall=is_wall,
+            pos_encoding=pos,
+        ),
+        max_walls=_MAX_WALLS,
+    )
+    output = Concatenate([out.sel_bsp_rank, out.sort_done])
+    return compile_headless(
+        output, pos, d=2048, d_head=32, max_layers=60, verbose=False,
+    )
+
+
+@pytest.mark.parametrize("prev_bsp_rank,prev_mask,expected_sel_rank,expected_sort_done,label", [
+    # EOS seed: prev_bsp_rank=-1, first pick gets bsp_rank=0.
+    # diff = -1 - 0 = -1 < -0.5 → sort_done = -1 (active).
+    (-1.0, [0.0, 0.0, 0.0, 0.0], 0, -1.0, "eos_seed_first_pick"),
+    # Progress: prev=2, next pick is rank 3 (ranks 0..2 already masked).
+    # diff = 2 - 3 = -1 < -0.5 → sort_done = -1 (active).
+    (2.0, [1.0, 1.0, 1.0, 0.0], 3, -1.0, "progress_next_rank"),
+    # Exhaustion: all 4 walls masked, prev_bsp_rank=3 (picked wall 3 last).
+    # The masked-valid fallback picks the lowest-score wall (rank 0).
+    # diff = 3 - 0 = 3 > -0.5 → sort_done = +1 (done).  Any sel_bsp_rank
+    # ≤ prev_bsp_rank fires sort_done — this is the invariant the signal
+    # relies on, since during normal progress sel is strictly greater.
+    (3.0, [1.0, 1.0, 1.0, 1.0], 0, 1.0, "exhausted_fallback_wraps"),
+    # Adjacent-integer boundary below threshold: prev=0, sel=1.
+    # diff = -1 → active.  Combined with the exhaustion case above this
+    # pins the -0.5 threshold between diff=-1 and diff=0.
+    (0.0, [1.0, 0.0, 0.0, 0.0], 1, -1.0, "adjacent_below_threshold"),
+    # Threshold boundary at diff=0: prev=0 and fallback re-picks rank 0.
+    # diff = 0 > -0.5 → sort_done = +1.  Tightens the pin from the other
+    # side: the threshold must sit strictly below 0 for this to fire.
+    (0.0, [1.0, 1.0, 1.0, 1.0], 0, 1.0, "threshold_boundary_zero"),
+])
+def test_sort_done_signal(
+    sort_done_module, prev_bsp_rank, prev_mask,
+    expected_sel_rank, expected_sort_done, label,
+):
+    """sort_done = sign(prev_bsp_rank - sel_bsp_rank + 0.5).
+
+    Pinning behavior now guards Phase E's sort-exhaustion handling, which
+    reuses the same signal: when the masked-valid fallback re-picks the
+    same wall (diff=0), the sort is exhausted; while the sort still makes
+    progress (diff <= -1), it's active.
+    """
+    # Wall rows: score == bsp_rank == wall index, so picks happen in order
+    # 0, 1, 2, 3 as the mask fills up.
+    wall_rows = []
+    for i in range(_MAX_WALLS):
+        wall_rows.append({
+            "sort_score": float(i),
+            "is_renderable": 1.0,
+            "position_onehot": _onehot(i, _MAX_WALLS),
+            "sort_value": _wall_payload(
+                ax=0.0, ay=0.0, bx=0.0, by=0.0, tex_id=0.0,
+                sort_den=0.0, C=0.0, D=0.0, E=0.0, H_inv=0.0,
+                center_dist=float(i),  # bsp_rank slot
+                onehot=_onehot(i, _MAX_WALLS),
+            ),
+            "prev_mask": prev_mask,
+            "prev_bsp_rank": prev_bsp_rank,
+            "is_sorted": 0.0,
+            "is_wall": 1.0,
+        })
+    sorted_row = {
+        "sort_score": 99.0,
+        "is_renderable": -1.0,
+        "position_onehot": [0.5] * _MAX_WALLS,
+        "sort_value": [0.0] * (13 + _MAX_WALLS),
+        "prev_mask": prev_mask,
+        "prev_bsp_rank": prev_bsp_rank,
+        "is_sorted": 1.0,
+        "is_wall": 0.0,
+    }
+    inputs = _pack(sort_done_module, wall_rows + [sorted_row])
+    with torch.no_grad():
+        out = sort_done_module(inputs)
+    sorted_pos = len(wall_rows)
+    sel_rank_got = out[sorted_pos, 0].item()
+    sort_done_got = out[sorted_pos, 1].item()
+    assert abs(sel_rank_got - expected_sel_rank) < 0.3, (
+        f"{label}: sel_bsp_rank={sel_rank_got:+.3f}, expected {expected_sel_rank}"
+    )
+    # sort_done is a compare output (ramp width ~0.1), so a 0.5 tolerance
+    # against the expected ±1 saturation is plenty.
+    assert sort_done_got * expected_sort_done > 0.5, (
+        f"{label}: sort_done={sort_done_got:+.3f}, expected sign {expected_sort_done}"
+    )
+
+
 def test_updated_mask_adds_selected_wall(sorted_module):
     """After selecting wall 2, updated_mask should have bit 2 set."""
     scores = [5.0, 2.0, 8.0, 99.0]
