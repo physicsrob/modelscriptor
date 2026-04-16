@@ -35,8 +35,9 @@ _HEAVY_FILES = [
     "tests/doom/test_game_graph.py",
     "tests/doom/test_wall_selection.py",
     "tests/doom/test_bsp_rank_integration.py",
-    "tests/doom/test_mode_c_probe.py",
+    "tests/doom/test_angle_192_column_drift.py",
     "tests/doom/test_tex_col.py",
+    "tests/debug/test_probe_phase_e_trace.py",
 ]
 
 _MEDIUM_FILES = [

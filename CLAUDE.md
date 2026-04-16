@@ -119,3 +119,214 @@ the walkthrough GIF.
 
 All flags (`--width`, `--height`, `--fps`, `--scale`, `--d`, `--d-head`,
 `--rows-per-patch`, `--tex-size`) are passed through via `ARGS=`.
+
+## Critical Rules
+
+- NEVER pipe `make walkthrough` through `tail`, `head`, or any other
+  output-truncating filter.  The user always wants to see the full
+  output.
+
+# Doctrine
+
+The DOOM renderer project has a recurring failure mode: ship a
+99%-working thing, build on top, and have the 1% bite later. The
+rules below exist to defeat that pattern. They constrain how to
+investigate, what to ship, what to defer, and what to write in
+xfail reasons.
+
+**Pending tooling links.** Some doctrines below reference tooling
+or reference docs that have not yet been built (Plans 1–3 in
+`/tmp/DERISK_PLAN.md`).  Those are flagged inline as
+`[TBD: link to <path> when Plan N lands]`.  If you encounter a
+`[TBD:` marker and the named artifact now exists, replace the
+marker with the actual link.
+
+## D1 — Suspected-compiler-bug protocol
+
+**A suspected compiler bug stops all other work.** Don't reshape
+user code to route around it.
+
+**Triggers** (any one): a reproducible value mismatch that no
+per-op error budget can explain; residual corruption after a
+topology-only change to the user graph; output that violates a
+stated compiler invariant.
+
+**Why.** Routing around a compiler bug leaves a landmine for the
+next user. Every "I packed it differently and the bug went away"
+fix is one we'll re-encounter, harder to debug, somewhere else.
+
+**Worked example.** Phase E (commit `c2d5a7a`) attempted three
+rounds of routing around suspected residual-column overlap by
+reshaping user code (separate output → packed payload →
+packed-but-narrow-extract).  None resolved the root cause; the bug
+surfaced again as the (3, 2, 20) xfail at
+`tests/doom/test_game_graph.py:146`.  See `/tmp/plan-e.md` for the
+full attempt log.
+
+**Escalation.** Inform the user immediately with the specific
+trigger that fired and ask for guidance.  Do not proceed with
+workarounds unilaterally.
+
+**Tooling.** [TBD: link to the compiler-invariants reference once
+Plan 2 lands.]
+
+## D2 — Never defer numerical problems
+
+**Off-by-an-unexpected-amount has exactly one acceptable answer:
+the bit-level reason for the divergence.** "I don't know yet,
+investigating" is also acceptable — it admits ignorance honestly.
+A plausible-sounding guess is *not* acceptable, because guesses
+look like understanding.
+
+**Why.** Numerical bugs compound.  A guess shipped today becomes
+tomorrow's assumed explanation, and the real bug grows another
+layer of camouflage.
+
+**Worked example.** The Phase E xfail at
+`tests/doom/test_game_graph.py:146` was shipped with the reason
+*"likely due to compile-side precision loss in the per-wall
+is_renderable gate at geometry that lands near the
+attention-edge-of-view."* The actual smoking gun (a deterministic
+`-1000 == -_ABOVE_BONUS` output from the SORTED stage) was never
+investigated.  The reason is a guess wearing the costume of an
+explanation.
+
+**Tooling.** `torchwright/debug/probe.py` runs a compiled module
+side-by-side with the recursive graph oracle and reports the first
+node whose compiled value diverges.  Use it as the first step on
+any unexplained divergence.  [TBD: link to the per-op
+numerical-noise reference once Plan 3 lands.]
+
+## D3 — Understanding rule
+
+**If you can't explain a behavior's root cause in one sentence
+without hand-waving, you don't understand it.** The one-sentence
+test applies whenever you describe a bug, write an xfail reason,
+fill in a postmortem, or tell the user "this code does X because
+Y."  Research until the sentence compresses without hedges.  If
+the doc that would have let someone else write the sentence is
+missing, add it.
+
+**Why.** Compressing the cause to one sentence is the diagnostic.
+If the sentence won't compress, the cause isn't known yet.
+
+**Worked example.** The Phase E xfail reason wraps three hedged
+conjunctions into one sentence ("likely … near … under …").  That
+*and-of-maybes* structure is the warning sign — when only an
+and-of-maybes will fit, the sentence is hiding ignorance.
+
+## D4 — Foundation rule
+
+**Never move on if the foundation isn't 100% solid.** An
+un-investigated anomaly in phase N is the first task of phase
+N+1, not a footnote.
+
+**Why.** Every layer added on top of an anomaly multiplies the
+cost of going back.  The cost of fixing Phase E grows with every
+downstream change to the SORTED stage.
+
+**Worked example.** The Phase E xfail was shipped to unblock
+downstream phases.  By the time the (3, 2, 20) regression is
+investigated, the xfailed test will no longer be the only code
+touching the SORTED above-threshold primitive — the cost of
+reverting or re-architecting has gone up.
+
+## D5 — xfail hygiene
+
+**No `xfail` without a precisely documented root cause.** Two
+acceptable forms:
+
+1. `xfail(reason="precise root cause: X; will be fixed by Y",
+   strict=True)` — root cause known, fix deferred for a stated
+   reason.
+2. `xfail(reason="unknown, investigating, linked to issue N",
+   strict=True)` — root cause not yet known, but a tracked
+   follow-up exists.
+
+Unacceptable: `xfail(reason="likely due to <guess>")` with no
+evidence and no follow-up.
+
+**Why.** An xfail with a guessed reason isn't a TODO — it's a
+trap.  The next contributor reads the reason, takes it as an
+explanation, and stops looking.
+
+**Worked example.** `tests/doom/test_game_graph.py:146` shipped
+with the unacceptable form.  It must be replaced by form 1 or
+form 2 before the test can be shipped again as a known
+limitation.
+
+**Tooling.** `torchwright/debug/probe.py` is what you use to
+convert form 2 into form 1.
+
+## D6 — Reproducer-before-fix
+
+**Every bug becomes a permanent unit test at the smallest
+reproducing layer** — not the integration test that surfaced it,
+the smallest layer that still reproduces it.  A render mismatch
+caused by an op error becomes an op test, not a render test.
+(Trivial fixes — typos, comment changes — have no reproducing
+layer; this rule applies to behavior bugs.)
+
+**Why.** Integration tests that catch bugs are slow, indirect,
+and easily broken by unrelated changes.  Smallest repros are
+fast, direct, and survive refactors.
+
+**Worked example.** Phase E's (3, 2, 20) regression surfaced as a
+render test (slow, system-level).  The smallest repro is a
+SORTED-stage call to `attend_argmin_above_integer` with the
+specific `indicators_above` input that fails to concentrate.  The
+stage-level test belongs in `tests/doom/stages/test_sorted.py` or
+below.
+
+**Tooling.** `torchwright/debug/probe.py` to identify which
+layer / which node / which inputs reproduce the bug; `make
+test-local FILE=...` to iterate fast against the resulting unit
+test.
+
+## D7 — Per-op noise sync
+
+**Modifying a piecewise op's implementation or breakpoint grid
+requires re-measuring its noise bound and updating its docstring
+in the same commit.** When a consolidated noise reference exists,
+update it too.
+
+**Why.** Stale noise bounds are the supply chain for stale
+assumptions.  If `compare`'s bound moves from 1e-3 to 5e-3
+silently, every downstream stage that budgeted against 1e-3 is
+now over-budget without anyone knowing.
+
+**Worked example.** Phase E raised `_ABOVE_BONUS` from 100 to
+1000 to give the SORTED softmax more headroom.  That changes the
+piecewise softmax's effective working range and may change its
+measured error bound.  Neither was re-measured at the time.
+
+**Tooling.** Op docstrings under `torchwright/ops/` are today's
+source of truth — keep them current.  [TBD: link to the
+consolidated numerical-noise reference and the proposed
+docstring/reference-doc consistency check once Plan 3 lands.]
+
+## D8 — Tooling sources of truth
+
+**Use the established tooling; do not reinvent.** Ad-hoc debug
+scripts in `/tmp/` are write-once, never indexed, never
+re-runnable, and don't accumulate institutional knowledge.
+
+- **Probing residual values / divergence:**
+  `torchwright/debug/probe.py`.  [TBD: extend the description
+  once Plan 1's generalized harness — residual inspection,
+  attention inspection, layer-wise diff — lands.]
+- **Compiler invariants:** assertions in
+  `torchwright/compiler/`.  [TBD: link to the compiler-invariants
+  reference once Plan 2 lands.]
+- **Per-op precision budgets:** op docstrings under
+  `torchwright/ops/`.  [TBD: link to the consolidated noise
+  reference once Plan 3 lands.]
+- **Adversarial integration coverage:**
+  `tests/doom/test_game_graph.py`.  [TBD: link to the parametric
+  sweep section once Plan 4 lands.]
+
+**Why.** `tests/doom/test_mode_c_probe.py` started life as an
+ad-hoc probe and grew to 1000+ lines hard-coded to `angle=192`.
+The cost of generalizing it later (Plan 1) is exactly the cost
+of having let the ad-hoc form persist.  Don't repeat the
+pattern.
