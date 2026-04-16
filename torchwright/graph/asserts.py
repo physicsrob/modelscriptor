@@ -534,7 +534,7 @@ def assert_score_gap_at_least(
     ``ln(999) / 8 ≈ 0.864``.  Pair this assert with the score node
     immediately upstream of the argmin to catch precision regressions
     that close the gap below softmax resolution — the failure mode
-    behind angle-192 / Mode C.
+    behind the historical angle-192 sort-concentration regression.
 
     The default margin of ``1.0`` matches the integer-score invariant
     that all current callers uphold (BSP rank, digit, slot index —

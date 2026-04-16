@@ -10,8 +10,18 @@ import numpy as np
 import pytest
 import torch
 
-from torchwright.debug.probe import probe_graph, reference_eval
+from torchwright.compiler.export import compile_headless
+from torchwright.debug.probe import (
+    probe_attention,
+    probe_graph,
+    probe_layer_diff,
+    probe_residual,
+    reference_eval,
+)
+from torchwright.graph import Attn
 from torchwright.doom.game_graph import build_game_graph
+from torchwright.ops.arithmetic_ops import add_const, multiply_const
+from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 from torchwright.reference_renderer.scenes import box_room
 from torchwright.reference_renderer.textures import default_texture_atlas
 from torchwright.reference_renderer.trig import generate_trig_table
@@ -87,6 +97,144 @@ def test_reference_eval_matches_direct_compute_tiny():
     assert torch.allclose(cache[y], input_values["y"])
 
 
+def test_probe_residual_reads_intermediate_node():
+    """Compile a tiny chain and confirm ``probe_residual`` reports the
+    intermediate node's value at the layer that materialises it.
+
+    Graph: y = 3*x, z = y + 1.  Compile overlaid on x, probe y.  Every
+    layer that has y live must hold 3*x; empty per_layer would indicate
+    the probe failed to surface the node.
+    """
+    pos = create_pos_encoding()
+    x = create_input(2)
+    y = multiply_const(x, 3.0)
+    z = add_const(y, 1.0)
+    module = compile_headless(
+        pos, io={"x": (x, z)}, d=64, verbose=False,
+    )
+
+    inp = torch.tensor([[2.0, 4.0]])
+    report = probe_residual(module, inp, y)
+
+    assert report.layers, "probe_residual surfaced no layers for y"
+    expected_y = torch.tensor([[6.0, 12.0]])
+    for layer_i in report.layers:
+        v = report.at(layer_i)
+        assert v is not None
+        assert torch.allclose(v, expected_y, atol=0.1), (
+            f"layer {layer_i}: expected {expected_y.tolist()} got {v.tolist()}"
+        )
+    # at_layer filter: restrict to the last layer that holds y.
+    one = probe_residual(module, inp, y, at_layer=report.layers[-1])
+    assert one.layers == [report.layers[-1]]
+
+
+def test_probe_attention_captures_softmax_weights():
+    """Build a tiny single-Attn graph, compile, and confirm
+    ``probe_attention`` returns per-head softmax weights that sum to
+    one, with at least one non-trivial top contributor at the queried
+    row.  This exercises the monkey-patch + forward path end-to-end on
+    a graph small enough that layer-hosting lookup is unambiguous.
+    """
+    pos = create_pos_encoding()
+    x = create_input("x", 4)
+    torch.manual_seed(0)
+    attn = Attn(
+        query_in=x, key_in=x, value_in=x,
+        query_matrix=torch.randn(4, 4),
+        key_matrix=torch.randn(4, 4),
+        value_matrix=torch.randn(4, 4),
+        output_matrix=torch.randn(4, 4),
+    )
+    module = compile_headless(
+        pos, io={"x": (x, attn)}, d=256, d_head=16, verbose=False,
+    )
+
+    inp = torch.randn(3, 4)
+    report = probe_attention(module, inp, attn, query_pos=2)
+
+    assert report.layer_index >= 0
+    # Softmax sums to 1 per head (within fp tolerance).
+    sums = report.weights.sum(dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-4), (
+        f"weights don't sum to 1 per head: {sums.tolist()}"
+    )
+    # Causal mask: query row 2 can attend to positions 0, 1, 2 only.
+    # Positions 3..n_keys-1 (if any) must have negligible weight.
+    if report.weights.shape[1] > 3:
+        future_mass = report.weights[:, 3:].sum().item()
+        assert future_mass < 1e-3, (
+            f"causal mask leak — future positions got {future_mass:.3g}"
+        )
+    # top() returns a ranked list.
+    top = report.top(k=3, head=0)
+    assert len(top) == 3
+    # Sorted descending by weight.
+    assert top[0][1] >= top[1][1] >= top[2][1]
+
+
+def test_probe_layer_diff_drift_and_sentinel():
+    """Compile y = 3*x, sample at multiple positions, and verify
+    ``probe_layer_diff``:
+
+    * reports ``first_drift_layer is None`` when given the correct
+      reference (no drift beyond tolerance),
+    * reports a populated ``first_drift_layer`` when given a wrong
+      reference,
+    * reports ``first_sentinel_layer`` at the earliest layer where
+      the node equals a caller-supplied sentinel (set to the first
+      per-layer value).
+    """
+    pos = create_pos_encoding()
+    x = create_input("x", 2)
+    y = multiply_const(x, 3.0)
+    module = compile_headless(
+        pos, io={"x": (x, y)}, d=64, verbose=False,
+    )
+
+    inp = torch.tensor([[2.0, 4.0], [1.0, 5.0]])
+    positions = [0, 1]
+    true_ref = torch.tensor([[6.0, 12.0], [3.0, 15.0]])
+
+    # Correct reference → no drift.
+    ok = probe_layer_diff(
+        module, inp, y,
+        reference=true_ref, positions=positions, drift_threshold=0.5,
+    )
+    assert ok.records, "no layers traced"
+    assert ok.first_drift_layer is None, (
+        f"unexpected drift at layer {ok.first_drift_layer}: "
+        f"max_abs_delta={ok.records[0].max_abs_delta}"
+    )
+
+    # Wrong reference → drift flagged at the first layer.
+    bad_ref = torch.zeros_like(true_ref)
+    bad = probe_layer_diff(
+        module, inp, y,
+        reference=bad_ref, positions=positions, drift_threshold=0.5,
+    )
+    assert bad.first_drift_layer is not None
+    assert bad.first_drift_layer == bad.records[0].layer_index
+
+    # Sentinel detection: the first layer's value should contain 6.0
+    # (the top-left element).  Using that as the sentinel must flag the
+    # first layer; a value that never surfaces must not flag anything.
+    s_hit = probe_layer_diff(
+        module, inp, y,
+        reference=true_ref, positions=positions,
+        sentinel=6.0, sentinel_tol=0.1,
+    )
+    assert s_hit.first_sentinel_layer == s_hit.records[0].layer_index
+    assert s_hit.sentinel_value == 6.0
+
+    s_miss = probe_layer_diff(
+        module, inp, y,
+        reference=true_ref, positions=positions,
+        sentinel=-999.0, sentinel_tol=0.01,
+    )
+    assert s_miss.first_sentinel_layer is None
+
+
 def test_probe_clean_on_v2_box_room(tiny_config):
     """V2 box_room at 16×20 — the config used by the existing
     ``test_v2_renders_box_room`` test — is known good.  The probe must
@@ -104,7 +252,7 @@ def test_probe_clean_on_v2_box_room(tiny_config):
 
     from torchwright.doom.game_graph import E8_INPUT
     d_render_fb = 2 * max_walls + 11
-    d_sort_out = 8 + 5 + 3 + 2 * max_walls
+    d_sort_out = 8 + 5 + 3 + max_walls
     tex_h = textures[0].shape[1]
     input_values = {
         "input_backward": torch.tensor([[0.0]]),
