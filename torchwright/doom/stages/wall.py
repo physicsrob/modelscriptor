@@ -153,7 +153,11 @@ def build_wall(
 
     with annotate("wall/visibility"):
         vis_lo, vis_hi = _compute_visibility_columns(
-            inputs, is_renderable, config=config, max_coord=max_coord,
+            inputs.wall_ax, inputs.wall_ay, inputs.wall_bx, inputs.wall_by,
+            inputs.player_x, inputs.player_y,
+            inputs.move_cos, inputs.move_sin,
+            is_renderable,
+            config=config, max_coord=max_coord,
         )
 
     with annotate("wall/onehot"):
@@ -445,8 +449,18 @@ _COL_FOLD_BP_CROSS = [
 _COL_FOLD_BP_DOT_ABS = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
 
 
+# Saturation scale for compares whose input is a t-parameter difference
+# naturally clustering near 0 (t ∈ [0, 1]).  The piecewise compare's built-in
+# ramp width is ~1/step_sharpness ≈ 0.1 in input units, too wide when real
+# t-differences are ~0.01.  Scaling by 100 shrinks the ramp to ~0.001 in
+# t-space — tight enough that real differences always saturate cleanly.
+_T_COMPARE_SCALE = 100.0
+
+
 def _compute_visibility_columns(
-    inputs: WallInputs,
+    wall_ax: Node, wall_ay: Node, wall_bx: Node, wall_by: Node,
+    player_x: Node, player_y: Node,
+    move_cos: Node, move_sin: Node,
     is_renderable: Node,
     *,
     config: RenderConfig,
@@ -481,10 +495,10 @@ def _compute_visibility_columns(
     W = config.screen_width
     fov = config.fov_columns
 
-    dax = subtract(inputs.wall_ax, inputs.player_x)
-    day = subtract(inputs.wall_ay, inputs.player_y)
-    dbx = subtract(inputs.wall_bx, inputs.player_x)
-    dby = subtract(inputs.wall_by, inputs.player_y)
+    dax = subtract(wall_ax, player_x)
+    day = subtract(wall_ay, player_y)
+    dbx = subtract(wall_bx, player_x)
+    dby = subtract(wall_by, player_y)
 
     # Rotate both endpoints into the player's (cross, dot) frame.
     # These are computed independently of precomp_D/E (which rotate the
@@ -492,10 +506,10 @@ def _compute_visibility_columns(
     # entangle residual-stream columns and amplify cross-coupling
     # through the compiled softmax.
     cross_a, dot_a = _rotate_into_player_frame(
-        inputs.move_cos, inputs.move_sin, dax, day, "va",
+        move_cos, move_sin, dax, day, "va",
     )
     cross_b, dot_b = _rotate_into_player_frame(
-        inputs.move_cos, inputs.move_sin, dbx, dby, "vb",
+        move_cos, move_sin, dbx, dby, "vb",
     )
 
     fov_rad = float(fov) * math.pi / 128.0
@@ -530,9 +544,8 @@ def _compute_visibility_columns(
 
     # Segment fully outside FOV iff t_lo > t_hi.  Scale so the compare
     # saturates even when the range is "just barely" empty/non-empty.
-    _COMPARE_SCALE_EMPTY = 100.0
     is_empty = compare(
-        multiply_const(subtract(t_lo, t_hi), _COMPARE_SCALE_EMPTY), 0.0,
+        multiply_const(subtract(t_lo, t_hi), _T_COMPARE_SCALE), 0.0,
     )
 
     # ---- Project the clipped endpoints to screen cols ------------------
@@ -554,19 +567,10 @@ def _compute_visibility_columns(
 
     # Which side of the cone clipped A?  L contribution won → col=W (left
     # screen edge).  R contribution won → col=0 (right edge).
-    #
-    # Scale the t-difference before compare so the ±1 saturation is clean
-    # when contributions are close (e.g., t_lo_L=0 vs t_lo_R=0.09).  The
-    # compare's built-in ramp width is ~1/step_sharpness ≈ 0.1 in input
-    # units, which is too wide when t values naturally cluster near
-    # [0, 1] boundaries.  Scaling by 100 shrinks the ramp to ~0.001 in
-    # t-space — tight enough that real differences always saturate.
-    _COMPARE_SCALE = 100.0
-
     a_inside_L = compare(f_L_a, 0.0)
     a_inside_R = compare(f_R_a, 0.0)
     a_clipped_on_L = compare(
-        multiply_const(subtract(t_lo_L, t_lo_R), _COMPARE_SCALE), 0.0,
+        multiply_const(subtract(t_lo_L, t_lo_R), _T_COMPARE_SCALE), 0.0,
     )
     col_A_boundary = select(a_clipped_on_L, W_lit, zero_lit)
     col_A = select(
@@ -579,7 +583,7 @@ def _compute_visibility_columns(
     b_inside_L = compare(f_L_b, 0.0)
     b_inside_R = compare(f_R_b, 0.0)
     b_clipped_on_L = compare(
-        multiply_const(subtract(t_hi_R, t_hi_L), _COMPARE_SCALE), 0.0,
+        multiply_const(subtract(t_hi_R, t_hi_L), _T_COMPARE_SCALE), 0.0,
     )
     col_B_boundary = select(b_clipped_on_L, W_lit, zero_lit)
     col_B = select(

@@ -32,7 +32,7 @@ from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig
 
-from torchwright.doom.stages.wall import WallInputs, _compute_visibility_columns
+from torchwright.doom.stages.wall import _compute_visibility_columns
 
 
 _MAX_COORD = 20.0
@@ -70,25 +70,11 @@ def vis_module():
     move_sin = create_input("move_sin", 1)
     is_renderable = create_input("is_renderable", 1)
 
-    # Unused fields — _compute_visibility_columns only accesses
-    # wall geometry, player pos, and move_cos/sin.
-    dummy1 = create_input("dummy1", 1)
-    dummy_bsp = create_input("dummy_bsp", 1)
-
-    inputs = WallInputs(
-        wall_ax=wall_ax, wall_ay=wall_ay,
-        wall_bx=wall_bx, wall_by=wall_by,
-        wall_tex_id=dummy1, wall_index=dummy1,
-        player_x=player_x, player_y=player_y,
-        is_wall=dummy1,
-        vel_dx=dummy1, vel_dy=dummy1,
-        move_cos=move_cos, move_sin=move_sin,
-        wall_bsp_coeffs=dummy_bsp, wall_bsp_const=dummy1,
-        side_P_vec=dummy_bsp,
-    )
-
     vis_lo, vis_hi = _compute_visibility_columns(
-        inputs, is_renderable,
+        wall_ax, wall_ay, wall_bx, wall_by,
+        player_x, player_y,
+        move_cos, move_sin,
+        is_renderable,
         config=_config(), max_coord=_MAX_COORD,
     )
     output = Concatenate([vis_lo, vis_hi])
@@ -251,7 +237,6 @@ def test_visibility_columns_match_oracle(vis_module, name, px, py, angle, wall):
         "player_x": px, "player_y": py,
         "move_cos": cos_p, "move_sin": sin_p,
         "is_renderable": 1.0,
-        "dummy1": 0.0, "dummy_bsp": 0.0,
     }
     # compile_headless wants at least 2 positions for the sequence to be
     # non-degenerate; the probe reads from position 0.
