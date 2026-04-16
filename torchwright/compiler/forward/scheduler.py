@@ -284,6 +284,14 @@ class LayerScheduler:
             n_heads = (len(live_addend) + self.d_head - 1) // self.d_head
             if heads_used + n_heads > self.n_heads:
                 continue
+            self._require_live(
+                dead_addend, residual_map,
+                f"add_into dead-addend for {add_node!r}",
+            )
+            self._require_live(
+                live_addend, residual_map,
+                f"add_into live-addend for {add_node!r}",
+            )
             target_cols = residual_map.get_indices(dead_addend)
             live_source_cols = residual_map.resolve_indices(live_addend)
             attn_ops.append(AttnHeadOp(
@@ -397,14 +405,23 @@ class LayerScheduler:
             # lookups — a precondition for same-layer eager-freeing.
             op = AttnHeadOp(op_type, node, target_cols)
             if op_type == "compute_linear":
+                self._require_live(
+                    node.inputs[0], residual_map,
+                    f"compute_linear input for {node!r}",
+                )
                 op.source_cols = residual_map.resolve_indices(node.inputs[0])
             elif op_type == "compute_attn":
                 q_in, k_in, v_in = node.inputs
+                self._require_live(q_in, residual_map, f"compute_attn Q for {node!r}")
+                self._require_live(k_in, residual_map, f"compute_attn K for {node!r}")
+                self._require_live(v_in, residual_map, f"compute_attn V for {node!r}")
                 op.q_source_cols = residual_map.resolve_indices(q_in)
                 op.k_source_cols = residual_map.resolve_indices(k_in)
                 op.source_cols = residual_map.resolve_indices(v_in)
             elif op_type == "compute_add":
                 a0, a1 = node.inputs
+                self._require_live(a0, residual_map, f"compute_add a0 for {node!r}")
+                self._require_live(a1, residual_map, f"compute_add a1 for {node!r}")
                 op.source_cols = residual_map.resolve_indices(a0)
                 op.source_cols_b = residual_map.resolve_indices(a1)
             attn_ops.append(op)
@@ -536,6 +553,10 @@ class LayerScheduler:
                 continue
             mlp_slots = list(range(next_slot, next_slot + d_hidden))
             next_slot += d_hidden
+            self._require_live(
+                l1.inputs[0], residual_map,
+                f"compute_relu (L1 input) for {l2!r}",
+            )
             input_cols = residual_map.resolve_indices(l1.inputs[0])
             mlp_ops.append(MLPOp(
                 "compute_relu", l2, target_cols, mlp_slots,
@@ -589,6 +610,10 @@ class LayerScheduler:
                 continue
             mlp_slots = list(range(next_slot, next_slot + d_relu))
             next_slot += d_relu
+            self._require_live(
+                node.inputs[0], residual_map,
+                f"compute_standalone_relu input for {node!r}",
+            )
             input_cols = residual_map.resolve_indices(node.inputs[0])
             mlp_ops.append(MLPOp(
                 "compute_standalone_relu", node, target_cols, mlp_slots,
@@ -958,3 +983,41 @@ class LayerScheduler:
             else:
                 deferred.append(c)
         return admissible, deferred
+
+    def _require_live(
+        self,
+        node: Node,
+        residual_map: ResidualStreamMap,
+        op_label: str,
+    ) -> None:
+        """Invariant A (schedule-time): ``node`` must be retrievable from
+        ``residual_map`` when its value is read as a source.
+
+        Walks through Concatenate to check every leaf.  Raises
+        :class:`AssertionError` with op context if any required leaf is
+        not currently allocated — surfaces a liveness bug *before* the
+        KeyError from get_indices, so the message names the node, the
+        consumer op, and the residual_map state.
+        """
+        if isinstance(node, Concatenate):
+            missing = [
+                leaf
+                for leaf in flatten_concat_nodes([node])
+                if not residual_map.is_allocated(leaf)
+            ]
+            if missing:
+                raise AssertionError(
+                    f"Live-column invariant violated while scheduling "
+                    f"{op_label}: Concatenate {node!r} has unallocated "
+                    f"leaves {[repr(m) for m in missing[:4]]}. "
+                    f"free_count={residual_map.get_free_count()}, "
+                    f"allocated={len(residual_map.get_allocated_nodes())}."
+                )
+            return
+        if not residual_map.is_allocated(node):
+            raise AssertionError(
+                f"Live-column invariant violated while scheduling "
+                f"{op_label}: input {node!r} is not allocated. "
+                f"free_count={residual_map.get_free_count()}, "
+                f"allocated={len(residual_map.get_allocated_nodes())}."
+            )
