@@ -223,14 +223,11 @@ def build_game_graph(
             position_onehot=wall_out.position_onehot,
             sort_value=wall_out.sort_value,
             prev_mask=fb_fields["prev_mask"],
-            eos_px=eos_out.px, eos_py=eos_out.py, eos_angle=eos_out.angle,
             is_sorted=tf["is_sorted"],
             is_wall=tf["is_wall"],
             pos_encoding=pos_encoding,
         ),
-        config=config,
         max_walls=max_walls,
-        max_coord=max_coord,
     )
 
     # ---------- THINKING ----------

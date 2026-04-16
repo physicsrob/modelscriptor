@@ -91,11 +91,11 @@ def compute_min_d_head(max_walls: int, tex_w: int) -> int:
     """Minimum d_head required by the game graph's attention heads.
 
     Three attention patterns drive the requirement:
-    - Sort (attend_argmin_unmasked): 1 + max_walls + (11 + max_walls)
+    - Sort (attend_argmin_unmasked): 1 + max_walls + (13 + max_walls)
     - Render (attend_argmin_unmasked): 1 + max_walls + (8 + max_walls)
     - TEX_COL (attend_argmax_dot): 8 + tex_w + 1
     """
-    d_sort_val = 11 + max_walls
+    d_sort_val = 13 + max_walls
     sort_d = 1 + max_walls + d_sort_val
     render_d = 1 + max_walls + 8 + max_walls
     tex_d = 8 + tex_w + 1

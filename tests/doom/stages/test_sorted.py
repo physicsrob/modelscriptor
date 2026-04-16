@@ -3,13 +3,8 @@
 Focus: verify that ``attend_argmin_unmasked`` picks the lowest-score
 wall whose ``prev_mask`` bit is zero, and that its payload is correctly
 unpacked into ``sel_wall_data`` + ``sel_render``.
-
-Visibility-mask math is covered in ``test_visibility_mask_pieces.py``;
-this file adds a smoke test that the masked column range at least
-overlaps the expected column for a centered wall.
 """
 
-import math
 from typing import List
 
 import pytest
@@ -19,23 +14,11 @@ from torchwright.compiler.export import compile_headless
 from torchwright.graph import Concatenate
 from torchwright.graph.asserts import assert_01, assert_integer, assert_onehot
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
-from torchwright.reference_renderer.trig import generate_trig_table
-from torchwright.reference_renderer.types import RenderConfig
 
 from torchwright.doom.stages.sorted import SortedInputs, build_sorted
 
 
-_MAX_COORD = 20.0
 _MAX_WALLS = 4
-
-
-def _tiny_config() -> RenderConfig:
-    return RenderConfig(
-        screen_width=32, screen_height=16, fov_columns=32,
-        trig_table=generate_trig_table(),
-        ceiling_color=(0.2, 0.2, 0.2),
-        floor_color=(0.4, 0.4, 0.4),
-    )
 
 
 @pytest.fixture(scope="module")
@@ -56,9 +39,6 @@ def sorted_module():
     position_onehot = assert_onehot(create_input("position_onehot", _MAX_WALLS))
     sort_value = create_input("sort_value", payload_w)
     prev_mask = assert_01(create_input("prev_mask", _MAX_WALLS))
-    eos_px = create_input("eos_px", 1)
-    eos_py = create_input("eos_py", 1)
-    eos_angle = create_input("eos_angle", 1)
     is_sorted = create_input("is_sorted", 1)
     is_wall = create_input("is_wall", 1)
 
@@ -69,16 +49,11 @@ def sorted_module():
             position_onehot=position_onehot,
             sort_value=sort_value,
             prev_mask=prev_mask,
-            eos_px=eos_px,
-            eos_py=eos_py,
-            eos_angle=eos_angle,
             is_sorted=is_sorted,
             is_wall=is_wall,
             pos_encoding=pos,
         ),
-        config=_tiny_config(),
         max_walls=_MAX_WALLS,
-        max_coord=_MAX_COORD,
     )
     output = Concatenate([
         out.sel_wall_data,       # 5-wide
@@ -103,9 +78,11 @@ def _pack(module, rows: list[dict]) -> torch.Tensor:
 
 
 def _wall_payload(ax, ay, bx, by, tex_id, sort_den, C, D, E, H_inv,
-                  center_dist, onehot: List[float]) -> List[float]:
+                  center_dist, vis_lo=0.0, vis_hi=0.0,
+                  onehot: List[float] = ()) -> List[float]:
     """Canonical wall payload layout — must match wall_payload.pack_wall_payload."""
-    return [ax, ay, bx, by, tex_id, sort_den, C, D, E, H_inv, center_dist] + onehot
+    return ([ax, ay, bx, by, tex_id, sort_den, C, D, E, H_inv, center_dist,
+             vis_lo, vis_hi] + list(onehot))
 
 
 def _onehot(i: int, n: int) -> List[float]:
@@ -143,7 +120,6 @@ def test_argmin_picks_lowest_unmasked(sorted_module, scores, prev_mask, expected
                 center_dist=0.0, onehot=_onehot(i, _MAX_WALLS),
             ),
             "prev_mask": prev_mask,
-            "eos_px": 0.0, "eos_py": 0.0, "eos_angle": 0.0,
             "is_sorted": 0.0,
             "is_wall": 1.0,
         })
@@ -152,9 +128,8 @@ def test_argmin_picks_lowest_unmasked(sorted_module, scores, prev_mask, expected
         "sort_score": 99.0,
         "is_renderable": -1.0,
         "position_onehot": [0.5] * _MAX_WALLS,
-        "sort_value": [0.0] * (11 + _MAX_WALLS),
+        "sort_value": [0.0] * (13 + _MAX_WALLS),
         "prev_mask": prev_mask,
-        "eos_px": 0.0, "eos_py": 0.0, "eos_angle": 0.0,
         "is_sorted": 1.0,
         "is_wall": 0.0,
     }
@@ -210,7 +185,6 @@ def test_angle_192_validity_excludes_invalid_clean_pick(sorted_module):
                 center_dist=0.0, onehot=pure_onehot(i, _MAX_WALLS),
             ),
             "prev_mask": prev_mask,
-            "eos_px": 0.0, "eos_py": 0.0, "eos_angle": 192.0,
             "is_sorted": 0.0,
             "is_wall": 1.0,
         })
@@ -219,9 +193,8 @@ def test_angle_192_validity_excludes_invalid_clean_pick(sorted_module):
         "sort_score": 0.0,
         "is_renderable": -1.0,
         "position_onehot": pure_onehot(0, _MAX_WALLS),
-        "sort_value": [0.0] * (11 + _MAX_WALLS),
+        "sort_value": [0.0] * (13 + _MAX_WALLS),
         "prev_mask": prev_mask,
-        "eos_px": 0.0, "eos_py": 0.0, "eos_angle": 192.0,
         "is_sorted": 1.0,
         "is_wall": 0.0,
     }
@@ -258,7 +231,6 @@ def test_updated_mask_adds_selected_wall(sorted_module):
                 center_dist=0.0, onehot=_onehot(i, _MAX_WALLS),
             ),
             "prev_mask": prev_mask,
-            "eos_px": 0.0, "eos_py": 0.0, "eos_angle": 0.0,
             "is_sorted": 0.0,
             "is_wall": 1.0,
         })
@@ -266,9 +238,8 @@ def test_updated_mask_adds_selected_wall(sorted_module):
         "sort_score": 99.0,
         "is_renderable": -1.0,
         "position_onehot": [0.5] * _MAX_WALLS,
-        "sort_value": [0.0] * (11 + _MAX_WALLS),
+        "sort_value": [0.0] * (13 + _MAX_WALLS),
         "prev_mask": prev_mask,
-        "eos_px": 0.0, "eos_py": 0.0, "eos_angle": 0.0,
         "is_sorted": 1.0,
         "is_wall": 0.0,
     }

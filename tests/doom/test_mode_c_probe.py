@@ -647,7 +647,7 @@ def _find_sort_attn_node(graph_io):
     ]
     # There may be a few Attn nodes under the annotation; the argmin
     # itself is the one whose value-input resolves to sort_value
-    # (width 11 + max_walls).
+    # (width 13 + max_walls).
     return candidates
 
 
@@ -700,8 +700,8 @@ def test_find_sort_argmin_layer_and_inspect_V(graph_and_module):
     print("-" * 72)
 
     # Pick the candidate whose V-input matches sort_value's width
-    # (11 + max_walls).  That's the argmin.
-    expected_v_width = 11 + _MAX_WALLS
+    # (13 + max_walls).  That's the argmin.
+    expected_v_width = 13 + _MAX_WALLS
     argmin_attn = None
     for attn_node, layer_idx in sort_attn_to_layer.items():
         v_width = len(attn_node.inputs[2]) if attn_node.inputs[2] is not None else -1
@@ -847,7 +847,7 @@ def test_inspect_sorted_argmin_attention_weights_at_sort2(graph_and_module):
     sort_attn_candidates = _find_sort_attn_node(graph_io)
     argmin_attn = next(
         n for n in sort_attn_candidates
-        if n.inputs[2] is not None and len(n.inputs[2]) == 11 + _MAX_WALLS
+        if n.inputs[2] is not None and len(n.inputs[2]) == 13 + _MAX_WALLS
     )
     ra = net.residual_assignment
     argmin_layer = None
