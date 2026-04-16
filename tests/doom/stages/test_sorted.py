@@ -17,6 +17,7 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.graph import Concatenate
+from torchwright.graph.asserts import assert_integer
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig
@@ -50,7 +51,7 @@ def sorted_module():
     pos = create_pos_encoding()
     payload_w = payload_width(_MAX_WALLS)
 
-    sort_score = create_input("sort_score", 1)
+    sort_score = assert_integer(create_input("sort_score", 1))
     is_renderable = create_input("is_renderable", 1)
     position_onehot = create_input("position_onehot", _MAX_WALLS)
     sort_value = create_input("sort_value", payload_w)

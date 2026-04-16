@@ -20,6 +20,7 @@ from typing import Tuple
 import torch
 
 from torchwright.graph import Concatenate, Linear, Node
+from torchwright.graph.asserts import assert_integer
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.spherical_codes import index_to_vector
 from torchwright.ops.arithmetic_ops import (
@@ -91,7 +92,9 @@ def build_range_printer_graph(
     sentinel = create_literal_value(
         torch.tensor([_SENTINEL_SCORE]), name="sentinel",
     )
-    score = select(is_item, item_index, sentinel)
+    # Both branches are integer-valued by construction; select's
+    # PL-encoded arithmetic adds FP fuzz, so re-declare the invariant.
+    score = assert_integer(select(is_item, item_index, sentinel))
 
     # --- Position one-hot ({0,1}, width max_items) ---------------------
     item_index_p1 = add_const(item_index, 1.0)

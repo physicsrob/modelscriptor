@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import torch
 
 from torchwright.graph import Node, annotate
+from torchwright.graph.asserts import assert_integer
 from torchwright.ops.arithmetic_ops import (
     abs,
     add,
@@ -385,7 +386,7 @@ def _compute_bsp_rank(
         s_bool = compare(s_i, 0.5)
         bsp_products.append(cond_gate(s_bool, c_i))
     bsp_dot = sum_nodes(bsp_products)
-    bsp_rank = add(bsp_dot, inputs.wall_bsp_const)
+    bsp_rank = assert_integer(add(bsp_dot, inputs.wall_bsp_const))
 
     # Renderability: is_wall AND |sort_den| > ε AND num_t × sign(den) > 0.
     abs_sort_den = abs(sort_den)
