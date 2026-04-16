@@ -167,8 +167,9 @@ full attempt log.
 trigger that fired and ask for guidance.  Do not proceed with
 workarounds unilaterally.
 
-**Tooling.** [TBD: link to the compiler-invariants reference once
-Plan 2 lands.]
+**Tooling.** See the *Compiler Invariants* section below — the four
+runtime-asserted invariants are the canonical list of "stated
+compiler invariants" for this trigger.
 
 ## D2 — Never defer numerical problems
 
@@ -316,8 +317,8 @@ re-runnable, and don't accumulate institutional knowledge.
   once Plan 1's generalized harness — residual inspection,
   attention inspection, layer-wise diff — lands.]
 - **Compiler invariants:** assertions in
-  `torchwright/compiler/`.  [TBD: link to the compiler-invariants
-  reference once Plan 2 lands.]
+  `torchwright/compiler/`.  See the *Compiler Invariants* section
+  below for the canonical list.
 - **Per-op precision budgets:** op docstrings under
   `torchwright/ops/`.  [TBD: link to the consolidated noise
   reference once Plan 3 lands.]
@@ -330,3 +331,111 @@ ad-hoc probe and grew to 1000+ lines hard-coded to `angle=192`.
 The cost of generalizing it later (Plan 1) is exactly the cost
 of having let the ad-hoc form persist.  Don't repeat the
 pattern.
+
+# Compiler Invariants
+
+The forward-compile pipeline guarantees the four invariants below.
+Each is enforced at runtime by an `AssertionError` inside the
+compiler — negative unit tests in
+`tests/compile/forward/test_compiler_assertions.py` pin the error
+shape.  These are the canonical "stated compiler invariants"
+referenced by doctrine D1.
+
+**Absolute rule.** If one of these assertions fires on the existing
+test suite, **STOP**.  That is a real compiler bug.  Do NOT weaken
+the assertion, do NOT `try/except` around it, do NOT xfail the
+affected test.  Follow D1: report the firing assertion, the test,
+and `git rev-parse HEAD` to the user and wait for guidance.
+
+Also: **do not add new assertions here without a matching negative
+test** in `tests/compile/forward/test_compiler_assertions.py`.  The
+pair (assertion + negative test) is what keeps the invariant honest
+across refactors.
+
+## I1 — Allocator self-consistency
+
+`ResidualStreamMap`'s internal state is consistent after every
+mutation:
+
+1. Pairwise disjoint — no column appears in two nodes' index lists.
+2. `_free ∩ allocated == ∅`.
+3. `_free ∪ allocated == {0 .. d-1}`.
+
+**Enforced in** `torchwright/compiler/forward/residual_map.py`:
+`ResidualStreamMap._check_invariants`, called at the end of
+`allocate`, `free`, and `reassign`.  `allocate` also runs a
+pre-commit uniqueness check so a firing assertion names the
+conflicting node.
+
+**What a fire means.** Either (a) allocator code was edited and no
+longer preserves the invariant, or (b) an external caller reached
+in and mutated `_free` / `_node_to_indices`.  Both are bugs.
+
+## I2 — Literal stability
+
+Every `LiteralValue` scheduled via `compute_literal_value`, and
+every `Linear` bias scheduled via `compute_bias`, has
+`len(op.target_cols) == node.value.numel()` (or
+`node.output_bias.numel()`).  Writes never silently truncate.
+
+**Enforced in**
+`torchwright/compiler/forward/scheduler.py` at emission time
+(around `compute_literal_value`), and
+`torchwright/compiler/forward/weight_writer.py` at
+`_write_compute_literal_value` and `_write_compute_bias`.
+
+**What a fire means.** Allocation width drifted from the source
+tensor's numel — either scheduler logic changed without updating
+the invariant, or a `LiteralValue` / `Linear` was constructed with
+inconsistent width.  Removing the assertion would reintroduce the
+pre-invariant silent `[: len(target_cols)]` slice that masked the
+bug.
+
+## I3 — Attention Q/K/V/O row-width correctness
+
+At `_write_compute_attn` entry, the captured column indices match
+the `Attn` node's declared input / output widths:
+
+- `len(q_source_cols) == len(query_in)`
+- `len(k_source_cols) == len(key_in)`
+- `len(source_cols)   == len(value_in)`   (V)
+- `len(target_cols)   == node.d_output`   (O)
+
+**Enforced in**
+`torchwright/compiler/forward/weight_writer.py:_write_compute_attn`.
+
+**What a fire means.** The scheduler captured the wrong columns
+for this attention op.  Most likely a `Concatenate`-resolution
+bug dropped or duplicated a leaf.  The attention head's Q/K/V
+rows would otherwise be scattered to the wrong positions —
+silent value corruption.
+
+## I4 — Column liveness
+
+A node's residual columns stay allocated until every effective
+consumer (transparent through `Concatenate`) has been computed.
+Two enforcement points:
+
+- **Schedule-time (always on):** every source-column capture in
+  `LayerScheduler` — `compute_linear`, `compute_attn` Q/K/V,
+  `compute_add` a0/a1, `add_into` dead/live addends,
+  `compute_relu` L1 input, `compute_standalone_relu` input —
+  first calls `LayerScheduler._require_live(node, rmap, op_label)`
+  which walks through `Concatenate` leaves.
+- **End-of-layer (gated behind `TW_COMPILER_VERIFY=1`):**
+  `compile._verify_end_of_layer_liveness` walks every computed
+  non-`Concatenate` node after `write_mlp_sublayer`; if any has
+  uncomputed effective consumers and is no longer allocated, it
+  raises.
+
+**Enforced in**
+`torchwright/compiler/forward/scheduler.py:_require_live` and
+`torchwright/compiler/forward/compile.py:_verify_end_of_layer_liveness`.
+
+**What a fire means.** Something freed a node's columns before
+all its consumers ran.  Without the assertion the symptom would
+be a `KeyError` deep inside `get_indices` with no op context, or
+(worse) silently reading stale residual values from the reclaimed
+columns.  Always-on for schedule-time because every read needs a
+live source; gated for end-of-layer because the walk is
+`O(|nodes| · fanout)`.
