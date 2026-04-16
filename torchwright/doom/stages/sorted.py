@@ -45,6 +45,7 @@ from torchwright.ops.arithmetic_ops import (
     add_scaled_nodes,
     clamp,
     compare,
+    low_rank_2d,
     max as max_node,
     min as min_node,
     multiply_2d,
@@ -502,45 +503,37 @@ def _endpoint_to_column(
 ) -> Node:
     """Convert ``(cross, dot)`` to a signed screen column.
 
-    Front case uses a fused ``piecewise_linear_2d(cross, |dot|)`` lookup
-    that replaces the prior ``reciprocal → multiply_2d →
-    piecewise_linear(atan)`` chain.  The behind case (``dot < 0``) is a
-    single select on ``sign(dot)`` afterwards, reflecting the column
-    across screen centre just like the prior code did — keeping it out
-    of the piecewise avoids the steep atan discontinuity at ``dot = 0``
-    that otherwise ruins the least-squares fit of the fused table.
+    Front case uses ``low_rank_2d`` to approximate ``atan(cross/|dot|)``
+    as a rank-3 SVD-truncated separable sum, then applies the
+    ``·col_scale + W/2`` affine as a free Linear.  The behind case
+    (``dot < 0``) is a single select on ``sign(dot)`` afterwards,
+    reflecting the column across screen centre.
 
-    The fused front lookup is clamped inside the fn so the
-    least-squares sees a bounded target function.  The grid is tight
-    on the active region only; for (cross, |dot|) pairs outside the
-    grid the piecewise holds edge values, which already sit at the
-    clamp limits — no hyperplane budget spent on trivial constants.
+    **Why low_rank_2d, not piecewise_linear_2d:** the latter's pinv
+    min-norm solution oscillates in cell interiors on the non-uniform
+    ``_COL_FOLD_BP_DOT_ABS`` grid — a single wall endpoint landing
+    mid-cell produced ~4-col drift (see TODO.md).  ``low_rank_2d`` is
+    the SVD-optimal rank-K fit with a deterministic worst-cell error
+    bound of ``σ_{K+1}``.
 
-    Motivation: the old chain compounded three discretisations; its
-    ``multiply_2d`` at ``step=0.5`` drove ~0.06 absolute error in
-    ``tan``, which atan's ~40 col/tan-unit slope near zero amplified
-    into ~1-col drift at oblique angles.  One well-conditioned 2D
-    table avoids the cascade.
+    The fn is the raw ``atan`` (no scale, no clamp) because absorbing
+    ``col_scale`` inflates the SVD spectrum and clamping at the grid
+    corners inflates the effective rank.  Scale + bias are applied
+    outside by a free Linear; saturation is handled by the outer
+    ``clamp(col_final, col_lo, col_hi)`` below.
+
+    **Precision:** rank-3 on this grid gives max error ≤ 0.0018 rad
+    ≈ 0.28 col at ``col_scale ≈ 150``, below the ~0.5-col render
+    tolerance.
     """
     col_lo, col_hi = -2.0, float(W + 2)
     fov_rad = float(fov) * math.pi / 128.0
     col_scale = float(W) / fov_rad
     half_W = float(W) / 2.0
 
-    def _col_front_of(cr: float, dt_abs: float) -> float:
-        # Clamp inside the fn so the least-squares sees a bounded
-        # target — the alternative (unclamped atan, final clamp after
-        # the select) drifts further from the clamped boundary because
-        # the piecewise fit tries to track values that go well past the
-        # screen edges.
-        col = math.atan(cr / dt_abs) * col_scale + half_W
-        return builtins.max(col_lo, builtins.min(col_hi, col))
+    def _atan_of(cr: float, dt_abs: float) -> float:
+        return math.atan(cr / dt_abs)
 
-    # Clamp the piecewise's inputs to the grid bounds — piecewise_linear_2d's
-    # extrapolation outside the grid is ill-behaved, but any
-    # ``(cross, |dot|)`` that would have projected to a column outside
-    # ``[-2, W+2]`` already maps to a clamped boundary value inside the
-    # grid, so clamping the inputs is lossless.
     bp_cross_lo = _COL_FOLD_BP_CROSS[0]
     bp_cross_hi = _COL_FOLD_BP_CROSS[-1]
     bp_dot_lo = _COL_FOLD_BP_DOT_ABS[0]
@@ -551,11 +544,16 @@ def _endpoint_to_column(
     cross_clamped = clamp(cross, bp_cross_lo, bp_cross_hi)
     dot_pos = clamp(abs_dot, bp_dot_lo, bp_dot_hi)
 
-    col_front = piecewise_linear_2d(
+    atan_val = low_rank_2d(
         cross_clamped, dot_pos,
         _COL_FOLD_BP_CROSS, _COL_FOLD_BP_DOT_ABS,
-        _col_front_of,
-        name=f"col_front_{suffix}",
+        _atan_of,
+        rank=3,
+        name=f"atan_front_{suffix}",
+    )
+    col_front = Linear(
+        atan_val, torch.tensor([[col_scale]]),
+        torch.tensor([half_W]), name=f"col_front_{suffix}",
     )
 
     # Behind-flip: ``col_back = W − col_front`` (reflection across
