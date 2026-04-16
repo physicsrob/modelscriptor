@@ -142,7 +142,6 @@ _KNOWN_RESIDUALS = [
 ]
 
 
-@pytest.mark.xfail(reason="piecewise_linear_2d pinv drift at clamp plateau boundary")
 @pytest.mark.parametrize("name,cross,dot", _KNOWN_RESIDUALS)
 def test_endpoint_projection_known_residuals(endpoint_module, name, cross, dot):
     rows = [
