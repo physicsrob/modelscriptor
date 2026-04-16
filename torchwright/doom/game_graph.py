@@ -495,7 +495,8 @@ def _assemble_output(
         out_col = select(token_flags["is_render"], render_out.active_col, zero_1)
         out_start = select(token_flags["is_render"], render_out.active_start, zero_1)
         out_length = select(token_flags["is_render"], render_out.chunk_length, zero_1)
-        out_done = select(token_flags["is_render"], render_out.done_flag, zero_1)
+        neg_1 = create_literal_value(torch.tensor([-1.0]), name="done_default")
+        out_done = select(token_flags["is_render"], render_out.done_flag, neg_1)
 
     overlaid = {
         "token_type": out_token_type,
