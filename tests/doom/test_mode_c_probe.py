@@ -822,23 +822,26 @@ def test_find_sort_argmin_layer_and_inspect_V(graph_and_module):
 def test_inspect_sorted_argmin_attention_weights_at_sort2(graph_and_module):
     """Directly inspect the argmin layer's attention weights at sort[0].
 
-    With the validity-first SORTED attention (``attend_argmin_valid_
-    unmasked``), at angle-192 only south is renderable (east/west are
-    parallel to the viewing ray, north is behind the player).  The hot-
-    case head 0 should therefore concentrate ≈100 % of its mass on the
-    south wall's position, and the logit gap between valid (south) and
-    invalid (east/north/west) should be ≈
-    ``2 · _QUERY_GAIN · _VALIDITY_KEY_COEFF`` = 16000 (the gained
-    multiplicative validity encoding used by
-    ``attend_argmin_valid_unmasked`` to tolerate mask-bit accumulation
-    during the end-of-sort fallback).  No blending is possible by
-    construction.
+    With Phase E's above-threshold SORTED attention
+    (``attend_argmin_above_integer``), at angle-192 only south is
+    renderable (east/west are parallel to the viewing ray, north is
+    behind the player).  Non-renderable walls have all-zero
+    ``indicators_above``, so the above-logit contribution is zero and
+    they can't outscore south.  The softmax should concentrate
+    ≈100 % of its mass on the south wall's position.
 
-    After sort[0] picks south, sort[1..3] degenerate into a re-pick of
-    south (the masked-valid fallback — wasteful but safe, documented in
-    ``attend_argmin_valid_unmasked``'s docstring).  This test still
-    samples sort[0] because that's the only position where the "is the
-    softmax concentrating?" question is non-vacuous.
+    The logit gap between the above-threshold winner (south) and any
+    invalid wall is ≈ ``_ABOVE_BONUS`` (= 1000).  That's the direct
+    additive bonus in the query matrix; unlike the old
+    ``_VALIDITY_KEY_COEFF`` path, it doesn't route through the
+    slow-cosine gain.
+
+    After sort[0] picks south, sort[1..N-1] exhaust the above-threshold
+    search (no renderable wall has rank > 0), so those picks return
+    softmax-averaged garbage per the primitive's contract — but
+    ``sort_done`` catches the exhaustion.  This test samples sort[0]
+    because that's where the "is the softmax concentrating?" question
+    is non-vacuous.
     """
     graph_io, module, subset, config = graph_and_module
     net = module._net
@@ -991,15 +994,14 @@ def test_inspect_sorted_argmin_attention_weights_at_sort2(graph_and_module):
         print(f"    sort[{k - sort_start}] (pos {k}):  "
               f"logit={l[k].item():+10.4f}  weight={w[k].item():.6f}")
 
-    # --- Validity gap assertions ---
-    # ``attend_argmin_valid_unmasked`` keeps validity in the gained
-    # column, so flipping validity from +1 to −1 shifts the logit by
-    # ``2 · _QUERY_GAIN · _VALIDITY_KEY_COEFF``.  Valid south should
-    # beat invalid walls by ≈ that gap; softmax mass on south should
-    # therefore be indistinguishable from 1.0.
-    from torchwright.ops.attention_ops import (
-        _QUERY_GAIN, _VALIDITY_KEY_COEFF,
-    )
+    # --- Above-threshold gap assertions ---
+    # ``attend_argmin_above_integer`` applies ``_ABOVE_BONUS`` directly
+    # to the logit for positions where ``indicators_above[threshold]``
+    # is 1.  Non-renderable walls have all-zero indicators, so the
+    # bonus-logit gap between valid and invalid is exactly
+    # ``_ABOVE_BONUS`` at reference eval, minus compile-side precision
+    # loss.
+    from torchwright.ops.attention_ops import _ABOVE_BONUS
     south_pos = wall_positions[3]
     l_south = l[south_pos].item()
     w_south = w[south_pos].item()
@@ -1008,13 +1010,13 @@ def test_inspect_sorted_argmin_attention_weights_at_sort2(graph_and_module):
         for i, lbl in enumerate(["east", "north", "west"])
     ]
     min_gap = min(l_south - li for _, li in invalid_logits)
-    expected_gap = 2.0 * _QUERY_GAIN * _VALIDITY_KEY_COEFF
-    print(f"\nValidity-gap check:")
-    print(f"  logit(south, valid) = {l_south:.2f}")
+    expected_gap = _ABOVE_BONUS
+    print(f"\nAbove-threshold gap check:")
+    print(f"  logit(south, above) = {l_south:.2f}")
     for lbl, li in invalid_logits:
-        print(f"  logit({lbl}, invalid) = {li:.2f}  gap = {l_south - li:.2f}")
-    print(f"  min valid/invalid gap = {min_gap:.2f}  "
-          f"(design: 2·_QUERY_GAIN·_VALIDITY_KEY_COEFF = {expected_gap:.0f})")
+        print(f"  logit({lbl}, below) = {li:.2f}  gap = {l_south - li:.2f}")
+    print(f"  min above/below gap = {min_gap:.2f}  "
+          f"(design: _ABOVE_BONUS = {expected_gap:.0f})")
     print(f"  weight(south) = {w_south:.6f}")
 
     assert w_south > 0.999, (
@@ -1023,33 +1025,14 @@ def test_inspect_sorted_argmin_attention_weights_at_sort2(graph_and_module):
     )
     # The logit gap should be within ~10 % of the design separation.
     assert min_gap > 0.5 * expected_gap, (
-        f"valid/invalid logit gap {min_gap:.0f} is less than half of the "
+        f"above/below logit gap {min_gap:.0f} is less than half of the "
         f"design separation {expected_gap:.0f} — compile-side precision "
-        f"loss has eroded the validity signal."
+        f"loss has eroded the above-threshold signal."
     )
 
-    # --- Sort[2] is a degenerate re-pick of south ---
-    # After sort[0] picks south, the masked-valid fallback (documented
-    # in the primitive) re-picks south at every subsequent step.  Walk
-    # through sort[1..3] and confirm the output is consistently south.
-    south_ax, south_ay, south_bx, south_by = -5.0, -5.0, 5.0, -5.0
-    print("\nSort[1..3] degenerate re-pick check:")
-    out_specs_local = {n: (s, w) for n, s, w in module._output_specs}
-    sf_out_s, _ = out_specs_local["sort_feedback"]
-    for k in range(1, 4):
-        with torch.no_grad():
-            out, past = module.step(prev, past, past_len=step)
-        step += 1
-        raw_sf = out[0, sf_out_s:sf_out_s + 8 + 5].detach().cpu().numpy()
-        ax, ay, bx, by, tex = raw_sf[8:13]
-        print(f"  sort[{k}]: ax={ax:+.3f}  ay={ay:+.3f}  bx={bx:+.3f}  "
-              f"by={by:+.3f}  tex={tex:.2f}")
-        for name, got, exp in [
-            ("ax", ax, south_ax), ("ay", ay, south_ay),
-            ("bx", bx, south_bx), ("by", by, south_by),
-        ]:
-            assert abs(got - exp) < 0.01, (
-                f"sort[{k}].{name}={got:+.4f} should re-pick south's "
-                f"{name}={exp:+.4f} under the masked-valid fallback"
-            )
-        prev = _out_to_input(out)
+    # Exhausted-step behavior (sort[1..3]) isn't pinned here — the
+    # above-threshold primitive's garbage regime interacts with
+    # subsequent steps' prev_bsp_rank in ways that depend on the
+    # softmax-averaged rank.  End-to-end correctness is covered by
+    # the integration test (test_game_graph.py); this test's job is
+    # to verify sort[0] concentrates cleanly.

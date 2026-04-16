@@ -28,7 +28,7 @@ from torchwright.doom.graph_utils import extract_from
 _MAX_WALLS = 4
 # Mirror of game_graph.py's d_sort_out formula.  Hardcoded here so a
 # change to the formula on one side but not the other trips this test.
-_D_SORT_OUT = 8 + 5 + 3 + 2 * _MAX_WALLS
+_D_SORT_OUT = 8 + 5 + 3 + _MAX_WALLS
 
 
 @pytest.fixture(scope="module")
@@ -46,7 +46,6 @@ def feedback_roundtrip_module():
     vis_lo = create_input("vis_lo", 1)
     vis_hi = create_input("vis_hi", 1)
     sel_onehot = create_input("sel_onehot", _MAX_WALLS)
-    updated_mask = create_input("updated_mask", _MAX_WALLS)
 
     # An 8-wide E8_SORTED_WALL constant — placeholder values, only width
     # matters for layout.  Matches the 8-wide token-type vector prepended
@@ -63,7 +62,6 @@ def feedback_roundtrip_module():
         vis_lo,          # 1
         vis_hi,          # 1
         sel_onehot,      # max_walls
-        updated_mask,    # max_walls
     ])
     assert len(sort_feedback_out) == _D_SORT_OUT, (
         f"sort_feedback_out width {len(sort_feedback_out)} != "
@@ -75,12 +73,8 @@ def feedback_roundtrip_module():
     extracted_prev_bsp_rank = extract_from(
         sort_feedback_out, _D_SORT_OUT, 8 + 5, 1, "extracted_prev_bsp_rank",
     )
-    extracted_prev_mask = extract_from(
-        sort_feedback_out, _D_SORT_OUT, 8 + 5 + 3 + _MAX_WALLS, _MAX_WALLS,
-        "extracted_prev_mask",
-    )
 
-    output = Concatenate([extracted_prev_bsp_rank, extracted_prev_mask])
+    output = extracted_prev_bsp_rank
     return compile_headless(
         output, pos, d=512, d_head=16, max_layers=40, verbose=False,
     )
@@ -98,18 +92,17 @@ def _pack(module, rows: list[dict]) -> torch.Tensor:
     return t
 
 
-@pytest.mark.parametrize("sel_bsp_rank,updated_mask,label", [
-    (-1.0, [0.0, 0.0, 0.0, 0.0], "eos_seed_value"),
-    (0.0,  [1.0, 0.0, 0.0, 0.0], "first_pick"),
-    (3.0,  [1.0, 1.0, 1.0, 1.0], "last_pick"),
-    (2.5,  [1.0, 1.0, 0.0, 0.0], "non_integer_guard"),
+@pytest.mark.parametrize("sel_bsp_rank,label", [
+    (-1.0, "eos_seed_value"),
+    (0.0,  "first_pick"),
+    (3.0,  "last_pick"),
+    (2.5,  "non_integer_guard"),
 ])
 def test_sort_feedback_round_trip(
-    feedback_roundtrip_module, sel_bsp_rank, updated_mask, label,
+    feedback_roundtrip_module, sel_bsp_rank, label,
 ):
     """Writing ``sel_bsp_rank`` at offset 13 must round-trip through
-    the Concatenate and out of extract_from unchanged.  Same for
-    ``updated_mask`` at offset ``8+5+3+max_walls``.
+    the Concatenate and out of extract_from unchanged.
     """
     row = {
         "sel_wall_data": [0.1, 0.2, 0.3, 0.4, 0.5],
@@ -117,7 +110,6 @@ def test_sort_feedback_round_trip(
         "vis_lo": 7.0,
         "vis_hi": 11.0,
         "sel_onehot": [0.5, 0.5, 0.5, 0.5],
-        "updated_mask": updated_mask,
     }
     # compile_headless requires at least 2 positions.
     pad = {k: ([0.0] * len(v) if isinstance(v, list) else 0.0) for k, v in row.items()}
@@ -126,17 +118,10 @@ def test_sort_feedback_round_trip(
         out = feedback_roundtrip_module(inputs)
 
     got_bsp_rank = out[0, 0].item()
-    got_mask = out[0, 1:1 + _MAX_WALLS].tolist()
-
     assert abs(got_bsp_rank - sel_bsp_rank) < 1e-3, (
         f"{label}: prev_bsp_rank round-trip mismatch; "
         f"wrote {sel_bsp_rank}, read {got_bsp_rank}"
     )
-    for i, (got, expected) in enumerate(zip(got_mask, updated_mask)):
-        assert abs(got - expected) < 1e-3, (
-            f"{label}: prev_mask[{i}] round-trip mismatch; "
-            f"wrote {expected}, read {got}"
-        )
 
 
 def test_eos_seed_layout_preserves_prev_bsp_rank_slot():
@@ -160,8 +145,8 @@ def test_eos_seed_layout_preserves_prev_bsp_rank_slot():
         create_literal_value(torch.zeros(2), name="pad1"),            # 2
         create_literal_value(torch.tensor([-1.0]), name="prev_bsp"),  # 1
         create_literal_value(
-            torch.zeros(2 + 2 * _MAX_WALLS), name="pad2",
-        ),                                                            # 2 + 2*max_walls
+            torch.zeros(2 + _MAX_WALLS), name="pad2",
+        ),                                                            # 2 + max_walls
     ])
     assert len(eos_sort_seed) == _D_SORT_OUT, (
         f"eos_sort_seed width {len(eos_sort_seed)} != _D_SORT_OUT "

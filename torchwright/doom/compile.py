@@ -91,8 +91,10 @@ def compute_min_d_head(max_walls: int, tex_w: int) -> int:
     """Minimum d_head required by the game graph's attention heads.
 
     Three attention patterns drive the requirement:
-    - Sort (attend_argmin_unmasked): 1 + max_walls + (13 + max_walls)
-    - Render (attend_argmin_unmasked): 1 + max_walls + (8 + max_walls)
+    - Sort (attend_argmin_above_integer):
+          1 + n_thresholds + d_value = 1 + max_walls + (13 + max_walls)
+    - Render (attend_argmin_unmasked):
+          1 + max_walls + (8 + max_walls)
     - TEX_COL (attend_argmax_dot): 8 + tex_w + 1
     """
     d_sort_val = 13 + max_walls
@@ -222,7 +224,7 @@ def _build_row(compiled, max_walls, **kwargs):
         "player_x": torch.zeros(1, device=device),
         "player_y": torch.zeros(1, device=device),
         "render_feedback": torch.zeros(d_render_fb, device=device),
-        "sort_feedback": torch.zeros(8 + 5 + 3 + 2 * max_walls, device=device),
+        "sort_feedback": torch.zeros(8 + 5 + 3 + max_walls_meta, device=device),
         "tex_col_input": torch.zeros(1, device=device),
         "tex_pixels": torch.zeros(tex_h * 3, device=device),
         "texture_id_e8": torch.zeros(8, device=device),
@@ -322,7 +324,7 @@ def step_frame(
 
     # Compute layout from compiled module
     d_input = max(s + w for _, s, w in module._input_specs)
-    d_sort_out = 8 + 5 + 3 + 2 * max_walls
+    d_sort_out = 8 + 5 + 3 + max_walls
     d_render_fb = 2 * max_walls + 11
     device = module._net.device
 

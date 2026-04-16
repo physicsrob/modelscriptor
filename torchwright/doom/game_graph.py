@@ -219,10 +219,8 @@ def build_game_graph(
     sorted_out = build_sorted(
         SortedInputs(
             sort_score=wall_out.sort_score,
-            is_renderable=wall_out.is_renderable,
-            position_onehot=wall_out.position_onehot,
             sort_value=wall_out.sort_value,
-            prev_mask=fb_fields["prev_mask"],
+            indicators_above=wall_out.indicators_above,
             prev_bsp_rank=fb_fields["prev_bsp_rank"],
             is_sorted=tf["is_sorted"],
             is_wall=tf["is_wall"],
@@ -333,7 +331,7 @@ def _create_inputs(
     inputs["wall_bsp_coeffs"] = create_input("wall_bsp_coeffs", max_bsp_nodes)
     inputs["wall_bsp_const"] = create_input("wall_bsp_const", 1)
 
-    d_sort_out = 8 + 5 + 3 + 2 * max_walls
+    d_sort_out = 8 + 5 + 3 + max_walls
     sort_feedback = create_input("sort_feedback", d_sort_out)
     inputs["sort_feedback"] = sort_feedback
 
@@ -342,12 +340,14 @@ def _create_inputs(
     inputs["render_feedback"] = render_feedback
 
     # Feedback field layout (must stay in sync with _assemble_output).
+    #   [0..8)       E8_SORTED_WALL token type
+    #   [8..13)      sel_wall_data (ax, ay, bx, by, tex_id)
+    #   [13..14)     sel_bsp_rank (== prev_bsp_rank for next step)
+    #   [14..16)     vis_lo, vis_hi
+    #   [16..16+max_walls)  sel_onehot (wall-index one-hot for THINKING)
     fields: Dict[str, Node] = {
         "prev_bsp_rank": extract_from(
             sort_feedback, d_sort_out, 8 + 5, 1, "prev_bsp_rank",
-        ),
-        "prev_mask": extract_from(
-            sort_feedback, d_sort_out, 8 + 5 + 3 + max_walls, max_walls, "prev_mask",
         ),
         "render_mask": extract_from(
             render_feedback, d_render_fb, 0, max_walls, "render_mask",
@@ -412,7 +412,7 @@ def _assemble_output(
     Overflow outputs bitblitted by the host:
         pixels, col, start, length, done
     """
-    d_sort_out = 8 + 5 + 3 + 2 * max_walls
+    d_sort_out = 8 + 5 + 3 + max_walls
     d_render_fb = 2 * max_walls + 11
 
     with annotate("output"):
@@ -450,7 +450,6 @@ def _assemble_output(
             sorted_out.vis_lo,
             sorted_out.vis_hi,
             sorted_out.sel_onehot,
-            sorted_out.updated_mask,
         ])
         assert len(sort_feedback_out) == d_sort_out, (
             f"sort_feedback_out width {len(sort_feedback_out)} != d_sort_out "
@@ -461,7 +460,8 @@ def _assemble_output(
         # EOS seeds the sort loop with a SORTED_WALL-type vector plus
         # resolved player pose.  The sel_bsp_rank slot (offset 13) is
         # initialized to -1 so the first SORTED step sees
-        # prev_bsp_rank=-1 < any valid BSP rank → sort_done=-1 (active).
+        # prev_bsp_rank=-1 → threshold slot 0 → picks any renderable
+        # wall (all indicators_above[0] are 1).
         eos_sort_seed = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="eos_sort_seed"),
             eos_out.resolved_x, eos_out.resolved_y, input_out.new_angle,
@@ -470,7 +470,7 @@ def _assemble_output(
                 torch.tensor([-1.0]), name="eos_prev_bsp_rank",
             ),
             create_literal_value(
-                torch.zeros(2 + 2 * max_walls), name="eos_sort_pad2",
+                torch.zeros(2 + max_walls), name="eos_sort_pad2",
             ),
         ])
         assert len(eos_sort_seed) == d_sort_out, (

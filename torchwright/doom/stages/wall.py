@@ -33,7 +33,7 @@ from dataclasses import dataclass
 
 import torch
 
-from torchwright.graph import Linear, Node, annotate
+from torchwright.graph import Concatenate, Linear, Node, annotate
 from torchwright.graph.asserts import assert_integer, assert_onehot
 from torchwright.ops.arithmetic_ops import (
     abs,
@@ -119,6 +119,9 @@ class WallOutputs:
     sort_value: Node        # packed payload, fed as ``value`` to SORTED's argmin
     position_onehot: Node   # per-wall one-hot + 0.5 bias, fed to SORTED argmin
     is_renderable: Node     # ±1 validity signal fed to SORTED's argmin
+    indicators_above: Node  # max_walls-wide thermometer I(bsp_rank >= c AND
+                            # is_renderable) — fed as key_in to SORTED's
+                            # attend_argmin_above_integer
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +166,11 @@ def build_wall(
     with annotate("wall/onehot"):
         position_onehot = _compute_position_onehot(inputs.wall_index, max_walls)
 
+    with annotate("wall/indicators_above"):
+        indicators_above = _compute_indicators_above(
+            bsp_rank, is_renderable, max_walls,
+        )
+
     sort_value = pack_wall_payload(
         inputs.wall_ax, inputs.wall_ay, inputs.wall_bx, inputs.wall_by,
         inputs.wall_tex_id,
@@ -178,6 +186,7 @@ def build_wall(
         sort_value=sort_value,
         position_onehot=position_onehot,
         is_renderable=is_renderable,
+        indicators_above=indicators_above,
     )
 
 
@@ -426,6 +435,41 @@ def _compute_position_onehot(wall_index: Node, max_walls: int) -> Node:
     onehot_bool = in_range(wall_index, wall_index_p1, max_walls)
     ones_oh = create_literal_value(torch.ones(max_walls), name="ones_oh")
     return assert_onehot(add_scaled_nodes(0.5, onehot_bool, 0.5, ones_oh))
+
+
+def _compute_indicators_above(
+    bsp_rank: Node, is_renderable: Node, max_walls: int,
+) -> Node:
+    """Width-``max_walls`` thermometer encoding of the BSP rank.
+
+    Slot ``c`` is ``1.0`` iff the wall is renderable and its
+    ``bsp_rank`` is strictly greater than ``c - 1`` (equivalently,
+    ``bsp_rank >= c``).  Non-renderable walls get all-zero indicators
+    so they never win SORTED's ``attend_argmin_above_integer`` search.
+
+    Used by SORTED as ``key_in`` for the attention: the query-side
+    ``threshold_onehot[c] = I(prev_bsp_rank + 1 == c)`` selects which
+    threshold applies, and the bilinear rendezvous evaluates to
+    ``I(bsp_rank > prev_bsp_rank AND is_renderable)`` per key position.
+
+    Mirrors ``examples.sort_digits_v1._build_indicators_above``.
+    """
+    zero_lit = create_literal_value(
+        torch.tensor([0.0]), name="indicators_zero",
+    )
+    cols = []
+    for c in range(max_walls):
+        # Direct {0, 1} levels on the compare avoids an intermediate
+        # ±1 → {0, 1} select.  ``bsp_rank > c - 1`` is equivalent to
+        # ``bsp_rank >= c`` for integer ranks; the 0.5 offset places
+        # the ramp cleanly between adjacent integers.  Non-renderable
+        # walls have the step zeroed out by the outer select.
+        step_01 = compare(
+            bsp_rank, (c - 1) + 0.5, true_level=1.0, false_level=0.0,
+        )
+        col = select(is_renderable, step_01, zero_lit)
+        cols.append(col)
+    return Concatenate(cols)
 
 
 # ---------------------------------------------------------------------------
