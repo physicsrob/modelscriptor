@@ -31,7 +31,6 @@ _HEAVY_FILES = [
     "tests/doom/test_bsp_rank_integration.py",
     "tests/doom/test_angle_192_column_drift.py",
     "tests/doom/test_tex_col.py",
-    "tests/doom/test_render_graph_precision.py",
     "tests/debug/test_probe_phase_e_trace.py",
 ]
 
@@ -40,6 +39,7 @@ _MEDIUM_FILES = [
     "tests/debug/test_probe.py",
     "tests/doom/test_parametric_render.py",
     "tests/doom/test_parametric_intersection.py",
+    "tests/doom/test_render_graph_precision.py",
 ]
 
 SHARDS = [
