@@ -2,130 +2,167 @@
 
 **Test:** `tests/doom/test_game_graph.py::TestGameGraph::test_renders_off_center_oblique[3.0-2.0-20]`
 **Xfail landed:** commit `c2d5a7a` (Phase E)
-**Investigation:** commit TBD (this doc)
+**Xfail removed:** commit `8367413`
+**Root-cause fix:** commit `2e6f5da` (tightened `piecewise_linear_2d` output range)
 
 ## Status
 
-- **Proximate cause:** Precisely characterized below.
-- **Root cause:** Partially characterized. The specific residual-column aliasing (or equivalent structural fault) has not been named — doing so requires compiler-internals inspection beyond what the Phase-6 investigation deliverables cover.
-- **Fix:** Not landed. The xfail remains, with an honest reason (updated from "precision loss near the edge of FOV") and a pointer to this doc.
+**Resolved.** The original xfail hypothesis — residual-column aliasing
+in the compiled SORTED attention layer — was wrong. The actual cause
+was fp32 precision compounding driven by an overly-loose declared
+value range on `piecewise_linear_2d` outputs, which in turn propagated
+through the approximate-path `cond_gate`/`select` formula and amplified
+small `compare`-op noise by a factor of 1000× or more. Tightening
+`piecewise_linear_2d`'s declared output to the function's exact grid
+min/max bound collapsed the amplification chain and the test passes
+cleanly.
 
-## What happens at scene (px=3, py=2, angle=20)
+This document is preserved for its history of the diagnostic dead-end
+and the lessons it surfaced about noise measurement and value-type
+discipline.
 
-At sort[0] (the first SORTED token after EOS), the SORTED stage's attention returns a value whose `sel_bsp_rank` residual column reads **-1171.875** instead of a clean integer in `[0, max_walls-1]`. `sort_done` correctly detects the nonsense (`-1 - -1171.875 = +1170.875 > -0.5`), fires, and the SORTED stage's sentinel replaces the output with 99. Downstream THINKING then picks the 99-marked cached position (or blends), producing garbage wall data that RENDER draws incorrectly.
+## What happened at scene (px=3, py=2, angle=20)
 
-All observations below use the diagnostic harness from plan 1; the investigation script lives at `scripts/investigate_phase_e.py`.
+At sort[0], the SORTED stage's `attend_argmin_above_integer` softmax
+concentrated on SORTED[0] itself (weight 1.0, logit +800) rather than
+any WALL position (logits +555..+637 instead of design +1000). The
+raw `sel_bsp_rank` residual carried -1171.875 instead of a clean
+integer in `[0, max_walls-1]`. `sort_done` correctly detected the
+nonsense and replaced the bogus value with a 99-sentinel, but
+downstream THINKING/RENDER produced incorrect pixels from the 99-marked
+cached position.
 
-### Attention softmax at sort[0]
+Only this specific scene (and a small neighborhood around it) triggered
+the failure; other off-center / oblique scenes worked correctly.
 
-The SORTED stage's `attend_argmin_above_integer` concentrates with weight `1.000000` on **position 86 — SORTED[0] itself**, not on any of the four WALL positions. Per-head-representative logits at the query row:
+## How the original hypothesis went wrong
 
-| Position | Label               | Logit      | Weight    |
-|---------:|---------------------|-----------:|----------:|
-| 86       | SORTED[0] (self)    | +800.0000  | 1.000000  |
-| 85       | EOS                 | +748.5167  | 0.000000  |
-| 84       | WALL[3] (south)     | +636.8276  | 0.000000  |
-| 81       | WALL[0] (east)      | +613.7040  | 0.000000  |
-| 82       | WALL[1] (west)      | +555.9678  | 0.000000  |
-| 83       | WALL[2] (north)     | +554.3101  | 0.000000  |
+The xfail's original reason claimed the bug was "column aliasing in
+the compiled SORTED attention layer — specific pair not yet
+identified." The reasoning path was:
 
-### What the primitive math says these should be
+1. Observation: non-WALL residual columns carry ~100-magnitude values
+   where the graph says they should be exactly zero.
+2. Magnitude argument: the per-op noise docs show `compare_near_thresh_05`
+   with max abs error 0.005 and `piecewise_linear_2d doom_diff_trig`
+   with max abs error 7.78. Neither can produce a 100-unit error alone.
+3. Inference: the only remaining explanation is residual-column
+   aliasing — some other live node's value landed in `sort_value`'s
+   bsp_rank slot.
+4. Claim: "most naturally explained by residual-column aliasing."
 
-`attend_argmin_above_integer`'s logit formula at position `i` under the threshold-0 query is:
+Three flaws in this chain:
 
-```
-logit_i = _QUERY_GAIN · (−score_i + tiebreak · pos_scalar_i)
-       + _ABOVE_BONUS · indicators_above_i[0]
-```
+- **Step 2 compared the observed error to per-op bounds in isolation.**
+  A chain of N piecewise ops compounds fp32 rounding-order drift and
+  accumulation error. More importantly, the approximate-path
+  `cond_gate`/`select` formula `M·cond + inp - M` has a built-in
+  Lipschitz constant `M` w.r.t. its `cond` input. When `M` is in the
+  millions (because a downstream `multiply_2d` declared its output
+  range to be millions wide), even the tiny `compare`-op noise of
+  0.005 becomes 5000-unit error at the gate output.
+- **Step 3 named the wrong mechanism.** I1 (allocator
+  self-consistency) already forbids two simultaneously-live nodes from
+  sharing a residual column; it's asserted on every mutation. "Column
+  aliasing" was the one hypothesis that was mechanically ruled out by
+  the existing invariants. The author either didn't know I1 covered
+  exactly this case, or did and didn't cross-check against it.
+- **Step 4 stated confidence without evidence.** No allocator-state
+  dump existed; no compiled-vs-oracle per-node walk had been run; the
+  investigation tooling available at the time (`scripts/investigate_phase_e.py`)
+  only probed residual *values*, not ownership or per-node divergence.
 
-With `_QUERY_GAIN = 8`, `_ABOVE_BONUS = 1000`, and the graph-level intended values:
+## What actually happened
 
-* **Renderable WALL at rank 0:** `score=0`, `indicators_above[0]=1` → `logit ≈ 0 + 1000 = +1000`.
-* **Non-WALL position (SORTED[0], EOS, BSP_NODE, TEX_COL):** `score=0` (zero `wall_bsp_coeffs`/`wall_bsp_const`), `indicators_above[0]=0` (gated by `is_renderable=false` at non-WALL) → `logit ≈ 0 + 0 = ~0`.
+Evidence from the follow-up investigation (commit `640d523` and the
+`scripts/dump_phase_e_allocator.py` runs):
 
-### What the compiled module actually produces
+1. **I1 holds.** 212 live columns across 47 nodes at the SORTED
+   attention's read layer, all pairwise-disjoint. Allocator bookkeeping
+   is sound.
+2. **No aliasing at key_in columns.** `pos_encoding`, `score`, and
+   `indicators_above`'s leaves own exclusively the columns they're
+   supposed to own. The aliasing hypothesis is directly refuted.
+3. **Weights are wired correctly.** Moving the compiled module to
+   CPU + fp64 collapses the entire compiled-vs-oracle error to ~3e-6.
+   The graph's semantic math and the compiler's weight-matrix
+   construction agree to double-precision accuracy.
+4. **In fp32 on GPU the error is ~16,000 at select_linear2 outputs.**
+   First divergence at `c_day_ex_linear2` is a trivial 0.0007 (within
+   per-op bounds). Through the chain `piecewise_linear_2d` →
+   `cond_gate` → `multiply_const` → `select_linear2`, the error balloons
+   to four-digit magnitude.
+5. **The amplification lever is the approximate gate's `M` constant.**
+   After per-call `M` was introduced (commit `f0e6f86`), `side_P_vec`
+   collapsed to clean values (M≈1 for one-hot gating, so M·ε_cond ≈
+   0.005). But the `select` chains downstream of `multiply_2d` outputs
+   had `M ≈ 8.6 million` — because `piecewise_linear_2d` never declared
+   a tight output range and the Linear's default `linear_output_range`
+   worst-case bound claimed ranges in the millions for functions whose
+   actual output is bounded by ~100.
+6. **Tightening `piecewise_linear_2d`'s declared range** (commit
+   `2e6f5da`) to the mathematically exact `[min over grid, max over
+   grid]` bound collapsed `max(M)` from 8.6M to 16.8K — a 513× drop —
+   and brought the worst `select_linear2` fp32 error from 16,223 to 57.
+   The Phase E test then passed on its own.
 
-The WALL-position logits are **≈ 400 below design** (+555 to +636 instead of +1000). SORTED[0]'s logit is **≈ 800 above design** (+800 instead of ~0).
+## Doctrine lessons this incident teaches
 
-For the primitive math to produce these, one of the following must hold at non-WALL positions:
+### Noise docs measure op behavior on clean inputs; the amplification story needs input-Lipschitz constants too.
 
-1. **`score ≈ -100`** at non-WALL positions. That would give `_QUERY_GAIN · 100 = +800` in column 0.
-2. **Or `indicators_above[0] ≈ 0.8`** at non-WALL positions. That would give `_ABOVE_BONUS · 0.8 = +800` in the indicator columns.
+`cond_gate`'s per-op noise-footer measurement (3e-5 abs, 4e-3 rel)
+was taken with `cond ∈ {-1, +1}` to machine precision. The op's
+*sensitivity to input noise* is governed by its Lipschitz constant
+w.r.t. `cond` (= `M`, which with the old `big_offset = 1000` was
+1000). Three orders of magnitude of amplification weren't
+documented anywhere because the measurement harness never fed a
+noisy `cond`. Any op that routes a signal via a "large offset
+cancellation" trick has this property, and its noise envelope
+should be stated as a *function of input noise*, not a single
+number.
 
-Either way, **something in the compiled residual stream at non-WALL positions carries a non-zero value in the score or indicator rows** — graph-level, both should be exactly zero.
+### Declared value ranges are load-bearing, not decorative.
 
-At WALL positions, the ≈ 400-unit deficit corresponds to either `indicators_above ≈ 0.6` (instead of 1) or a compensating `score ≈ +50`. Graph-level, both are wrong: `indicators_above[0] = I(bsp_rank ≥ 0 AND is_renderable)` should be exactly 1 for every renderable wall at threshold 0.
+`piecewise_linear_2d` never declared a tight output range because
+"nobody reads it downstream" was assumed. That assumption was false
+— every downstream `cond_gate`/`select` uses `max|declared_range|` as
+the `M` constant in its approximate formula. A 4-order-of-magnitude
+over-estimate on one op's declared range became a 4-order-of-magnitude
+amplification on every downstream approximate gate. The cheapest
+fix was a 5-line addition that declares the range the op's own
+docstring already promised.
 
-### Magnitude rules out ordinary noise
+### Rule out stated invariants before hypothesizing violations of them.
 
-The observed errors are 1–2 orders of magnitude outside any documented per-op noise budget (`docs/numerical_noise.md`):
+The original xfail hypothesized "residual-column aliasing" — which
+is precisely what I1 (allocator self-consistency) forbids, with an
+assertion on every allocator mutation. The one-minute check of "does
+I1 fire on this test?" would have immediately ruled out the
+hypothesis and pointed the investigator elsewhere. The CLAUDE.md
+entry for I1 has since been tightened (commit `640d523`) to state
+explicitly: "this is the invariant that forbids residual-column
+aliasing among simultaneously-live nodes; if I1 doesn't fire, the
+bug is not aliasing."
 
-* `compare_near_thresh_05` worst abs error ≤ 0.005 — not 0.4.
-* `piecewise_linear_2d doom_diff_trig` worst abs error 7.78 on a reference of -22.22 (~35% relative) — far below the 100-scale absolute errors we'd need to explain the SORTED[0] logit.
-* Per-op compose through the BSP-rank chain at non-WALL positions evaluates `0 + 0 + … + 0 = 0`; no precision op can turn a chain of exact zeros into ≈ -100.
+### Investigation tooling should probe structure, not just values.
 
-**Conclusion:** the error is not drift inside a single op. It's a structural contamination in the compiled residual stream at specific positions — most naturally explained by column aliasing where some other node's value lands in bsp_rank's columns at the attention read layer.
+`scripts/investigate_phase_e.py` was purpose-built for this scene but
+only surfaced residual values. Walking the allocator's per-layer
+column ownership, or running `probe_compiled` to get per-node
+compiled-vs-oracle divergence, would have located the actual failing
+node in minutes. `scripts/dump_phase_e_allocator.py` (landed in
+commit `640d523`) adds exactly that dimension, organised into six
+blocks: I1 sanity, key_in ownership, compiled-vs-oracle values at
+the read layer, `probe_compiled`'s first-divergent walk, CPU-fp64
+replay, and a per-approximate-gate M-audit with back-traced upstream
+sources.
 
-## Why the original xfail reason was wrong
+## Tooling introduced during the investigation
 
-Commit `c2d5a7a`'s xfail reason read:
-
-> Phase E regression: at this off-center + oblique pose, the SORTED `attend_argmin_above_integer` softmax fails to concentrate on step 0 — all `indicators_above` slots evaluate to near-zero (likely due to compile-side precision loss in the per-wall is_renderable gate at geometry that lands near the attention-edge-of-view) …
-
-Two of three substantive claims are wrong:
-
-1. ✅ **"softmax fails to concentrate on step 0"** — corroborated. It concentrates on the **self** position (SORTED[0]), which is equally wrong.
-2. ❌ **"all `indicators_above` slots evaluate to near-zero"** — not corroborated. `indicators_above` is evaluated across many positions and the compiled values aren't shown; the claim doesn't map to a measurable quantity.
-3. ❌ **"compile-side precision loss in the per-wall is_renderable gate at geometry that lands near the attention-edge-of-view"** — **not supported by any evidence**. This is the ℓ∞ exemplar of "dressing up don't-know as know" the project doctrine exists to prevent. The observed logit magnitudes are far too large for precision drift in the validity gate; they're consistent with residual contamination at non-WALL positions whose cause is unknown.
-
-## Partial mitigations that *looked* like fixes but weren't
-
-Commit `a979f69` ("flat sum_nodes, 100→70 layers") was claimed in `tests/debug/test_probe_phase_e_trace.py` to have "collaterally fixed the underlying precision loss so the sentinel no longer surfaces on main." That claim is also wrong:
-
-* The probe test only checks for `sel_bsp_rank = -_ABOVE_BONUS` (a single specific sentinel value).
-* Post-a979f69 (HEAD of this branch), the raw `sel_bsp_rank` at sort[0] for this scene is **-1171.875**, not -1000. The probe test passes only because it checks for exactly -1000 and the post-select sentinel (99) hides the underlying bogus value.
-* The actual symptom (wrong attention pick + value contamination) **is still present**.
-
-`a979f69` reduced compiled-graph depth, which perturbed the compiler's residual-column allocation. That may have changed *where* the aliasing lands, but did not fix the underlying structural fault. Other scenes happen not to hit it; (3, 2, 20) does.
-
-The pattern — an unrelated optimization "fixing" a bug by reshuffling residual allocation — is itself worth naming as a project risk. Such fixes are coincidence, not resolution.
-
-## What would fix this properly
-
-A real fix requires one of:
-
-1. **Compiler-internals investigation.** Instrument the residual allocator to log, at each layer: which nodes share columns, and for each Attn layer, which nodes' columns are read by the key/value matrices. For this scene at the SORTED attention's layer, identify which node's columns land on `sort_value`'s `bsp_rank` slot and on the `indicators_above` slots. That's the aliasing pair. Then either:
-   * Change the allocator to forbid that pair (general fix), or
-   * Change the graph to break the pair (point fix).
-
-2. **Pin residual state explicitly.** If the compiler supported pinned allocations for specific nodes, we could ensure `bsp_rank` and `indicators_above` get non-aliased columns at the SORTED attention layer. Today there's no such mechanism.
-
-3. **Remove the residual-sensitivity of the above-integer primitive.** If `attend_argmin_above_integer`'s key_in Concatenate stayed un-fused (the current Linear fusion absorbs the Concatenate, which may be where the aliasing enters), the allocator would see the 3-slot structure explicitly.
-
-Options 1 and 2 are substantial compiler work. Option 3 requires a compiler-fusion policy change (or an opt-out), also non-trivial.
-
-## Doctrine violations this investigation surfaced
-
-* **Never defer numerical problems.** c2d5a7a shipped a plausible reason rather than a measured one. Any 1–2-orders-of-magnitude logit error that a future agent might ever claim is "precision loss" should be challenged with this exact calculation: does the primitive's math close at the observed numbers? Here it didn't even close to an order of magnitude.
-* **Xfail hygiene.** The xfail reason had three claims, two unfounded. Today's doctrine would require "unknown; investigating; linked to `docs/postmortems/phase_e_xfail.md`."
-* **Foundation rule.** Phase E built on a residual-aliasing sensitivity that was already known-known per `plan-e.md` (5 prior failed attempts). We shipped anyway. The doctrine's lesson: when a plan already lists unresolved open questions about compiler behavior, those questions are the work.
-
-## Tooling used
-
-* `scripts/investigate_phase_e.py` — purpose-built investigation script. It:
-  1. Rebuilds the game graph with the same compile knobs as `compile_game` (d=2048, d_head=32).
-  2. Walks the graph to find `sel_bsp_rank_effective`, steps backward through the `select()` to find `raw_sel_bsp_rank` and `sort_done`.
-  3. Probes all three nodes via `probe_layer_diff` at sort[0] during an autoregressive decode step.
-  4. Probes the SORTED attention's softmax via `probe_attention` with per-position labels.
-* `torchwright/debug/probe.py` — harness from plan 1.
-* `docs/numerical_noise.md` and `op_noise_data.json` — noise budgets (plan 3), used to rule out per-op precision loss as an explanation.
-* Compiler assertions from plan 2 did not fire for this scene (their scope is residual liveness, not cross-node column non-overlap).
-
-## Regression test
-
-The existing `tests/debug/test_probe_phase_e_trace.py` locks in "no `-_ABOVE_BONUS` (== -1000) in `sel_bsp_rank`." That's a too-narrow check — the current post-a979f69 value is -1171.875, not -1000, and that test passes vacuously. A correct regression test should assert either:
-
-1. Raw `sel_bsp_rank` at sort[0] for (3, 2, 20) is within `[0, max_walls - 1]` (a clean integer), or
-2. The SORTED attention's softmax at sort[0] concentrates on a WALL position, not SORTED[0].
-
-Both are direct observables from the investigation script. Leaving the test narrow would recreate the Phase D failure mode. Updating it is tracked as a follow-up alongside any future fix.
+- `scripts/dump_phase_e_allocator.py` — six-block diagnostic dump
+  (see section above).
+- `modal_dump_phase_e.py` — Modal entrypoint for the dump.
+- CLAUDE.md §I1 — tightened doc entry naming the aliasing hypothesis
+  as I1's explicit domain.
+- `piecewise_linear_2d` — now declares its output range to the
+  mathematically exact grid bound.
