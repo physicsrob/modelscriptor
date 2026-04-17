@@ -984,9 +984,7 @@ def main():
     # outputs, it's the next target for tightening.
     print("\n  Forward-trace from top-5 observed-error sites:")
     err_sorted = [
-        r
-        for r in gate_records
-        if r["fp32_err"] is not None and r["fp32_err"] > 1.0
+        r for r in gate_records if r["fp32_err"] is not None and r["fp32_err"] > 1.0
     ]
     err_sorted.sort(key=lambda r: -r["fp32_err"])
 
