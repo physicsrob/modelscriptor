@@ -13,15 +13,9 @@ import sys
 
 import modal
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .uv_sync(groups=["dev"], extra_options="--no-install-project")
-    .add_local_file("E8.8.1024.txt", "/root/E8.8.1024.txt")
-    .add_local_file("doom1.wad", "/root/doom1.wad")
-    .add_local_python_source("torchwright", "examples", "tests")
-)
+from modal_image import IMAGE
 
-app = modal.App("torchwright-walkthrough", image=image)
+app = modal.App("torchwright-walkthrough", image=IMAGE)
 
 
 def _scene_data(scene, tex_size):
@@ -32,12 +26,14 @@ def _scene_data(scene, tex_size):
 
     if scene == "box":
         segments, textures = box_room_textured(
-            wad_path="doom1.wad", tex_size=tex_size,
+            wad_path="doom1.wad",
+            tex_size=tex_size,
         )
         return segments, textures, 0.0, 0.0, 0, 10.0
     else:
         segments, textures = multi_room_textured(
-            wad_path="doom1.wad", tex_size=tex_size,
+            wad_path="doom1.wad",
+            tex_size=tex_size,
         )
         return segments, textures, -8.0, 0.0, 0, 15.0
 
@@ -73,11 +69,14 @@ def generate_transformer(
     from torchwright.doom.walkthrough import generate_walkthrough, save_gif
 
     config = _config(width, height)
-    segments, textures, start_x, start_y, start_angle, max_coord = _scene_data(scene, tex_size)
+    segments, textures, start_x, start_y, start_angle, max_coord = _scene_data(
+        scene, tex_size
+    )
 
     print(f"Compiling game graph (walls-as-tokens, {len(segments)} walls)...")
     module = compile_game(
-        config, textures,
+        config,
+        textures,
         max_walls=max(8, len(segments)),
         max_coord=max_coord,
         d=d,
@@ -87,13 +86,18 @@ def generate_transformer(
     subset = build_scene_subset(segments, textures)
 
     def frame_fn(state, inputs):
-        return step_frame(module, state, inputs, subset, config,
-                          textures=textures)
+        return step_frame(module, state, inputs, subset, config, textures=textures)
 
     print(f"Generating {frames} transformer frames at {width}x{height}...")
     frame_list = generate_walkthrough(
-        segments, config, frame_fn, start_x, start_y, start_angle,
-        total_frames=frames, wall_threshold=1.5,
+        segments,
+        config,
+        frame_fn,
+        start_x,
+        start_y,
+        start_angle,
+        total_frames=frames,
+        wall_threshold=1.5,
     )
 
     gif_path = "/tmp/walkthrough.gif"
@@ -122,18 +126,31 @@ def generate_reference(
 
     def frame_fn(state, inputs):
         new_state = update_state(
-            state, inputs, segments, config.trig_table,
+            state,
+            inputs,
+            segments,
+            config.trig_table,
         )
         frame = render_frame(
-            new_state.x, new_state.y, new_state.angle, segments, config,
+            new_state.x,
+            new_state.y,
+            new_state.angle,
+            segments,
+            config,
             textures=textures,
         )
         return frame, new_state
 
     print(f"Generating {frames} reference frames at {width}x{height}...")
     frame_list = generate_walkthrough(
-        segments, config, frame_fn, start_x, start_y, start_angle,
-        total_frames=frames, wall_threshold=1.5,
+        segments,
+        config,
+        frame_fn,
+        start_x,
+        start_y,
+        start_angle,
+        total_frames=frames,
+        wall_threshold=1.5,
     )
 
     gif_path = "/tmp/reference.gif"
@@ -157,13 +174,24 @@ def main(
 ):
     # Launch both in parallel
     transformer_call = generate_transformer.spawn(
-        scene=scene, width=width, height=height,
-        chunk_size=chunk_size, tex_size=tex_size,
-        frames=frames, fps=fps, scale=scale, d=d,
+        scene=scene,
+        width=width,
+        height=height,
+        chunk_size=chunk_size,
+        tex_size=tex_size,
+        frames=frames,
+        fps=fps,
+        scale=scale,
+        d=d,
     )
     reference_call = generate_reference.spawn(
-        scene=scene, width=width, height=height,
-        tex_size=tex_size, frames=frames, fps=fps, scale=scale,
+        scene=scene,
+        width=width,
+        height=height,
+        tex_size=tex_size,
+        frames=frames,
+        fps=fps,
+        scale=scale,
     )
 
     transformer_bytes = transformer_call.get()

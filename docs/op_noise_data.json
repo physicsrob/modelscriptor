@@ -1,0 +1,612 @@
+{
+  "schema_version": 1,
+  "commit": "a979f69",
+  "measured_at": "2026-04-16",
+  "ops": [
+    {
+      "name": "abs",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Exact decomposition: `ReLU(x) + ReLU(-x)`. Any non-zero measurement here would indicate a compiler or float32 bug.",
+      "distributions": [
+        {
+          "name": "abs_uniform_pm50",
+          "description": "Uniform signed inputs on [-50, 50]. `abs` is exact (ReLU(x) + ReLU(-x)) so any residual is float32 round-off only.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": -0.37434
+          }
+        }
+      ]
+    },
+    {
+      "name": "bool_all_true",
+      "module": "torchwright.ops.logic_ops",
+      "notes": "Single `compare` at threshold `N-1` over the sum of N ±1 inputs. Sum is N only when all are +1; otherwise ≤ N-2 — threshold cleanly separates the two, so exact on ±1 inputs.",
+      "distributions": [
+        {
+          "name": "bool_triple_signed",
+          "description": "Three independent ±1 boolean streams — exercises all 8 truth-table rows of `bool_any_true` and `bool_all_true`.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": -1.0,
+            "b": 1.0,
+            "c": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "bool_any_true",
+      "module": "torchwright.ops.logic_ops",
+      "notes": "Two stacked `compare` layers. On clean ±1 inputs the intermediate sum lands well outside every ramp zone, so the composition is exact.",
+      "distributions": [
+        {
+          "name": "bool_triple_signed",
+          "description": "Three independent ±1 boolean streams — exercises all 8 truth-table rows of `bool_any_true` and `bool_all_true`.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": -1.0,
+            "b": 1.0,
+            "c": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "bool_not",
+      "module": "torchwright.ops.logic_ops",
+      "notes": "Single `compare` with inverted levels. Exact on clean ±1 inputs; inherits `compare`'s ramp-zone error for inputs near 0.",
+      "distributions": [
+        {
+          "name": "bool_single_signed",
+          "description": "Random ±1 inputs (discrete, no ramp-zone samples) — `bool_not` is only defined on clean boolean inputs.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": -1.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "ceil_int",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Reduction to `-floor_int(-x)`. On integer inputs every value lands in a flat zone of the floor staircase, so the op is exact here even though it inherits approximate semantics for continuous inputs.",
+      "distributions": [
+        {
+          "name": "ceil_integers_neg5_10",
+          "description": "Integer inputs on [-5, 10]. `ceil_int(k) = k` for integer k (flat zones in the floor staircase reused under -floor(-x)).",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 3834,
+          "worst_input": {
+            "x": 7.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "clamp",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Piecewise-linear identity with 4 breakpoints at `[lo, lo + eps, hi - eps, hi]`. In the interior flat zone (this distribution) the op is a pure identity; boundary samples would fall inside the `eps`-wide ramp and lose precision but are out of scope for this negative-control distribution.",
+      "distributions": [
+        {
+          "name": "clamp_flat_zone_pm20",
+          "description": "Uniform samples on [-8, 8] with clamp bounds [-10, 10] — every sample is inside the flat identity zone. Residual measures float32 round-off only.",
+          "n_samples": 4096,
+          "max_abs_error": 1.90735e-06,
+          "mean_abs_error": 2.46433e-07,
+          "p99_abs_error": 9.53674e-07,
+          "max_rel_error": 0.000289855,
+          "mean_rel_error": 1.98993e-07,
+          "p99_rel_error": 1.66109e-06,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 6.45994
+          }
+        }
+      ]
+    },
+    {
+      "name": "compare",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "ReLU-pair ramp. Inputs within `1/step_sharpness` of the threshold land inside the ramp zone and yield an interpolated value; inputs further away match the step function exactly. The `compare_near_thresh_*` distributions deliberately stress the ramp — the reference is a discrete step function, so samples inside the ramp legitimately report large error.",
+      "distributions": [
+        {
+          "name": "compare_near_thresh_0",
+          "description": "Samples within ±0.3 of the threshold at 0.0 — stresses the 2-neuron ramp zone (width 1/step_sharpness).",
+          "n_samples": 4096,
+          "max_abs_error": 1.99752,
+          "mean_abs_error": 0.167942,
+          "p99_abs_error": 1.90109,
+          "max_rel_error": 1.99752,
+          "mean_rel_error": 0.167942,
+          "p99_rel_error": 1.90109,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 0.000123948
+          }
+        },
+        {
+          "name": "compare_uniform_pm80",
+          "description": "Uniform samples on [-80, 80] — measures compare's ramp error well away from the threshold (expected ≈ 0).",
+          "n_samples": 4096,
+          "max_abs_error": 1.33899,
+          "mean_abs_error": 0.000479534,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 1.33899,
+          "mean_rel_error": 0.000479534,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 0.0330505
+          }
+        }
+      ]
+    },
+    {
+      "name": "cond_gate",
+      "module": "torchwright.ops.logic_ops",
+      "notes": "`big_offset` ReLU gate. On clean ±1 conditions the output is exactly `inp` (cond=+1) or `0` (cond=-1) up to float32 round-off; noisy conditions blur the gate.",
+      "distributions": [
+        {
+          "name": "cond_gate_signed_bool_times_value",
+          "description": "±1 conditions paired with scalar values in [-5, 5]. Expected output: `value` when cond=+1, `0` when cond=-1.",
+          "n_samples": 4096,
+          "max_abs_error": 3.05176e-05,
+          "mean_abs_error": 7.84674e-06,
+          "p99_abs_error": 3.00407e-05,
+          "max_rel_error": 0.00399042,
+          "mean_rel_error": 2.55099e-05,
+          "p99_rel_error": 0.000359515,
+          "rel_valid_samples": 2089,
+          "worst_input": {
+            "cond": 1.0,
+            "inp": 1.57278
+          }
+        }
+      ]
+    },
+    {
+      "name": "equals_vector",
+      "module": "torchwright.ops.logic_ops",
+      "notes": "Single-ReLU approximate equality test. Inside the `1/embedding_step_sharpness`-wide transition ball around the target the output interpolates between -1 and +1.",
+      "distributions": [
+        {
+          "name": "equals_vector_match_and_off",
+          "description": "Half exact-match against target vector [1, 2, 3], half random vectors in [-3, 3]³ — measures the ReLU-based equality test's margin of separation between matches and non-matches.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x[0]": 1.0,
+            "x[1]": 2.0,
+            "x[2]": 3.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "floor_int",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Staircase with ramp width `1/step_sharpness` directly below each integer. Inputs near integer boundaries land in the ramp zone and produce interpolated values; callers with integer-ish inputs should use `thermometer_floor_div` instead, whose ramps sit at half-integer thresholds.",
+      "distributions": [
+        {
+          "name": "floor_near_boundary_10",
+          "description": "Samples within ±1/step_sharpness of integer k=5 — stresses the ramp zone where `floor_int` interpolates.",
+          "n_samples": 4096,
+          "max_abs_error": 0.999283,
+          "mean_abs_error": 0.128753,
+          "p99_abs_error": 0.970371,
+          "max_rel_error": 0.249821,
+          "mean_rel_error": 0.0321882,
+          "p99_rel_error": 0.242593,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 4.99993
+          }
+        },
+        {
+          "name": "floor_uniform_neg5_10",
+          "description": "Uniform continuous samples on [-5, 10] — most land in flat zones; measures baseline `floor_int` accuracy.",
+          "n_samples": 4096,
+          "max_abs_error": 0.998161,
+          "mean_abs_error": 0.0465447,
+          "p99_abs_error": 0.895853,
+          "max_rel_error": 0.953022,
+          "mean_rel_error": 0.0184897,
+          "p99_rel_error": 0.461096,
+          "rel_valid_samples": 3828,
+          "worst_input": {
+            "x": 5.99982
+          }
+        }
+      ]
+    },
+    {
+      "name": "linear_bin_index",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "End-to-end composite (~6 MLP sublayers). Error compounds across `reciprocal`, `signed_multiply`, `clamp`, and the terminal `thermometer_floor_div`. Inputs close to integer bin boundaries land in the staircase's ramp zone; `_bin_index_ref` uses `torch.floor` on the exact linear mapping, so tight bin edges reveal ramp-zone slippage.",
+      "distributions": [
+        {
+          "name": "linear_bin_index_tex_col_16",
+          "description": "16-bin quantisation of x ∈ [0, 64] with x_min=0, x_max=64 — mirrors texture-column bucketing in the RENDER stage.",
+          "n_samples": 4096,
+          "max_abs_error": 1.0,
+          "mean_abs_error": 0.0747671,
+          "p99_abs_error": 0.921875,
+          "max_rel_error": 1.0,
+          "mean_rel_error": 0.0152883,
+          "p99_rel_error": 0.246094,
+          "rel_valid_samples": 3715,
+          "worst_input": {
+            "x": 7.99831,
+            "x_min": 0.0,
+            "x_max": 64.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "low_rank_2d",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Rank-3 SVD of `atan(cross/dot)` on a non-uniform grid. Worst-cell error is bounded by σ_{K+1}, the first truncated singular value — verify against the SVD computed in `tests/ops/test_low_rank_2d.py:100`.",
+      "distributions": [
+        {
+          "name": "doom_atan_cross_dot",
+          "description": "atan2(cross/dot) over [-2, 2] × [0.5, 10] on non-uniform grid — mirrors the `atan_front_*` callsite at `torchwright/doom/stages/sorted.py:549` (rank-3 SVD).",
+          "n_samples": 4096,
+          "max_abs_error": 0.0651014,
+          "mean_abs_error": 0.0158553,
+          "p99_abs_error": 0.0574395,
+          "max_rel_error": 0.331315,
+          "mean_rel_error": 0.0803216,
+          "p99_rel_error": 0.217156,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": -2.0,
+            "b": 3.36508
+          }
+        }
+      ]
+    },
+    {
+      "name": "max",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Exact via `(a + b + |a - b|) / 2`.",
+      "distributions": [
+        {
+          "name": "minmax_uniform_pm50",
+          "description": "Two independent uniform streams on [-50, 50]². `min`/`max` are exact via the abs-trick; residual is float32 round-off only.",
+          "n_samples": 4096,
+          "max_abs_error": 3.8147e-06,
+          "mean_abs_error": 5.31843e-07,
+          "p99_abs_error": 3.8147e-06,
+          "max_rel_error": 1.95265e-06,
+          "mean_rel_error": 6.58503e-08,
+          "p99_rel_error": 1.95265e-06,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": -50.0,
+            "b": -46.8254
+          }
+        }
+      ]
+    },
+    {
+      "name": "min",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Exact via `(a + b - |a - b|) / 2`.",
+      "distributions": [
+        {
+          "name": "minmax_uniform_pm50",
+          "description": "Two independent uniform streams on [-50, 50]². `min`/`max` are exact via the abs-trick; residual is float32 round-off only.",
+          "n_samples": 4096,
+          "max_abs_error": 3.8147e-06,
+          "mean_abs_error": 5.31843e-07,
+          "p99_abs_error": 3.8147e-06,
+          "max_rel_error": 1.95265e-06,
+          "mean_rel_error": 6.58503e-08,
+          "p99_rel_error": 1.95265e-06,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": -46.8254,
+            "b": -43.6508
+          }
+        }
+      ]
+    },
+    {
+      "name": "mod_const",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Identity `x % d = x - d · thermometer_floor_div(x, d)`. Exact on integer inputs (the input class this op is declared for).",
+      "distributions": [
+        {
+          "name": "mod_integers_0_100_by7",
+          "description": "Integer inputs on [0, 100] with divisor=7. `mod_const` is x − divisor × `thermometer_floor_div(x)`, exact on integers.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 3486,
+          "worst_input": {
+            "x": 64.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "multiply_2d",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Single-sublayer product via 2D piecewise-linear lookup. Analytical worst-cell absolute bound is `step1*step2/4 = 0.25` for this configuration.",
+      "distributions": [
+        {
+          "name": "multiply_uniform_pm10",
+          "description": "a·b over [-10, 10]² with step=1 — generic uniform product grid; analytical bound `step1*step2/4 = 0.25`.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0624921,
+          "mean_abs_error": 0.0201983,
+          "p99_abs_error": 0.0584729,
+          "max_rel_error": 2.15015,
+          "mean_rel_error": 0.0072932,
+          "p99_rel_error": 0.0661772,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": 1.74603,
+            "b": -1.74603
+          }
+        }
+      ]
+    },
+    {
+      "name": "multiply_integers",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Polarization + `square` on non-negative integer inputs. Exact on integer inputs by construction (the polarization identity is exact; `square` is exact at integer grid points).",
+      "distributions": [
+        {
+          "name": "multiply_integers_0_10",
+          "description": "Integer pairs in [0, 10] — `multiply_integers` is exact on integer inputs by construction; serves as a precision-parity check.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 3387,
+          "worst_input": {
+            "a": 10.0,
+            "b": 2.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "piecewise_linear",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Foundation 1D piecewise-linear primitive; measured on the canonical x² test function with 11 integer breakpoints. Error is zero at breakpoints and bounded by the interpolation error of the reference function over each segment.",
+      "distributions": [
+        {
+          "name": "parabola_0_10_step1",
+          "description": "f(x)=x² on [0, 10] with integer breakpoints — probes generic `piecewise_linear` precision between grid points.",
+          "n_samples": 4096,
+          "max_abs_error": 0.250004,
+          "mean_abs_error": 0.163799,
+          "p99_abs_error": 0.249977,
+          "max_rel_error": 231.114,
+          "mean_rel_error": 0.585063,
+          "p99_rel_error": 11.396,
+          "rel_valid_samples": 4094,
+          "worst_input": {
+            "x": 6.49947
+          }
+        }
+      ]
+    },
+    {
+      "name": "piecewise_linear_2d",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Triangulated-grid lookup with non-uniform breakpoints. On non-uniform grids `piecewise_linear_2d` uses a constrained least-squares fit that can oscillate in cell interiors — `low_rank_2d` is preferred there.",
+      "distributions": [
+        {
+          "name": "doom_diff_trig",
+          "description": "wall-geometry product over DIFF_BP × TRIG_BP — mirrors the `sort_ey_cos`/`sort_ex_sin` family of calls at `torchwright/doom/stages/wall.py:263` and neighbours.",
+          "n_samples": 4096,
+          "max_abs_error": 7.77785,
+          "mean_abs_error": 1.30067,
+          "p99_abs_error": 6.54323,
+          "max_rel_error": 0.60163,
+          "mean_rel_error": 0.117967,
+          "p99_rel_error": 0.350006,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": 22.2222,
+            "b": -1.0
+          }
+        },
+        {
+          "name": "doom_diff_vel",
+          "description": "collision product over DIFF_BP × VEL_BP — mirrors the `p_dx_ey`/`p_dy_ex` family at `torchwright/doom/stages/wall.py:205`.",
+          "n_samples": 4096,
+          "max_abs_error": 5.44453,
+          "mean_abs_error": 0.937458,
+          "p99_abs_error": 4.72484,
+          "max_rel_error": 0.601709,
+          "mean_rel_error": 0.123236,
+          "p99_rel_error": 0.350014,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": 22.2222,
+            "b": -0.7
+          }
+        }
+      ]
+    },
+    {
+      "name": "reciprocal",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Geometric breakpoint spacing keeps relative interpolation error roughly constant across the range. Measurement op is built with `min_value=0.1, max_value=200.0, step=1.0` so a single compiled instance covers both production distributions.",
+      "distributions": [
+        {
+          "name": "doom_reciprocal_sorted",
+          "description": "1/x over [0.1, 50.0], step=0.1 — mirrors the `inv_denom_abs` callsite at `torchwright/doom/stages/sorted.py:439`.",
+          "n_samples": 4096,
+          "max_abs_error": 0.00250864,
+          "mean_abs_error": 0.000259315,
+          "p99_abs_error": 0.00131503,
+          "max_rel_error": 0.12228,
+          "mean_rel_error": 0.00838194,
+          "p99_rel_error": 0.0583375,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 0.143451
+          }
+        },
+        {
+          "name": "doom_reciprocal_wall",
+          "description": "1/x over [0.3, 200.0], step=1.0 — mirrors the `inv_abs_num_t` callsite at `torchwright/doom/stages/wall.py:339`.",
+          "n_samples": 4096,
+          "max_abs_error": 0.00698127,
+          "mean_abs_error": 0.000981591,
+          "p99_abs_error": 0.00447691,
+          "max_rel_error": 1.38859,
+          "mean_rel_error": 0.127856,
+          "p99_rel_error": 0.80623,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 198.88
+          }
+        }
+      ]
+    },
+    {
+      "name": "signed_multiply",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Polarization identity `a·b = (|a+b|² - |a-b|²)/4`. Absolute error scales with `step × (max_abs1 + max_abs2)`, not with `|a·b|`; pathological near-zero × large-magnitude inputs exhibit high relative error.",
+      "distributions": [
+        {
+          "name": "signed_multiply_pm10",
+          "description": "a·b over [-10, 10]² via polarization identity, step=1.0 — analytical bound `step × (max_abs1 + max_abs2) / 4 = 5.0` absolute, much smaller relative.",
+          "n_samples": 4096,
+          "max_abs_error": 0.062484,
+          "mean_abs_error": 0.0201976,
+          "p99_abs_error": 0.0584545,
+          "max_rel_error": 2.15001,
+          "mean_rel_error": 0.00729324,
+          "p99_rel_error": 0.0661538,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": -1.74603,
+            "b": -1.74603
+          }
+        }
+      ]
+    },
+    {
+      "name": "square",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Always an underestimate of x² between grid points. Max segment error is `(step/2)²` at half-integers.",
+      "distributions": [
+        {
+          "name": "square_unsigned_0_10",
+          "description": "x² over [0, 10] with step=1.0 — exact at integers, worst error at half-integers.",
+          "n_samples": 4096,
+          "max_abs_error": 0.250004,
+          "mean_abs_error": 0.163799,
+          "p99_abs_error": 0.249977,
+          "max_rel_error": 231.114,
+          "mean_rel_error": 0.585063,
+          "p99_rel_error": 11.396,
+          "rel_valid_samples": 4094,
+          "worst_input": {
+            "x": 6.49947
+          }
+        }
+      ]
+    },
+    {
+      "name": "square_signed",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Same interpolation profile as `square` but spans [-max_abs, max_abs]; saves one MLP sublayer vs. abs+square in `multiply_integers` / `signed_multiply` deep strategies.",
+      "distributions": [
+        {
+          "name": "square_signed_pm10",
+          "description": "x² over [-10, 10] with step=1.0 — covers the negative half the unsigned variant cannot reach.",
+          "n_samples": 4096,
+          "max_abs_error": 0.250023,
+          "mean_abs_error": 0.163952,
+          "p99_abs_error": 0.249971,
+          "max_rel_error": 276.695,
+          "mean_rel_error": 0.748596,
+          "p99_rel_error": 13.238,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 9.49681
+          }
+        }
+      ]
+    },
+    {
+      "name": "thermometer_floor_div",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Integer-input-only staircase. Ramps sit at `k*divisor - 0.5`, giving clean separation for integer inputs. Feeding continuous floats produces ramp-zone interpolation artefacts — those belong to `floor_int`, not this op.",
+      "distributions": [
+        {
+          "name": "thermometer_integers_0_100_by10",
+          "description": "Integer inputs on [0, 100] with divisor=10 — `thermometer_floor_div` is defined only for integer inputs.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 3699,
+          "worst_input": {
+            "x": 64.0
+          }
+        }
+      ]
+    }
+  ]
+}

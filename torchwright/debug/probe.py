@@ -29,8 +29,9 @@ Scope and limits:
   that broke it rather than only the top output.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -43,6 +44,7 @@ from torchwright.compiler.residual_assignment import (
 from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import Concatenate, Node
+from torchwright.graph.attn import Attn, CAUSAL_MASK_SENTINEL
 from torchwright.graph.misc import Assert, InputNode, LiteralValue, Placeholder
 from torchwright.graph.pos_encoding import PosEncoding
 
@@ -193,6 +195,92 @@ class ProbeReport:
 
 
 # ---------------------------------------------------------------------------
+# Shared forward / state-capture helpers
+# ---------------------------------------------------------------------------
+
+
+def _ordered_mlp_states(
+    net: HeadlessTransformer,
+    ra: ResidualAssignment,
+) -> List[Tuple[int, str, ResidualStreamState]]:
+    """Post-MLP sublayer states in execution order.
+
+    Returns ``(layer_index, state_name, state)`` triples, one per
+    transformer layer whose ``mlp.out_state`` is recorded in
+    ``ra.mapping``.  The final layer's ``mlp.out_state`` is always
+    appended (even if missing from ``ra.mapping``) so the top-level
+    output is reachable when the last layer happens to receive no new
+    assignments.
+    """
+    ordered: List[Tuple[int, str, ResidualStreamState]] = []
+    for i, layer in enumerate(net.layers):
+        st = layer.mlp.out_state
+        if st in ra.mapping:
+            ordered.append((i, f"L{i}.mlp_out", st))
+    last_i = len(net.layers) - 1
+    last_st = net.layers[-1].mlp.out_state
+    if not any(s is last_st for _, _, s in ordered):
+        ordered.append((last_i, f"L{last_i}.mlp_out", last_st))
+    return ordered
+
+
+def _run_with_states(
+    compiled: "CompiledHeadless",
+    prefill: torch.Tensor,
+    past_len: int = 0,
+    past_kvs: Optional[
+        List[Optional[Tuple[torch.Tensor, torch.Tensor]]]
+    ] = None,
+) -> Tuple[
+    HeadlessTransformer,
+    ResidualAssignment,
+    Dict[ResidualStreamState, Tuple[torch.Tensor, str]],
+]:
+    """Forward the compiled module once with per-sublayer state capture.
+
+    When ``past_kvs`` is ``None`` (prefill) this runs
+    ``net.forward(return_states=True)`` and returns every captured
+    sublayer snapshot — matches the oracle-probe path used by
+    :func:`probe_compiled`.
+
+    When ``past_kvs`` is a list (decode), this walks the layers
+    manually — ``layer.attn.forward_cached(res, past_kvs[i])`` →
+    ``layer.mlp.forward(res)`` — and records each sublayer's
+    post-output residual stream.  ``net.forward`` cannot do this
+    directly because it has no KV-cache entrypoint; the manual walk
+    mirrors ``HeadlessTransformer.forward_cached`` exactly plus state
+    capture.
+
+    Returns ``(net, ra, state_tensor)``.  ``ra`` is asserted non-None.
+    """
+    net: HeadlessTransformer = compiled._net
+    ra = net.residual_assignment
+    assert ra is not None, "compiled module has no residual_assignment"
+
+    res_stream = compiled._build_res_stream(prefill, past_len=past_len)
+
+    state_tensor: Dict[ResidualStreamState, Tuple[torch.Tensor, str]] = {}
+
+    if past_kvs is None:
+        _, all_states = net.forward(res_stream, return_states=True)
+        for key, (state, tensor) in all_states.items():
+            state_tensor[state] = (tensor, key)
+    else:
+        res = res_stream
+        with torch.no_grad():
+            for i, layer in enumerate(net.layers):
+                res, _kv = layer.attn.forward_cached(res, past_kvs[i])
+                state_tensor[layer.attn.out_state] = (
+                    res, f"layer_{i}_attn_skip_out_state",
+                )
+                res = layer.mlp.forward(res)
+                state_tensor[layer.mlp.out_state] = (
+                    res, f"layer_{i}_mlp_out_state",
+                )
+    return net, ra, state_tensor
+
+
+# ---------------------------------------------------------------------------
 # Probe runner
 # ---------------------------------------------------------------------------
 
@@ -267,35 +355,13 @@ def probe_compiled(
     Returns:
         A populated :class:`ProbeReport`.
     """
-    net: HeadlessTransformer = compiled._net
-    ra = net.residual_assignment
-    assert ra is not None, "compiled module has no residual_assignment"
-
     # Oracle first — cheap and deterministic.
     oracle = reference_eval(output_node, input_values, n_pos)
 
-    # Run compiled forward with per-sublayer state capture.  The
-    # compiled path needs the initial residual stream built the same
-    # way CompiledHeadless.__call__ builds it.
-    res_stream = compiled._build_res_stream(
-        _inputs_from_dict(compiled, input_values, n_pos), past_len=0,
+    net, ra, state_tensor = _run_with_states(
+        compiled, _inputs_from_dict(compiled, input_values, n_pos), past_len=0,
     )
-    _, all_states = net.forward(res_stream, return_states=True)
-
-    # Map from ResidualStreamState to (tensor, pretty_key).
-    state_tensor: Dict[ResidualStreamState, Tuple[torch.Tensor, str]] = {}
-    for key, (state, tensor) in all_states.items():
-        state_tensor[state] = (tensor, key)
-
-    # Ordered list of sublayer end-states in execution order.  We only
-    # need states the compiler actually recorded assignments for — the
-    # top-level in_state/out_state, plus every per-layer MLP out_state.
-    ordered_states: List[ResidualStreamState] = []
-    for i, layer in enumerate(net.layers):
-        if layer.mlp.out_state in ra.mapping:
-            ordered_states.append(layer.mlp.out_state)
-    if net.layers[-1].mlp.out_state not in ordered_states:
-        ordered_states.append(net.layers[-1].mlp.out_state)
+    ordered_states = [s for _, _, s in _ordered_mlp_states(net, ra)]
 
     graph = GraphAnalyzer(output_node)
     report = ProbeReport(atol=atol)
@@ -411,6 +477,477 @@ def probe_graph(
 
 
 # ---------------------------------------------------------------------------
+# Direct-inspection harness — residual / attention / layer-diff probes
+# ---------------------------------------------------------------------------
+#
+# The probes above (probe_compiled / probe_graph) check a compiled module
+# against its oracle and report *divergence* — useful for confirming
+# correctness.  The harness below answers a different question: "what is
+# this node's value right now, at this layer, at these positions, in
+# this compiled module?"  Callers that already have a failing scene and
+# want to localise it reach for these.
+
+
+def build_prefill_from_input_values(
+    compiled: CompiledHeadless,
+    input_values: Dict[str, torch.Tensor],
+    n_pos: int,
+) -> torch.Tensor:
+    """Pack an ``{input_name: tensor}`` dict into the flat prefill layout.
+
+    Thin public wrapper over :func:`_inputs_from_dict` for callers that
+    already speak the dict convention from the oracle-probe API but
+    want to feed the resulting tensor into the direct-inspection probes
+    (which accept a flat prefill so callers can also build one via the
+    DOOM pipeline's ``_build_row`` machinery).
+    """
+    return _inputs_from_dict(compiled, input_values, n_pos)
+
+
+@dataclass
+class ResidualProbe:
+    """A graph node's compiled residual values, indexed by layer.
+
+    ``per_layer`` maps layer index to a ``(n_pos, node.d_output)``
+    tensor extracted from that layer's post-MLP snapshot.  Only layers
+    where the node is materialised appear; an empty dict means the node
+    never surfaced in the captured states (either never materialised,
+    or the caller restricted ``at_layer`` to a layer that does not
+    hold it).
+    """
+
+    node: Node
+    per_layer: Dict[int, torch.Tensor] = field(default_factory=dict)
+    layers: List[int] = field(default_factory=list)
+    # Shape of any per-layer tensor (all layers share the same shape by
+    # construction); empty tuple if ``per_layer`` is empty.
+    shape: Tuple[int, ...] = ()
+
+    def at(self, layer: int) -> Optional[torch.Tensor]:
+        """Value at ``layer``, or ``None`` if the node is not materialised there."""
+        return self.per_layer.get(layer)
+
+    def positions(self, positions: "Sequence[int]") -> "ResidualProbe":
+        """Return a copy restricted to the given token positions.
+
+        Indexes each per-layer tensor along axis 0.  Useful for zooming
+        in on e.g. just the WALL rows of a long prefill.
+        """
+        pos = list(positions)
+        new_per_layer = {
+            layer: tensor[pos] for layer, tensor in self.per_layer.items()
+        }
+        new_shape = (
+            (len(pos), *self.shape[1:]) if self.shape else ()
+        )
+        return ResidualProbe(
+            node=self.node,
+            per_layer=new_per_layer,
+            layers=list(self.layers),
+            shape=new_shape,
+        )
+
+
+def probe_residual(
+    compiled: CompiledHeadless,
+    prefill: torch.Tensor,
+    node: Node,
+    *,
+    at_layer: Optional[int] = None,
+    past_len: int = 0,
+    past_kvs: Optional[
+        List[Optional[Tuple[torch.Tensor, torch.Tensor]]]
+    ] = None,
+) -> ResidualProbe:
+    """Extract a node's residual value from each post-MLP layer snapshot.
+
+    Runs the compiled module once with ``return_states=True`` and pulls
+    ``node``'s columns out of every captured post-MLP residual-stream
+    tensor.  The result is a layer → ``(n_pos, node.d_output)`` tensor
+    mapping; callers slice to the positions they care about with
+    :meth:`ResidualProbe.positions` or indexed access.
+
+    Args:
+        compiled: the module to probe.  Must have a populated
+            ``residual_assignment`` (post ``forward_compile``).
+        prefill: the flat ``(n_pos, d_input)`` input the compiled
+            module expects.  Build with :func:`build_prefill_from_input_values`
+            or with the pipeline-specific helpers (e.g. the DOOM
+            ``_build_row`` family).
+        node: any graph :class:`Node` — including :class:`Concatenate`
+            groupings, which resolve to the concat of their leaves'
+            columns via :meth:`ResidualAssignment.get_node_indices`.
+        at_layer: optional single-layer filter.  When set, only that
+            layer's snapshot is scanned; other layers are skipped
+            without reading.  When ``None`` (the default), every
+            post-MLP snapshot where the node is materialised is
+            returned.
+        past_len: forwarded to ``compiled._build_res_stream`` for
+            KV-cache-aware prefills (default 0 = fresh forward).
+        past_kvs: optional per-layer ``(K, V)`` cache — when supplied,
+            the probe drives the module through the cached decode path
+            instead of a full prefill forward.  Pair with ``past_len``
+            to match the cache length.
+
+    Returns:
+        A :class:`ResidualProbe` with per-layer values.
+    """
+    _net, ra, state_tensor = _run_with_states(
+        compiled, prefill, past_len, past_kvs=past_kvs,
+    )
+
+    ordered = _ordered_mlp_states(_net, ra)
+    per_layer: Dict[int, torch.Tensor] = {}
+    shape: Tuple[int, ...] = ()
+    for layer_i, _name, state in ordered:
+        if at_layer is not None and layer_i != at_layer:
+            continue
+        tensor_pair = state_tensor.get(state)
+        if tensor_pair is None:
+            continue
+        res_tensor, _ = tensor_pair
+        value = _extract_compiled_value(node, ra, state, res_tensor)
+        if value is None:
+            continue
+        per_layer[layer_i] = value
+        if not shape:
+            shape = tuple(value.shape)
+
+    layers = sorted(per_layer.keys())
+    return ResidualProbe(
+        node=node, per_layer=per_layer, layers=layers, shape=shape,
+    )
+
+
+@contextmanager
+def attention_capture(
+    net: HeadlessTransformer,
+    layer_index: int,
+) -> Iterator[Dict[str, Optional[torch.Tensor]]]:
+    """Monkey-patch ``net.layers[layer_index].attn.attn.forward_cached`` to
+    capture the explicit softmax weights and raw logits produced on each
+    call.
+
+    On ``__enter__`` the attention module's ``forward_cached`` is
+    replaced with a version that reproduces its numerical contract (Q /
+    K / V projections, causal mask, softmax, output projection) while
+    recording the per-head ``logits`` and ``weights`` tensors into the
+    yielded dict.  On ``__exit__`` the original method is restored, even
+    on exception.
+
+    Only the *final* call to ``forward_cached`` at this layer is
+    retained — if you drive the compiled module through multiple steps,
+    the captured tensors reflect the last step.  For multi-step capture
+    wrap each step in its own ``attention_capture`` block.
+
+    Yields a dict with keys ``"logits"`` and ``"weights"`` (initially
+    ``None``; populated when the hook fires), each of shape
+    ``(n_heads, n_queries, n_keys)``.
+    """
+    captured: Dict[str, Optional[torch.Tensor]] = {
+        "logits": None, "weights": None,
+    }
+    attn_module = net.layers[layer_index].attn.attn
+    orig_fwd_cached = attn_module.forward_cached
+
+    def patched_fwd_cached(inp, past_kv=None):
+        Q = torch.einsum("pd,hdk->hpk", inp, attn_module.query_matrix)
+        K_new = torch.einsum("pd,hdk->hpk", inp, attn_module.key_matrix)
+        V_new = torch.einsum("pd,hdk->hpk", inp, attn_module.value_matrix)
+        if past_kv is not None:
+            K = torch.cat([past_kv[0], K_new], dim=1)
+            V = torch.cat([past_kv[1], V_new], dim=1)
+        else:
+            K, V = K_new, V_new
+        n_new = inp.shape[0]
+        n_total = K.shape[1]
+        attn_logits = torch.bmm(Q, K.transpose(1, 2))
+        mask = torch.triu(
+            torch.ones(n_new, n_total, device=inp.device),
+            diagonal=n_total - n_new + 1,
+        ).bool()
+        attn_logits.masked_fill_(mask.unsqueeze(0), CAUSAL_MASK_SENTINEL)
+        weights = torch.softmax(attn_logits, dim=2)
+        captured["logits"] = attn_logits.detach().cpu()
+        captured["weights"] = weights.detach().cpu()
+        weighted = torch.bmm(weights, V)
+        output = torch.einsum(
+            "hpk,hkd->pd", weighted, attn_module.output_matrix,
+        )
+        return output, (K, V)
+
+    attn_module.forward_cached = patched_fwd_cached
+    try:
+        yield captured
+    finally:
+        attn_module.forward_cached = orig_fwd_cached
+
+
+@dataclass
+class AttentionProbe:
+    """Per-head softmax weights and logits at a single query position."""
+
+    attn_node: Attn
+    #: Transformer layer index whose attention sublayer hosts ``attn_node``.
+    layer_index: int
+    #: Query row we extracted.
+    query_pos: int
+    #: ``(n_heads, n_keys)`` softmax weights at the query row.
+    weights: torch.Tensor
+    #: ``(n_heads, n_keys)`` pre-softmax logits at the query row.
+    logits: torch.Tensor
+    #: Optional per-key labels (len == n_keys), supplied by the caller.
+    #: Empty list if the caller did not pass ``position_labels``.
+    position_labels: List[str] = field(default_factory=list)
+
+    def top(
+        self, k: int = 8, head: int = 0,
+    ) -> List[Tuple[int, float, str]]:
+        """Return ``(key_pos, weight, label)`` for the ``k`` largest
+        weights in head ``head``.  ``label`` is empty if
+        ``position_labels`` was not supplied.
+        """
+        w = self.weights[head]
+        n_keys = int(w.shape[0])
+        k_eff = min(k, n_keys)
+        topk = torch.topk(w, k=k_eff)
+        out: List[Tuple[int, float, str]] = []
+        for val, idx in zip(topk.values.tolist(), topk.indices.tolist()):
+            label = (
+                self.position_labels[idx]
+                if idx < len(self.position_labels) else ""
+            )
+            out.append((int(idx), float(val), label))
+        return out
+
+
+def probe_attention(
+    compiled: CompiledHeadless,
+    prefill: torch.Tensor,
+    attn_node: Attn,
+    *,
+    query_pos: int,
+    past_len: int = 0,
+    past_kvs: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+    position_labels: Optional[Sequence[str]] = None,
+) -> AttentionProbe:
+    """Capture softmax weights and logits at a specific query position.
+
+    Locates the transformer layer whose post-MLP state first surfaces
+    ``attn_node`` in ``residual_assignment``, installs
+    :func:`attention_capture` on that layer, drives the compiled module
+    with ``compiled._build_res_stream(prefill, past_len) →
+    net.forward_cached(..., past_kvs)``, then reads the weights/logits
+    row at ``query_pos``.
+
+    Args:
+        compiled: post-``forward_compile`` module.
+        prefill: flat ``(n_pos, d_input)`` input for the new rows —
+            the full prefill on a fresh run, or the single decode step
+            when ``past_kvs`` is supplied.
+        attn_node: the graph :class:`Attn` whose attention distribution
+            you want.  Must be materialised at some layer — raises
+            :class:`ValueError` if no hosting layer is found.
+        query_pos: row in the attention output to extract.  Indexes
+            into the *new* rows axis of the patched forward: for a
+            fresh prefill this matches the row in ``prefill``; for a
+            single-row decode step it's always ``0``.
+        past_len: forwarded to ``_build_res_stream``.  Usually matches
+            the cache length when ``past_kvs`` is supplied.
+        past_kvs: optional per-layer ``(K, V)`` cache, as produced by
+            :meth:`CompiledHeadless.step` / :meth:`empty_past` and
+            re-used in autoregressive decode.  ``None`` means fresh
+            prefill.
+        position_labels: optional per-key labels, length equal to the
+            total number of key positions (i.e. ``past_len +
+            prefill.shape[0]``).  Populates
+            :attr:`AttentionProbe.position_labels`.
+
+    Returns:
+        :class:`AttentionProbe` with one-query-row slices of the
+        captured tensors.
+    """
+    net: HeadlessTransformer = compiled._net
+    ra = net.residual_assignment
+    assert ra is not None, "compiled module has no residual_assignment"
+
+    layer_index: Optional[int] = None
+    for i, layer in enumerate(net.layers):
+        if ra.has_node(layer.mlp.out_state, attn_node):
+            layer_index = i
+            break
+    if layer_index is None:
+        raise ValueError(
+            f"Attn node {attn_node!r} not materialised in any layer's "
+            f"residual assignment — nothing to hook"
+        )
+
+    with attention_capture(net, layer_index) as captured:
+        res_stream = compiled._build_res_stream(prefill, past_len=past_len)
+        with torch.no_grad():
+            # Use the cached path so the patched ``forward_cached`` fires.
+            # ``net.forward`` uses the fused kernel path, which does not
+            # call ``attn.attn.forward_cached`` and therefore would not
+            # surface explicit softmax weights.
+            net.forward_cached(res_stream, past_kvs=past_kvs)
+
+    weights = captured["weights"]
+    logits = captured["logits"]
+    assert weights is not None and logits is not None, (
+        "attention_capture did not fire — hook installed on wrong layer?"
+    )
+
+    return AttentionProbe(
+        attn_node=attn_node,
+        layer_index=layer_index,
+        query_pos=query_pos,
+        weights=weights[:, query_pos, :],
+        logits=logits[:, query_pos, :],
+        position_labels=list(position_labels) if position_labels else [],
+    )
+
+
+@dataclass
+class LayerDiffRecord:
+    """A node's value + delta-vs-reference at a single post-MLP layer."""
+
+    layer_index: int
+    state_name: str
+    value: torch.Tensor            # (len(positions), node.d_output)
+    delta: torch.Tensor            # abs(value - reference)
+    max_abs_delta: float
+
+
+@dataclass
+class LayerDiffReport:
+    """Layer-by-layer trace of a node's value against a reference."""
+
+    node: Node
+    #: One record per layer where ``node`` is materialised within
+    #: ``layer_range``, in ascending layer order.
+    records: List[LayerDiffRecord] = field(default_factory=list)
+    #: Earliest layer with ``max_abs_delta > drift_threshold``; ``None``
+    #: if the delta stayed within threshold across every observed layer.
+    first_drift_layer: Optional[int] = None
+    #: Earliest layer where ``|value - sentinel| < sentinel_tol`` holds
+    #: for at least one element; ``None`` either because the caller
+    #: did not set ``sentinel`` or because the sentinel never surfaced.
+    first_sentinel_layer: Optional[int] = None
+    #: Echoed back from the call for reference; ``None`` when sentinel
+    #: detection was not requested.
+    sentinel_value: Optional[float] = None
+
+
+def probe_layer_diff(
+    compiled: CompiledHeadless,
+    prefill: torch.Tensor,
+    node: Node,
+    *,
+    reference: torch.Tensor,
+    positions: Sequence[int],
+    layer_range: Optional[Tuple[int, int]] = None,
+    drift_threshold: float = 1e-3,
+    sentinel: Optional[float] = None,
+    sentinel_tol: float = 1e-4,
+    past_len: int = 0,
+    past_kvs: Optional[
+        List[Optional[Tuple[torch.Tensor, torch.Tensor]]]
+    ] = None,
+) -> LayerDiffReport:
+    """Track a node's value + delta-vs-reference across consecutive layers.
+
+    For every post-MLP snapshot in ``layer_range`` where ``node`` is
+    materialised, record the extracted value at ``positions``, the
+    absolute delta against ``reference``, and the maximum of that
+    delta.  The first layer whose max delta exceeds ``drift_threshold``
+    is flagged in :attr:`LayerDiffReport.first_drift_layer`.  If
+    ``sentinel`` is set, the first layer whose value equals
+    ``sentinel`` within ``sentinel_tol`` (elementwise min) is flagged
+    in :attr:`LayerDiffReport.first_sentinel_layer`.
+
+    ``reference`` is a caller-supplied "ground truth" tensor of shape
+    ``(len(positions), node.d_output)``.  This function does *not*
+    compute it — callers who want oracle-based reference should feed
+    the output of ``reference_eval(...)[node][positions]`` themselves.
+    Callers who want sentinel-only detection can pass a zero tensor and
+    ignore ``first_drift_layer``.
+
+    Args:
+        compiled: post-``forward_compile`` module.
+        prefill: flat ``(n_pos, d_input)`` input to drive the compiled
+            forward pass.
+        node: graph :class:`Node` to trace.
+        reference: host-known truth; shape
+            ``(len(positions), node.d_output)``.
+        positions: token-position indices to extract (e.g. the WALL
+            rows of a long prefill).
+        layer_range: optional ``(start, end)`` filter on layer index;
+            both ends inclusive.  ``None`` means "every layer".
+        drift_threshold: max-abs-delta above which a layer is flagged
+            as the first drift.
+        sentinel: optional sentinel value.  When set, the first layer
+            whose extracted value contains an element within
+            ``sentinel_tol`` of this number is recorded in
+            ``first_sentinel_layer``.
+        sentinel_tol: tolerance for sentinel match (elementwise).
+        past_len: forwarded to ``_build_res_stream``.
+        past_kvs: optional KV cache for decode-path probes (e.g.
+            inspecting the residual on a single autoregressive step).
+            ``None`` means fresh-prefill forward.
+
+    Returns:
+        A populated :class:`LayerDiffReport`.
+    """
+    _net, ra, state_tensor = _run_with_states(
+        compiled, prefill, past_len, past_kvs=past_kvs,
+    )
+    ordered = _ordered_mlp_states(_net, ra)
+
+    pos_list = list(positions)
+    ref_cpu = reference.detach().cpu()
+
+    lo = layer_range[0] if layer_range is not None else -1
+    hi = layer_range[1] if layer_range is not None else 10**9
+
+    report = LayerDiffReport(node=node, sentinel_value=sentinel)
+    for layer_i, state_name, state in ordered:
+        if not (lo <= layer_i <= hi):
+            continue
+        tensor_pair = state_tensor.get(state)
+        if tensor_pair is None:
+            continue
+        res_tensor, _ = tensor_pair
+        value_all = _extract_compiled_value(node, ra, state, res_tensor)
+        if value_all is None:
+            continue
+        value = value_all[pos_list].detach().cpu()
+        if value.shape != ref_cpu.shape:
+            raise ValueError(
+                f"reference shape {tuple(ref_cpu.shape)} does not match "
+                f"value shape {tuple(value.shape)} at layer {layer_i}"
+            )
+        delta = (value - ref_cpu).abs()
+        max_abs = float(delta.max().item())
+        report.records.append(LayerDiffRecord(
+            layer_index=layer_i,
+            state_name=state_name,
+            value=value,
+            delta=delta,
+            max_abs_delta=max_abs,
+        ))
+        if report.first_drift_layer is None and max_abs > drift_threshold:
+            report.first_drift_layer = layer_i
+        if (
+            sentinel is not None
+            and report.first_sentinel_layer is None
+            and float((value - sentinel).abs().min().item()) < sentinel_tol
+        ):
+            report.first_sentinel_layer = layer_i
+
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Compiled-side Assert checks
 # ---------------------------------------------------------------------------
 
@@ -443,25 +980,10 @@ def check_asserts_on_compiled(
     if not asserts:
         return
 
-    net: HeadlessTransformer = compiled._net
-    ra = net.residual_assignment
-    assert ra is not None, "compiled module has no residual_assignment"
-
-    res_stream = compiled._build_res_stream(
-        _inputs_from_dict(compiled, input_values, n_pos), past_len=0,
+    _net, ra, state_tensor = _run_with_states(
+        compiled, _inputs_from_dict(compiled, input_values, n_pos), past_len=0,
     )
-    _, all_states = net.forward(res_stream, return_states=True)
-
-    state_tensor: Dict[ResidualStreamState, Tuple[torch.Tensor, str]] = {}
-    for key, (state, tensor) in all_states.items():
-        state_tensor[state] = (tensor, key)
-
-    ordered_states: List[ResidualStreamState] = []
-    for layer in net.layers:
-        if layer.mlp.out_state in ra.mapping:
-            ordered_states.append(layer.mlp.out_state)
-    if net.layers[-1].mlp.out_state not in ordered_states:
-        ordered_states.append(net.layers[-1].mlp.out_state)
+    ordered_states = [s for _, _, s in _ordered_mlp_states(_net, ra)]
 
     for assert_node in asserts:
         # If an assert wraps another assert (e.g. a user's outer

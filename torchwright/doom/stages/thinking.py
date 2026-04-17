@@ -1,18 +1,17 @@
 """THINKING stage: select the next wall to render, seed RENDER iteration.
 
 At each THINKING token the graph runs ``attend_argmin_unmasked`` over
-SORTED positions.  The score is ``sort_rank`` (the BSP front-to-back
-index produced by SORTED); the mask is ``render_mask`` (walls already
-fully rendered).  Hoisting this attention out of RENDER means a block
-of RENDER tokens can share the same wall data — saving one attention
-per column chunk.
+SORTED positions.  The score is ``sel_bsp_rank`` (the BSP rank of the
+wall selected at that SORTED step); the mask is ``render_mask`` (walls
+already fully rendered).  The position key is ``sel_onehot`` (the
+wall-index one-hot), so both mask spaces align in wall-index space.
 
 The attention's **value** is the full wall payload plus visibility
 column bounds plus the per-wall one-hot needed to advance the render
 mask:
 
     value = [sort_den, C, D, E, H_inv, tex_id, vis_lo, vis_hi,
-             sort_rank_onehot]   # 8 + max_walls wide
+             sel_onehot]   # 8 + max_walls wide
 
 Each field is emitted as its own Node so the orchestrator can assemble
 the render_feedback vector without extra extracts.
@@ -44,11 +43,11 @@ import torch
 @dataclass
 class ThinkingInputs:
     # SORTED-stage outputs (per-SORTED-position Nodes read via attention).
-    sort_rank: Node            # score; sentinel replaces at non-SORTED
-    sort_rank_onehot: Node     # position key for argmin
+    sel_bsp_rank: Node         # score; sentinel replaces at non-SORTED
+    sel_onehot: Node           # wall-index position key for argmin
     gated_render_data: Node    # 6-wide wall render data gated to 0 off-SORTED
-    vis_lo: Node               # col_lo (float)
-    vis_hi: Node               # col_hi (float)
+    vis_lo: Node               # col_lo (float, zeroed when sort exhausted)
+    vis_hi: Node               # col_hi (float, zeroed when sort exhausted)
 
     # Host-fed running mask of walls already fully rendered.
     render_mask: Node          # max_walls-wide
@@ -86,29 +85,31 @@ class ThinkingOutputs:
 
 def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
     with annotate("thinking/wall_attention"):
-        # Score: sort_rank at SORTED positions, sentinel elsewhere so the
-        # argmin only considers SORTED candidates.
+        # Score: sel_bsp_rank at SORTED positions, sentinel elsewhere so
+        # the argmin only considers SORTED candidates.
         render_sentinel = create_literal_value(
             torch.tensor([99.0]), name="render_sentinel",
         )
         render_score = assert_integer(
-            select(inputs.is_sorted, inputs.sort_rank, render_sentinel)
+            select(inputs.is_sorted, inputs.sel_bsp_rank, render_sentinel)
         )
 
-        # Position key: sort_rank_onehot at SORTED, zeros elsewhere.
+        # Position key: sel_onehot (wall-index) at SORTED, zeros elsewhere.
         z_mw = create_literal_value(
             torch.zeros(max_walls), name="z_mw_thinking",
         )
         render_position_onehot = assert_onehot(select(
-            inputs.is_sorted, inputs.sort_rank_onehot, z_mw,
+            inputs.is_sorted, inputs.sel_onehot, z_mw,
         ))
 
         # Value: render data + col bounds + one-hot for downstream mask update.
+        # gated_render_data and vis_lo/vis_hi are already gated by
+        # sort_active in SORTED (zeroed at exhausted positions).
         render_value = Concatenate([
             inputs.gated_render_data,  # 6
             inputs.vis_lo,             # 1
             inputs.vis_hi,             # 1
-            inputs.sort_rank_onehot,   # max_walls
+            inputs.sel_onehot,         # max_walls
         ])
         render_value_gated = cond_gate(inputs.is_sorted, render_value)
 

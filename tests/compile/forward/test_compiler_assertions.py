@@ -1,0 +1,238 @@
+"""Negative tests for the compiler's invariant assertions.
+
+Each test deliberately constructs bad state and asserts the matching
+invariant fires with a useful message. Constructing the bad state
+directly (rather than hoping the compiler gets there) is intentional —
+the assertion is supposed to make the bad state unreachable through
+normal paths, so the only way to exercise it is to force it.
+"""
+
+import pytest
+import torch
+
+import torchwright.compiler.device as device_mod
+from torchwright.compiler.forward.compile import (
+    _verify_end_of_layer_liveness,
+    forward_compile,
+)
+from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.compiler.forward.weight_writer import (
+    AttnHeadOp,
+    MLPOp,
+    _write_compute_attn,
+    _write_compute_literal_value,
+)
+from torchwright.compiler.groups.transformer_layer import TransformerLayer
+from torchwright.graph import Attn, Linear
+from torchwright.graph.misc import InputNode, LiteralValue
+from torchwright.graph.pos_encoding import PosEncoding, attention_hardness
+
+
+D = 64
+D_HEAD = 16
+
+
+# ---------------------------------------------------------------------------
+# D — allocator self-consistency
+# ---------------------------------------------------------------------------
+
+
+def test_D_allocate_rejects_overlap_with_live_node():
+    """If _free somehow contained a column already owned by a live node,
+    allocate's pre-commit check fires with the overlap detail."""
+    rmap = ResidualStreamMap(32)
+    a = InputNode("a", 4)
+    rmap.allocate(a)
+
+    # Poison: re-add a's columns to _free while leaving a allocated.
+    a_cols = rmap.get_indices(a)
+    rmap._free |= set(a_cols)
+
+    b = InputNode("b", 4)
+    with pytest.raises(AssertionError, match=r"free set proposed columns already owned"):
+        rmap.allocate(b)
+
+
+def test_D_check_invariants_catches_missing_column():
+    """After mutation, if a column is neither in _free nor in any node's
+    indices, _check_invariants names the missing column(s)."""
+    rmap = ResidualStreamMap(16)
+    a = InputNode("a", 4)
+    rmap.allocate(a)
+
+    # Poison: remove one column from _free without adding it anywhere.
+    orphan = next(iter(rmap._free))
+    rmap._free.discard(orphan)
+
+    with pytest.raises(AssertionError, match=r"neither free nor allocated"):
+        rmap._check_invariants("poisoned")
+
+
+def test_D_check_invariants_catches_pairwise_overlap():
+    """If two nodes' index lists share a column, disjointness check fires."""
+    rmap = ResidualStreamMap(16)
+    a = InputNode("a", 4)
+    b = InputNode("b", 4)
+    rmap.allocate(a)
+    rmap.allocate(b)
+
+    # Poison: overwrite b's indices to overlap with a's.
+    rmap._node_to_indices[b] = list(rmap._node_to_indices[a])
+
+    with pytest.raises(AssertionError, match=r"assigned to both"):
+        rmap._check_invariants("poisoned")
+
+
+# ---------------------------------------------------------------------------
+# C — literal stability
+# ---------------------------------------------------------------------------
+
+
+def test_C_literal_write_rejects_truncation():
+    """_write_compute_literal_value refuses when target_cols is shorter
+    than the literal's value tensor."""
+    layer = TransformerLayer(D, D_HEAD)
+    lit = LiteralValue(torch.tensor([1.0, 2.0, 3.0, 4.0]), name="lit")
+    # Only 2 target cols, but value has 4 entries — would silently drop.
+    bogus = MLPOp(op_type="compute_literal_value", node=lit, target_cols=[0, 1], mlp_slots=[])
+    with pytest.raises(AssertionError, match=r"Literal truncation would drop values"):
+        _write_compute_literal_value(layer.mlp, bogus)
+
+
+def test_C_literal_write_rejects_extra_target_cols():
+    """Target cols wider than the literal would write uninitialized tail."""
+    layer = TransformerLayer(D, D_HEAD)
+    lit = LiteralValue(torch.tensor([1.0, 2.0]), name="lit")
+    bogus = MLPOp(
+        op_type="compute_literal_value",
+        node=lit,
+        target_cols=[0, 1, 2, 3],
+        mlp_slots=[],
+    )
+    with pytest.raises(AssertionError, match=r"Literal truncation"):
+        _write_compute_literal_value(layer.mlp, bogus)
+
+
+# ---------------------------------------------------------------------------
+# B — Q/K/V row-width correctness
+# ---------------------------------------------------------------------------
+
+
+def test_B_attn_rejects_v_source_cols_wrong_length():
+    """_write_compute_attn raises when V source_cols length doesn't match
+    value_in width."""
+    pos = PosEncoding(d_pos=D_HEAD)
+    v_in = InputNode("v", 4)
+    node = Attn(
+        query_in=pos,
+        key_in=pos,
+        value_in=v_in,
+        query_matrix=attention_hardness * torch.eye(len(pos), D_HEAD),
+        key_matrix=torch.eye(len(pos), D_HEAD),
+        value_matrix=torch.eye(len(v_in), D_HEAD),
+        output_matrix=torch.eye(D_HEAD, len(v_in)),
+    )
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(v_in)
+    out_cols = rmap.allocate(node)
+
+    layer = TransformerLayer(D, D_HEAD, pos)
+    bogus = AttnHeadOp(
+        op_type="compute_attn",
+        node=node,
+        target_cols=out_cols,
+        q_source_cols=rmap.resolve_indices(pos),
+        k_source_cols=rmap.resolve_indices(pos),
+        source_cols=rmap.resolve_indices(v_in)[:2],  # too short — truncated
+    )
+    with pytest.raises(AssertionError, match=r"V row-width mismatch"):
+        _write_compute_attn(layer.attn.attn, bogus, rmap)
+
+
+def test_B_attn_rejects_q_source_cols_wrong_length():
+    pos = PosEncoding(d_pos=D_HEAD)
+    v_in = InputNode("v", 4)
+    node = Attn(
+        query_in=pos,
+        key_in=pos,
+        value_in=v_in,
+        query_matrix=attention_hardness * torch.eye(len(pos), D_HEAD),
+        key_matrix=torch.eye(len(pos), D_HEAD),
+        value_matrix=torch.eye(len(v_in), D_HEAD),
+        output_matrix=torch.eye(D_HEAD, len(v_in)),
+    )
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(v_in)
+    out_cols = rmap.allocate(node)
+
+    layer = TransformerLayer(D, D_HEAD, pos)
+    bogus = AttnHeadOp(
+        op_type="compute_attn",
+        node=node,
+        target_cols=out_cols,
+        q_source_cols=rmap.resolve_indices(pos)[:4],  # too short
+        k_source_cols=rmap.resolve_indices(pos),
+        source_cols=rmap.resolve_indices(v_in),
+    )
+    with pytest.raises(AssertionError, match=r"Q row-width mismatch"):
+        _write_compute_attn(layer.attn.attn, bogus, rmap)
+
+
+# ---------------------------------------------------------------------------
+# A — end-of-layer liveness (gated)
+# ---------------------------------------------------------------------------
+
+
+def test_A_end_of_layer_catches_freed_too_early(monkeypatch):
+    """If a node is freed while still having uncomputed consumers, the
+    gated end-of-layer check fires with the consumer names."""
+    # Two-node linear chain: x -> l (Linear). Compile expects l to read
+    # x's columns, so x must stay allocated while l is uncomputed.
+    x = InputNode("x", 4)
+    weight = torch.eye(4, 4)
+    bias = torch.zeros(4)
+    l = Linear(x, weight, bias)
+    pos = PosEncoding(d_pos=D_HEAD)
+
+    graph = GraphAnalyzer(l)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(x)
+
+    # x is allocated, l is uncomputed — invariant holds here.
+    computed = {x}
+    _verify_end_of_layer_liveness(graph, rmap, computed, layer_idx=0)
+
+    # Poison: free x while l still needs it. The check must fire.
+    rmap.free(x)
+    with pytest.raises(AssertionError, match=r"liveness violation"):
+        _verify_end_of_layer_liveness(graph, rmap, computed, layer_idx=1)
+
+
+# ---------------------------------------------------------------------------
+# A — schedule-time liveness
+# ---------------------------------------------------------------------------
+
+
+def test_A_require_live_raises_for_unallocated_input():
+    """LayerScheduler._require_live surfaces unallocated source nodes with
+    op context before the downstream KeyError."""
+    from torchwright.compiler.forward.scheduler import LayerScheduler
+
+    pos = PosEncoding(d_pos=D_HEAD)
+    x = InputNode("x", 4)
+    weight = torch.eye(4, 4)
+    bias = torch.zeros(4)
+    l = Linear(x, weight, bias)
+
+    graph = GraphAnalyzer(l)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    # Deliberately do NOT allocate x — this should be caught by _require_live.
+
+    with pytest.raises(AssertionError, match=r"Live-column invariant violated"):
+        scheduler._require_live(x, rmap, f"compute_linear input for {l!r}")

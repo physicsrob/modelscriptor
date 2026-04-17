@@ -16,15 +16,9 @@ import time
 
 import modal
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .uv_sync(groups=["dev"], extra_options="--no-install-project")
-    .add_local_file("E8.8.1024.txt", "/root/E8.8.1024.txt")
-    .add_local_file("doom1.wad", "/root/doom1.wad")
-    .add_local_python_source("torchwright", "examples", "tests")
-)
+from modal_image import IMAGE
 
-app = modal.App("torchwright-test", image=image)
+app = modal.App("torchwright-test", image=IMAGE)
 
 # ── Shard definitions ─────────────────────────────────────────────
 # Simple file-level sharding.  Heavy compiled-test files get their
@@ -35,8 +29,9 @@ _HEAVY_FILES = [
     "tests/doom/test_game_graph.py",
     "tests/doom/test_wall_selection.py",
     "tests/doom/test_bsp_rank_integration.py",
-    "tests/doom/test_mode_c_probe.py",
+    "tests/doom/test_angle_192_column_drift.py",
     "tests/doom/test_tex_col.py",
+    "tests/debug/test_probe_phase_e_trace.py",
 ]
 
 _MEDIUM_FILES = [
@@ -54,6 +49,7 @@ SHARDS = [
 
 
 # ── Remote function ───────────────────────────────────────────────
+
 
 @app.function(gpu="a100-80gb", cpu=8, memory=32768, timeout=1800)
 def run_pytest(pytest_args: str, extra_args: str = "") -> int:
@@ -79,6 +75,7 @@ def run_pytest(pytest_args: str, extra_args: str = "") -> int:
 
 
 # ── Entrypoint ────────────────────────────────────────────────────
+
 
 @app.local_entrypoint()
 def main(file: str = "tests", args: str = ""):

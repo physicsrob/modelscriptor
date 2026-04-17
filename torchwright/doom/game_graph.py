@@ -220,25 +220,21 @@ def build_game_graph(
     sorted_out = build_sorted(
         SortedInputs(
             sort_score=wall_out.sort_score,
-            is_renderable=wall_out.is_renderable,
-            position_onehot=wall_out.position_onehot,
             sort_value=wall_out.sort_value,
-            prev_mask=fb_fields["prev_mask"],
-            eos_px=eos_out.px, eos_py=eos_out.py, eos_angle=eos_out.angle,
+            indicators_above=wall_out.indicators_above,
+            prev_bsp_rank=fb_fields["prev_bsp_rank"],
             is_sorted=tf["is_sorted"],
             is_wall=tf["is_wall"],
             pos_encoding=pos_encoding,
         ),
-        config=config,
         max_walls=max_walls,
-        max_coord=max_coord,
     )
 
     # ---------- THINKING ----------
     thinking_out = build_thinking(
         ThinkingInputs(
-            sort_rank=sorted_out.sort_rank,
-            sort_rank_onehot=sorted_out.sort_rank_onehot,
+            sel_bsp_rank=sorted_out.sel_bsp_rank,
+            sel_onehot=sorted_out.sel_onehot,
             gated_render_data=sorted_out.gated_render_data,
             vis_lo=sorted_out.vis_lo,
             vis_hi=sorted_out.vis_hi,
@@ -359,7 +355,7 @@ def _create_inputs(
 
     # Feedback vectors carry a mix of one-hots, flags, and coord-scale
     # intermediates; bound by max_coord which dominates all sub-fields.
-    d_sort_out = 8 + 5 + 3 + 2 * max_walls
+    d_sort_out = 8 + 5 + 3 + max_walls
     sort_feedback = create_input(
         "sort_feedback", d_sort_out, value_range=(-max_coord, max_coord),
     )
@@ -372,9 +368,14 @@ def _create_inputs(
     inputs["render_feedback"] = render_feedback
 
     # Feedback field layout (must stay in sync with _assemble_output).
+    #   [0..8)       E8_SORTED_WALL token type
+    #   [8..13)      sel_wall_data (ax, ay, bx, by, tex_id)
+    #   [13..14)     sel_bsp_rank (== prev_bsp_rank for next step)
+    #   [14..16)     vis_lo, vis_hi
+    #   [16..16+max_walls)  sel_onehot (wall-index one-hot for THINKING)
     fields: Dict[str, Node] = {
-        "prev_mask": extract_from(
-            sort_feedback, d_sort_out, 8 + 5 + 3 + max_walls, max_walls, "prev_mask",
+        "prev_bsp_rank": extract_from(
+            sort_feedback, d_sort_out, 8 + 5, 1, "prev_bsp_rank",
         ),
         "render_mask": extract_from(
             render_feedback, d_render_fb, 0, max_walls, "render_mask",
@@ -439,7 +440,7 @@ def _assemble_output(
     Overflow outputs bitblitted by the host:
         pixels, col, start, length, done
     """
-    d_sort_out = 8 + 5 + 3 + 2 * max_walls
+    d_sort_out = 8 + 5 + 3 + max_walls
     d_render_fb = 2 * max_walls + 11
 
     with annotate("output"):
@@ -473,23 +474,37 @@ def _assemble_output(
         sort_feedback_out = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="sort_type"),
             sorted_out.sel_wall_data,
-            sorted_out.sort_rank,
+            sorted_out.sel_bsp_rank,
             sorted_out.vis_lo,
             sorted_out.vis_hi,
             sorted_out.sel_onehot,
-            sorted_out.updated_mask,
         ])
+        assert len(sort_feedback_out) == d_sort_out, (
+            f"sort_feedback_out width {len(sort_feedback_out)} != d_sort_out "
+            f"{d_sort_out}; keep _assemble_output's Concatenate and "
+            f"_create_inputs's d_sort_out formula in sync."
+        )
 
         # EOS seeds the sort loop with a SORTED_WALL-type vector plus
-        # resolved player pose.  The rest of the layout is zero-padded
-        # since no wall has been picked yet.
+        # resolved player pose.  The sel_bsp_rank slot (offset 13) is
+        # initialized to -1 so the first SORTED step sees
+        # prev_bsp_rank=-1 → threshold slot 0 → picks any renderable
+        # wall (all indicators_above[0] are 1).
         eos_sort_seed = Concatenate([
             create_literal_value(E8_SORTED_WALL, name="eos_sort_seed"),
             eos_out.resolved_x, eos_out.resolved_y, input_out.new_angle,
+            create_literal_value(torch.zeros(2), name="eos_sort_pad1"),
             create_literal_value(
-                torch.zeros(2 + 3 + 2 * max_walls), name="eos_sort_pad",
+                torch.tensor([-1.0]), name="eos_prev_bsp_rank",
+            ),
+            create_literal_value(
+                torch.zeros(2 + max_walls), name="eos_sort_pad2",
             ),
         ])
+        assert len(eos_sort_seed) == d_sort_out, (
+            f"eos_sort_seed width {len(eos_sort_seed)} != d_sort_out "
+            f"{d_sort_out}; pad widths must match sort_feedback_out layout."
+        )
 
         # Next token type per source:
         #   THINKING → E8_RENDER (start rendering the picked wall)
