@@ -977,6 +977,63 @@ def main():
         if shown >= 15:
             break
 
+    # For the TOP 5 nodes with non-zero observed fp32 error, walk FORWARD
+    # from each to see what render-visible outputs they feed into.  If a
+    # noisy node only affects dead-end paths, it's not a priority.  If it
+    # flows into wall_data, render_data, pixel outputs, or overlaid graph
+    # outputs, it's the next target for tightening.
+    print("\n  Forward-trace from top-5 observed-error sites:")
+    err_sorted = [
+        r
+        for r in gate_records
+        if r["fp32_err"] is not None and r["fp32_err"] > 1.0
+    ]
+    err_sorted.sort(key=lambda r: -r["fp32_err"])
+
+    def _walk_forward(start_node, max_depth=5):
+        reachable_roots = list(graph_io.overlaid_outputs.values()) + list(
+            graph_io.overflow_outputs.values()
+        )
+        all_nodes_local = get_ancestor_nodes(set(reachable_roots))
+        rev = {n: [] for n in all_nodes_local}
+        for n in all_nodes_local:
+            for inp in getattr(n, "inputs", []):
+                if inp in rev:
+                    rev[inp].append(n)
+        frontier = [(start_node, 0)]
+        seen = {start_node}
+        visited = []
+        while frontier:
+            n, d = frontier.pop(0)
+            if d > max_depth:
+                continue
+            visited.append((n, d))
+            for c in rev.get(n, []):
+                if c not in seen:
+                    seen.add(c)
+                    frontier.append((c, d + 1))
+        return visited
+
+    for r in err_sorted[:5]:
+        n = r["node"]
+        fp32 = r["fp32_err"]
+        rec = report.per_node[n]
+        print(
+            f"\n    id={n.node_id} name={n.name!r}  fp32|Δ|={fp32:.2f}  "
+            f"compiled~{rec.compiled_mean:+.3f} "
+            f"oracle~{rec.oracle_mean:+.3f}"
+        )
+        visited = _walk_forward(n, max_depth=4)
+        shown = 0
+        for d_n, depth in visited[1:]:
+            nm = d_n.name or ""
+            if nm and shown < 10:
+                print(
+                    f"      depth={depth} {type(d_n).__name__:<15} "
+                    f"name={nm!r}  id={d_n.node_id}"
+                )
+                shown += 1
+
     # Also: histogram of M across all approximate gates.
     import statistics
 
