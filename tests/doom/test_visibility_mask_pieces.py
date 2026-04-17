@@ -52,10 +52,10 @@ class TestCrossDotColumnIndex:
         fov_rad = fov * math.pi / 128.0
 
         pos = create_pos_encoding()
-        dx = create_input("dx", 1)
-        dy = create_input("dy", 1)
-        cos_pa = create_input("cos_pa", 1)
-        sin_pa = create_input("sin_pa", 1)
+        dx = create_input("dx", 1, value_range=(-20.0, 20.0))
+        dy = create_input("dy", 1, value_range=(-20.0, 20.0))
+        cos_pa = create_input("cos_pa", 1, value_range=(-1.0, 1.0))
+        sin_pa = create_input("sin_pa", 1, value_range=(-1.0, 1.0))
 
         cross = subtract(
             piecewise_linear_2d(cos_pa, dy, _TRIG_BP, _DIFF_BP,
@@ -148,8 +148,8 @@ class TestInRangeMask:
     @pytest.fixture(scope="class")
     def mask_module(self):
         pos = create_pos_encoding()
-        lo = create_input("lo", 1)
-        hi = create_input("hi", 1)
+        lo = create_input("lo", 1, value_range=(-40.0, 40.0))
+        hi = create_input("hi", 1, value_range=(-40.0, 40.0))
         mask = in_range(lo, hi, 32)
         output = Concatenate([mask])
         return compile_headless(
@@ -207,7 +207,7 @@ class TestColumnOneHot:
     @pytest.fixture(scope="class")
     def onehot_module(self):
         pos = create_pos_encoding()
-        col = create_input("col", 1)
+        col = create_input("col", 1, value_range=(0.0, 40.0))
         col_p1 = add_const(col, 1.0)
         oh = in_range(col, col_p1, 32)
         oh_01 = multiply_const(add_const(oh, 1.0), 0.5)

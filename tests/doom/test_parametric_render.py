@@ -218,16 +218,16 @@ def build_parametric_render_graph(
     tex_h = textures[0].shape[1]
 
     # Inputs
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    ray_cos = create_input("ray_cos", 1)
-    ray_sin = create_input("ray_sin", 1)
-    perp_cos = create_input("perp_cos", 1)
-    wall_ax = create_input("wall_ax", 1)
-    wall_ay = create_input("wall_ay", 1)
-    wall_bx = create_input("wall_bx", 1)
-    wall_by = create_input("wall_by", 1)
-    wall_tex_id = create_input("wall_tex_id", 1)
+    player_x = create_input("player_x", 1, value_range=(-max_coord, max_coord))
+    player_y = create_input("player_y", 1, value_range=(-max_coord, max_coord))
+    ray_cos = create_input("ray_cos", 1, value_range=(-1.0, 1.0))
+    ray_sin = create_input("ray_sin", 1, value_range=(-1.0, 1.0))
+    perp_cos = create_input("perp_cos", 1, value_range=(-1.0, 1.0))
+    wall_ax = create_input("wall_ax", 1, value_range=(-max_coord, max_coord))
+    wall_ay = create_input("wall_ay", 1, value_range=(-max_coord, max_coord))
+    wall_bx = create_input("wall_bx", 1, value_range=(-max_coord, max_coord))
+    wall_by = create_input("wall_by", 1, value_range=(-max_coord, max_coord))
+    wall_tex_id = create_input("wall_tex_id", 1, value_range=(0.0, 255.0))
 
     # Stage 1-2: Parametric intersection
     den, num_t, num_u = _parametric_segment_intersection(

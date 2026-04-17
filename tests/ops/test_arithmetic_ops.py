@@ -491,8 +491,8 @@ def test_multiply_integers_strategies():
 
 def test_reduce_min():
     """Find minimum key and its associated value."""
-    keys = [create_input(f"k{i}", 1) for i in range(4)]
-    vals = [create_input(f"v{i}", 2) for i in range(4)]
+    keys = [create_input(f"k{i}", 1, value_range=(0.0, 100.0)) for i in range(4)]
+    vals = [create_input(f"v{i}", 2, value_range=(0.0, 1000.0)) for i in range(4)]
     win_k, win_v = reduce_min(keys, vals)
 
     input_values = {
@@ -514,8 +514,8 @@ def test_reduce_min():
 
 def test_reduce_max():
     """Find maximum key and its associated value."""
-    keys = [create_input(f"k{i}", 1) for i in range(4)]
-    vals = [create_input(f"v{i}", 2) for i in range(4)]
+    keys = [create_input(f"k{i}", 1, value_range=(0.0, 100.0)) for i in range(4)]
+    vals = [create_input(f"v{i}", 2, value_range=(0.0, 1000.0)) for i in range(4)]
     win_k, win_v = reduce_max(keys, vals)
 
     input_values = {
@@ -553,8 +553,8 @@ def test_reduce_min_single():
 
 def test_reduce_min_odd():
     """N=3: odd element passes through."""
-    keys = [create_input(f"k{i}", 1) for i in range(3)]
-    vals = [create_input(f"v{i}", 1) for i in range(3)]
+    keys = [create_input(f"k{i}", 1, value_range=(0.0, 100.0)) for i in range(3)]
+    vals = [create_input(f"v{i}", 1, value_range=(0.0, 1000.0)) for i in range(3)]
     win_k, win_v = reduce_min(keys, vals)
 
     input_values = {

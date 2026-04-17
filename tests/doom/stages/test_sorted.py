@@ -51,16 +51,22 @@ def sorted_module():
     pos = create_pos_encoding()
     payload_w = payload_width(_MAX_WALLS)
 
-    sort_score = assert_integer(create_input("sort_score", 1))
-    is_renderable = create_input("is_renderable", 1)
-    position_onehot = assert_onehot(create_input("position_onehot", _MAX_WALLS))
-    sort_value = create_input("sort_value", payload_w)
-    prev_mask = assert_01(create_input("prev_mask", _MAX_WALLS))
-    eos_px = create_input("eos_px", 1)
-    eos_py = create_input("eos_py", 1)
-    eos_angle = create_input("eos_angle", 1)
-    is_sorted = create_input("is_sorted", 1)
-    is_wall = create_input("is_wall", 1)
+    sort_score = assert_integer(
+        create_input("sort_score", 1, value_range=(0.0, 100.0))
+    )
+    is_renderable = create_input("is_renderable", 1, value_range=(-1.0, 1.0))
+    position_onehot = assert_onehot(
+        create_input("position_onehot", _MAX_WALLS, value_range=(0.0, 1.0))
+    )
+    sort_value = create_input("sort_value", payload_w, value_range=(-_MAX_COORD, _MAX_COORD))
+    prev_mask = assert_01(
+        create_input("prev_mask", _MAX_WALLS, value_range=(0.0, 1.0))
+    )
+    eos_px = create_input("eos_px", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    eos_py = create_input("eos_py", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    eos_angle = create_input("eos_angle", 1, value_range=(0.0, 255.0))
+    is_sorted = create_input("is_sorted", 1, value_range=(-1.0, 1.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
 
     out = build_sorted(
         SortedInputs(
@@ -305,8 +311,8 @@ def test_tied_wall_scores_raise_at_reference_eval():
     from torchwright.debug.probe import reference_eval
     from torchwright.graph.asserts import assert_distinct_across
 
-    sort_score = create_input("sort_score", 1)
-    is_wall = create_input("is_wall", 1)
+    sort_score = create_input("sort_score", 1, value_range=(0.0, 100.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
     checked = assert_distinct_across(sort_score, is_wall, margin=0.5)
 
     # Two WALL rows with tied scores (1.0 and 1.1, margin 0.5 → tie).
@@ -329,8 +335,8 @@ def test_score_gap_fires_at_reference_eval():
     from torchwright.debug.probe import reference_eval
     from torchwright.graph.asserts import assert_score_gap_at_least
 
-    sort_score = create_input("sort_score", 1)
-    is_wall = create_input("is_wall", 1)
+    sort_score = create_input("sort_score", 1, value_range=(0.0, 100.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
     checked = assert_score_gap_at_least(sort_score, is_wall, margin=0.05)
 
     input_values = {
@@ -346,8 +352,8 @@ def test_score_gap_passes_with_comfortable_margin():
     from torchwright.debug.probe import reference_eval
     from torchwright.graph.asserts import assert_score_gap_at_least
 
-    sort_score = create_input("sort_score", 1)
-    is_wall = create_input("is_wall", 1)
+    sort_score = create_input("sort_score", 1, value_range=(0.0, 100.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
     checked = assert_score_gap_at_least(sort_score, is_wall, margin=0.05)
 
     input_values = {
@@ -362,8 +368,8 @@ def test_score_gap_vacuous_zero_valid():
     from torchwright.debug.probe import reference_eval
     from torchwright.graph.asserts import assert_score_gap_at_least
 
-    sort_score = create_input("sort_score", 1)
-    is_wall = create_input("is_wall", 1)
+    sort_score = create_input("sort_score", 1, value_range=(0.0, 100.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
     checked = assert_score_gap_at_least(sort_score, is_wall, margin=0.05)
 
     input_values = {
@@ -378,8 +384,8 @@ def test_score_gap_vacuous_one_valid():
     from torchwright.debug.probe import reference_eval
     from torchwright.graph.asserts import assert_score_gap_at_least
 
-    sort_score = create_input("sort_score", 1)
-    is_wall = create_input("is_wall", 1)
+    sort_score = create_input("sort_score", 1, value_range=(0.0, 100.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
     checked = assert_score_gap_at_least(sort_score, is_wall, margin=0.05)
 
     input_values = {
@@ -396,8 +402,8 @@ def test_score_gap_ignores_non_wall_ties():
     from torchwright.debug.probe import reference_eval
     from torchwright.graph.asserts import assert_score_gap_at_least
 
-    sort_score = create_input("sort_score", 1)
-    is_wall = create_input("is_wall", 1)
+    sort_score = create_input("sort_score", 1, value_range=(0.0, 100.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
     checked = assert_score_gap_at_least(sort_score, is_wall, margin=0.05)
 
     input_values = {

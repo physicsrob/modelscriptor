@@ -60,10 +60,12 @@ def vis_module():
     three 1-wide scalars.
     """
     pos = create_pos_encoding()
-    sel_wall_data = create_input("sel_wall_data", 5)
-    eos_px = create_input("eos_px", 1)
-    eos_py = create_input("eos_py", 1)
-    eos_angle = create_input("eos_angle", 1)
+    sel_wall_data = create_input(
+        "sel_wall_data", 5, value_range=(-_MAX_COORD, _MAX_COORD),
+    )
+    eos_px = create_input("eos_px", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    eos_py = create_input("eos_py", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    eos_angle = create_input("eos_angle", 1, value_range=(0.0, 255.0))
 
     vis_lo, vis_hi = _compute_visibility_columns(
         sel_wall_data, eos_px, eos_py, eos_angle,

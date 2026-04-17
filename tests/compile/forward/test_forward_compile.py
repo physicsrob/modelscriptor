@@ -105,9 +105,9 @@ def test_compile_add():
 
 def test_compile_select():
     """select(cond, true, false) — uses cond_add_vector + mlp_layer."""
-    cond = create_input("cond", 1)
-    true_val = create_input("true_val", 4)
-    false_val = create_input("false_val", 4)
+    cond = create_input("cond", 1, value_range=(-1.0, 1.0))
+    true_val = create_input("true_val", 4, value_range=(-4.0, 4.0))
+    false_val = create_input("false_val", 4, value_range=(-4.0, 4.0))
     out = select(cond, true_val, false_val)
 
     n_pos = 3
@@ -191,8 +191,8 @@ def test_compile_cond_gate():
     cond_gate(cond, inp) = cond_add_vector(cond, relu(cond_add_vector(cond, inp, ...)), ...)
     """
     pos = create_pos_encoding()
-    cond = create_input("cond", 1)
-    inp = create_input("inp", 4)
+    cond = create_input("cond", 1, value_range=(-1.0, 1.0))
+    inp = create_input("inp", 4, value_range=(-4.0, 4.0))
     out = cond_gate(cond, inp)
 
     n_pos = 4

@@ -1,4 +1,6 @@
+from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.spherical_codes import index_to_vector
+from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.inout_nodes import create_literal_value, create_input
 from torchwright.ops.logic_ops import (
     equals_vector,
@@ -42,8 +44,9 @@ def test_cond_add_vector():
 
 def test_cond_gate():
     x = create_input("x", 1)
+    x_bounded = assert_matches_value_type(x, NodeValueType(value_range=Range(-2.0, 2.0)))
     cond_input = create_input("cond", 1)
-    out = cond_gate(cond_input, x)
+    out = cond_gate(cond_input, x_bounded)
     for cond_value in [-1.0, 1.0]:
         for x_value in [-2.0, -1.0, 0.0, 1.0, 2.0]:
             output = out.compute(
@@ -58,6 +61,76 @@ def test_cond_gate():
             else:
                 expected_value = 0.0
             assert output.item() == expected_value
+
+
+def test_cond_gate_exact_branch_passes_clean_cond():
+    """Two-sublayer branch matches the single-sublayer branch under clean ±1 cond."""
+    x = create_input("x", 1)
+    x_bounded = assert_matches_value_type(x, NodeValueType(value_range=Range(-2.0, 2.0)))
+    cond_input = create_input("cond", 1)
+    out = cond_gate(cond_input, x_bounded, approximate=False)
+    for cond_value in [-1.0, 1.0]:
+        for x_value in [-2.0, -1.0, 0.0, 1.0, 2.0]:
+            output = out.compute(
+                n_pos=1,
+                input_values={
+                    "cond": torch.tensor([[cond_value]]),
+                    "x": torch.tensor([[x_value]]),
+                },
+            )
+            expected_value = x_value if cond_value > 0.0 else 0.0
+            assert output.item() == expected_value
+
+
+def test_cond_gate_exact_branch_preserves_small_inputs():
+    """With a bounded inp range the cancellation-free branch is float-exact on pass-through."""
+    x = create_input("x", 1)
+    # Wrap in Assert to declare a bounded range; cond_gate reads this range to set M.
+    x_bounded = assert_matches_value_type(x, NodeValueType(value_range=Range(-1.0, 1.0)))
+    cond_input = create_input("cond", 1)
+    out = cond_gate(cond_input, x_bounded, approximate=False)
+
+    x_tensor = torch.tensor([[1.0e-5]])
+    output = out.compute(
+        n_pos=1,
+        input_values={
+            "cond": torch.tensor([[1.0]]),
+            "x": x_tensor,
+        },
+    )
+    # False branch on-path is structurally exact: ReLU(v) - ReLU(-v) = v with no
+    # large-constant cancellation. Output should equal the input bit-for-bit.
+    assert torch.equal(output, x_tensor)
+
+
+def test_cond_gate_adaptive_M_uses_value_range():
+    """Single-sublayer (approximate=True) branch picks M from inp.value_type.value_range,
+    so small inputs survive that would be lost under the old global big_offset=1000."""
+    x = create_input("x", 1)
+    x_bounded = assert_matches_value_type(x, NodeValueType(value_range=Range(-1.0, 1.0)))
+    cond_input = create_input("cond", 1)
+    out = cond_gate(cond_input, x_bounded, approximate=True)
+
+    small = 1.0e-5
+    output = out.compute(
+        n_pos=1,
+        input_values={
+            "cond": torch.tensor([[1.0]]),
+            "x": torch.tensor([[small]]),
+        },
+    )
+    # M=1 here, so ULP(M)≈1.2e-7; 1e-5 survives cancellation cleanly.
+    assert abs(output.item() - small) < 1.0e-6
+
+
+def test_cond_gate_rejects_unbounded_inp():
+    """Unbounded inp range fails at build time with a TypeError pointing at value_range."""
+    import pytest
+
+    x = create_input("x", 1)
+    cond_input = create_input("cond", 1)
+    with pytest.raises(TypeError, match="value_range"):
+        cond_gate(cond_input, x)
 
 
 def test_bool_any_true():

@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional, Tuple
 
 from torchwright.graph import Node, InputNode, LiteralValue, Embedding, PosEncoding
 import torch
@@ -6,7 +6,12 @@ import torch
 from torchwright.graph.embedding import Unembedding
 
 
-def create_input(name_or_width, width: int = None) -> Node:
+def create_input(
+    name_or_width,
+    width: int = None,
+    *,
+    value_range: Optional[Tuple[float, float]] = None,
+) -> Node:
     """
     Create an input node with optional name and specified dimension.
 
@@ -17,18 +22,21 @@ def create_input(name_or_width, width: int = None) -> Node:
     Args:
     - name_or_width: Either the input name (str) or width (int)
     - width: Width when name is provided (optional)
+    - value_range: Optional (lo, hi) bound on the input tensor values.
+      Declaring this lets downstream ops like ``cond_gate`` / ``select``
+      derive a tight offset instead of failing at graph-build time.
 
     Returns:
     - Node: The created input node.
     """
     if isinstance(name_or_width, int):
         # New pattern: create_input(width)
-        return InputNode(name_or_width)
+        return InputNode(name_or_width, value_range=value_range)
     else:
         # Legacy pattern: create_input(name, width)
         if width is None:
             raise ValueError("width is required when name is provided")
-        return InputNode(width, name=name_or_width)
+        return InputNode(width, name=name_or_width, value_range=value_range)
 
 
 def create_literal_value(vector: torch.Tensor, name: str = "") -> Node:

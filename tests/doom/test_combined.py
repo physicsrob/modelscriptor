@@ -114,18 +114,18 @@ def build_combined_graph(
     pos_encoding = create_pos_encoding()
 
     # --- Inputs ---
-    token_type = create_input("token_type", 8)
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    player_angle = create_input("player_angle", 1)
-    wall_ax = create_input("wall_ax", 1)
-    wall_ay = create_input("wall_ay", 1)
-    wall_bx = create_input("wall_bx", 1)
-    wall_by = create_input("wall_by", 1)
-    wall_tex_id = create_input("wall_tex_id", 1)
-    sort_mask = create_input("sort_mask", max_walls)
-    col_idx = create_input("col_idx", 1)
-    patch_idx = create_input("patch_idx", 1)
+    token_type = create_input("token_type", 8, value_range=(-1.0, 1.0))
+    player_x = create_input("player_x", 1, value_range=(-20.0, 20.0))
+    player_y = create_input("player_y", 1, value_range=(-20.0, 20.0))
+    player_angle = create_input("player_angle", 1, value_range=(0.0, 255.0))
+    wall_ax = create_input("wall_ax", 1, value_range=(-20.0, 20.0))
+    wall_ay = create_input("wall_ay", 1, value_range=(-20.0, 20.0))
+    wall_bx = create_input("wall_bx", 1, value_range=(-20.0, 20.0))
+    wall_by = create_input("wall_by", 1, value_range=(-20.0, 20.0))
+    wall_tex_id = create_input("wall_tex_id", 1, value_range=(0.0, 255.0))
+    sort_mask = create_input("sort_mask", max_walls, value_range=(0.0, 1.0))
+    col_idx = create_input("col_idx", 1, value_range=(0.0, 255.0))
+    patch_idx = create_input("patch_idx", 1, value_range=(0.0, 255.0))
 
     # --- Token type detection ---
     is_start = equals_vector(token_type, E8_START)
@@ -159,7 +159,7 @@ def build_combined_graph(
 
     # Wall index: fed by host (0, 1, 2, ... at WALL positions, 0 elsewhere).
     # No prefix_sum needed — the host knows the order it feeds walls.
-    wall_index = create_input("wall_index", 1)
+    wall_index = create_input("wall_index", 1, value_range=(0.0, 255.0))
     wall_index_p1 = add_const(wall_index, 1.0)
     onehot_bool = in_range(wall_index, wall_index_p1, max_walls)
     ones_oh = create_literal_value(torch.ones(max_walls), name="ones_oh")

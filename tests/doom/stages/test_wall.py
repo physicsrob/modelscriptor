@@ -53,22 +53,28 @@ def wall_collision_module():
     """
     pos = create_pos_encoding()
 
-    is_wall = create_input("is_wall", 1)
-    move_cos = create_input("move_cos", 1)
-    move_sin = create_input("move_sin", 1)
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    vel_dx = create_input("vel_dx", 1)
-    vel_dy = create_input("vel_dy", 1)
-    wall_ax = create_input("wall_ax", 1)
-    wall_ay = create_input("wall_ay", 1)
-    wall_bx = create_input("wall_bx", 1)
-    wall_by = create_input("wall_by", 1)
-    wall_index = create_input("wall_index", 1)
-    wall_tex_id = create_input("wall_tex_id", 1)
-    wall_bsp_coeffs = create_input("wall_bsp_coeffs", _MAX_BSP_NODES)
-    wall_bsp_const = create_input("wall_bsp_const", 1)
-    side_P_vec = create_input("side_P_vec", _MAX_BSP_NODES)
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
+    move_cos = create_input("move_cos", 1, value_range=(-1.0, 1.0))
+    move_sin = create_input("move_sin", 1, value_range=(-1.0, 1.0))
+    player_x = create_input("player_x", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    player_y = create_input("player_y", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    vel_dx = create_input("vel_dx", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    vel_dy = create_input("vel_dy", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    wall_ax = create_input("wall_ax", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    wall_ay = create_input("wall_ay", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    wall_bx = create_input("wall_bx", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    wall_by = create_input("wall_by", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    wall_index = create_input("wall_index", 1, value_range=(0.0, 255.0))
+    wall_tex_id = create_input("wall_tex_id", 1, value_range=(0.0, 255.0))
+    wall_bsp_coeffs = create_input(
+        "wall_bsp_coeffs", _MAX_BSP_NODES, value_range=(-_MAX_COORD, _MAX_COORD),
+    )
+    wall_bsp_const = create_input(
+        "wall_bsp_const", 1, value_range=(-_MAX_COORD, _MAX_COORD),
+    )
+    side_P_vec = create_input(
+        "side_P_vec", _MAX_BSP_NODES, value_range=(0.0, 1.0),
+    )
 
     outputs = build_wall(
         WallInputs(
@@ -110,22 +116,28 @@ def wall_sort_value_module():
     """
     pos = create_pos_encoding()
 
-    is_wall = create_input("is_wall", 1)
-    move_cos = create_input("move_cos", 1)
-    move_sin = create_input("move_sin", 1)
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    vel_dx = create_input("vel_dx", 1)
-    vel_dy = create_input("vel_dy", 1)
-    wall_ax = create_input("wall_ax", 1)
-    wall_ay = create_input("wall_ay", 1)
-    wall_bx = create_input("wall_bx", 1)
-    wall_by = create_input("wall_by", 1)
-    wall_index = create_input("wall_index", 1)
-    wall_tex_id = create_input("wall_tex_id", 1)
-    wall_bsp_coeffs = create_input("wall_bsp_coeffs", _MAX_BSP_NODES)
-    wall_bsp_const = create_input("wall_bsp_const", 1)
-    side_P_vec = create_input("side_P_vec", _MAX_BSP_NODES)
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
+    move_cos = create_input("move_cos", 1, value_range=(-1.0, 1.0))
+    move_sin = create_input("move_sin", 1, value_range=(-1.0, 1.0))
+    player_x = create_input("player_x", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    player_y = create_input("player_y", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    vel_dx = create_input("vel_dx", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    vel_dy = create_input("vel_dy", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    wall_ax = create_input("wall_ax", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    wall_ay = create_input("wall_ay", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    wall_bx = create_input("wall_bx", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    wall_by = create_input("wall_by", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    wall_index = create_input("wall_index", 1, value_range=(0.0, 255.0))
+    wall_tex_id = create_input("wall_tex_id", 1, value_range=(0.0, 255.0))
+    wall_bsp_coeffs = create_input(
+        "wall_bsp_coeffs", _MAX_BSP_NODES, value_range=(-_MAX_COORD, _MAX_COORD),
+    )
+    wall_bsp_const = create_input(
+        "wall_bsp_const", 1, value_range=(-_MAX_COORD, _MAX_COORD),
+    )
+    side_P_vec = create_input(
+        "side_P_vec", _MAX_BSP_NODES, value_range=(0.0, 1.0),
+    )
 
     outputs = build_wall(
         WallInputs(
@@ -324,9 +336,9 @@ def test_is_renderable_output(wall_collision_module):
 
 
 def test_non_wall_positions_always_miss(wall_collision_module):
-    """With is_wall=0, all three hit flags should be gated to -1 (miss)."""
+    """At non-WALL positions (is_wall=-1), all three hit flags gate to -1."""
     inputs = _pack(wall_collision_module, {
-        "is_wall": 0.0,
+        "is_wall": -1.0,
         "player_x": 0.0, "player_y": 0.0,
         "vel_dx": 0.3, "vel_dy": 0.0,
         "wall_ax": 0.2, "wall_ay": -1.0,

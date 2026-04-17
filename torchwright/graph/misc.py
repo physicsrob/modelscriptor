@@ -21,7 +21,14 @@ Predicate = Callable[[torch.Tensor], Tuple[bool, str]]
 
 
 class InputNode(Node):
-    def __init__(self, d_output_or_name, d_output_or_nothing=None, name: str = ""):
+    def __init__(
+        self,
+        d_output_or_name,
+        d_output_or_nothing=None,
+        name: str = "",
+        *,
+        value_range: Optional[Tuple[float, float]] = None,
+    ):
         # Support both old and new constructor patterns:
         # - InputNode(d_output) - new anonymous pattern
         # - InputNode(d_output, name=name) - new named pattern
@@ -37,7 +44,14 @@ class InputNode(Node):
             d_output = d_output_or_name
             if d_output_or_nothing is not None and isinstance(d_output_or_nothing, str):
                 name = d_output_or_nothing
+        self._declared_value_range = value_range
         super().__init__(d_output, [], name=name)
+
+    def compute_value_type(self) -> NodeValueType:
+        if self._declared_value_range is None:
+            return NodeValueType.unknown()
+        lo, hi = self._declared_value_range
+        return NodeValueType(value_range=Range(float(lo), float(hi)))
 
     def compute(self, n_pos: int, input_values: dict, name: str = None) -> torch.Tensor:
         # Use provided name or fall back to stored name

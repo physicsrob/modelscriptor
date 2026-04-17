@@ -1,3 +1,4 @@
+import math
 from typing import List
 
 from torchwright.graph import Node, Add, Concatenate
@@ -11,8 +12,27 @@ from torchwright.ops.arithmetic_ops import sum_nodes, compare
 from torchwright.ops.const import (
     step_sharpness,
     embedding_step_sharpness,
-    big_offset,
 )
+
+
+_GATE_OFFSET_SAFETY_FACTOR = 2.0
+"""Headroom over the declared ``max|value|`` so that activation noise
+from the compiled transformer's ReLU approximations doesn't leak
+through the gate's off-path. The old global ``big_offset = 1000`` gave
+~100× headroom over typical values; a 2× factor keeps the precision
+win (M ≈ 2·max_abs rather than 1000) while tolerating modest drift."""
+
+
+def _max_abs_or_raise(vt: NodeValueType, caller: str) -> float:
+    r = vt.value_range
+    m = max(abs(r.lo), abs(r.hi))
+    if not math.isfinite(m):
+        raise TypeError(
+            f"{caller} requires a bounded value_range on its gated input; "
+            f"got {vt}. Wrap the upstream node with "
+            f"`assert_matches_value_type(node, NodeValueType(value_range=Range(lo, hi)))`."
+        )
+    return _GATE_OFFSET_SAFETY_FACTOR * m
 
 
 def bool_any_true(inp_list: List[Node]) -> Node:
@@ -158,7 +178,6 @@ def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
     vt = inp.value_type
     r = vt.value_range
     out_range = Range(min(0.0, r.lo), max(0.0, r.hi))
-    # An approximate condition demotes the output guarantee level.
     cond_g = cond.value_type.is_sign
     if vt.is_binary:
         return NodeValueType(
@@ -171,10 +190,10 @@ def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
             value_range=out_range,
             is_integer=_min_guarantee(cond_g, vt.is_integer),
         )
-    return NodeValueType.unknown()
+    return NodeValueType(value_range=out_range)
 
 
-def cond_gate(cond: Node, inp: Node) -> Node:
+def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
     """
     Gates the value of a node based on a condition. If the condition is true,
     outputs the value. If false, outputs a zero tensor of the same shape as value.
@@ -182,6 +201,15 @@ def cond_gate(cond: Node, inp: Node) -> Node:
     Args:
         cond (Node): Condition node.
         inp (Node): The node whose value is to be gated.
+        approximate: When ``True`` (default), uses a single L→ReLU→L sublayer
+            with an additive cancellation trick. The on-path computes
+            ``(M + v) − M`` where ``M`` is derived from ``inp.value_type``; this
+            loses precision for ``|v| ≪ ULP(M)`` and amplifies approximate-cond
+            error as ``M·ε``. When ``False``, uses two sublayers: the first
+            maps ``cond`` to ``c_off = ReLU(−cond) ∈ {0, 1}`` (clipping cond
+            noise on the on-side); the second gates ``inp`` via
+            ``ReLU(±inp − M·c_off)``. The on-path is float-exact and immune to
+            cond noise; costs one extra MLP sublayer.
 
     Returns:
         Node: Output node after applying the gate based on condition.
@@ -189,36 +217,77 @@ def cond_gate(cond: Node, inp: Node) -> Node:
     assert len(cond) == 1
 
     d = len(inp)
-    # Fused single L->ReLU->L reading [cond, inp]:
-    #   unit_a[j] = ReLU( big_offset * cond + inp[j])  -- alive when cond=+1
-    #   unit_b[j] = ReLU(-big_offset * cond)            -- alive when cond=-1
-    #   out[j]    = unit_a[j] + unit_b[j] - big_offset
-    #
-    # cond=+1: out = inp,  cond=-1: out = 0
-    d_hidden = 2 * d
-    input_proj = torch.zeros(d_hidden, 1 + d)
-    input_bias = torch.zeros(d_hidden)
-    output_proj = torch.zeros(d_hidden, d)
-    output_bias = torch.full((d,), -big_offset)
+    M = _max_abs_or_raise(inp.value_type, "cond_gate")
 
-    for j in range(d):
-        a = j
-        b = d + j
-        input_proj[a, 0] = big_offset
-        input_proj[a, 1 + j] = 1.0
-        input_proj[b, 0] = -big_offset
-        output_proj[a, j] = 1.0
-        output_proj[b, j] = 1.0
+    if approximate:
+        # Single L->ReLU->L reading [cond, inp]:
+        #   unit_a[j] = ReLU( M * cond + inp[j])  -- alive when cond=+1
+        #   unit_b[j] = ReLU(-M * cond)           -- alive when cond=-1
+        #   out[j]    = unit_a[j] + unit_b[j] - M
+        d_hidden = 2 * d
+        input_proj = torch.zeros(d_hidden, 1 + d)
+        input_bias = torch.zeros(d_hidden)
+        output_proj = torch.zeros(d_hidden, d)
+        output_bias = torch.full((d,), -M)
 
-    x = Concatenate([cond, inp])
-    result = linear_relu_linear(
-        input_node=x,
-        input_proj=input_proj,
-        input_bias=input_bias,
-        output_proj=output_proj,
-        output_bias=output_bias,
-        name="cond_gate",
-    )
+        for j in range(d):
+            a = j
+            b = d + j
+            input_proj[a, 0] = M
+            input_proj[a, 1 + j] = 1.0
+            input_proj[b, 0] = -M
+            output_proj[a, j] = 1.0
+            output_proj[b, j] = 1.0
+
+        x = Concatenate([cond, inp])
+        result = linear_relu_linear(
+            input_node=x,
+            input_proj=input_proj,
+            input_bias=input_bias,
+            output_proj=output_proj,
+            output_bias=output_bias,
+            name="cond_gate",
+        )
+    else:
+        # Two-sublayer cancellation-free gate.
+        # Sublayer 1: c_off = ReLU(-cond)   -- {0, 1} via ReLU clipping
+        c_off = linear_relu_linear(
+            input_node=cond,
+            input_proj=torch.tensor([[-1.0]]),
+            input_bias=torch.tensor([0.0]),
+            output_proj=torch.tensor([[1.0]]),
+            output_bias=torch.tensor([0.0]),
+            name="cond_gate_c_off",
+        )
+        # Sublayer 2 reads [c_off, inp]:
+        #   unit_pos[j] = ReLU( inp[j] - M * c_off)
+        #   unit_neg[j] = ReLU(-inp[j] - M * c_off)
+        #   out[j]      = unit_pos[j] - unit_neg[j]
+        d_hidden = 2 * d
+        input_proj = torch.zeros(d_hidden, 1 + d)
+        input_bias = torch.zeros(d_hidden)
+        output_proj = torch.zeros(d_hidden, d)
+        output_bias = torch.zeros(d)
+
+        for j in range(d):
+            a = j
+            b = d + j
+            input_proj[a, 0] = -M
+            input_proj[a, 1 + j] = 1.0
+            input_proj[b, 0] = -M
+            input_proj[b, 1 + j] = -1.0
+            output_proj[a, j] = 1.0
+            output_proj[b, j] = -1.0
+
+        x = Concatenate([c_off, inp])
+        result = linear_relu_linear(
+            input_node=x,
+            input_proj=input_proj,
+            input_bias=input_bias,
+            output_proj=output_proj,
+            output_bias=output_bias,
+            name="cond_gate",
+        )
 
     vt = _cond_gate_output_type(cond, inp)
     if vt != NodeValueType.unknown():

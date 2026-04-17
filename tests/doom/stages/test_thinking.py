@@ -33,13 +33,18 @@ def thinking_module():
     gated_render_data is 6-wide: [sort_den, C, D, E, H_inv, tex_id].
     """
     pos = create_pos_encoding()
-    sort_rank = create_input("sort_rank", 1)
-    sort_rank_onehot = create_input("sort_rank_onehot", _MAX_WALLS)
-    gated_render_data = create_input("gated_render_data", 6)
-    vis_lo = create_input("vis_lo", 1)
-    vis_hi = create_input("vis_hi", 1)
-    render_mask = create_input("render_mask", _MAX_WALLS)
-    is_sorted = create_input("is_sorted", 1)
+    _MAX_COORD = 20.0
+    sort_rank = create_input("sort_rank", 1, value_range=(0.0, 100.0))
+    sort_rank_onehot = create_input(
+        "sort_rank_onehot", _MAX_WALLS, value_range=(0.0, 1.0),
+    )
+    gated_render_data = create_input(
+        "gated_render_data", 6, value_range=(-_MAX_COORD, _MAX_COORD),
+    )
+    vis_lo = create_input("vis_lo", 1, value_range=(0.0, 255.0))
+    vis_hi = create_input("vis_hi", 1, value_range=(0.0, 255.0))
+    render_mask = create_input("render_mask", _MAX_WALLS, value_range=(0.0, 1.0))
+    is_sorted = create_input("is_sorted", 1, value_range=(-1.0, 1.0))
 
     out = build_thinking(
         ThinkingInputs(

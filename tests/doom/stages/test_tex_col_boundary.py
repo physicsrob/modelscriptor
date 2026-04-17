@@ -48,11 +48,11 @@ def _build_tex_col_graph(fov=_FOV, tex_w=_TEX_W, thresh=_THRESH):
       4..10   diff_k1..k7     8·abs_nuc − k·abs_den
     """
     pos = create_pos_encoding()
-    r_D   = create_input("r_D",   1)
-    r_E   = create_input("r_E",   1)
-    r_sd  = create_input("r_sd",  1)   # sort_den
-    r_C   = create_input("r_C",   1)
-    r_ao  = create_input("r_ao",  1)   # angle_offset (integer trig steps)
+    r_D   = create_input("r_D",   1, value_range=(-100.0, 100.0))
+    r_E   = create_input("r_E",   1, value_range=(-100.0, 100.0))
+    r_sd  = create_input("r_sd",  1, value_range=(-100.0, 100.0))   # sort_den
+    r_C   = create_input("r_C",   1, value_range=(-100.0, 100.0))
+    r_ao  = create_input("r_ao",  1, value_range=(0.0, 255.0))   # angle_offset
 
     tan_o, tan_val_bp = _compute_angle_offset_tan(r_ao, fov=fov)
     _, abs_den = _compute_den_over_cos(r_sd, r_C, tan_o, tan_val_bp)

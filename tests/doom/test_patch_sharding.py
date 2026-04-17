@@ -71,8 +71,10 @@ def _build_sharding_graph(W: int, H: int, rp: int):
     total_positions = W * shards_per_col
 
     pos_encoding = create_pos_encoding()
-    cur_col_idx = create_input("cur_col_idx", 1)
-    cur_patch_idx_in_col = create_input("cur_patch_idx_in_col", 1)
+    cur_col_idx = create_input("cur_col_idx", 1, value_range=(0.0, float(W)))
+    cur_patch_idx_in_col = create_input(
+        "cur_patch_idx_in_col", 1, value_range=(0.0, float(shards_per_col)),
+    )
 
     patch_plus_one = add_const(cur_patch_idx_in_col, 1.0)
     next_patch_idx_in_col = mod_const(

@@ -45,14 +45,14 @@ def input_module():
     is the INPUT token and position 1 is the "receiver".
     """
     pos = create_pos_encoding()
-    player_angle = create_input("player_angle", 1)
-    input_forward = create_input("input_forward", 1)
-    input_backward = create_input("input_backward", 1)
-    input_turn_left = create_input("input_turn_left", 1)
-    input_turn_right = create_input("input_turn_right", 1)
-    input_strafe_left = create_input("input_strafe_left", 1)
-    input_strafe_right = create_input("input_strafe_right", 1)
-    is_input = create_input("is_input", 1)
+    player_angle = create_input("player_angle", 1, value_range=(0.0, 255.0))
+    input_forward = create_input("input_forward", 1, value_range=(0.0, 1.0))
+    input_backward = create_input("input_backward", 1, value_range=(0.0, 1.0))
+    input_turn_left = create_input("input_turn_left", 1, value_range=(0.0, 1.0))
+    input_turn_right = create_input("input_turn_right", 1, value_range=(0.0, 1.0))
+    input_strafe_left = create_input("input_strafe_left", 1, value_range=(0.0, 1.0))
+    input_strafe_right = create_input("input_strafe_right", 1, value_range=(0.0, 1.0))
+    is_input = create_input("is_input", 1, value_range=(-1.0, 1.0))
 
     out = build_input(
         InputInputs(

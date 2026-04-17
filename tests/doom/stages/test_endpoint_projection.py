@@ -38,8 +38,8 @@ def endpoint_module():
     position 1 exists only so the sequence isn't degenerate.
     """
     pos = create_pos_encoding()
-    cross = create_input("cross", 1)
-    dot = create_input("dot", 1)
+    cross = create_input("cross", 1, value_range=(-_MAX_COORD * _MAX_COORD, _MAX_COORD * _MAX_COORD))
+    dot = create_input("dot", 1, value_range=(-_MAX_COORD * _MAX_COORD, _MAX_COORD * _MAX_COORD))
     col = _endpoint_to_column(
         cross, dot, W=_W, fov=_FOV, max_coord=_MAX_COORD, suffix="probe",
     )

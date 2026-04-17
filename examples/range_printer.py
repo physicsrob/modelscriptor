@@ -77,13 +77,13 @@ def build_range_printer_graph(
     pos_encoding = create_pos_encoding()
 
     # --- Inputs --------------------------------------------------------
-    token_type = create_input("token_type", D_TOKEN_TYPE)
-    item_index = create_input("item_index", 1)
-    range_lo = create_input("range_lo", 1)
-    range_hi = create_input("range_hi", 1)
-    print_mask = create_input("print_mask", max_items)
-    col = create_input("col", 1)
-    is_new_item = create_input("is_new_item", 1)  # +1 = new item, -1 = cont.
+    token_type = create_input("token_type", D_TOKEN_TYPE, value_range=(-1.0, 1.0))
+    item_index = create_input("item_index", 1, value_range=(0.0, float(max_items)))
+    range_lo = create_input("range_lo", 1, value_range=(-999.0, 999.0))
+    range_hi = create_input("range_hi", 1, value_range=(-999.0, 999.0))
+    print_mask = create_input("print_mask", max_items, value_range=(0.0, 1.0))
+    col = create_input("col", 1, value_range=(0.0, 255.0))
+    is_new_item = create_input("is_new_item", 1, value_range=(-1.0, 1.0))
 
     # --- Token type detection ------------------------------------------
     is_item = equals_vector(token_type, E8_ITEM)

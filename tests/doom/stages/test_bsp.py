@@ -32,13 +32,15 @@ def bsp_module():
     ``create_input`` so the tests can set them per-position.
     """
     pos = create_pos_encoding()
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    bsp_plane_nx = create_input("bsp_plane_nx", 1)
-    bsp_plane_ny = create_input("bsp_plane_ny", 1)
-    bsp_plane_d = create_input("bsp_plane_d", 1)
-    bsp_node_id_onehot = create_input("bsp_node_id_onehot", _MAX_BSP_NODES)
-    is_bsp_node = create_input("is_bsp_node", 1)
+    player_x = create_input("player_x", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    player_y = create_input("player_y", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    bsp_plane_nx = create_input("bsp_plane_nx", 1, value_range=(-1.0, 1.0))
+    bsp_plane_ny = create_input("bsp_plane_ny", 1, value_range=(-1.0, 1.0))
+    bsp_plane_d = create_input("bsp_plane_d", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    bsp_node_id_onehot = create_input(
+        "bsp_node_id_onehot", _MAX_BSP_NODES, value_range=(0.0, 1.0),
+    )
+    is_bsp_node = create_input("is_bsp_node", 1, value_range=(-1.0, 1.0))
 
     out = build_bsp(
         BspInputs(

@@ -8,7 +8,7 @@ from torchwright.ops.loop_ops import unrolled_loop
 
 def test_count_to_target():
     """Counter increments by 1, stops at 3 with 3 max iters."""
-    counter_input = create_input("counter", 1)
+    counter_input = create_input("counter", 1, value_range=(0.0, 100.0))
 
     def step_fn(state):
         return {"counter": add_const(state["counter"], 1.0)}
@@ -36,7 +36,7 @@ def test_count_to_target():
 
 def test_already_done():
     """done_fn returns true initially — state should be unchanged after 3 iters."""
-    x_input = create_input("x", 1)
+    x_input = create_input("x", 1, value_range=(-500.0, 500.0))
 
     def step_fn(state):
         return {"x": add_const(state["x"], 100.0)}
@@ -92,7 +92,7 @@ def test_zero_iterations():
 
 def test_never_done():
     """done_fn always false — all 3 iters run, done=false at end."""
-    counter_input = create_input("counter", 1)
+    counter_input = create_input("counter", 1, value_range=(0.0, 100.0))
 
     def step_fn(state):
         return {"counter": add_const(state["counter"], 1.0)}
@@ -120,8 +120,8 @@ def test_never_done():
 
 def test_multi_variable_freeze():
     """x increments by 1, y by 10 — both freeze together when x >= 3."""
-    x_input = create_input("x", 1)
-    y_input = create_input("y", 1)
+    x_input = create_input("x", 1, value_range=(0.0, 100.0))
+    y_input = create_input("y", 1, value_range=(0.0, 100.0))
 
     def step_fn(state):
         return {

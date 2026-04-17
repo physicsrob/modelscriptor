@@ -6,7 +6,7 @@ import torch
 
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.relu import ReLU
-from torchwright.graph.value_type import NodeValueType
+from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 from torchwright.ops.const import step_sharpness
@@ -512,8 +512,22 @@ def piecewise_linear(
         )
 
     if len(chunks) == 1:
-        return chunks[0]
-    return sum_nodes(chunks)
+        result = chunks[0]
+    else:
+        result = sum_nodes(chunks)
+
+    # With clamp=True the output is bounded by the min/max of fn evaluated
+    # on the breakpoints (per-channel). Declare that range so downstream
+    # gating ops can derive a tight offset.
+    if clamp:
+        per_channel_los = [builtins.min(values[i][j] for i in range(n)) for j in range(d_out)]
+        per_channel_his = [builtins.max(values[i][j] for i in range(n)) for j in range(d_out)]
+        lo = float(builtins.min(per_channel_los))
+        hi = float(builtins.max(per_channel_his))
+        result = assert_matches_value_type(
+            result, NodeValueType(value_range=Range(lo, hi))
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------

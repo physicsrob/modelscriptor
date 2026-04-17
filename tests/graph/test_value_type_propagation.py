@@ -189,11 +189,16 @@ def test_value_logger_passes_through():
 # --- Attn default is unknown (claims come via Assert wrappers) -----
 
 
-def test_attn_default_value_type_is_unknown():
-    # Attention outputs are soft; the graph-level Attn node makes no
-    # structural claim by default.  Primitives that produce hard
-    # selection wrap their Attn output in assert_matches_value_type
-    # to stake a claim; see tests/graph/test_asserts.py.
+def test_attn_propagates_value_range_from_value_input():
+    # Softmax produces non-negative weights summing to 1, so each output
+    # position is a convex combination of rows of (V @ output_matrix).
+    # Convex combinations don't expand per-element range, so Attn's output
+    # range is bounded by the input range propagated through
+    # ``value_matrix @ output_matrix``.  Structural claims (is_integer,
+    # is_binary, is_one_hot) are NOT preserved — those callers should
+    # wrap with assert_matches_value_type.
+    from torchwright.graph.value_type import Range
+
     pe = PosEncoding(d_pos=8)
     value = LiteralValue(torch.tensor([2.0, 3.0]))
     attn = Attn(
@@ -205,7 +210,10 @@ def test_attn_default_value_type_is_unknown():
         value_matrix=torch.eye(2),
         output_matrix=torch.eye(2),
     )
-    assert attn.value_type == NodeValueType.unknown()
+    assert attn.value_type.value_range == Range(2.0, 3.0)
+    # Structural claims not carried from value_in even though the literal
+    # is integer-valued — softmax mixing breaks integer invariance.
+    assert not attn.value_type.is_integer
 
 
 # --- Op propagation rules ----------------------------------------

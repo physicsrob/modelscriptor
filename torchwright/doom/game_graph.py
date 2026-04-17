@@ -141,6 +141,7 @@ def build_game_graph(
 
     inputs, fb_fields = _create_inputs(
         max_walls=max_walls, tex_h=tex_h, max_bsp_nodes=max_bsp_nodes,
+        max_coord=max_coord,
     )
     tf = _detect_token_types(inputs["token_type"])
 
@@ -302,7 +303,7 @@ def build_game_graph(
 
 
 def _create_inputs(
-    *, max_walls: int, tex_h: int, max_bsp_nodes: int,
+    *, max_walls: int, tex_h: int, max_bsp_nodes: int, max_coord: float,
 ) -> Tuple[Dict[str, Node], Dict[str, Node]]:
     """Create host-fed input nodes + unpack the overlaid feedback vectors.
 
@@ -312,35 +313,62 @@ def _create_inputs(
     """
     inputs: Dict[str, Node] = {}
 
-    inputs["token_type"] = create_input("token_type", 8)
-    inputs["player_x"] = create_input("player_x", 1)
-    inputs["player_y"] = create_input("player_y", 1)
-    inputs["player_angle"] = create_input("player_angle", 1)
+    # token_type is a spherical-code 8-vector with components in [-1, 1].
+    inputs["token_type"] = create_input("token_type", 8, value_range=(-1.0, 1.0))
+    # Player/world coords are bounded by the configured max_coord.
+    inputs["player_x"] = create_input("player_x", 1, value_range=(-max_coord, max_coord))
+    inputs["player_y"] = create_input("player_y", 1, value_range=(-max_coord, max_coord))
+    # Angles are u8 (0..255).
+    inputs["player_angle"] = create_input("player_angle", 1, value_range=(0.0, 255.0))
+    # Input flags are 0/1 (host sends integer booleans).
     for k in (
         "input_forward", "input_backward",
         "input_turn_left", "input_turn_right",
         "input_strafe_left", "input_strafe_right",
     ):
-        inputs[k] = create_input(k, 1)
-    for k in ("wall_ax", "wall_ay", "wall_bx", "wall_by", "wall_tex_id", "wall_index"):
-        inputs[k] = create_input(k, 1)
-    inputs["tex_col_input"] = create_input("tex_col_input", 1)
-    inputs["tex_pixels"] = create_input("tex_pixels", tex_h * 3)
-    inputs["texture_id_e8"] = create_input("texture_id_e8", 8)
+        inputs[k] = create_input(k, 1, value_range=(0.0, 1.0))
+    # Wall endpoint coords + ids.
+    for k in ("wall_ax", "wall_ay", "wall_bx", "wall_by"):
+        inputs[k] = create_input(k, 1, value_range=(-max_coord, max_coord))
+    # Integer IDs — u8 is plenty.
+    for k in ("wall_tex_id", "wall_index"):
+        inputs[k] = create_input(k, 1, value_range=(0.0, 255.0))
+    # Texture column index (u8).
+    inputs["tex_col_input"] = create_input("tex_col_input", 1, value_range=(0.0, 255.0))
+    # Texture pixels are float RGB ∈ [0, 1].
+    inputs["tex_pixels"] = create_input("tex_pixels", tex_h * 3, value_range=(0.0, 1.0))
+    # texture_id_e8 is a spherical-code 8-vector.
+    inputs["texture_id_e8"] = create_input("texture_id_e8", 8, value_range=(-1.0, 1.0))
 
-    inputs["bsp_plane_nx"] = create_input("bsp_plane_nx", 1)
-    inputs["bsp_plane_ny"] = create_input("bsp_plane_ny", 1)
-    inputs["bsp_plane_d"] = create_input("bsp_plane_d", 1)
-    inputs["bsp_node_id_onehot"] = create_input("bsp_node_id_onehot", max_bsp_nodes)
-    inputs["wall_bsp_coeffs"] = create_input("wall_bsp_coeffs", max_bsp_nodes)
-    inputs["wall_bsp_const"] = create_input("wall_bsp_const", 1)
+    # BSP plane normal components are unit-normalised → [-1, 1].
+    inputs["bsp_plane_nx"] = create_input("bsp_plane_nx", 1, value_range=(-1.0, 1.0))
+    inputs["bsp_plane_ny"] = create_input("bsp_plane_ny", 1, value_range=(-1.0, 1.0))
+    # Plane offset d = n · point ≤ max_coord in magnitude.
+    inputs["bsp_plane_d"] = create_input("bsp_plane_d", 1, value_range=(-max_coord, max_coord))
+    # Per-node onehot selector.
+    inputs["bsp_node_id_onehot"] = create_input(
+        "bsp_node_id_onehot", max_bsp_nodes, value_range=(0.0, 1.0),
+    )
+    # Wall-BSP coefficients are signed integer weights; bound generously.
+    inputs["wall_bsp_coeffs"] = create_input(
+        "wall_bsp_coeffs", max_bsp_nodes, value_range=(-max_coord, max_coord),
+    )
+    inputs["wall_bsp_const"] = create_input(
+        "wall_bsp_const", 1, value_range=(-max_coord, max_coord),
+    )
 
+    # Feedback vectors carry a mix of one-hots, flags, and coord-scale
+    # intermediates; bound by max_coord which dominates all sub-fields.
     d_sort_out = 8 + 5 + 3 + 2 * max_walls
-    sort_feedback = create_input("sort_feedback", d_sort_out)
+    sort_feedback = create_input(
+        "sort_feedback", d_sort_out, value_range=(-max_coord, max_coord),
+    )
     inputs["sort_feedback"] = sort_feedback
 
     d_render_fb = 2 * max_walls + 11
-    render_feedback = create_input("render_feedback", d_render_fb)
+    render_feedback = create_input(
+        "render_feedback", d_render_fb, value_range=(-max_coord, max_coord),
+    )
     inputs["render_feedback"] = render_feedback
 
     # Feedback field layout (must stay in sync with _assemble_output).

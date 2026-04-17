@@ -113,15 +113,15 @@ def _build_sort_precomp(pos):
     Returns (precomp_dict, pos) where precomp_dict has all precomputed
     nodes and input nodes needed for rendering.
     """
-    wall_ax = create_input("wall_ax", 1)
-    wall_ay = create_input("wall_ay", 1)
-    wall_bx = create_input("wall_bx", 1)
-    wall_by = create_input("wall_by", 1)
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    player_cos = create_input("player_cos", 1)
-    player_sin = create_input("player_sin", 1)
-    angle_offset = create_input("angle_offset", 1)
+    wall_ax = create_input("wall_ax", 1, value_range=(-20.0, 20.0))
+    wall_ay = create_input("wall_ay", 1, value_range=(-20.0, 20.0))
+    wall_bx = create_input("wall_bx", 1, value_range=(-20.0, 20.0))
+    wall_by = create_input("wall_by", 1, value_range=(-20.0, 20.0))
+    player_x = create_input("player_x", 1, value_range=(-20.0, 20.0))
+    player_y = create_input("player_y", 1, value_range=(-20.0, 20.0))
+    player_cos = create_input("player_cos", 1, value_range=(-1.0, 1.0))
+    player_sin = create_input("player_sin", 1, value_range=(-1.0, 1.0))
+    angle_offset = create_input("angle_offset", 1, value_range=(0.0, 255.0))
 
     ex = subtract(wall_bx, wall_ax)
     ey = subtract(wall_by, wall_ay)
@@ -351,7 +351,7 @@ class TestRenderPixels:
 
         pos = create_pos_encoding()
         p, pos = _build_sort_precomp(pos)
-        wall_tex = create_input("wall_tex", 1)
+        wall_tex = create_input("wall_tex", 1, value_range=(0.0, 255.0))
 
         wh, wt, wb, u_raw, _, _, _ = _build_render_pipeline(p)
 

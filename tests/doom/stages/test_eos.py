@@ -38,16 +38,17 @@ def eos_module():
     """
     pos = create_pos_encoding()
 
-    hit_full = create_input("hit_full", 1)
-    hit_x = create_input("hit_x", 1)
-    hit_y = create_input("hit_y", 1)
-    is_wall = create_input("is_wall", 1)
-    is_eos = create_input("is_eos", 1)
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    vel_dx = create_input("vel_dx", 1)
-    vel_dy = create_input("vel_dy", 1)
-    new_angle = create_input("new_angle", 1)
+    _MAX_COORD = 20.0
+    hit_full = create_input("hit_full", 1, value_range=(-1.0, 1.0))
+    hit_x = create_input("hit_x", 1, value_range=(-1.0, 1.0))
+    hit_y = create_input("hit_y", 1, value_range=(-1.0, 1.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
+    is_eos = create_input("is_eos", 1, value_range=(-1.0, 1.0))
+    player_x = create_input("player_x", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    player_y = create_input("player_y", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    vel_dx = create_input("vel_dx", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    vel_dy = create_input("vel_dy", 1, value_range=(-_MAX_COORD, _MAX_COORD))
+    new_angle = create_input("new_angle", 1, value_range=(0.0, 255.0))
 
     out = build_eos(EosInputs(
         is_wall=is_wall,

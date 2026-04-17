@@ -21,13 +21,13 @@ def test_concatenate_output_mixed_depth():
     pos_encoding = create_pos_encoding()
 
     # Shallow subgraph (~3 layers)
-    a = create_input("a", 1)
-    b = create_input("b", 1)
+    a = create_input("a", 1, value_range=(-10.0, 10.0))
+    b = create_input("b", 1, value_range=(-10.0, 10.0))
     shallow = select(compare(a, 0.5), a, b)
 
     # Deep subgraph (~15 layers): two signed_multiplies + reciprocal
-    c = create_input("c", 1)
-    d = create_input("d", 1)
+    c = create_input("c", 1, value_range=(-10.0, 10.0))
+    d = create_input("d", 1, value_range=(-10.0, 10.0))
     p = signed_multiply(c, d, max_abs1=10, max_abs2=10, step=0.5)
     p2 = signed_multiply(p, c, max_abs1=100, max_abs2=10, step=1.0)
     deep = reciprocal(p2, min_value=0.5, max_value=100, step=1.0)

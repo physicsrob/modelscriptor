@@ -464,7 +464,15 @@ def check_asserts_on_compiled(
         ordered_states.append(net.layers[-1].mlp.out_state)
 
     for assert_node in asserts:
+        # If an assert wraps another assert (e.g. a user's outer
+        # ``assert_in_range(y, ...)`` wrapping an op that internally
+        # asserted its output range), the direct ``.inputs[0]`` is the
+        # inner Assert node — stripped at compile time with no residual
+        # state.  Unwrap the chain so we look up the innermost non-Assert
+        # target, which does have a state.
         target = assert_node.inputs[0]
+        while isinstance(target, Assert):
+            target = target.inputs[0]
         state = _first_state_with(target, ra, ordered_states)
         if state is None:
             continue  # no residual assignment — can't check on compiled.

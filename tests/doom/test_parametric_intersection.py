@@ -252,14 +252,14 @@ def _build_graph():
     """Build the parametric intersection graph and return
     ``(den, num_t, num_u)`` nodes plus the list of input nodes.
     """
-    player_x = create_input("player_x", 1)
-    player_y = create_input("player_y", 1)
-    ray_cos = create_input("ray_cos", 1)
-    ray_sin = create_input("ray_sin", 1)
-    wall_ax = create_input("wall_ax", 1)
-    wall_ay = create_input("wall_ay", 1)
-    wall_bx = create_input("wall_bx", 1)
-    wall_by = create_input("wall_by", 1)
+    player_x = create_input("player_x", 1, value_range=(-20.0, 20.0))
+    player_y = create_input("player_y", 1, value_range=(-20.0, 20.0))
+    ray_cos = create_input("ray_cos", 1, value_range=(-1.0, 1.0))
+    ray_sin = create_input("ray_sin", 1, value_range=(-1.0, 1.0))
+    wall_ax = create_input("wall_ax", 1, value_range=(-20.0, 20.0))
+    wall_ay = create_input("wall_ay", 1, value_range=(-20.0, 20.0))
+    wall_bx = create_input("wall_bx", 1, value_range=(-20.0, 20.0))
+    wall_by = create_input("wall_by", 1, value_range=(-20.0, 20.0))
 
     den, num_t, num_u = _parametric_segment_intersection(
         player_x, player_y, ray_cos, ray_sin,

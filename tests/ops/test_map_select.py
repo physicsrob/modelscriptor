@@ -1,3 +1,7 @@
+import pytest
+
+from torchwright.graph.asserts import assert_matches_value_type
+from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.arithmetic_ops import add_const
 from torchwright.ops.inout_nodes import (
     create_input,
@@ -26,6 +30,92 @@ def test_select():
         output = x.compute(n_pos=1, input_values={"cond": torch.tensor([[cond]])})
         expected_value = start + (offset if cond > 0 else 0)
         assert output.tolist() == [[expected_value]]
+
+
+def test_select_exact_branch_passes_clean_cond():
+    """Two-sublayer select matches approximate=True under clean ±1 cond."""
+    cond_input = create_input("cond", 1)
+    true_node = create_literal_value(torch.tensor([2.0]))
+    false_node = create_literal_value(torch.tensor([-3.0]))
+    out = select(cond_input, true_node, false_node, approximate=False)
+    for cond in [1.0, -1.0]:
+        output = out.compute(n_pos=1, input_values={"cond": torch.tensor([[cond]])})
+        expected = 2.0 if cond > 0 else -3.0
+        assert output.item() == expected
+
+
+def test_select_exact_branch_preserves_small_inputs():
+    """Bounded small inputs pass through bit-for-bit on the cancellation-free branch."""
+    cond_input = create_input("cond", 1)
+    t = create_input("t", 1)
+    f = create_input("f", 1)
+    t_bounded = assert_matches_value_type(t, NodeValueType(value_range=Range(-1.0, 1.0)))
+    f_bounded = assert_matches_value_type(f, NodeValueType(value_range=Range(-1.0, 1.0)))
+    out = select(cond_input, t_bounded, f_bounded, approximate=False)
+
+    t_val = torch.tensor([[1.0e-5]])
+    f_val = torch.tensor([[-1.0e-5]])
+
+    # cond=+1 should pick t exactly
+    output = out.compute(
+        n_pos=1,
+        input_values={"cond": torch.tensor([[1.0]]), "t": t_val, "f": f_val},
+    )
+    assert torch.equal(output, t_val)
+
+    # cond=-1 should pick f exactly
+    output = out.compute(
+        n_pos=1,
+        input_values={"cond": torch.tensor([[-1.0]]), "t": t_val, "f": f_val},
+    )
+    assert torch.equal(output, f_val)
+
+
+def test_select_rejects_unbounded_branches():
+    """Unbounded true/false branches fail at build time with a TypeError."""
+    cond_input = create_input("cond", 1)
+    t = create_input("t", 1)  # unbounded
+    f = create_literal_value(torch.tensor([1.0]))  # bounded
+    with pytest.raises(TypeError, match="value_range"):
+        select(cond_input, t, f)
+
+
+def test_broadcast_select_exact_branch():
+    """Two-sublayer broadcast_select preserves small inputs bit-for-bit at mask=±1."""
+    n_slots = 3
+    d_fill = 1
+
+    masks_input = create_input("masks", n_slots)
+    t = create_input("t", d_fill)
+    f = create_input("f", d_fill)
+    t_bounded = assert_matches_value_type(t, NodeValueType(value_range=Range(-1.0, 1.0)))
+    f_bounded = assert_matches_value_type(f, NodeValueType(value_range=Range(-1.0, 1.0)))
+    out = broadcast_select(
+        masks_input, t_bounded, f_bounded, n_slots, d_fill, approximate=False
+    )
+
+    t_val = torch.tensor([[1.0e-5]])
+    f_val = torch.tensor([[-1.0e-5]])
+
+    # alternating mask: slot 0 true, slot 1 false, slot 2 true
+    masks = torch.tensor([[1.0, -1.0, 1.0]])
+    output = out.compute(
+        n_pos=1,
+        input_values={"masks": masks, "t": t_val, "f": f_val},
+    )
+    expected = torch.tensor([[1.0e-5, -1.0e-5, 1.0e-5]])
+    assert torch.equal(output, expected)
+
+
+def test_broadcast_select_rejects_unbounded_values():
+    """Unbounded true_value / false_value fails with a TypeError."""
+    n_slots = 2
+    d_fill = 1
+    masks_input = create_input("masks", n_slots)
+    t = create_input("t", d_fill)  # unbounded
+    f = create_literal_value(torch.tensor([0.0]))
+    with pytest.raises(TypeError, match="value_range"):
+        broadcast_select(masks_input, t, f, n_slots, d_fill)
 
 
 def test_switch():

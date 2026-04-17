@@ -22,6 +22,8 @@ from typing import List
 import torch
 
 from torchwright.graph import Node, Embedding
+from torchwright.graph.asserts import assert_matches_value_type
+from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.arithmetic_ops import (
     add_scaled_nodes,
     sum_nodes,
@@ -83,14 +85,25 @@ def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> List[
     for i in range(num_digits):
         place = 10 ** (num_digits - 1 - i)
         if place == 1:
-            # Last digit: just the remainder, no division needed
-            digits.append(remainder)
+            # Last digit: just the remainder, no division needed.
+            # Declare the tight [0, 9] range so downstream ops see it.
+            digits.append(
+                assert_matches_value_type(
+                    remainder, NodeValueType(value_range=Range(0.0, 9.0)),
+                )
+            )
         else:
             digit = thermometer_floor_div(remainder, place, max_value)
             digits.append(digit)
-            # remainder = remainder - digit * place
+            # remainder = remainder - digit * place. The math guarantees
+            # the new remainder is in [0, place - 1]; declare that so
+            # Linear's interval arithmetic doesn't pessimistically inflate
+            # it on subsequent iterations.
             remainder = add_scaled_nodes(1.0, remainder, -float(place), digit)
-            max_value = place - 1  # Tighten range for next digit
+            remainder = assert_matches_value_type(
+                remainder, NodeValueType(value_range=Range(0.0, float(place - 1))),
+            )
+            max_value = place - 1
     return digits
 
 

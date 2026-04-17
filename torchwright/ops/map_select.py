@@ -5,11 +5,10 @@ import torch
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import (
-    big_offset,
     step_sharpness,
     embedding_step_sharpness,
 )
-from torchwright.ops.logic_ops import cond_add_vector, cond_gate
+from torchwright.ops.logic_ops import cond_add_vector, cond_gate, _max_abs_or_raise
 from torchwright.ops.arithmetic_ops import sum_nodes
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
@@ -55,12 +54,37 @@ def map_to_table(
         input_bias[i] = 1.0 / speed - (key @ key)
         output_proj[i, :] = speed * (value - default)
 
-    return linear_relu_linear(
+    result = linear_relu_linear(
         input_node=inp,
         input_proj=input_proj,
         input_bias=input_bias,
         output_proj=output_proj,
         output_bias=default,
+    )
+    # Output = default + sum_i ReLU_i * speed * (value_i - default).
+    # When multiple keys overlap, multiple ReLU_i can fire at once, so
+    # bound per channel by |default[j]| + sum_i |value_i[j] - default[j]|.
+    # Wider than [min, max] over the table (tight only when keys are
+    # cleanly separated) but covers the overlapping-key case. Without
+    # this claim, Linear's pessimistic interval arithmetic on the wide
+    # MLP blows up after a few chained map_to_tables.
+    diff_abs_sum = torch.zeros(d_value)
+    for value in key_to_value.values():
+        diff_abs_sum = diff_abs_sum + (value - default).abs()
+    lo = float((default - diff_abs_sum).min().item())
+    hi = float((default + diff_abs_sum).max().item())
+    # If all table values and the default are integer-valued tensors,
+    # the output is approximately integer (softmax-leakage on overlapping
+    # keys is the only source of non-integer drift, same reason compare
+    # declares APPROXIMATE).
+    from torchwright.graph.value_type import Guarantee
+    from torchwright.graph.value_type import is_integer_tensor
+    all_values = list(key_to_value.values()) + [default]
+    is_int = (
+        Guarantee.APPROXIMATE if all(is_integer_tensor(v) for v in all_values) else False
+    )
+    return assert_matches_value_type(
+        result, NodeValueType(value_range=Range(lo, hi), is_integer=is_int),
     )
 
 
@@ -90,7 +114,6 @@ def _select_output_type(
     tv = true_node.value_type
     fv = false_node.value_type
     r = tv.value_range.union(fv.value_range)
-    # An approximate condition demotes the output guarantee level.
     cond_g = cond.value_type.is_sign
     is_int = _min_guarantee(cond_g, _min_guarantee(tv.is_integer, fv.is_integer))
     is_bin = _min_guarantee(cond_g, _min_guarantee(tv.is_binary, fv.is_binary))
@@ -103,10 +126,22 @@ def _select_output_type(
         return NodeValueType(value_range=r, is_integer=is_int, is_binary=is_bin)
     if is_int:
         return NodeValueType(value_range=r, is_integer=is_int)
-    return NodeValueType.unknown()
+    return NodeValueType(value_range=r)
 
 
-def select(cond: Node, true_node: Node, false_node: Node) -> Node:
+def _select_offset(true_node: Node, false_node: Node, caller: str) -> float:
+    union_range = true_node.value_type.value_range.union(false_node.value_type.value_range)
+    union_vt = NodeValueType(value_range=union_range)
+    return _max_abs_or_raise(union_vt, caller)
+
+
+def select(
+    cond: Node,
+    true_node: Node,
+    false_node: Node,
+    *,
+    approximate: bool = True,
+) -> Node:
     """
     Outputs one of two nodes based on a boolean condition.
 
@@ -114,6 +149,15 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
         cond (Node): Condition node that outputs either true or false.
         true_node (Node): Node to be outputted if the condition is true.
         false_node (Node): Node to be outputted if the condition is false.
+        approximate: When ``True`` (default), uses a single L→ReLU→L sublayer
+            with an additive cancellation trick. Both branches compute
+            ``(M + v) − M`` where ``M`` is derived from the union of
+            ``true_node`` / ``false_node`` ranges; this loses precision for
+            ``|v| ≪ ULP(M)``. When ``False``, uses two sublayers: the first
+            maps ``cond`` to ``c_on = ReLU(cond)`` and ``c_off = ReLU(−cond)``;
+            the second gates each branch with ReLU clipping (no cancellation).
+            The winning branch is float-exact and immune to cond noise; costs
+            one extra MLP sublayer.
 
     Returns:
         Node: Either true_node or false_node based on the condition.
@@ -122,35 +166,90 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     assert len(true_node) == len(false_node)
 
     d = len(true_node)
-    # Fused single L→R→L reading [cond, true_node, false_node]:
-    #   unit_a[j] = ReLU(big_offset*cond + true_j)    -- alive when cond=+1
-    #   unit_b[j] = ReLU(-big_offset*cond + false_j)  -- alive when cond=-1
-    #   out_j     = unit_a[j] + unit_b[j] - big_offset
-    d_hidden = 2 * d
-    input_proj = torch.zeros(d_hidden, 1 + 2 * d)
-    input_bias = torch.zeros(d_hidden)
-    output_proj = torch.zeros(d_hidden, d)
-    output_bias = torch.full((d,), -big_offset)
+    M = _select_offset(true_node, false_node, "select")
 
-    for j in range(d):
-        a = j
-        b = d + j
-        input_proj[a, 0] = big_offset
-        input_proj[a, 1 + j] = 1.0
-        input_proj[b, 0] = -big_offset
-        input_proj[b, 1 + d + j] = 1.0
-        output_proj[a, j] = 1.0
-        output_proj[b, j] = 1.0
+    if approximate:
+        # Fused single L→R→L reading [cond, true_node, false_node]:
+        #   unit_a[j] = ReLU( M*cond + true_j)   -- alive when cond=+1
+        #   unit_b[j] = ReLU(-M*cond + false_j)  -- alive when cond=-1
+        #   out_j     = unit_a[j] + unit_b[j] - M
+        d_hidden = 2 * d
+        input_proj = torch.zeros(d_hidden, 1 + 2 * d)
+        input_bias = torch.zeros(d_hidden)
+        output_proj = torch.zeros(d_hidden, d)
+        output_bias = torch.full((d,), -M)
 
-    x = Concatenate([cond, true_node, false_node])
-    result = linear_relu_linear(
-        input_node=x,
-        input_proj=input_proj,
-        input_bias=input_bias,
-        output_proj=output_proj,
-        output_bias=output_bias,
-        name="select",
-    )
+        for j in range(d):
+            a = j
+            b = d + j
+            input_proj[a, 0] = M
+            input_proj[a, 1 + j] = 1.0
+            input_proj[b, 0] = -M
+            input_proj[b, 1 + d + j] = 1.0
+            output_proj[a, j] = 1.0
+            output_proj[b, j] = 1.0
+
+        x = Concatenate([cond, true_node, false_node])
+        result = linear_relu_linear(
+            input_node=x,
+            input_proj=input_proj,
+            input_bias=input_bias,
+            output_proj=output_proj,
+            output_bias=output_bias,
+            name="select",
+        )
+    else:
+        # Sublayer 1: c_off = ReLU(-cond), c_on = ReLU(cond) -- both in {0, 1}.
+        cond_gates = linear_relu_linear(
+            input_node=cond,
+            input_proj=torch.tensor([[-1.0], [1.0]]),
+            input_bias=torch.tensor([0.0, 0.0]),
+            output_proj=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            output_bias=torch.tensor([0.0, 0.0]),
+            name="select_cond_gates",
+        )
+        # Sublayer 2 reads [c_off, c_on, true, false]:
+        #   unit_t_pos[j] = ReLU( true[j]  - M*c_off)    alive when cond=+1
+        #   unit_t_neg[j] = ReLU(-true[j]  - M*c_off)
+        #   unit_f_pos[j] = ReLU( false[j] - M*c_on)     alive when cond=-1
+        #   unit_f_neg[j] = ReLU(-false[j] - M*c_on)
+        #   out[j] = (unit_t_pos - unit_t_neg) + (unit_f_pos - unit_f_neg)
+        d_hidden = 4 * d
+        d_input = 2 + 2 * d
+        input_proj = torch.zeros(d_hidden, d_input)
+        input_bias = torch.zeros(d_hidden)
+        output_proj = torch.zeros(d_hidden, d)
+        output_bias = torch.zeros(d)
+
+        for j in range(d):
+            t_pos = j
+            t_neg = d + j
+            f_pos = 2 * d + j
+            f_neg = 3 * d + j
+            # true-branch units gate by c_off (input col 0)
+            input_proj[t_pos, 0] = -M
+            input_proj[t_pos, 2 + j] = 1.0
+            input_proj[t_neg, 0] = -M
+            input_proj[t_neg, 2 + j] = -1.0
+            # false-branch units gate by c_on (input col 1)
+            input_proj[f_pos, 1] = -M
+            input_proj[f_pos, 2 + d + j] = 1.0
+            input_proj[f_neg, 1] = -M
+            input_proj[f_neg, 2 + d + j] = -1.0
+            output_proj[t_pos, j] = 1.0
+            output_proj[t_neg, j] = -1.0
+            output_proj[f_pos, j] = 1.0
+            output_proj[f_neg, j] = -1.0
+
+        x = Concatenate([cond_gates, true_node, false_node])
+        result = linear_relu_linear(
+            input_node=x,
+            input_proj=input_proj,
+            input_bias=input_bias,
+            output_proj=output_proj,
+            output_bias=output_bias,
+            name="select",
+        )
 
     vt = _select_output_type(cond, true_node, false_node)
     if vt != NodeValueType.unknown():
@@ -340,6 +439,8 @@ def broadcast_select(
     false_value: Node,
     n_slots: int,
     d_fill: int,
+    *,
+    approximate: bool = True,
 ) -> Node:
     """Select between two values at each of N slots, based on per-slot masks.
 
@@ -347,54 +448,25 @@ def broadcast_select(
     picks true_value or false_value based on its mask. Values can be
     broadcast (same for all slots) or per-slot (different per slot).
 
-    **Robustness at fractional masks.**  This op is composed of four
-    ReLU units per ``(slot, channel)``, structured as
-
-    ::
-
-        unit_pos_t = ReLU( half_big * mask_i + true_ij )
-        unit_pos_b = ReLU( half_big * mask_i )
-        unit_neg_t = ReLU(-half_big * mask_i + false_ij)
-        unit_neg_b = ReLU(-half_big * mask_i )
-
-        gated_true  = unit_pos_t - unit_pos_b   # ≈ true_ij  at mask=+1, 0 at mask=-1
-        gated_false = unit_neg_t - unit_neg_b   # ≈ false_ij at mask=-1, 0 at mask=+1
-        out_ij      = gated_true + gated_false
-
-    The two ``_b`` units are pure-mask carriers that *cancel* the
-    ``half_big`` offset that the corresponding ``_t`` unit picks up
-    when the mask is fully on.  The previous formulation
-    ``unit_a + unit_b - half_big`` (a single output bias of
-    ``-half_big``) is correct only when exactly one of the two units is
-    fully active — i.e. when ``mask`` is exactly ``+1`` or ``-1``.  At
-    fractional masks (``mask ∈ (-1, 1)``) **both** units fall into
-    their ReLU's positive zone with values smaller than ``half_big``,
-    and the ``-half_big`` output bias under-cancels: the output
-    collapses to ``true + false - half_big ≈ -500``, a sentinel that
-    propagates through any downstream consumer.
-
-    The four-unit form here cancels the ``half_big`` carry on a
-    *per-unit* basis instead of via a single output bias.  At
-    fractional masks the worst-case output is the sum
-    ``true_ij + false_ij`` (instead of ``-half_big``), which for the
-    common usage pattern (positive RGB values, ``false = 0``) is
-    bounded in ``[0, 1]``.  No more catastrophic ``-500`` leaks at
-    inputs that fall into the ramp zone of an upstream ``in_range``
-    or ``compare``.
-
-    Cost: doubles the hidden width (``4 * n_slots * d_fill`` instead
-    of ``2 * n_slots * d_fill``) and uses no output bias.
-
     Args:
-        masks: Node of width n_slots. Each value is 1.0 (true) or
-            -1.0 (false).  Fractional values are **safe** but produce
-            a smooth blend of ``true`` and ``false`` rather than a
-            sharp choice — see the robustness discussion above.
+        masks: Node of width n_slots. Each value is 1.0 (true) or -1.0
+            (false). Fractional values are safe but produce a smooth
+            blend of ``true`` and ``false`` bounded by ``O(max|v|)``;
+            no catastrophic sentinel leaks.
         true_value: Node of width d_fill (broadcast to all slots)
             or n_slots*d_fill (per-slot values).
         false_value: Same shape options as true_value.
         n_slots: Number of slots.
         d_fill: Width of the value at each slot.
+        approximate: When ``True`` (default), uses a single L→ReLU→L
+            sublayer with four units per ``(slot, channel)`` that cancel
+            the mask-offset carry per-unit (no output bias). Offset is
+            ``M = max|true ∪ false|`` derived from value ranges. When
+            ``False``, uses two sublayers: sublayer 1 produces
+            ``c_off[i] = ReLU(-mask_i)`` and ``c_on[i] = ReLU(mask_i)``;
+            sublayer 2 gates each branch by ReLU clipping against
+            ``M·c_on`` / ``M·c_off`` — no cancellation, winning branch
+            is float-exact at mask=±1.
 
     Returns:
         Node of width n_slots * d_fill.
@@ -405,59 +477,130 @@ def broadcast_select(
     assert true_is_broadcast or len(true_value) == n_slots * d_fill
     assert false_is_broadcast or len(false_value) == n_slots * d_fill
 
-    half_big = big_offset / 2.0
+    M = _select_offset(true_value, false_value, "broadcast_select")
+
+    if approximate:
+        d_hidden = 4 * n_slots * d_fill
+        inp = Concatenate([masks, true_value, false_value])
+        d_input = len(inp)
+
+        # Offsets into the concatenated input
+        mask_offset = 0
+        true_offset = n_slots
+        false_offset = n_slots + len(true_value)
+
+        input_proj = torch.zeros(d_hidden, d_input)
+        input_bias = torch.zeros(d_hidden)
+        output_proj = torch.zeros(d_hidden, n_slots * d_fill)
+        # Output bias is zero — every M offset is cancelled locally by
+        # the matching ``_b`` carrier unit.
+        output_bias = torch.zeros(n_slots * d_fill)
+
+        for i in range(n_slots):
+            for j in range(d_fill):
+                out_idx = i * d_fill + j
+                unit_pos_t = 4 * out_idx
+                unit_pos_b = 4 * out_idx + 1
+                unit_neg_t = 4 * out_idx + 2
+                unit_neg_b = 4 * out_idx + 3
+
+                # unit_pos_t = ReLU(M * mask_i + true_ij)
+                input_proj[unit_pos_t, mask_offset + i] = M
+                if true_is_broadcast:
+                    input_proj[unit_pos_t, true_offset + j] = 1.0
+                else:
+                    input_proj[unit_pos_t, true_offset + i * d_fill + j] = 1.0
+
+                # unit_pos_b = ReLU(M * mask_i)
+                input_proj[unit_pos_b, mask_offset + i] = M
+
+                # unit_neg_t = ReLU(-M * mask_i + false_ij)
+                input_proj[unit_neg_t, mask_offset + i] = -M
+                if false_is_broadcast:
+                    input_proj[unit_neg_t, false_offset + j] = 1.0
+                else:
+                    input_proj[unit_neg_t, false_offset + i * d_fill + j] = 1.0
+
+                # unit_neg_b = ReLU(-M * mask_i)
+                input_proj[unit_neg_b, mask_offset + i] = -M
+
+                # output = (unit_pos_t - unit_pos_b) + (unit_neg_t - unit_neg_b)
+                output_proj[unit_pos_t, out_idx] = 1.0
+                output_proj[unit_pos_b, out_idx] = -1.0
+                output_proj[unit_neg_t, out_idx] = 1.0
+                output_proj[unit_neg_b, out_idx] = -1.0
+
+        return linear_relu_linear(
+            input_node=inp,
+            input_proj=input_proj,
+            input_bias=input_bias,
+            output_proj=output_proj,
+            output_bias=output_bias,
+            name="broadcast_select",
+        )
+
+    # approximate=False: two sublayers, cancellation-free.
+    # Sublayer 1: c_off[i] = ReLU(-masks[i]), c_on[i] = ReLU(masks[i]).
+    # Output layout is [c_off_0..c_off_{n-1}, c_on_0..c_on_{n-1}] (width 2n).
+    s1_in_proj = torch.zeros(2 * n_slots, n_slots)
+    s1_out_proj = torch.zeros(2 * n_slots, 2 * n_slots)
+    for i in range(n_slots):
+        s1_in_proj[i, i] = -1.0  # c_off row
+        s1_in_proj[n_slots + i, i] = 1.0  # c_on row
+        s1_out_proj[i, i] = 1.0
+        s1_out_proj[n_slots + i, n_slots + i] = 1.0
+    cond_gates = linear_relu_linear(
+        input_node=masks,
+        input_proj=s1_in_proj,
+        input_bias=torch.zeros(2 * n_slots),
+        output_proj=s1_out_proj,
+        output_bias=torch.zeros(2 * n_slots),
+        name="broadcast_select_cond_gates",
+    )
+
+    # Sublayer 2 reads [c_off (n_slots), c_on (n_slots), true_value, false_value].
+    # Column layout:
+    c_off_col = 0                              # c_off[i] at col i
+    c_on_col = n_slots                         # c_on[i]  at col n_slots + i
+    true_col = 2 * n_slots                     # true_value slice
+    false_col = 2 * n_slots + len(true_value)  # false_value slice
+
     d_hidden = 4 * n_slots * d_fill
-    inp = Concatenate([masks, true_value, false_value])
-    d_input = len(inp)
-
-    # Offsets into the concatenated input
-    mask_offset = 0
-    true_offset = n_slots
-    false_offset = n_slots + len(true_value)
-
+    d_input = 2 * n_slots + len(true_value) + len(false_value)
     input_proj = torch.zeros(d_hidden, d_input)
     input_bias = torch.zeros(d_hidden)
     output_proj = torch.zeros(d_hidden, n_slots * d_fill)
-    # Output bias is zero — every half_big offset is cancelled
-    # locally by the matching ``_b`` carrier unit.
     output_bias = torch.zeros(n_slots * d_fill)
 
     for i in range(n_slots):
         for j in range(d_fill):
             out_idx = i * d_fill + j
-            unit_pos_t = 4 * out_idx
-            unit_pos_b = 4 * out_idx + 1
-            unit_neg_t = 4 * out_idx + 2
-            unit_neg_b = 4 * out_idx + 3
+            t_pos = 4 * out_idx
+            t_neg = 4 * out_idx + 1
+            f_pos = 4 * out_idx + 2
+            f_neg = 4 * out_idx + 3
+            true_src = true_col + (j if true_is_broadcast else i * d_fill + j)
+            false_src = false_col + (j if false_is_broadcast else i * d_fill + j)
 
-            # unit_pos_t = ReLU(half_big * mask_i + true_ij)
-            input_proj[unit_pos_t, mask_offset + i] = half_big
-            if true_is_broadcast:
-                input_proj[unit_pos_t, true_offset + j] = 1.0
-            else:
-                input_proj[unit_pos_t, true_offset + i * d_fill + j] = 1.0
+            # true branch gated by c_off[i]
+            input_proj[t_pos, c_off_col + i] = -M
+            input_proj[t_pos, true_src] = 1.0
+            input_proj[t_neg, c_off_col + i] = -M
+            input_proj[t_neg, true_src] = -1.0
+            # false branch gated by c_on[i]
+            input_proj[f_pos, c_on_col + i] = -M
+            input_proj[f_pos, false_src] = 1.0
+            input_proj[f_neg, c_on_col + i] = -M
+            input_proj[f_neg, false_src] = -1.0
 
-            # unit_pos_b = ReLU(half_big * mask_i)
-            input_proj[unit_pos_b, mask_offset + i] = half_big
+            output_proj[t_pos, out_idx] = 1.0
+            output_proj[t_neg, out_idx] = -1.0
+            output_proj[f_pos, out_idx] = 1.0
+            output_proj[f_neg, out_idx] = -1.0
 
-            # unit_neg_t = ReLU(-half_big * mask_i + false_ij)
-            input_proj[unit_neg_t, mask_offset + i] = -half_big
-            if false_is_broadcast:
-                input_proj[unit_neg_t, false_offset + j] = 1.0
-            else:
-                input_proj[unit_neg_t, false_offset + i * d_fill + j] = 1.0
-
-            # unit_neg_b = ReLU(-half_big * mask_i)
-            input_proj[unit_neg_b, mask_offset + i] = -half_big
-
-            # output = (unit_pos_t - unit_pos_b) + (unit_neg_t - unit_neg_b)
-            output_proj[unit_pos_t, out_idx] = 1.0
-            output_proj[unit_pos_b, out_idx] = -1.0
-            output_proj[unit_neg_t, out_idx] = 1.0
-            output_proj[unit_neg_b, out_idx] = -1.0
-
+    x = Concatenate([cond_gates, true_value, false_value])
     return linear_relu_linear(
-        input_node=inp,
+        input_node=x,
         input_proj=input_proj,
         input_bias=input_bias,
         output_proj=output_proj,

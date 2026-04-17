@@ -14,4 +14,3 @@ embedding_step_sharpness = (
 # absorb dot-product errors from approximate embeddings.
 # Embedding norms are ~40 (self-dot ~1600), so even tiny
 # Euclidean errors become large dot-product errors.
-big_offset = 1000.0  # Needs to be larger than any element we route in a comparison

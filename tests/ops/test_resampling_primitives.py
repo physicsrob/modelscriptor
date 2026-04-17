@@ -53,8 +53,10 @@ def _dynamic_extract_reference(
 
 
 def _build_dynamic_extract_graph(n_entries: int, d_fill: int):
-    table_node = create_input("table", n_entries * d_fill)
-    idx_node = create_input("idx", 1)
+    table_node = create_input(
+        "table", n_entries * d_fill, value_range=(0.0, 1.0),
+    )
+    idx_node = create_input("idx", 1, value_range=(0.0, float(n_entries)))
     out_node = dynamic_extract(table_node, idx_node, n_entries, d_fill)
     return out_node
 
@@ -329,10 +331,10 @@ def test_linear_bin_index_into_dynamic_extract():
     x_min_val, x_max_val = 0.0, 16.0
     min_r, max_r = _bounds_for(x_min_val, x_max_val)
 
-    x = create_input("x", 1)
-    x_min = create_input("x_min", 1)
-    x_max = create_input("x_max", 1)
-    table = create_input("table", n_bins * d_fill)
+    x = create_input("x", 1, value_range=(x_min_val, x_max_val))
+    x_min = create_input("x_min", 1, value_range=(x_min_val, x_max_val))
+    x_max = create_input("x_max", 1, value_range=(x_min_val, x_max_val))
+    table = create_input("table", n_bins * d_fill, value_range=(0.0, 1.0))
 
     idx = linear_bin_index(
         x, x_min, x_max, n_bins,
