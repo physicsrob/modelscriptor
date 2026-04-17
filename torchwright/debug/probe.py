@@ -109,11 +109,11 @@ def reference_eval(
             if "compute" in cls.__dict__:
                 orig = cls.__dict__["compute"]
                 patched.append((cls, orig))
-                cls.compute = _make_cached(orig)
+                cls.compute = _make_cached(orig)  # type: ignore[method-assign]
         output_node.compute(n_pos, input_values)
     finally:
         for cls, orig in patched:
-            cls.compute = orig
+            cls.compute = orig  # type: ignore[method-assign]
 
     return cache
 
@@ -683,11 +683,11 @@ def attention_capture(
         )
         return output, (K, V)
 
-    attn_module.forward_cached = patched_fwd_cached
+    attn_module.forward_cached = patched_fwd_cached  # type: ignore[method-assign]
     try:
         yield captured
     finally:
-        attn_module.forward_cached = orig_fwd_cached
+        attn_module.forward_cached = orig_fwd_cached  # type: ignore[method-assign]
 
 
 @dataclass

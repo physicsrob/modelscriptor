@@ -107,7 +107,7 @@ def play(
             )
 
     else:
-        current_subset = [None]
+        current_subset = [None]  # type: ignore[list-item]
         trig_table = config.trig_table
 
         def frame_fn(state, inputs):

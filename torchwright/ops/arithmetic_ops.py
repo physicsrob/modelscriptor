@@ -11,7 +11,7 @@ from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 from torchwright.ops.const import step_sharpness
 
-_builtin_abs = abs  # save before module-level def abs() shadows the builtin
+_builtin_abs = builtins.abs  # save before module-level def abs() shadows the builtin
 
 
 # ---------------------------------------------------------------------------
@@ -1759,7 +1759,7 @@ def signed_multiply(
     max_abs1: float,
     max_abs2: float,
     step: float = 1.0,
-    max_abs_output: float = None,
+    max_abs_output: float | None = None,
     d_max: int = 1024,
     strategy: str = "deep",
 ) -> Node:

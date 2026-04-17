@@ -340,7 +340,7 @@ def test_segment_back_side_reversed_vs_front(e1m1: MapData) -> None:
     reversed relative to the front side.
     """
     # Find a two-sided linedef that has both front and back segs.
-    seg_pairs = {}  # linedef -> {side: seg}
+    seg_pairs: dict[int, dict[int, Seg]] = {}  # linedef -> {side: seg}
     for seg in e1m1.segs:
         seg_pairs.setdefault(seg.linedef, {})[seg.side] = seg
     for ld_idx, sides in seg_pairs.items():

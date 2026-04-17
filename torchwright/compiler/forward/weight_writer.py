@@ -38,14 +38,14 @@ class AttnHeadOp:
     #   compute_add: first addend's columns
     #   add_into: live addend's columns
     #   delta_transfer: source columns (where the output value is)
-    source_cols: List[int] = None
+    source_cols: Optional[List[int]] = None
     # compute_add: second addend's columns.
-    source_cols_b: List[int] = None
+    source_cols_b: Optional[List[int]] = None
     # compute_attn: Q and K input columns (V is in source_cols).
-    q_source_cols: List[int] = None
-    k_source_cols: List[int] = None
+    q_source_cols: Optional[List[int]] = None
+    k_source_cols: Optional[List[int]] = None
     # delta_transfer: subtract columns (same as target for overlay).
-    subtract_cols: List[int] = None
+    subtract_cols: Optional[List[int]] = None
 
 
 @dataclass
@@ -61,7 +61,7 @@ class MLPOp:
     mlp_slots: List[int] = field(default_factory=list)
     # Input columns captured at schedule time.  Used by compute_relu
     # (l1's input) and compute_standalone_relu (relu's input).
-    source_cols: List[int] = None
+    source_cols: Optional[List[int]] = None
 
 
 def write_attn_sublayer(
@@ -573,7 +573,10 @@ def _write_delta_transfer(
 
 
 def _write_compute_relu(
-    mlp, op: MLPOp, rmap: ResidualStreamMap, biased_linears: Set[Node] = frozenset()
+    mlp,
+    op: MLPOp,
+    rmap: ResidualStreamMap,
+    biased_linears: Optional[Set[Node]] = None,
 ):
     """Compile a Linear1 -> ReLU -> Linear2 chain through the MLP sublayer.
 
@@ -621,6 +624,7 @@ def _write_compute_relu(
         offset = 0
         for leaf in leaves:
             if leaf in biased_linears:
+                assert isinstance(leaf, Linear)
                 # contrib[j] = sum_i l1.W[offset+i, j] * leaf.bias[i]
                 contrib = (
                     leaf.output_bias
@@ -668,7 +672,10 @@ def _write_compute_bias(mlp, op: MLPOp):
 
 
 def _write_compute_standalone_relu(
-    mlp, op: MLPOp, rmap: ResidualStreamMap, biased_linears: Set[Node] = frozenset()
+    mlp,
+    op: MLPOp,
+    rmap: ResidualStreamMap,
+    biased_linears: Optional[Set[Node]] = None,
 ):
     """Compile a standalone ReLU through the MLP sublayer.
 
@@ -707,6 +714,7 @@ def _write_compute_standalone_relu(
         offset = 0
         for leaf in leaves:
             if leaf in biased_linears:
+                assert isinstance(leaf, Linear)
                 leaf_slots = slots_t[offset : offset + len(leaf)]
                 mlp.linear1.output_bias[leaf_slots] += leaf.output_bias.to(bias_dtype)
             offset += len(leaf)

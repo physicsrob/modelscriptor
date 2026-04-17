@@ -115,7 +115,7 @@ def _wall_payload(
     bsp_rank,
     vis_lo=0.0,
     vis_hi=0.0,
-    onehot: List[float] = (),
+    onehot: List[float] = [],
 ) -> List[float]:
     """Canonical wall payload layout — must match wall_payload.pack_wall_payload."""
     return [

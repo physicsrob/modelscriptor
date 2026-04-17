@@ -103,26 +103,33 @@ def _count_layer_params(
     params_per_head = 4 * d * d_head
 
     heads_used = 0
-    for op in attn_ops:
-        if op.op_type == "compute_attn":
-            heads_used += (op.node.d_v + d_head - 1) // d_head
-        elif op.op_type == "compute_linear":
-            d_input = len(op.node.inputs[0])
+    for attn_op in attn_ops:
+        if attn_op.op_type == "compute_attn":
+            assert attn_op.node is not None
+            from torchwright.graph.attn import Attn as _Attn
+
+            assert isinstance(attn_op.node, _Attn)
+            heads_used += (attn_op.node.d_v + d_head - 1) // d_head
+        elif attn_op.op_type == "compute_linear":
+            assert attn_op.node is not None
+            d_input = len(attn_op.node.inputs[0])
             heads_used += (d_input + d_head - 1) // d_head
-        elif op.op_type == "compute_add":
-            heads_used += 2 * ((len(op.node) + d_head - 1) // d_head)
-        elif op.op_type == "cancel":
-            heads_used += (len(op.target_cols) + d_head - 1) // d_head
-        elif op.op_type == "add_into":
-            heads_used += (len(op.node) + d_head - 1) // d_head
+        elif attn_op.op_type == "compute_add":
+            assert attn_op.node is not None
+            heads_used += 2 * ((len(attn_op.node) + d_head - 1) // d_head)
+        elif attn_op.op_type == "cancel":
+            heads_used += (len(attn_op.target_cols) + d_head - 1) // d_head
+        elif attn_op.op_type == "add_into":
+            assert attn_op.node is not None
+            heads_used += (len(attn_op.node) + d_head - 1) // d_head
 
     slots_used = 0
     bias_entries = 0
-    for op in mlp_ops:
-        if op.mlp_slots:
-            slots_used += len(op.mlp_slots)
-        if op.op_type in ("compute_literal_value", "compute_bias"):
-            bias_entries += len(op.target_cols)
+    for mlp_op in mlp_ops:
+        if mlp_op.mlp_slots:
+            slots_used += len(mlp_op.mlp_slots)
+        if mlp_op.op_type in ("compute_literal_value", "compute_bias"):
+            bias_entries += len(mlp_op.target_cols)
 
     params_per_slot = 2 * d + 2  # linear1 column + bias + linear2 row + bias
     return heads_used * params_per_head + slots_used * params_per_slot + bias_entries
@@ -323,7 +330,7 @@ def forward_compile(
         if os.environ.get("TW_COMPILER_VERIFY"):
             _verify_end_of_layer_liveness(graph, residual_map, computed, i)
 
-        if on_node_scheduled is not None:
+        if on_node_scheduled is not None and prev_computed is not None:
             for node in computed - prev_computed:
                 on_node_scheduled(node, i)
 

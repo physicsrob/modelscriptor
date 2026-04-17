@@ -88,8 +88,10 @@ class Linear(Node):
                     per_col_maxs = child_maxs
                 else:
                     per_col_mins = per_col_mins + child_mins
+                    assert per_col_maxs is not None  # set alongside per_col_mins
                     per_col_maxs = per_col_maxs + child_maxs
             if per_col_mins is not None:
+                assert per_col_maxs is not None  # set alongside per_col_mins
                 per_col_mins = per_col_mins + self.output_bias
                 per_col_maxs = per_col_maxs + self.output_bias
                 out_range = Range(

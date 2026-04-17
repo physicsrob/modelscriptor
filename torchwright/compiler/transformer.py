@@ -8,6 +8,7 @@ from torchwright.compiler.groups.mlp_sublayer import MLPSubLayer
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import (
     Node,
+    Assert,
     LiteralValue,
     InputNode,
     PosEncoding,
@@ -29,6 +30,7 @@ class HeadlessTransformer:
     d_head: int
     pos_encoding: Optional[PosEncoding]
     residual_assignment: Optional[ResidualAssignment]
+    assert_aliases: Optional[Dict[Assert, Node]]
 
     def __init__(
         self,
@@ -43,6 +45,7 @@ class HeadlessTransformer:
         self.pos_encoding = pos_encoding
         self.layers = []
         self.residual_assignment = None
+        self.assert_aliases = None
 
     @property
     def device(self) -> torch.device:
@@ -172,7 +175,7 @@ class HeadlessTransformer:
         for node in self.residual_assignment.get_nodes(out_state):
             indices = self.residual_assignment.get_node_indices(out_state, node)
             result[node] = res[:, indices]
-        if hasattr(self, "assert_aliases"):
+        if self.assert_aliases is not None:
             for assert_node, target in self.assert_aliases.items():
                 if target in result and assert_node not in result:
                     result[assert_node] = result[target]

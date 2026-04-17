@@ -101,6 +101,7 @@ class WalkthroughController:
         if self._prev_x is not None:
             if (
                 abs(state.x - self._prev_x) < 0.01
+                and self._prev_y is not None
                 and abs(state.y - self._prev_y) < 0.01
             ):
                 stuck = True
@@ -194,7 +195,7 @@ def save_gif(
         img = Image.fromarray(f, mode="RGB")
         if scale > 1:
             w, h = img.size
-            img = img.resize((w * scale, h * scale), Image.NEAREST)
+            img = img.resize((w * scale, h * scale), Image.Resampling.NEAREST)
         pil_frames.append(img)
 
     pil_frames[0].save(

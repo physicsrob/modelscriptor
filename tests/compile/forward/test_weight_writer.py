@@ -12,6 +12,8 @@ Conventions:
   The scheduler (Phase 3) enforces this ordering.
 """
 
+from typing import cast, Literal
+
 import torch
 import torch.nn.functional as F
 
@@ -78,7 +80,22 @@ def _make_op(rmap: ResidualStreamMap, op_type: str, node, target_cols, **kwargs)
                 kwargs["source_cols"] = rmap.resolve_indices(a0)
             else:
                 kwargs["source_cols"] = rmap.resolve_indices(a1)
-    return AttnHeadOp(op_type=op_type, node=node, target_cols=target_cols, **kwargs)
+    return AttnHeadOp(
+        op_type=cast(
+            Literal[
+                "compute_attn",
+                "compute_linear",
+                "compute_add",
+                "cancel",
+                "add_into",
+                "delta_transfer",
+            ],
+            op_type,
+        ),
+        node=node,
+        target_cols=target_cols,
+        **kwargs,
+    )
 
 
 def _make_mlp_op(
@@ -95,7 +112,15 @@ def _make_mlp_op(
     elif op_type == "compute_standalone_relu":
         kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
     return MLPOp(
-        op_type=op_type,
+        op_type=cast(
+            Literal[
+                "compute_relu",
+                "compute_standalone_relu",
+                "compute_literal_value",
+                "compute_bias",
+            ],
+            op_type,
+        ),
         node=node,
         target_cols=target_cols,
         mlp_slots=mlp_slots,

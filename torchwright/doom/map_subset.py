@@ -44,6 +44,7 @@ from torchwright.doom.wad import (
     _assign_tex_id,
     _pick_seg_texture,
 )
+from torchwright.reference_renderer.types import Segment
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -80,7 +81,7 @@ class MapSubset:
     with zeros, so they contribute nothing to rank.
     """
 
-    segments: List["Segment"]
+    segments: List[Segment]
     textures: List[np.ndarray]
     tex_name_to_id: Dict[str, int]
     bsp_nodes: List[BspNodeSubset]
@@ -328,7 +329,7 @@ class _BspTreeNode:
 
 def _build_balanced_bsp(
     seg_indices: List[int],
-    segments: List["Segment"],
+    segments: List[Segment],
     depth: int = 0,
 ) -> _BspTreeNode:
     """Build an axis-aligned balanced BSP over ``seg_indices``.
@@ -405,8 +406,12 @@ def _flatten_bsp_tree(
 
     def visit(node: _BspTreeNode, current_path: List[Tuple[int, int]]) -> int:
         if node.is_leaf:
+            assert node.seg_idx is not None
             paths[node.seg_idx] = list(current_path)
             return 1
+        assert node.plane is not None
+        assert node.front is not None
+        assert node.back is not None
         node_id = len(bsp_nodes)
         bsp_nodes.append(node.plane)
 
@@ -456,7 +461,7 @@ def _compute_scene_coefficients(
 
 
 def build_scene_subset(
-    segments: List["Segment"],
+    segments: List[Segment],
     textures: List[np.ndarray],
     max_bsp_nodes: int = 48,
 ) -> MapSubset:
@@ -535,7 +540,6 @@ def load_map_subset(
     ``max_walls``.
     """
     from torchwright.reference_renderer.textures import downscale_texture
-    from torchwright.reference_renderer.types import Segment
 
     wad = WADReader(wad_path)
     md = wad.get_map(map_name)
@@ -645,19 +649,19 @@ def load_map_subset(
     # rest become -1 (so the renderer falls back to solid color).
     new_name_to_id: Dict[str, int] = {name: i for i, name in enumerate(kept_names)}
     remapped: List[Segment] = []
-    for seg in segments:
-        if seg.texture_id < 0:
-            remapped.append(seg)
+    for s in segments:
+        if s.texture_id < 0:
+            remapped.append(s)
             continue
-        old_name = _reverse_lookup(name_to_id, seg.texture_id)
+        old_name = _reverse_lookup(name_to_id, s.texture_id)
         new_id = new_name_to_id.get(old_name, -1)
         remapped.append(
             Segment(
-                ax=seg.ax,
-                ay=seg.ay,
-                bx=seg.bx,
-                by=seg.by,
-                color=seg.color,
+                ax=s.ax,
+                ay=s.ay,
+                bx=s.bx,
+                by=s.by,
+                color=s.color,
                 texture_id=new_id,
             )
         )

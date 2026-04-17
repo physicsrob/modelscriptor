@@ -991,7 +991,7 @@ def _compute_io_layout(
 
     # Output region: overlaid at input positions, overflow after
     output_specs = []
-    overlays = {}
+    overlays: Dict[Node, Tuple[Optional[Node], List[int]]] = {}
     overflow_offset = d_input
 
     for name in sorted_names:
@@ -1325,7 +1325,7 @@ def compile_headless(
     # Build output indices from output_specs
     # For overlaid outputs, offset is the input's column offset
     # For overflow outputs, offset is in the overflow region
-    output_indices = []
+    output_indices: list[int] = []
     ch_output_specs: List[tuple] = []
     running = 0
     for name, offset, width, out_node in output_specs:

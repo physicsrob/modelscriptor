@@ -24,6 +24,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from torchwright.reference_renderer.types import Segment
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -548,7 +550,7 @@ class WADReader:
         self,
         map_name: str,
         tex_size: int = 8,
-    ) -> Tuple[List["Segment"], List[np.ndarray], Dict[str, int]]:
+    ) -> Tuple[List[Segment], List[np.ndarray], Dict[str, int]]:
         """Load renderable segments and their texture atlas from a map.
 
         Uses the map's SEGS (BSP-split wall fragments) — these are what
@@ -688,7 +690,7 @@ def _pick_seg_texture(sidedef: Sidedef) -> str:
 
 def seg_list_to_segments(
     md: MapData,
-) -> Tuple[List["Segment"], Dict[str, int]]:
+) -> Tuple[List[Segment], Dict[str, int]]:
     """Convert a map's SEGS to a list of renderable ``Segment`` objects.
 
     Each seg becomes one Segment with:

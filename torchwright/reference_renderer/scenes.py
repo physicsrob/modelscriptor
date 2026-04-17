@@ -94,7 +94,7 @@ def multi_room() -> List[Segment]:
 
 
 def multi_room_textured(
-    wad_path: str = "doom1.wad",
+    wad_path: str | None = "doom1.wad",
     tex_size: int = 8,
 ) -> Tuple[List[Segment], List[np.ndarray]]:
     """Multi-room scene with textured walls.
@@ -113,8 +113,10 @@ def multi_room_textured(
 
         wad = WADReader(wad_path)
         names = ["STARTAN3", "STARG3", "BROWN1", "BROWNGRN"]
+        raw = [wad.get_texture(n) for n in names]
+        assert all(t is not None for t in raw), "WAD texture not found"
         textures = [
-            downscale_texture(wad.get_texture(n), tex_size, tex_size) for n in names
+            downscale_texture(t, tex_size, tex_size) for t in raw if t is not None
         ]
     else:
         from torchwright.reference_renderer.textures import default_texture_atlas
@@ -167,7 +169,7 @@ def multi_room_textured(
 
 def box_room_textured(
     size: float = 10.0,
-    wad_path: str = None,
+    wad_path: str | None = None,
     tex_size: int = 8,
 ) -> Tuple[List[Segment], List[np.ndarray]]:
     """Box room with textured walls.
@@ -188,8 +190,10 @@ def box_room_textured(
 
         wad = WADReader(wad_path)
         names = ["STARTAN3", "STARG3", "BROWN1", "BROWNGRN"]
+        raw = [wad.get_texture(n) for n in names]
+        assert all(t is not None for t in raw), "WAD texture not found"
         textures = [
-            downscale_texture(wad.get_texture(n), tex_size, tex_size) for n in names
+            downscale_texture(t, tex_size, tex_size) for t in raw if t is not None
         ]
     else:
         from torchwright.reference_renderer.textures import default_texture_atlas

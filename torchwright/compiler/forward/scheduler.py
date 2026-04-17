@@ -986,6 +986,9 @@ class LayerScheduler:
         in_flight = self._in_flight.get(cluster_id, set())
         if chain_id in in_flight:
             return True
+        assert (
+            self._clusters is not None
+        )  # key is not None implies _clusters is not None
         cluster = self._clusters.clusters[cluster_id]
         projected = (len(in_flight) + 1) * cluster.peak_chain_width
         budget = int(self._admission_budget_fraction * self.d)

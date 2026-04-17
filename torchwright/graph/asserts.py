@@ -696,8 +696,8 @@ def assert_picked_from(
         q = bad.nonzero(as_tuple=False)[0].item()
         return False, (
             f"query row {q}: result doesn't match any value row "
-            f"within atol={atol}; closest valid key #{argmin_k[q].item()} "
-            f"at L∞ distance {min_dists[q].item():.4f}"
+            f"within atol={atol}; closest valid key #{argmin_k[int(q)].item()} "
+            f"at L∞ distance {min_dists[int(q)].item():.4f}"
         )
 
     composite = Concatenate([result, values, keys])

@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from torchwright.compiler.export import compile_headless
+from torchwright.graph.node import Node
 from torchwright.doom.game import GameState
 from torchwright.doom.input import PlayerInput
 from torchwright.doom.game_graph import (
@@ -185,10 +186,10 @@ def compile_game(
     # output (compiler places the output at the input's columns via
     # delta transfer).  Input-only entries have no output node.  Overflow
     # entries have no input and live in overflow columns after d_input.
-    io = {}
+    io: dict[str, tuple[Node | None, Node | None]] = {}
     for name, node in graph_io.inputs.items():
-        out_node = graph_io.overlaid_outputs.get(name)
-        io[name] = (node, out_node)
+        overlaid_out: Node | None = graph_io.overlaid_outputs.get(name)
+        io[name] = (node, overlaid_out)
     for name, node in graph_io.overflow_outputs.items():
         assert name not in io, f"overflow name collides with input: {name}"
         io[name] = (None, node)

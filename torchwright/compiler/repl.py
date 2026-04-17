@@ -7,7 +7,7 @@ Requires: onnxruntime, numpy.
 import json
 import sys
 from dataclasses import dataclass
-from typing import Iterator, List
+from typing import Any, Iterator, List
 
 import numpy as np
 
@@ -32,7 +32,7 @@ class _Vocab:
 class _Model:
     """ONNX session plus the metadata the REPL loop needs for KV cache."""
 
-    session: "object"  # onnxruntime.InferenceSession
+    session: Any  # onnxruntime.InferenceSession
     vocab: _Vocab
     n_layers: int
     per_layer_n_heads: List[int]

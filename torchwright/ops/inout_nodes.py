@@ -8,7 +8,7 @@ from torchwright.graph.embedding import Unembedding
 
 def create_input(
     name_or_width,
-    width: int = None,
+    width: int | None = None,
     *,
     value_range: Optional[Tuple[float, float]] = None,
 ) -> Node:

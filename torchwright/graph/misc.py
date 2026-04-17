@@ -52,7 +52,9 @@ class InputNode(Node):
         lo, hi = self._declared_value_range
         return NodeValueType(value_range=Range(float(lo), float(hi)))
 
-    def compute(self, n_pos: int, input_values: dict, name: str = None) -> torch.Tensor:
+    def compute(
+        self, n_pos: int, input_values: dict, name: str | None = None
+    ) -> torch.Tensor:
         # Use provided name or fall back to stored name
         lookup_name = name if name is not None else self.name
         if not lookup_name:

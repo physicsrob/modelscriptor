@@ -13,7 +13,7 @@ D_HEAD = 16
 
 def decode_token(embedding: Embedding, vector: torch.Tensor) -> str:
     dists = torch.cdist(vector.unsqueeze(0).cpu(), embedding.table)
-    return embedding.tokenizer.decode_id(dists.argmin().item())
+    return embedding.tokenizer.decode_id(int(dists.argmin().item()))
 
 
 def run_autoregressive(

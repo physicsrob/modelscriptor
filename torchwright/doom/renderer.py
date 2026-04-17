@@ -4,7 +4,7 @@ The graph takes per-position inputs and outputs H*3 RGB values (one screen
 column).  Segment geometry is baked into the weights as constants.
 """
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, cast
 
 import builtins
 
@@ -59,7 +59,7 @@ def trig_lookup(ray_angle: Node) -> Tuple[Node, Node]:
     from torchwright.ops.arithmetic_ops import piecewise_linear
 
     table = generate_trig_table()  # (256, 2): col0=cos, col1=sin
-    breakpoints = list(range(256))
+    breakpoints: List[float] = list(range(256))
 
     ray_cos = piecewise_linear(
         ray_angle, breakpoints, lambda i: float(table[int(i), 0]), name="trig_cos"
@@ -560,7 +560,7 @@ def _build_angle_lookup(
     # Output layout: [signed_inv_den_0, abs_den_0, sign_den_0,
     #                 signed_inv_den_1, abs_den_1, sign_den_1, ...]
     d_out = 3 * n_segs
-    breakpoints = list(range(256))
+    breakpoints: List[float] = list(range(256))
 
     def _angle_row(angle_idx):
         cos_a = float(trig_table[int(angle_idx), 0])
@@ -605,7 +605,7 @@ def _build_angle_lookup(
         )
         result.append((signed_inv_den, abs_den_node, sign_den))
 
-    return result
+    return cast(List[Tuple[Node, Node, Node]], result)
 
 
 def _extract_matrix(d_in: int, idx: int) -> torch.Tensor:
@@ -837,8 +837,12 @@ def _textured_column_fill(
     # optimization_guide §7).  ``sequential_scope`` wires scheduling
     # deps so at most ``tex_sample_batch_size`` rows are in flight at
     # once, keeping peak residual usage within budget.
+    tex_row_factories: List[Callable[[], Node]] = [
+        lambda y_idx=y_idx: _build_tex_row(y_idx)  # type: ignore[misc]
+        for y_idx in range(rows_per_patch)
+    ]
     row_rgbs: List[Node] = sequential_scope(
-        [lambda y_idx=y_idx: _build_tex_row(y_idx) for y_idx in range(rows_per_patch)],
+        tex_row_factories,
         batch_size=tex_sample_batch_size,
     )
 
@@ -936,6 +940,8 @@ def build_textured_rendering_pipeline(
         tex_metas.append(tex_meta)
 
     # --- Stage 5: Min-reduction ---
+    closest_dist: Node
+    winning_meta: Node
     if len(segments) == 0:
         closest_dist = LiteralValue(torch.tensor([BIG_DISTANCE]), name="no_hit")
         winning_meta = LiteralValue(torch.tensor([0.0, 0.0, 1.0]), name="no_meta")
@@ -1088,8 +1094,8 @@ def build_rendering_pipeline(
         angle_data = _build_angle_lookup(ray_angle, segments)
 
     # Stages 3-4: Per-segment intersection + validity + distance
-    distances = []
-    colors = []
+    distances: List[Node] = []
+    colors: List[Node] = []
     for i, seg in enumerate(segments):
         _den, num_t, num_u = _segment_intersection(
             cos_sin,
@@ -1110,6 +1116,8 @@ def build_rendering_pipeline(
         colors.append(LiteralValue(torch.tensor(list(seg.color)), name="seg_color"))
 
     # Stage 5: Min-reduction — find nearest segment
+    closest_dist: Node
+    wall_color: Node
     if len(segments) == 0:
         closest_dist = LiteralValue(torch.tensor([BIG_DISTANCE]), name="no_hit")
         wall_color = LiteralValue(torch.tensor([0.0, 0.0, 0.0]), name="no_color")

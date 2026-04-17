@@ -224,10 +224,10 @@ def compare_digit_seqs(
     for prev_val in [-1.0, 0.0, 1.0]:
         for cur_val in [-1.0, 0.0, 1.0]:
             key = torch.tensor([prev_val, cur_val])
-            result = prev_val if prev_val != 0.0 else cur_val
-            combine_table[key] = torch.tensor([result])
+            val = prev_val if prev_val != 0.0 else cur_val
+            combine_table[key] = torch.tensor([val])
 
-    result = compare_digit_pair(embedding, seq1[0], seq2[0])
+    result: Node = compare_digit_pair(embedding, seq1[0], seq2[0])
     for a_i, b_i in zip(seq1[1:], seq2[1:]):
         cmp_i = compare_digit_pair(embedding, a_i, b_i)
         result = map_to_table(
@@ -307,6 +307,7 @@ def multiply_digit_seqs(
     for j in range(n):
         carry = create_literal_value(torch.tensor([-1.0]))
         row_digits = []
+        carry_digit: Node
         for i in reversed(range(n)):
             tens, ones = products[i, j]
             digit_sum, carry = sum_digits(
