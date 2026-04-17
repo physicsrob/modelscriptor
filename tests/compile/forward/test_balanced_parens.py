@@ -57,6 +57,10 @@ def test_balanced_parens():
     """Compile and verify balanced-parentheses detection."""
     net, output_node, embedding = _build()
 
+    n_layers = len(net.layers)
+    print(f"balanced_parens: {n_layers} layers, d={D}, d_head={D_HEAD}")
+    assert n_layers <= 60, f"Too many layers: {n_layers}"
+
     test_cases = [
         # Balanced
         ("()", "Y"),
@@ -84,11 +88,3 @@ def test_balanced_parens():
         assert (
             result == expected
         ), f"For '{input_str}': expected '{expected}' but got '{result}'"
-
-
-def test_balanced_parens_layer_count():
-    """Verify compilation stays within a reasonable layer budget."""
-    net, _, _ = _build()
-    n_layers = len(net.layers)
-    print(f"balanced_parens: {n_layers} layers, d={D}, d_head={D_HEAD}")
-    assert n_layers <= 60, f"Too many layers: {n_layers}"

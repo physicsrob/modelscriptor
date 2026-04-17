@@ -33,37 +33,30 @@ def multi_segments():
 # ── point_segment_distance ───────────────────────────────────────────
 
 
-class TestPointSegmentDistance:
-    def test_perpendicular_to_midpoint(self):
-        seg = Segment(ax=0, ay=0, bx=10, by=0, color=(1, 0, 0))
-        assert point_segment_distance(5, 3, seg) == pytest.approx(3.0)
-
-    def test_on_segment(self):
-        seg = Segment(ax=0, ay=0, bx=10, by=0, color=(1, 0, 0))
-        assert point_segment_distance(5, 0, seg) == pytest.approx(0.0)
-
-    def test_nearest_is_endpoint_a(self):
-        seg = Segment(ax=0, ay=0, bx=10, by=0, color=(1, 0, 0))
-        # Point is behind endpoint A
-        assert point_segment_distance(-3, 4, seg) == pytest.approx(5.0)
-
-    def test_nearest_is_endpoint_b(self):
-        seg = Segment(ax=0, ay=0, bx=10, by=0, color=(1, 0, 0))
-        # Point is past endpoint B
-        assert point_segment_distance(13, 4, seg) == pytest.approx(5.0)
-
-    def test_diagonal_segment(self):
-        seg = Segment(ax=0, ay=0, bx=3, by=4, color=(1, 0, 0))
-        # Point at origin is on endpoint A
-        assert point_segment_distance(0, 0, seg) == pytest.approx(0.0)
-
-    def test_degenerate_zero_length(self):
-        seg = Segment(ax=3, ay=4, bx=3, by=4, color=(1, 0, 0))
-        assert point_segment_distance(0, 0, seg) == pytest.approx(5.0)
-
-    def test_perpendicular_to_vertical_segment(self):
-        seg = Segment(ax=5, ay=0, bx=5, by=10, color=(1, 0, 0))
-        assert point_segment_distance(2, 5, seg) == pytest.approx(3.0)
+@pytest.mark.parametrize(
+    "ax,ay,bx,by,px,py,expected",
+    [
+        (0, 0, 10, 0, 5, 3, 3.0),  # perpendicular to midpoint
+        (0, 0, 10, 0, 5, 0, 0.0),  # on segment
+        (0, 0, 10, 0, -3, 4, 5.0),  # nearest is endpoint A
+        (0, 0, 10, 0, 13, 4, 5.0),  # nearest is endpoint B
+        (0, 0, 3, 4, 0, 0, 0.0),  # diagonal segment, on endpoint A
+        (3, 4, 3, 4, 0, 0, 5.0),  # degenerate zero-length
+        (5, 0, 5, 10, 2, 5, 3.0),  # perpendicular to vertical segment
+    ],
+    ids=[
+        "perpendicular_to_midpoint",
+        "on_segment",
+        "nearest_is_endpoint_a",
+        "nearest_is_endpoint_b",
+        "diagonal_segment",
+        "degenerate_zero_length",
+        "perpendicular_to_vertical_segment",
+    ],
+)
+def test_point_segment_distance(ax, ay, bx, by, px, py, expected):
+    seg = Segment(ax=ax, ay=ay, bx=bx, by=by, color=(1, 0, 0))
+    assert point_segment_distance(px, py, seg) == pytest.approx(expected)
 
 
 # ── resolve_collision ────────────────────────────────────────────────
@@ -104,67 +97,49 @@ class TestResolveCollision:
 
 
 class TestMovement:
-    def test_no_input_no_change(self, trig_table):
-        state = GameState(x=0, y=0, angle=0)
-        new = update_state(state, PlayerInput(), [], trig_table)
-        assert new.x == 0.0
-        assert new.y == 0.0
-        assert new.angle == 0
+    @pytest.mark.parametrize(
+        "angle,input_kwargs,expected_dx,expected_dy",
+        [
+            (0, {}, 0.0, 0.0),  # no input
+            (0, {"forward": True}, 1.0, 0.0),  # angle 0: +x
+            (64, {"forward": True}, 0.0, 1.0),  # angle 64: +y
+            (0, {"backward": True}, -1.0, 0.0),  # backward is opposite of forward
+            (0, {"strafe_left": True}, 0.0, -1.0),  # strafe left at angle 0: -y
+            (0, {"strafe_right": True}, 0.0, 1.0),  # strafe right at angle 0: +y
+        ],
+        ids=[
+            "no_input_no_change",
+            "forward_angle_0",
+            "forward_angle_64",
+            "backward_is_opposite",
+            "strafe_left_perpendicular",
+            "strafe_right_perpendicular",
+        ],
+    )
+    def test_position_change(
+        self, trig_table, angle, input_kwargs, expected_dx, expected_dy
+    ):
+        state = GameState(x=0, y=0, angle=angle, move_speed=1.0)
+        new = update_state(state, PlayerInput(**input_kwargs), [], trig_table)
+        assert new.x == pytest.approx(expected_dx, abs=1e-6)
+        assert new.y == pytest.approx(expected_dy, abs=1e-6)
 
-    def test_forward_angle_0(self, trig_table):
-        """Angle 0 = +x direction (cos=1, sin=0)."""
-        state = GameState(x=0, y=0, angle=0, move_speed=1.0)
-        new = update_state(state, PlayerInput(forward=True), [], trig_table)
-        assert new.x == pytest.approx(1.0, abs=1e-6)
-        assert new.y == pytest.approx(0.0, abs=1e-6)
-
-    def test_forward_angle_64(self, trig_table):
-        """Angle 64 = +y direction (cos=0, sin=1)."""
-        state = GameState(x=0, y=0, angle=64, move_speed=1.0)
-        new = update_state(state, PlayerInput(forward=True), [], trig_table)
-        assert new.x == pytest.approx(0.0, abs=1e-6)
-        assert new.y == pytest.approx(1.0, abs=1e-6)
-
-    def test_backward_is_opposite(self, trig_table):
-        state = GameState(x=0, y=0, angle=0, move_speed=1.0)
-        new = update_state(state, PlayerInput(backward=True), [], trig_table)
-        assert new.x == pytest.approx(-1.0, abs=1e-6)
-        assert new.y == pytest.approx(0.0, abs=1e-6)
-
-    def test_strafe_left_perpendicular(self, trig_table):
-        """Strafe left at angle 0 should move in +y direction."""
-        state = GameState(x=0, y=0, angle=0, move_speed=1.0)
-        new = update_state(state, PlayerInput(strafe_left=True), [], trig_table)
-        # At angle 0: cos=1, sin=0. Strafe left: dx += sin=0, dy -= cos=-1
-        assert new.x == pytest.approx(0.0, abs=1e-6)
-        assert new.y == pytest.approx(-1.0, abs=1e-6)
-
-    def test_strafe_right_perpendicular(self, trig_table):
-        """Strafe right at angle 0 should move in -y direction."""
-        state = GameState(x=0, y=0, angle=0, move_speed=1.0)
-        new = update_state(state, PlayerInput(strafe_right=True), [], trig_table)
-        assert new.x == pytest.approx(0.0, abs=1e-6)
-        assert new.y == pytest.approx(1.0, abs=1e-6)
-
-    def test_turn_left(self, trig_table):
-        state = GameState(x=0, y=0, angle=10, turn_speed=4)
-        new = update_state(state, PlayerInput(turn_left=True), [], trig_table)
-        assert new.angle == 6
-
-    def test_turn_right(self, trig_table):
-        state = GameState(x=0, y=0, angle=10, turn_speed=4)
-        new = update_state(state, PlayerInput(turn_right=True), [], trig_table)
-        assert new.angle == 14
-
-    def test_angle_wraps_below_zero(self, trig_table):
-        state = GameState(x=0, y=0, angle=2, turn_speed=4)
-        new = update_state(state, PlayerInput(turn_left=True), [], trig_table)
-        assert new.angle == 254
-
-    def test_angle_wraps_above_255(self, trig_table):
-        state = GameState(x=0, y=0, angle=254, turn_speed=4)
-        new = update_state(state, PlayerInput(turn_right=True), [], trig_table)
-        assert new.angle == 2
+    @pytest.mark.parametrize(
+        "start_angle,input_kwargs,turn_speed,expected_angle",
+        [
+            (10, {"turn_left": True}, 4, 6),  # turn left decreases by 4
+            (10, {"turn_right": True}, 4, 14),  # turn right increases by 4
+            (2, {"turn_left": True}, 4, 254),  # wraps below zero
+            (254, {"turn_right": True}, 4, 2),  # wraps above 255
+        ],
+        ids=["turn_left", "turn_right", "wraps_below_zero", "wraps_above_255"],
+    )
+    def test_turn(
+        self, trig_table, start_angle, input_kwargs, turn_speed, expected_angle
+    ):
+        state = GameState(x=0, y=0, angle=start_angle, turn_speed=turn_speed)
+        new = update_state(state, PlayerInput(**input_kwargs), [], trig_table)
+        assert new.angle == expected_angle
 
     def test_full_rotation_returns_to_start(self, trig_table):
         state = GameState(x=0, y=0, angle=0, turn_speed=1)
