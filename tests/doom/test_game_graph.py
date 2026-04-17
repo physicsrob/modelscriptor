@@ -160,8 +160,8 @@ class TestGameGraph:
         ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
 
         compare_images(frame, ref).assert_matches(
-            min_matched_fraction=0.95,
-            max_err=0.35,
+            min_matched_fraction=0.96,
+            max_err=0.30,
         )
 
     @pytest.mark.parametrize(
@@ -187,8 +187,8 @@ class TestGameGraph:
         ref = _ref_frame(px, py, angle, segs, config, textures)
 
         compare_images(frame, ref).assert_matches(
-            min_matched_fraction=0.95,
-            max_err=0.35,
+            min_matched_fraction=0.96,
+            max_err=0.30,
         )
 
     # ── Collision detection tests ──────────────────────────────────
