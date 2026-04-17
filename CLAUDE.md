@@ -475,6 +475,18 @@ conflicting node.
 longer preserves the invariant, or (b) an external caller reached
 in and mutated `_free` / `_node_to_indices`.  Both are bugs.
 
+**Equivalently: this is the invariant that forbids *residual-column
+aliasing* among simultaneously-live nodes.** If you suspect a bug
+where two live nodes share a column and their values contaminate
+each other, that hypothesis is "I1 is firing."  Since `_check_invariants`
+runs after every allocate/free/reassign, if the test suite compiles
+without I1 firing then no such aliasing exists — the bug is elsewhere
+(candidates: stale residual-stream values at reassigned columns
+despite clean allocator bookkeeping; compound numerical drift through
+a long op chain; schedule ordering across sublayers).  Do not restate
+this hypothesis without first checking that I1 is not fired on the
+repro.
+
 ## I2 — Literal stability
 
 Every `LiteralValue` scheduled via `compute_literal_value`, and
