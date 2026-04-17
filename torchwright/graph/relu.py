@@ -21,7 +21,9 @@ class ReLU(Node):
         new_range = t.value_range.relu()
         # sign-valued input ({-1, +1}) maps to binary {0, 1}; binary stays
         # binary; one-hot-ness is preserved only for already-binary inputs.
-        new_binary = _max_guarantee(t.is_binary, _min_guarantee(t.is_sign, t.is_integer))
+        new_binary = _max_guarantee(
+            t.is_binary, _min_guarantee(t.is_sign, t.is_integer)
+        )
         new_one_hot = _min_guarantee(t.is_one_hot, t.is_binary)
         return NodeValueType(
             value_range=new_range,

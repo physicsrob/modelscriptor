@@ -29,7 +29,6 @@ from torchwright.graph import Concatenate, Node
 
 from torchwright.doom.graph_utils import extract_from
 
-
 # ---------------------------------------------------------------------------
 # Section widths and offsets
 # ---------------------------------------------------------------------------
@@ -81,13 +80,24 @@ def pack_wall_payload(
     position_onehot: Node,
 ) -> Node:
     """Concatenate per-WALL values into the canonical sort payload."""
-    return Concatenate([
-        wall_ax, wall_ay, wall_bx, wall_by, wall_tex_id,
-        sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv,
-        bsp_rank,
-        vis_lo, vis_hi,
-        position_onehot,
-    ])
+    return Concatenate(
+        [
+            wall_ax,
+            wall_ay,
+            wall_bx,
+            wall_by,
+            wall_tex_id,
+            sort_den,
+            precomp_C,
+            precomp_D,
+            precomp_E,
+            precomp_H_inv,
+            bsp_rank,
+            vis_lo,
+            vis_hi,
+            position_onehot,
+        ]
+    )
 
 
 @dataclass
@@ -113,15 +123,18 @@ def unpack_wall_payload(node: Node, max_walls: int) -> UnpackedWallPayload:
     d_total = payload_width(max_walls)
     return UnpackedWallPayload(
         wall_data=extract_from(
-            node, d_total, GEOMETRY_OFFSET, GEOMETRY_WIDTH, "wall_data"),
+            node, d_total, GEOMETRY_OFFSET, GEOMETRY_WIDTH, "wall_data"
+        ),
         render_data=extract_from(
-            node, d_total, RENDER_OFFSET, RENDER_WIDTH, "render_data"),
+            node, d_total, RENDER_OFFSET, RENDER_WIDTH, "render_data"
+        ),
         bsp_rank=extract_from(
-            node, d_total, BSP_RANK_OFFSET, BSP_RANK_WIDTH, "bsp_rank"),
+            node, d_total, BSP_RANK_OFFSET, BSP_RANK_WIDTH, "bsp_rank"
+        ),
         vis_cols=extract_from(
-            node, d_total, VISIBILITY_OFFSET, VISIBILITY_WIDTH, "vis_cols"),
-        onehot=extract_from(
-            node, d_total, ONEHOT_OFFSET, max_walls, "onehot"),
+            node, d_total, VISIBILITY_OFFSET, VISIBILITY_WIDTH, "vis_cols"
+        ),
+        onehot=extract_from(node, d_total, ONEHOT_OFFSET, max_walls, "onehot"),
     )
 
 

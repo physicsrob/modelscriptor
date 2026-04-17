@@ -27,9 +27,7 @@ def test_bool_to_01():
     x = create_input("x", 1)
     out = bool_to_01(x)
     for x_val, expected in [(-1.0, 0.0), (1.0, 1.0)]:
-        result = out.compute(
-            n_pos=1, input_values={"x": torch.tensor([[x_val]])}
-        )
+        result = out.compute(n_pos=1, input_values={"x": torch.tensor([[x_val]])})
         assert result.item() == expected
 
 
@@ -451,7 +449,12 @@ def test_signed_multiply_strategies():
     ]
     for strategy in ("deep", "shallow"):
         prod = signed_multiply(
-            a, b, max_abs1=10.0, max_abs2=10.0, step=1.0, strategy=strategy,
+            a,
+            b,
+            max_abs1=10.0,
+            max_abs2=10.0,
+            step=1.0,
+            strategy=strategy,
         )
         for va, vb, expected in cases:
             result = prod.compute(

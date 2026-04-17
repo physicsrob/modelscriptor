@@ -513,8 +513,13 @@ def test_attend_argmin_valid_unmasked_all_valid_empty_mask_picks_min():
     value_in = torch.eye(4, 4) * 2.0
 
     result = _run(
-        out, n_pos, score=score_in, validity=validity_in,
-        mask=mask_in, onehot=onehot_in, value=value_in,
+        out,
+        n_pos,
+        score=score_in,
+        validity=validity_in,
+        mask=mask_in,
+        onehot=onehot_in,
+        value=value_in,
     )
     # Argmin over prefixes: pos 0, pos 1, pos 2, pos 2.
     assert torch.allclose(result[0], value_in[0], atol=1e-2), f"pos 0: {result[0]}"
@@ -542,8 +547,13 @@ def test_attend_argmin_valid_unmasked_validity_overrides_low_score():
     value_in = torch.eye(4, 4) * 2.0
 
     result = _run(
-        out, n_pos, score=score_in, validity=validity_in,
-        mask=mask_in, onehot=onehot_in, value=value_in,
+        out,
+        n_pos,
+        score=score_in,
+        validity=validity_in,
+        mask=mask_in,
+        onehot=onehot_in,
+        value=value_in,
     )
     assert torch.allclose(result[1], value_in[1], atol=1e-2), f"pos 1: {result[1]}"
     assert torch.allclose(result[2], value_in[1], atol=1e-2), f"pos 2: {result[2]}"
@@ -565,17 +575,24 @@ def test_attend_argmin_valid_unmasked_mask_excludes_picked():
     validity_in = torch.ones(4, 1)
     onehot_in = torch.eye(4, 4)
     # From pos 2 onwards, slot 2 is masked.
-    mask_in = torch.tensor([
-        [0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-    ])
+    mask_in = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
     value_in = torch.eye(4, 4) * 2.0
 
     result = _run(
-        out, n_pos, score=score_in, validity=validity_in,
-        mask=mask_in, onehot=onehot_in, value=value_in,
+        out,
+        n_pos,
+        score=score_in,
+        validity=validity_in,
+        mask=mask_in,
+        onehot=onehot_in,
+        value=value_in,
     )
     # pos 2: slot 2 masked, min of {0,1} is pos 1 (score 3).
     # pos 3: {0,1,3} unmasked, min is pos 1 (score 3).
@@ -600,17 +617,24 @@ def test_attend_argmin_valid_unmasked_mask_and_validity_combined():
     score_in = torch.tensor([[5.0], [3.0], [1.0], [4.0]])
     validity_in = torch.tensor([[1.0], [-1.0], [1.0], [1.0]])
     onehot_in = torch.eye(4, 4)
-    mask_in = torch.tensor([
-        [0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-    ])
+    mask_in = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
     value_in = torch.eye(4, 4) * 2.0
 
     result = _run(
-        out, n_pos, score=score_in, validity=validity_in,
-        mask=mask_in, onehot=onehot_in, value=value_in,
+        out,
+        n_pos,
+        score=score_in,
+        validity=validity_in,
+        mask=mask_in,
+        onehot=onehot_in,
+        value=value_in,
     )
     # pos 3: valid-unmasked set = {0 (s=5), 3 (s=4)}, argmin = pos 3.
     assert torch.allclose(result[3], value_in[3], atol=1e-2), f"pos 3: {result[3]}"
@@ -640,17 +664,24 @@ def test_attend_argmin_valid_unmasked_all_valid_masked_repicks_masked():
     validity_in = torch.tensor([[-1.0], [1.0], [-1.0], [-1.0]])
     onehot_in = torch.eye(4, 4)
     # Mask bit 1 on from query pos 1 onward (the one valid slot).
-    mask_in = torch.tensor([
-        [0.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-    ])
+    mask_in = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+        ]
+    )
     value_in = torch.eye(4, 4) * 2.0
 
     result = _run(
-        out, n_pos, score=score_in, validity=validity_in,
-        mask=mask_in, onehot=onehot_in, value=value_in,
+        out,
+        n_pos,
+        score=score_in,
+        validity=validity_in,
+        mask=mask_in,
+        onehot=onehot_in,
+        value=value_in,
     )
     # At pos 3, masked-valid (pos 1) must still win over any unmasked-invalid.
     assert torch.allclose(result[3], value_in[1], atol=1e-2), f"pos 3: {result[3]}"
@@ -671,13 +702,15 @@ def test_attend_mean_where_averages_valid_positions():
     n_pos = 5
     # Positions 0, 1, 3 are valid; 2, 4 are invalid.
     validity_in = torch.tensor([[1.0], [1.0], [-1.0], [1.0], [-1.0]])
-    value_in = torch.tensor([
-        [2.0, 0.0, 0.0],
-        [0.0, 4.0, 0.0],
-        [99.0, 99.0, 99.0],  # invalid — should be ignored
-        [0.0, 0.0, 6.0],
-        [99.0, 99.0, 99.0],  # invalid
-    ])
+    value_in = torch.tensor(
+        [
+            [2.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0],
+            [99.0, 99.0, 99.0],  # invalid — should be ignored
+            [0.0, 0.0, 6.0],
+            [99.0, 99.0, 99.0],  # invalid
+        ]
+    )
 
     result = _run(out, n_pos, validity=validity_in, value=value_in)
 
@@ -760,27 +793,33 @@ def test_attend_argmax_dot_selects_best_match():
 
     n_pos = 4
     # Query: one-hot selecting column 2 (0/1 convention)
-    qv_in = torch.tensor([
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-    ])
+    qv_in = torch.tensor(
+        [
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
     # Key: ±1 masks. Pos 0: col 2 = -1 (not matching).
     # Pos 1: col 2 = +1 (matching). Pos 2: col 2 = +1 (matching).
     # Pos 3: col 2 = -1 (not matching).
-    kv_in = torch.tensor([
-        [-1.0, 1.0, -1.0, 1.0],   # col 2 = -1
-        [1.0, -1.0, 1.0, -1.0],   # col 2 = +1
-        [-1.0, 1.0, 1.0, -1.0],   # col 2 = +1
-        [1.0, -1.0, -1.0, 1.0],   # col 2 = -1
-    ])
-    value_in = torch.tensor([
-        [10.0, 0.0],
-        [20.0, 1.0],
-        [30.0, 2.0],
-        [40.0, 3.0],
-    ])
+    kv_in = torch.tensor(
+        [
+            [-1.0, 1.0, -1.0, 1.0],  # col 2 = -1
+            [1.0, -1.0, 1.0, -1.0],  # col 2 = +1
+            [-1.0, 1.0, 1.0, -1.0],  # col 2 = +1
+            [1.0, -1.0, -1.0, 1.0],  # col 2 = -1
+        ]
+    )
+    value_in = torch.tensor(
+        [
+            [10.0, 0.0],
+            [20.0, 1.0],
+            [30.0, 2.0],
+            [40.0, 3.0],
+        ]
+    )
 
     result = _run(out, n_pos, qv=qv_in, kv=kv_in, value=value_in)
 
@@ -810,23 +849,29 @@ def test_attend_argmax_dot_zero_key_isolation():
 
     n_pos = 3
     # Query: one-hot column 0
-    qv_in = torch.tensor([
-        [1.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0],
-    ])
+    qv_in = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ]
+    )
     # Key: pos 0 is gated to zero (non-participating), pos 1 matches,
     # pos 2 doesn't match.
-    kv_in = torch.tensor([
-        [0.0, 0.0, 0.0],     # gated zero (dot product = 0)
-        [1.0, -1.0, -1.0],   # col 0 = +1 (dot product = +1)
-        [-1.0, 1.0, 1.0],    # col 0 = -1 (dot product = -1)
-    ])
-    value_in = torch.tensor([
-        [0.0, 0.0],   # gated zero value
-        [5.0, 5.0],
-        [9.0, 9.0],
-    ])
+    kv_in = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],  # gated zero (dot product = 0)
+            [1.0, -1.0, -1.0],  # col 0 = +1 (dot product = +1)
+            [-1.0, 1.0, 1.0],  # col 0 = -1 (dot product = -1)
+        ]
+    )
+    value_in = torch.tensor(
+        [
+            [0.0, 0.0],  # gated zero value
+            [5.0, 5.0],
+            [9.0, 9.0],
+        ]
+    )
 
     result = _run(out, n_pos, qv=qv_in, kv=kv_in, value=value_in)
     # At pos 2: pos 1 (dot=+200) beats pos 0 (dot=0) and pos 2 (dot=-200)
@@ -844,19 +889,23 @@ def test_attend_argmax_dot_different_queries_per_position():
     n_pos = 4
     # Key positions 0-2 each have a different column set to +1.
     # Position 3 queries column 0.
-    kv_in = torch.tensor([
-        [1.0, -1.0, -1.0],   # "visible at col 0"
-        [-1.0, 1.0, -1.0],   # "visible at col 1"
-        [-1.0, -1.0, 1.0],   # "visible at col 2"
-        [0.0, 0.0, 0.0],     # gated (non-participating)
-    ])
+    kv_in = torch.tensor(
+        [
+            [1.0, -1.0, -1.0],  # "visible at col 0"
+            [-1.0, 1.0, -1.0],  # "visible at col 1"
+            [-1.0, -1.0, 1.0],  # "visible at col 2"
+            [0.0, 0.0, 0.0],  # gated (non-participating)
+        ]
+    )
     # Queries: each position queries a different column.
-    qv_in = torch.tensor([
-        [1.0, 0.0, 0.0],   # query col 0
-        [0.0, 1.0, 0.0],   # query col 1
-        [0.0, 0.0, 1.0],   # query col 2
-        [1.0, 0.0, 0.0],   # query col 0 again
-    ])
+    qv_in = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],  # query col 0
+            [0.0, 1.0, 0.0],  # query col 1
+            [0.0, 0.0, 1.0],  # query col 2
+            [1.0, 0.0, 0.0],  # query col 0 again
+        ]
+    )
     value_in = torch.tensor([[10.0], [20.0], [30.0], [0.0]])
 
     result = _run(out, n_pos, qv=qv_in, kv=kv_in, value=value_in)

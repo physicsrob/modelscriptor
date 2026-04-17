@@ -52,10 +52,24 @@ from torchwright.graph import Concatenate
 from torchwright.ops.arithmetic_ops import clamp, low_rank_2d
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
-
 # Non-uniform grid that motivated low_rank_2d (TODO.md pathological case).
-_BP_X = [-2.0, -1.5, -1.0, -0.75, -0.5, -0.25, -0.1, 0.0,
-         0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+_BP_X = [
+    -2.0,
+    -1.5,
+    -1.0,
+    -0.75,
+    -0.5,
+    -0.25,
+    -0.1,
+    0.0,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1.0,
+    1.5,
+    2.0,
+]
 _BP_Y = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
 
 
@@ -77,7 +91,10 @@ def _build_atan_graph(rank: int, clamp_inputs: bool):
         x_in, y_in = x, y
 
     result = low_rank_2d(
-        x_in, y_in, _BP_X, _BP_Y,
+        x_in,
+        y_in,
+        _BP_X,
+        _BP_Y,
         lambda a, b: math.atan(a / b),
         rank=rank,
         name="atan_lr",

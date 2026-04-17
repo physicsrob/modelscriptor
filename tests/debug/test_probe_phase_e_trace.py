@@ -55,7 +55,6 @@ from torchwright.reference_renderer.textures import default_texture_atlas
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
-
 # Exactly the knobs that ``tests/doom/test_game_graph.py::TestGameGraph``
 # uses — the xfail's compile config.  Reproducing the bug requires the
 # same compile path, same texture atlas, and same segments.
@@ -67,7 +66,9 @@ _D_HEAD = 32
 
 def _box_room_config() -> RenderConfig:
     return RenderConfig(
-        screen_width=16, screen_height=20, fov_columns=16,
+        screen_width=16,
+        screen_height=20,
+        fov_columns=16,
         trig_table=generate_trig_table(),
         ceiling_color=(0.2, 0.2, 0.2),
         floor_color=(0.4, 0.4, 0.4),
@@ -76,14 +77,18 @@ def _box_room_config() -> RenderConfig:
 
 def _box_room_segments(half: float = 5.0):
     return [
-        Segment(ax=half, ay=-half, bx=half, by=half,
-                color=(0.8, 0.2, 0.1), texture_id=0),
-        Segment(ax=-half, ay=-half, bx=-half, by=half,
-                color=(0.8, 0.2, 0.1), texture_id=1),
-        Segment(ax=-half, ay=half, bx=half, by=half,
-                color=(0.8, 0.2, 0.1), texture_id=2),
-        Segment(ax=-half, ay=-half, bx=half, by=-half,
-                color=(0.8, 0.2, 0.1), texture_id=3),
+        Segment(
+            ax=half, ay=-half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=0
+        ),
+        Segment(
+            ax=-half, ay=-half, bx=-half, by=half, color=(0.8, 0.2, 0.1), texture_id=1
+        ),
+        Segment(
+            ax=-half, ay=half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=2
+        ),
+        Segment(
+            ax=-half, ay=-half, bx=half, by=-half, color=(0.8, 0.2, 0.1), texture_id=3
+        ),
     ]
 
 
@@ -102,13 +107,18 @@ def compiled_box_room():
     subset = build_scene_subset(segs, textures)
 
     graph_io, pos_encoding = build_game_graph(
-        config, textures,
-        max_walls=_MAX_WALLS, max_coord=20.0,
-        move_speed=0.3, turn_speed=4,
-        chunk_size=20, max_bsp_nodes=_MAX_BSP_NODES,
+        config,
+        textures,
+        max_walls=_MAX_WALLS,
+        max_coord=20.0,
+        move_speed=0.3,
+        turn_speed=4,
+        chunk_size=20,
+        max_bsp_nodes=_MAX_BSP_NODES,
     )
 
     from torchwright.graph.optimize import fuse_consecutive_linears
+
     output_nodes = set(graph_io.overlaid_outputs.values())
     output_nodes.update(graph_io.overflow_outputs.values())
     output_nodes.add(pos_encoding)
@@ -123,11 +133,15 @@ def compiled_box_room():
         io[name] = (None, node)
 
     module = compile_headless(
-        pos_encoding, io=io,
-        d=_D, d_head=_D_HEAD, max_layers=400,
+        pos_encoding,
+        io=io,
+        d=_D,
+        d_head=_D_HEAD,
+        max_layers=400,
         verbose=False,
         extra_metadata={
-            "chunk_size": 20, "max_walls": _MAX_WALLS,
+            "chunk_size": 20,
+            "max_walls": _MAX_WALLS,
             "max_bsp_nodes": _MAX_BSP_NODES,
             "tex_h": textures[0].shape[1],
         },
@@ -172,14 +186,17 @@ def _build_prefill(module, subset, *, px: float, py: float, angle: float):
         tex_e8 = index_to_vector(tex_idx + TEX_E8_OFFSET)
         for col in range(tex_w):
             pixel_data = subset.textures[tex_idx][col].flatten()
-            rows.append(_build_row(
-                module, max_walls,
-                token_type=E8_TEX_COL,
-                texture_id_e8=tex_e8,
-                tex_col_input=torch.tensor([float(col)]),
-                tex_pixels=torch.tensor(pixel_data, dtype=torch.float32),
-                **common,
-            ))
+            rows.append(
+                _build_row(
+                    module,
+                    max_walls,
+                    token_type=E8_TEX_COL,
+                    texture_id_e8=tex_e8,
+                    tex_col_input=torch.tensor([float(col)]),
+                    tex_pixels=torch.tensor(pixel_data, dtype=torch.float32),
+                    **common,
+                )
+            )
     rows.append(_build_row(module, max_walls, token_type=E8_INPUT, **common))
     for i in range(max_bsp_nodes):
         onehot = torch.zeros(max_bsp_nodes)
@@ -189,35 +206,43 @@ def _build_prefill(module, subset, *, px: float, py: float, angle: float):
             nx, ny, d = plane.nx, plane.ny, plane.d
         else:
             nx, ny, d = 0.0, 0.0, 0.0
-        rows.append(_build_row(
-            module, max_walls,
-            token_type=E8_BSP_NODE,
-            bsp_plane_nx=torch.tensor([nx], dtype=torch.float32),
-            bsp_plane_ny=torch.tensor([ny], dtype=torch.float32),
-            bsp_plane_d=torch.tensor([d], dtype=torch.float32),
-            bsp_node_id_onehot=onehot,
-            **common,
-        ))
+        rows.append(
+            _build_row(
+                module,
+                max_walls,
+                token_type=E8_BSP_NODE,
+                bsp_plane_nx=torch.tensor([nx], dtype=torch.float32),
+                bsp_plane_ny=torch.tensor([ny], dtype=torch.float32),
+                bsp_plane_d=torch.tensor([d], dtype=torch.float32),
+                bsp_node_id_onehot=onehot,
+                **common,
+            )
+        )
     for i, seg in enumerate(subset.segments):
         coeffs = torch.tensor(
-            subset.seg_bsp_coeffs[i, :max_bsp_nodes], dtype=torch.float32,
+            subset.seg_bsp_coeffs[i, :max_bsp_nodes],
+            dtype=torch.float32,
         )
         const = torch.tensor(
-            [float(subset.seg_bsp_consts[i])], dtype=torch.float32,
+            [float(subset.seg_bsp_consts[i])],
+            dtype=torch.float32,
         )
-        rows.append(_build_row(
-            module, max_walls,
-            token_type=E8_WALL,
-            wall_ax=torch.tensor([float(seg.ax)]),
-            wall_ay=torch.tensor([float(seg.ay)]),
-            wall_bx=torch.tensor([float(seg.bx)]),
-            wall_by=torch.tensor([float(seg.by)]),
-            wall_tex_id=torch.tensor([float(seg.texture_id)]),
-            wall_index=torch.tensor([float(i)]),
-            wall_bsp_coeffs=coeffs,
-            wall_bsp_const=const,
-            **common,
-        ))
+        rows.append(
+            _build_row(
+                module,
+                max_walls,
+                token_type=E8_WALL,
+                wall_ax=torch.tensor([float(seg.ax)]),
+                wall_ay=torch.tensor([float(seg.ay)]),
+                wall_bx=torch.tensor([float(seg.bx)]),
+                wall_by=torch.tensor([float(seg.by)]),
+                wall_tex_id=torch.tensor([float(seg.texture_id)]),
+                wall_index=torch.tensor([float(i)]),
+                wall_bsp_coeffs=coeffs,
+                wall_bsp_const=const,
+                **common,
+            )
+        )
     rows.append(_build_row(module, max_walls, token_type=E8_EOS, **common))
     return torch.cat(rows, dim=0)
 
@@ -238,9 +263,9 @@ def test_sel_bsp_rank_trace_at_sort0_phase_e_scene(compiled_box_room):
     """
     graph_io, module, subset, _textures = compiled_box_room
     sel_bsp_rank = _find_sel_bsp_rank(graph_io)
-    assert len(sel_bsp_rank) == 1, (
-        f"sel_bsp_rank width {len(sel_bsp_rank)} != 1 — update the walk"
-    )
+    assert (
+        len(sel_bsp_rank) == 1
+    ), f"sel_bsp_rank width {len(sel_bsp_rank)} != 1 — update the walk"
 
     prefill = _build_prefill(module, subset, px=3.0, py=2.0, angle=20.0)
 
@@ -262,13 +287,15 @@ def test_sel_bsp_rank_trace_at_sort0_phase_e_scene(compiled_box_room):
     for name in overlaid_names:
         in_s, w = in_specs[name]
         out_s, _ = out_specs[name]
-        sort0_in[0, in_s:in_s + w] = pre_out[-1, out_s:out_s + w]
+        sort0_in[0, in_s : in_s + w] = pre_out[-1, out_s : out_s + w]
 
     past_K, past_V = past
     past_kvs = [(past_K[i], past_V[i]) for i in range(len(past_K))]
 
     report = probe_layer_diff(
-        module, sort0_in, sel_bsp_rank,
+        module,
+        sort0_in,
+        sel_bsp_rank,
         # Host-truth reference is irrelevant for sentinel-only tracing —
         # zeros here; callers who want drift flagging would populate
         # this from ``reference_eval(...)[sel_bsp_rank][[0]]``.

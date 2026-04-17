@@ -63,10 +63,12 @@ from torchwright.ops.map_select import in_range, select
 from torchwright.reference_renderer.types import RenderConfig
 
 from torchwright.doom.graph_constants import (
-    DIFF_BP, E8_RENDER, E8_THINKING, TEX_E8_OFFSET,
+    DIFF_BP,
+    E8_RENDER,
+    E8_THINKING,
+    TEX_E8_OFFSET,
 )
 from torchwright.doom.renderer import _textured_column_fill
-
 
 # ---------------------------------------------------------------------------
 # Contract
@@ -83,10 +85,10 @@ class RenderInputs:
     """
 
     # Iteration state (overlay).
-    render_mask: Node           # max_walls-wide, walls fully rendered so far
-    render_col: Node            # current column
-    render_is_new_wall: Node    # +1 if just transitioned to a new wall
-    render_chunk_start: Node    # current chunk start row; sentinel -1 = "new col"
+    render_mask: Node  # max_walls-wide, walls fully rendered so far
+    render_col: Node  # current column
+    render_is_new_wall: Node  # +1 if just transitioned to a new wall
+    render_chunk_start: Node  # current chunk start row; sentinel -1 = "new col"
 
     # Wall data (overlay; populated by THINKING, forwarded by prior RENDER).
     fb_sort_den: Node
@@ -97,10 +99,10 @@ class RenderInputs:
     fb_tex_id: Node
     fb_col_lo: Node
     fb_col_hi: Node
-    fb_onehot: Node             # max_walls-wide
+    fb_onehot: Node  # max_walls-wide
 
     # TEX_COL inputs (host-fed at TEX_COL positions).
-    texture_id_e8: Node         # 8-wide
+    texture_id_e8: Node  # 8-wide
     tex_pixels: Node
 
     # TEX_COL stage output (per-TEX_COL-position one-hot).
@@ -127,13 +129,13 @@ class RenderOutputs:
       rendered (it can stop feeding RENDER tokens).
     """
 
-    pixels: Node                # chunk_size * 3 floats
+    pixels: Node  # chunk_size * 3 floats
     active_col: Node
     active_start: Node
     chunk_length: Node
     done_flag: Node
     next_render_feedback: Node
-    render_next_type: Node      # 8-wide: E8_THINKING or E8_RENDER
+    render_next_type: Node  # 8-wide: E8_THINKING or E8_RENDER
 
 
 # ---------------------------------------------------------------------------
@@ -157,22 +159,35 @@ def build_render(
     cs = chunk_size
 
     with annotate("render/state_machine"):
-        active_col = select(inputs.render_is_new_wall, inputs.fb_col_lo, inputs.render_col)
+        active_col = select(
+            inputs.render_is_new_wall, inputs.fb_col_lo, inputs.render_col
+        )
         angle_offset = _compute_angle_offset(active_col, W=W, fov=fov)
 
     with annotate("render/wall_height"):
         tan_o, tan_val_bp = _compute_angle_offset_tan(angle_offset, fov=fov)
         den_over_cos, abs_den_over_cos = _compute_den_over_cos(
-            inputs.fb_sort_den, inputs.fb_C, tan_o, tan_val_bp,
+            inputs.fb_sort_den,
+            inputs.fb_C,
+            tan_o,
+            tan_val_bp,
         )
         wall_top, wall_bottom, wall_height = _compute_wall_height(
-            inputs.fb_H_inv, abs_den_over_cos, H=H, max_coord=max_coord,
+            inputs.fb_H_inv,
+            abs_den_over_cos,
+            H=H,
+            max_coord=max_coord,
         )
 
     with annotate("render/tex_coord"):
         tex_col_idx = _compute_texture_column(
-            inputs.fb_D, inputs.fb_E, tan_o, tan_val_bp,
-            abs_den_over_cos, max_coord=max_coord, tex_w=tex_w,
+            inputs.fb_D,
+            inputs.fb_E,
+            tan_o,
+            tan_val_bp,
+            abs_den_over_cos,
+            max_coord=max_coord,
+            tex_w=tex_w,
         )
 
     with annotate("render/tex_attention"):
@@ -191,9 +206,15 @@ def build_render(
 
     with annotate("render/column_fill"):
         active_start, chunk_length, pixels = _chunk_fill(
-            wall_top, wall_bottom, wall_height, tex_column_colors,
+            wall_top,
+            wall_bottom,
+            wall_height,
+            tex_column_colors,
             render_chunk_start=inputs.render_chunk_start,
-            config=config, tex_h=tex_h, chunk_size=cs, max_coord=max_coord,
+            config=config,
+            tex_h=tex_h,
+            chunk_size=cs,
+            max_coord=max_coord,
             tex_sample_batch_size=tex_sample_batch_size,
         )
 
@@ -210,10 +231,14 @@ def build_render(
             fb_onehot=inputs.fb_onehot,
             fb_col_hi=inputs.fb_col_hi,
             fb_sort_den=inputs.fb_sort_den,
-            fb_C=inputs.fb_C, fb_D=inputs.fb_D, fb_E=inputs.fb_E,
-            fb_H_inv=inputs.fb_H_inv, fb_tex_id=inputs.fb_tex_id,
+            fb_C=inputs.fb_C,
+            fb_D=inputs.fb_D,
+            fb_E=inputs.fb_E,
+            fb_H_inv=inputs.fb_H_inv,
+            fb_tex_id=inputs.fb_tex_id,
             fb_col_lo=inputs.fb_col_lo,
-            chunk_size=cs, max_walls=max_walls,
+            chunk_size=cs,
+            max_walls=max_walls,
         )
 
     return RenderOutputs(
@@ -249,7 +274,8 @@ def _compute_angle_offset_tan(angle_offset: Node, *, fov: int):
     half_fov = fov // 2
     tan_bp = [float(i) for i in range(-half_fov, half_fov + 1)]
     tan_o = piecewise_linear(
-        angle_offset, tan_bp,
+        angle_offset,
+        tan_bp,
         lambda x: math.tan(x * 2.0 * math.pi / 256.0),
         name="tan_offset",
     )
@@ -259,12 +285,19 @@ def _compute_angle_offset_tan(angle_offset: Node, *, fov: int):
 
 
 def _compute_den_over_cos(
-    fb_sort_den: Node, fb_C: Node, tan_o: Node, tan_val_bp,
+    fb_sort_den: Node,
+    fb_C: Node,
+    tan_o: Node,
+    tan_val_bp,
 ):
     """``den/cos = sort_den - C*tan(offset)`` — per-column horizontal projection factor."""
     C_tan = piecewise_linear_2d(
-        fb_C, tan_o, DIFF_BP, tan_val_bp,
-        lambda a, b: a * b, name="C_tan_o",
+        fb_C,
+        tan_o,
+        DIFF_BP,
+        tan_val_bp,
+        lambda a, b: a * b,
+        name="C_tan_o",
     )
     den_over_cos = subtract(fb_sort_den, C_tan)
     abs_den_over_cos = abs(den_over_cos)
@@ -277,7 +310,11 @@ def _compute_den_over_cos(
 
 
 def _compute_wall_height(
-    fb_H_inv: Node, abs_den_over_cos: Node, *, H: int, max_coord: float,
+    fb_H_inv: Node,
+    abs_den_over_cos: Node,
+    *,
+    H: int,
+    max_coord: float,
 ):
     """Wall height = H_inv * |den/cos|, clamped.  Wall span is centered on H/2.
 
@@ -288,7 +325,7 @@ def _compute_wall_height(
     max_h_inv = float(H) / 0.3
     h_inv_n = 16
     h_inv_ratio = (max_h_inv / 0.01) ** (1.0 / (h_inv_n - 1))
-    height_inv_bp = [0.01 * (h_inv_ratio ** k) for k in range(h_inv_n)]
+    height_inv_bp = [0.01 * (h_inv_ratio**k) for k in range(h_inv_n)]
     height_inv_bp[0] = 0.0
     height_inv_bp[-1] = max_h_inv
 
@@ -296,30 +333,41 @@ def _compute_wall_height(
     doc_bp = [doc_max * i / 15 for i in range(16)]
 
     wall_height_raw = piecewise_linear_2d(
-        fb_H_inv, abs_den_over_cos,
-        height_inv_bp, doc_bp,
-        lambda a, b: a * b, name="wall_height_raw",
+        fb_H_inv,
+        abs_den_over_cos,
+        height_inv_bp,
+        doc_bp,
+        lambda a, b: a * b,
+        name="wall_height_raw",
     )
     wall_height = clamp(wall_height_raw, 0.0, float(H))
 
     center = float(H) / 2.0
     half_height = multiply_const(wall_height, 0.5)
     wall_top = Linear(
-        half_height, torch.tensor([[-1.0]]),
-        torch.tensor([center]), name="wall_top",
+        half_height,
+        torch.tensor([[-1.0]]),
+        torch.tensor([center]),
+        name="wall_top",
     )
     wall_bottom = Linear(
-        half_height, torch.tensor([[1.0]]),
-        torch.tensor([center]), name="wall_bottom",
+        half_height,
+        torch.tensor([[1.0]]),
+        torch.tensor([center]),
+        name="wall_bottom",
     )
     return wall_top, wall_bottom, wall_height
 
 
 def _compute_texture_column(
-    fb_D: Node, fb_E: Node, tan_o: Node, tan_val_bp,
+    fb_D: Node,
+    fb_E: Node,
+    tan_o: Node,
+    tan_val_bp,
     abs_den_over_cos: Node,
     *,
-    max_coord: float, tex_w: int,
+    max_coord: float,
+    tex_w: int,
 ) -> Node:
     """Texture column index via thermometer comparison (no division).
 
@@ -341,8 +389,12 @@ def _compute_texture_column(
     far above the comparison transition half-width of 0.05.
     """
     E_tan = piecewise_linear_2d(
-        fb_E, tan_o, DIFF_BP, tan_val_bp,
-        lambda a, b: a * b, name="E_tan_o",
+        fb_E,
+        tan_o,
+        DIFF_BP,
+        tan_val_bp,
+        lambda a, b: a * b,
+        name="E_tan_o",
     )
     num_u_over_cos = add(fb_D, E_tan)
     abs_nuc = abs(num_u_over_cos)
@@ -378,8 +430,9 @@ def _attend_to_texture_column(
     tex_e8_query = piecewise_linear(
         fb_tex_id,
         [float(i) for i in range(num_tex)],
-        lambda tid: [float(v) for v in
-                     index_to_vector(int(round(tid)) + TEX_E8_OFFSET)],
+        lambda tid: [
+            float(v) for v in index_to_vector(int(round(tid)) + TEX_E8_OFFSET)
+        ],
         name="tex_id_to_e8",
     )
     tex_col_p1 = add_const(tex_col_idx, 1.0)
@@ -391,10 +444,8 @@ def _attend_to_texture_column(
     scaled_tc = multiply_const(tc_onehot_01, COL_SCALE)
     return attend_argmax_dot(
         pos_encoding,
-        query_vector=cond_gate(
-            is_render, Concatenate([tex_e8_query, scaled_rc])),
-        key_vector=cond_gate(
-            is_tex_col, Concatenate([texture_id_e8, scaled_tc])),
+        query_vector=cond_gate(is_render, Concatenate([tex_e8_query, scaled_rc])),
+        key_vector=cond_gate(is_tex_col, Concatenate([texture_id_e8, scaled_tc])),
         value=cond_gate(is_tex_col, tex_pixels),
         match_gain=TEX_MATCH_GAIN,
     )
@@ -406,7 +457,9 @@ def _attend_to_texture_column(
 
 
 def _chunk_fill(
-    wall_top: Node, wall_bottom: Node, wall_height: Node,
+    wall_top: Node,
+    wall_bottom: Node,
+    wall_height: Node,
     tex_column_colors: Node,
     *,
     render_chunk_start: Node,
@@ -428,13 +481,21 @@ def _chunk_fill(
     active_start = select(is_new_col, vis_top_render, render_chunk_start)
 
     chunk_length = clamp(
-        subtract(vis_bottom_render, active_start), 0.0, float(chunk_size),
+        subtract(vis_bottom_render, active_start),
+        0.0,
+        float(chunk_size),
     )
 
     pixels = _textured_column_fill(
-        wall_top, wall_bottom, wall_height,
-        tex_column_colors, tex_h, config, max_coord=max_coord,
-        patch_row_start=active_start, rows_per_patch=chunk_size,
+        wall_top,
+        wall_bottom,
+        wall_height,
+        tex_column_colors,
+        tex_h,
+        config,
+        max_coord=max_coord,
+        patch_row_start=active_start,
+        rows_per_patch=chunk_size,
         tex_sample_batch_size=tex_sample_batch_size,
     )
     return active_start, chunk_length, pixels
@@ -448,8 +509,12 @@ def _compute_next_state(
     render_mask: Node,
     fb_onehot: Node,
     fb_col_hi: Node,
-    fb_sort_den: Node, fb_C: Node, fb_D: Node, fb_E: Node,
-    fb_H_inv: Node, fb_tex_id: Node,
+    fb_sort_den: Node,
+    fb_C: Node,
+    fb_D: Node,
+    fb_E: Node,
+    fb_H_inv: Node,
+    fb_tex_id: Node,
     fb_col_lo: Node,
     chunk_size: int,
     max_walls: int,
@@ -463,7 +528,8 @@ def _compute_next_state(
     """
     next_chunk_start_val = add_const(active_start, float(chunk_size))
     has_more_chunks = compare(
-        subtract(wall_bottom_clamped, next_chunk_start_val), 0.5,
+        subtract(wall_bottom_clamped, next_chunk_start_val),
+        0.5,
     )
 
     col_p1 = add_const(active_col, 1.0)
@@ -476,18 +542,22 @@ def _compute_next_state(
     next_render_mask = select(advance_wall, mask_with_new, render_mask)
 
     mask_sum = Linear(
-        mask_with_new, torch.ones(max_walls, 1), name="render_mask_sum",
+        mask_with_new,
+        torch.ones(max_walls, 1),
+        name="render_mask_sum",
     )
     all_walls_done = compare(mask_sum, max_walls - 0.5)
     done_flag = bool_all_true([advance_wall, all_walls_done])
 
     zero_col = create_literal_value(torch.tensor([0.0]), name="zero_col")
     next_col_output = select(
-        has_more_chunks, active_col,
+        has_more_chunks,
+        active_col,
         select(advance_col, col_p1, zero_col),
     )
     chunk_sentinel = create_literal_value(
-        torch.tensor([-1.0]), name="chunk_sentinel",
+        torch.tensor([-1.0]),
+        name="chunk_sentinel",
     )
     next_chunk = select(has_more_chunks, next_chunk_start_val, chunk_sentinel)
 
@@ -501,10 +571,22 @@ def _compute_next_state(
         create_literal_value(E8_RENDER, name="type_render"),
     )
 
-    next_render_feedback = Concatenate([
-        next_render_mask, next_col_output, next_is_new_wall, next_chunk,
-        fb_sort_den, fb_C, fb_D, fb_E, fb_H_inv, fb_tex_id,
-        fb_col_lo, fb_col_hi, fb_onehot,
-    ])
+    next_render_feedback = Concatenate(
+        [
+            next_render_mask,
+            next_col_output,
+            next_is_new_wall,
+            next_chunk,
+            fb_sort_den,
+            fb_C,
+            fb_D,
+            fb_E,
+            fb_H_inv,
+            fb_tex_id,
+            fb_col_lo,
+            fb_col_hi,
+            fb_onehot,
+        ]
+    )
 
     return next_render_feedback, done_flag, render_next_type

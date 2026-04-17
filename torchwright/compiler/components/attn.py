@@ -41,9 +41,9 @@ class AttnLayerComponent(Component):
         assert inp.shape[1] == self.d
 
         # All heads in parallel via batched ops
-        Q = torch.einsum('pd,hdk->hpk', inp, self.query_matrix)
-        K = torch.einsum('pd,hdk->hpk', inp, self.key_matrix)
-        V = torch.einsum('pd,hdk->hpk', inp, self.value_matrix)
+        Q = torch.einsum("pd,hdk->hpk", inp, self.query_matrix)
+        K = torch.einsum("pd,hdk->hpk", inp, self.key_matrix)
+        V = torch.einsum("pd,hdk->hpk", inp, self.value_matrix)
 
         # Fused attention kernel.  scale=1.0 preserves the raw dot-product
         # magnitude that all attention weights were compiled against (no
@@ -51,12 +51,16 @@ class AttnLayerComponent(Component):
         # upper-triangular mask for causal prefill.
         # Shape: (n_heads, n_pos, d_head) → unsqueeze batch → squeeze back.
         weighted = F.scaled_dot_product_attention(
-            Q.unsqueeze(0), K.unsqueeze(0), V.unsqueeze(0),
+            Q.unsqueeze(0),
+            K.unsqueeze(0),
+            V.unsqueeze(0),
             is_causal=True,
             scale=1.0,
-        ).squeeze(0)  # (n_heads, n_pos, d_head)
+        ).squeeze(
+            0
+        )  # (n_heads, n_pos, d_head)
 
-        output = torch.einsum('hpk,hkd->pd', weighted, self.output_matrix)
+        output = torch.einsum("hpk,hkd->pd", weighted, self.output_matrix)
         return output
 
     def forward_cached(
@@ -74,9 +78,9 @@ class AttnLayerComponent(Component):
             output: (n_new, d)
             new_kv: (K, V) each (n_heads, n_past+n_new, d_head)
         """
-        Q = torch.einsum('pd,hdk->hpk', inp, self.query_matrix)
-        K_new = torch.einsum('pd,hdk->hpk', inp, self.key_matrix)
-        V_new = torch.einsum('pd,hdk->hpk', inp, self.value_matrix)
+        Q = torch.einsum("pd,hdk->hpk", inp, self.query_matrix)
+        K_new = torch.einsum("pd,hdk->hpk", inp, self.key_matrix)
+        V_new = torch.einsum("pd,hdk->hpk", inp, self.value_matrix)
 
         if past_kv is not None:
             K = torch.cat([past_kv[0], K_new], dim=1)
@@ -94,12 +98,16 @@ class AttnLayerComponent(Component):
         # scale=1.0 preserves the raw dot-product magnitudes that all attention
         # weights were compiled against (no 1/sqrt(d_head) rescaling).
         weighted = F.scaled_dot_product_attention(
-            Q.unsqueeze(0), K.unsqueeze(0), V.unsqueeze(0),
+            Q.unsqueeze(0),
+            K.unsqueeze(0),
+            V.unsqueeze(0),
             is_causal=(n_new == n_total),
             scale=1.0,
-        ).squeeze(0)  # (n_heads, n_new, d_head)
+        ).squeeze(
+            0
+        )  # (n_heads, n_new, d_head)
 
-        output = torch.einsum('hpk,hkd->pd', weighted, self.output_matrix)
+        output = torch.einsum("hpk,hkd->pd", weighted, self.output_matrix)
 
         return output, (K, V)
 

@@ -74,12 +74,17 @@ def update_state(
 
     # Collision resolution
     new_x, new_y = collision_fn(
-        state.x, state.y,
-        state.x + dx, state.y + dy,
+        state.x,
+        state.y,
+        state.x + dx,
+        state.y + dy,
         segments,
     )
 
     return GameState(
-        x=new_x, y=new_y, angle=new_angle,
-        move_speed=state.move_speed, turn_speed=state.turn_speed,
+        x=new_x,
+        y=new_y,
+        angle=new_angle,
+        move_speed=state.move_speed,
+        turn_speed=state.turn_speed,
     )

@@ -15,12 +15,12 @@ from torchwright.ops.map_select import in_range
 
 @dataclass
 class TexColInputs:
-    tex_col_input: Node       # host-fed column index (meaningful at TEX_COL)
+    tex_col_input: Node  # host-fed column index (meaningful at TEX_COL)
 
 
 @dataclass
 class TexColOutputs:
-    tc_onehot_01: Node        # {0,1} one-hot over tex_w columns
+    tc_onehot_01: Node  # {0,1} one-hot over tex_w columns
 
 
 def build_tex_col(inputs: TexColInputs, tex_w: int) -> TexColOutputs:

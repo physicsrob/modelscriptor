@@ -81,7 +81,9 @@ def switch(conditions: List[Node], values: List[Node]) -> Node:
 
 
 def _select_output_type(
-    cond: Node, true_node: Node, false_node: Node,
+    cond: Node,
+    true_node: Node,
+    false_node: Node,
 ) -> NodeValueType:
     from torchwright.graph.value_type import _min_guarantee
 
@@ -97,7 +99,10 @@ def _select_output_type(
     is_onehot = _min_guarantee(cond_g, _min_guarantee(tv.is_one_hot, fv.is_one_hot))
     if is_onehot:
         return NodeValueType(
-            value_range=r, is_integer=is_int, is_binary=is_bin, is_one_hot=is_onehot,
+            value_range=r,
+            is_integer=is_int,
+            is_binary=is_bin,
+            is_one_hot=is_onehot,
         )
     if is_bin:
         return NodeValueType(value_range=r, is_integer=is_int, is_binary=is_bin)
@@ -229,7 +234,9 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     )
     from torchwright.graph.value_type import Guarantee
 
-    return assert_matches_value_type(result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE))
+    return assert_matches_value_type(
+        result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE)
+    )
 
 
 def dynamic_extract(
@@ -312,7 +319,8 @@ def dynamic_extract(
     # is width n_entries * d_fill with zeros at every slot the mask
     # marks as -1.
     zero_d_fill = LiteralValue(
-        torch.zeros(d_fill), name="dynamic_extract_zero",
+        torch.zeros(d_fill),
+        name="dynamic_extract_zero",
     )
     masked = broadcast_select(
         masks=one_hot,

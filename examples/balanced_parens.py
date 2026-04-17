@@ -37,7 +37,6 @@ from torchwright.ops.map_select import select
 from torchwright.ops.prefix_ops import prefix_and, prefix_sum
 from torchwright.ops.sequence_ops import output_sequence
 
-
 D_MODEL = 256
 
 

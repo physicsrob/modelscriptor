@@ -7,9 +7,7 @@ all follow this convention.
 """
 
 step_sharpness = 10.0
-embedding_step_sharpness = (
-    1.0  # For embedding-space ops (map_to_table, equals_vector).
-)
+embedding_step_sharpness = 1.0  # For embedding-space ops (map_to_table, equals_vector).
 # Lower than step_sharpness because the margin (1/speed) must
 # absorb dot-product errors from approximate embeddings.
 # Embedding norms are ~40 (self-dot ~1600), so even tiny

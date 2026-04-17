@@ -71,7 +71,6 @@ from torchwright.debug.probe import probe_graph, reference_eval
 from torchwright.graph import Attn, Concatenate
 from torchwright.ops.inout_nodes import create_input
 
-
 # ---------------------------------------------------------------------------
 # Slot layout
 # ---------------------------------------------------------------------------
@@ -191,10 +190,7 @@ def _walls_on_circle(n_walls: int, radius: float = 5.0) -> List[dict]:
     ``wall_id`` is ``k + 1`` so the "no wall selected" output of 0
     can never be mistaken for a real wall.
     """
-    return [
-        _wall_on_circle(k, n_walls, radius, wall_id=k + 1)
-        for k in range(n_walls)
-    ]
+    return [_wall_on_circle(k, n_walls, radius, wall_id=k + 1) for k in range(n_walls)]
 
 
 def _query_from_angle(ray_angle: float) -> dict:
@@ -272,9 +268,7 @@ def _expected_softmax_weights(
     logits = np.zeros(query_row + 1, dtype=np.float64)
     for i, w in enumerate(walls):
         cos_diff = w["wall_cos_mid"] * ray_cos + w["wall_sin_mid"] * ray_sin
-        logits[i] = logit_scale * (
-            cos_diff + wall_bias - dist_scale * w["wall_dist"]
-        )
+        logits[i] = logit_scale * (cos_diff + wall_bias - dist_scale * w["wall_dist"])
     # Query rows (positions n_walls..query_row inclusive) have K=0, logit=0.
     # Those positions are already zero in the `logits` array.
 
@@ -295,7 +289,12 @@ def _expected_output(
     should see given the expected softmax weights.
     """
     weights = _expected_softmax_weights(
-        walls, queries, query_idx, logit_scale, dist_scale, wall_bias,
+        walls,
+        queries,
+        query_idx,
+        logit_scale,
+        dist_scale,
+        wall_bias,
     )
     n_walls = len(walls)
     out = np.zeros(D_OUTPUT, dtype=np.float64)
@@ -340,9 +339,9 @@ def test_single_wall_single_query():
     # Query is at row n_pos - 1.
     query_row = n_pos - 1
     assert out.shape == (n_pos, D_OUTPUT)
-    assert abs(out[query_row, _OUT_WALL_ID].item() - 42.0) < 1e-4, (
-        f"attended wall_id was {out[query_row, _OUT_WALL_ID].item()}, expected 42.0"
-    )
+    assert (
+        abs(out[query_row, _OUT_WALL_ID].item() - 42.0) < 1e-4
+    ), f"attended wall_id was {out[query_row, _OUT_WALL_ID].item()}, expected 42.0"
     assert abs(out[query_row, _OUT_WALL_COS].item() - 1.0) < 1e-4
     assert abs(out[query_row, _OUT_WALL_SIN].item() - 0.0) < 1e-4
 
@@ -370,7 +369,9 @@ def test_n_walls_each_midpoint(n_walls):
     dist_scale = 1.0
     wall_bias = 30.0
     attn = _build_wall_attention_graph(
-        logit_scale=logit_scale, dist_scale=dist_scale, wall_bias=wall_bias,
+        logit_scale=logit_scale,
+        dist_scale=dist_scale,
+        wall_bias=wall_bias,
     )
 
     walls = _walls_on_circle(n_walls, radius=0.0)  # dist=0 to isolate angular selection
@@ -385,15 +386,20 @@ def test_n_walls_each_midpoint(n_walls):
     for q_idx in range(n_walls):
         query_row = n_walls + q_idx
         expected = _expected_output(
-            walls, queries, q_idx, logit_scale, dist_scale, wall_bias,
+            walls,
+            queries,
+            q_idx,
+            logit_scale,
+            dist_scale,
+            wall_bias,
         )
         got = out[query_row].numpy()
         # Correct wall dominates the softmax but adjacent walls leak a
         # small amount; use a tolerance wide enough for the blend and
         # assert the wall_id rounds to the right integer.
-        assert np.allclose(got, expected, atol=1e-4), (
-            f"n_walls={n_walls}, query {q_idx}: got {got}, expected {expected}"
-        )
+        assert np.allclose(
+            got, expected, atol=1e-4
+        ), f"n_walls={n_walls}, query {q_idx}: got {got}, expected {expected}"
         # And the actual wall_id rounds to the right integer.
         assert round(got[_OUT_WALL_ID]) == walls[q_idx]["wall_id"], (
             f"n_walls={n_walls}, query {q_idx}: attended wall_id "
@@ -406,23 +412,26 @@ def test_n_walls_each_midpoint(n_walls):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("n_walls,logit_scale,min_correct_weight", [
-    # Small scenes at a moderate scale are easy: the adjacent logit gap
-    # widens with angular separation, so the softmax saturates fast.
-    (2,   50.0, 0.99),
-    (4,   50.0, 0.99),
-    (4,  100.0, 0.999),
-    (8,   50.0, 0.97),
-    (8,  100.0, 0.99),
-    # For 16 walls the angular gap shrinks to ~22.5° which gives an
-    # adjacent-wall cos_diff of ~0.076.  At logit_scale=100 that's a
-    # 7.6 logit gap → adjacent weight ≈ 5e-4 → correct weight ≈ 0.999.
-    (16, 100.0, 0.99),
-    (16, 200.0, 0.999),
-    # At 32 walls and scale=200 the adjacent gap is ~0.019 cos units,
-    # logit gap ~3.9 → correct weight ≈ 0.95.  Scale=500 gets us to ≈ 0.99993.
-    (32, 500.0, 0.99),
-])
+@pytest.mark.parametrize(
+    "n_walls,logit_scale,min_correct_weight",
+    [
+        # Small scenes at a moderate scale are easy: the adjacent logit gap
+        # widens with angular separation, so the softmax saturates fast.
+        (2, 50.0, 0.99),
+        (4, 50.0, 0.99),
+        (4, 100.0, 0.999),
+        (8, 50.0, 0.97),
+        (8, 100.0, 0.99),
+        # For 16 walls the angular gap shrinks to ~22.5° which gives an
+        # adjacent-wall cos_diff of ~0.076.  At logit_scale=100 that's a
+        # 7.6 logit gap → adjacent weight ≈ 5e-4 → correct weight ≈ 0.999.
+        (16, 100.0, 0.99),
+        (16, 200.0, 0.999),
+        # At 32 walls and scale=200 the adjacent gap is ~0.019 cos units,
+        # logit gap ~3.9 → correct weight ≈ 0.95.  Scale=500 gets us to ≈ 0.99993.
+        (32, 500.0, 0.99),
+    ],
+)
 def test_softmax_weights_match_reference(n_walls, logit_scale, min_correct_weight):
     """Sweep ``(n_walls, logit_scale)`` and verify two things:
 
@@ -440,7 +449,9 @@ def test_softmax_weights_match_reference(n_walls, logit_scale, min_correct_weigh
     """
     wall_bias = 30.0
     attn = _build_wall_attention_graph(
-        logit_scale=logit_scale, dist_scale=1.0, wall_bias=wall_bias,
+        logit_scale=logit_scale,
+        dist_scale=1.0,
+        wall_bias=wall_bias,
     )
 
     walls = _walls_on_circle(n_walls, radius=0.0)
@@ -449,8 +460,12 @@ def test_softmax_weights_match_reference(n_walls, logit_scale, min_correct_weigh
     queries = [_query_from_angle(walls[0]["_angle"])]
 
     weights = _expected_softmax_weights(
-        walls, queries, query_idx=0,
-        logit_scale=logit_scale, dist_scale=1.0, wall_bias=wall_bias,
+        walls,
+        queries,
+        query_idx=0,
+        logit_scale=logit_scale,
+        dist_scale=1.0,
+        wall_bias=wall_bias,
     )
     correct_weight = weights[0]
     assert correct_weight >= min_correct_weight, (
@@ -464,8 +479,12 @@ def test_softmax_weights_match_reference(n_walls, logit_scale, min_correct_weigh
     out = cache[attn]
 
     expected = _expected_output(
-        walls, queries, query_idx=0,
-        logit_scale=logit_scale, dist_scale=1.0, wall_bias=wall_bias,
+        walls,
+        queries,
+        query_idx=0,
+        logit_scale=logit_scale,
+        dist_scale=1.0,
+        wall_bias=wall_bias,
     )
     query_row = n_walls  # first query
     got = out[query_row].numpy()
@@ -494,7 +513,9 @@ def test_distance_tiebreak():
     dist_scale = 1.0
     wall_bias = 30.0
     attn = _build_wall_attention_graph(
-        logit_scale=logit_scale, dist_scale=dist_scale, wall_bias=wall_bias,
+        logit_scale=logit_scale,
+        dist_scale=dist_scale,
+        wall_bias=wall_bias,
     )
 
     # Both walls sit at angle 0, so angular score is identical for both.
@@ -502,13 +523,13 @@ def test_distance_tiebreak():
         {
             "wall_cos_mid": 1.0,
             "wall_sin_mid": 0.0,
-            "wall_dist": 1.0,   # near
+            "wall_dist": 1.0,  # near
             "wall_id": 10.0,
         },
         {
             "wall_cos_mid": 1.0,
             "wall_sin_mid": 0.0,
-            "wall_dist": 3.0,   # far
+            "wall_dist": 3.0,  # far
             "wall_id": 20.0,
         },
     ]
@@ -532,12 +553,14 @@ def test_distance_tiebreak():
     # Also verify the reference softmax gives essentially all weight to
     # the near wall, so we know the test is checking what it thinks.
     weights = _expected_softmax_weights(
-        walls, queries, query_idx=0,
-        logit_scale=logit_scale, dist_scale=dist_scale, wall_bias=wall_bias,
+        walls,
+        queries,
+        query_idx=0,
+        logit_scale=logit_scale,
+        dist_scale=dist_scale,
+        wall_bias=wall_bias,
     )
-    assert weights[0] > 0.9999, (
-        f"near wall weight was {weights[0]}, expected > 0.9999"
-    )
+    assert weights[0] > 0.9999, f"near wall weight was {weights[0]}, expected > 0.9999"
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +581,9 @@ def test_multi_query_independence():
     dist_scale = 1.0
     wall_bias = 30.0
     attn = _build_wall_attention_graph(
-        logit_scale=logit_scale, dist_scale=dist_scale, wall_bias=wall_bias,
+        logit_scale=logit_scale,
+        dist_scale=dist_scale,
+        wall_bias=wall_bias,
     )
 
     n_walls = 4
@@ -607,7 +632,9 @@ def test_probe_compiled_matches_oracle():
     dist_scale = 1.0
     wall_bias = 30.0
     attn = _build_wall_attention_graph(
-        logit_scale=logit_scale, dist_scale=dist_scale, wall_bias=wall_bias,
+        logit_scale=logit_scale,
+        dist_scale=dist_scale,
+        wall_bias=wall_bias,
     )
 
     n_walls = 4
@@ -628,6 +655,6 @@ def test_probe_compiled_matches_oracle():
         verbose=False,
         atol=1e-3,
     )
-    assert report.first_divergent is None, (
-        f"probe reported divergence:\n{report.format_short()}"
-    )
+    assert (
+        report.first_divergent is None
+    ), f"probe reported divergence:\n{report.format_short()}"

@@ -29,7 +29,6 @@ from torchwright.doom.stages.render import (
     _compute_wall_height,
 )
 
-
 _MAX_COORD = 20.0
 
 
@@ -53,11 +52,18 @@ def wall_height_module():
     tan_o, tan_val_bp = _compute_angle_offset_tan(angle_offset, fov=fov)
     _, abs_den_over_cos = _compute_den_over_cos(r_sort_den, r_C, tan_o, tan_val_bp)
     _, _, wall_height = _compute_wall_height(
-        r_H_inv, abs_den_over_cos, H=H, max_coord=_MAX_COORD,
+        r_H_inv,
+        abs_den_over_cos,
+        H=H,
+        max_coord=_MAX_COORD,
     )
     return compile_headless(
-        Concatenate([wall_height]), pos,
-        d=1024, d_head=32, max_layers=50, verbose=False,
+        Concatenate([wall_height]),
+        pos,
+        d=1024,
+        d_head=32,
+        max_layers=50,
+        verbose=False,
     )
 
 
@@ -68,7 +74,12 @@ def tex_col_module():
     Exposes intermediates so tests can verify the division isn't degenerate.
     """
     from torchwright.ops.arithmetic_ops import (
-        abs, add, clamp, floor_int, multiply_const, piecewise_linear_2d,
+        abs,
+        add,
+        clamp,
+        floor_int,
+        multiply_const,
+        piecewise_linear_2d,
     )
     from torchwright.doom.graph_constants import DIFF_BP
 
@@ -87,16 +98,22 @@ def tex_col_module():
 
     # Inline _compute_texture_column so we can expose abs_nuc + u_raw.
     E_tan = piecewise_linear_2d(
-        r_E, tan_o, DIFF_BP, tan_val_bp,
-        lambda a, b: a * b, name="E_tan_o",
+        r_E,
+        tan_o,
+        DIFF_BP,
+        tan_val_bp,
+        lambda a, b: a * b,
+        name="E_tan_o",
     )
     num_u_over_cos = add(r_D, E_tan)
     abs_nuc = abs(num_u_over_cos)
     doc_max = 2.5 * _MAX_COORD
     doc_bp = [doc_max * i / 15 for i in range(16)]
     u_raw = piecewise_linear_2d(
-        abs_nuc, abs_den_over_cos,
-        doc_bp, doc_bp,
+        abs_nuc,
+        abs_den_over_cos,
+        doc_bp,
+        doc_bp,
         lambda n, d: n / d if d > 0.01 else 0.0,
         name="u_ratio",
     )
@@ -105,8 +122,12 @@ def tex_col_module():
     tex_col_idx = floor_int(tex_col_clamped, 0, tex_w - 1)
 
     return compile_headless(
-        Concatenate([tex_col_idx, abs_den_over_cos, abs_nuc, u_raw]), pos,
-        d=1024, d_head=32, max_layers=50, verbose=False,
+        Concatenate([tex_col_idx, abs_den_over_cos, abs_nuc, u_raw]),
+        pos,
+        d=1024,
+        d_head=32,
+        max_layers=50,
+        verbose=False,
     )
 
 
@@ -114,8 +135,9 @@ def _pack(module, values: dict) -> torch.Tensor:
     d_input = max(s + w for _, s, w in module._input_specs)
     row = torch.zeros(1, d_input, dtype=torch.float32)
     for name, start, width in module._input_specs:
-        row[0, start:start + width] = torch.tensor(
-            values[name], dtype=torch.float32,
+        row[0, start : start + width] = torch.tensor(
+            values[name],
+            dtype=torch.float32,
         ).reshape(width)
     return row
 
@@ -125,28 +147,37 @@ def _pack(module, values: dict) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("H_inv_num_t,den_over_cos,expected_h", [
-    # Wall far (large |num_t|), height small: H_inv = 48/100 = 0.48, den/cos = 1 → h = 0.48.
-    (0.48, 1.0, 0.48),
-    # Middle distance: H_inv = 48/20 = 2.4, den/cos = 1 → h = 2.4.
-    (2.4, 1.0, 2.4),
-    # Closer: H_inv = 48/4 = 12, den/cos = 1 → h = 12.
-    (12.0, 1.0, 12.0),
-    # Fish-eye correction: same H_inv, larger den/cos → taller.
-    (12.0, 2.0, 24.0),
-])
+@pytest.mark.parametrize(
+    "H_inv_num_t,den_over_cos,expected_h",
+    [
+        # Wall far (large |num_t|), height small: H_inv = 48/100 = 0.48, den/cos = 1 → h = 0.48.
+        (0.48, 1.0, 0.48),
+        # Middle distance: H_inv = 48/20 = 2.4, den/cos = 1 → h = 2.4.
+        (2.4, 1.0, 2.4),
+        # Closer: H_inv = 48/4 = 12, den/cos = 1 → h = 12.
+        (12.0, 1.0, 12.0),
+        # Fish-eye correction: same H_inv, larger den/cos → taller.
+        (12.0, 2.0, 24.0),
+    ],
+)
 def test_wall_height_scales_as_H_inv_times_den_over_cos(
-    wall_height_module, H_inv_num_t, den_over_cos, expected_h,
+    wall_height_module,
+    H_inv_num_t,
+    den_over_cos,
+    expected_h,
 ):
     """wall_height ≈ H_inv * |den/cos|, clamped to [0, H]."""
     # Set up so that r_sort_den - C*tan(angle_offset=0) = den_over_cos.
     # angle_offset=0 → tan_o=0, so abs_den_over_cos = |r_sort_den|.
-    inputs = _pack(wall_height_module, {
-        "r_H_inv": H_inv_num_t,
-        "r_sort_den": den_over_cos,
-        "r_C": 0.0,
-        "angle_offset": 0.0,
-    })
+    inputs = _pack(
+        wall_height_module,
+        {
+            "r_H_inv": H_inv_num_t,
+            "r_sort_den": den_over_cos,
+            "r_C": 0.0,
+            "angle_offset": 0.0,
+        },
+    )
     with torch.no_grad():
         out = wall_height_module(inputs)[0]
     wall_height = out[0].item()
@@ -174,22 +205,33 @@ def test_wall_height_scales_as_H_inv_times_den_over_cos(
     ),
     strict=False,
 )
-@pytest.mark.parametrize("D,sort_den,expected_u_frac", [
-    (5.0, 10.0, 0.5),
-    (2.5, 10.0, 0.25),
-    (7.5, 10.0, 0.75),
-    (0.0, 1.0, 0.0),    # edge: abs_nuc=0
-    (0.9, 1.0, 0.9),    # edge: abs_nuc ≈ abs_den
-])
+@pytest.mark.parametrize(
+    "D,sort_den,expected_u_frac",
+    [
+        (5.0, 10.0, 0.5),
+        (2.5, 10.0, 0.25),
+        (7.5, 10.0, 0.75),
+        (0.0, 1.0, 0.0),  # edge: abs_nuc=0
+        (0.9, 1.0, 0.9),  # edge: abs_nuc ≈ abs_den
+    ],
+)
 def test_texture_column_division_known_bug(
-    tex_col_module, D, sort_den, expected_u_frac,
+    tex_col_module,
+    D,
+    sort_den,
+    expected_u_frac,
 ):
     """tex_col_idx SHOULD track D/sort_den but the PL2D approximation drifts."""
-    inputs = _pack(tex_col_module, {
-        "r_D": D, "r_E": 0.0,
-        "r_sort_den": sort_den, "r_C": 0.0,
-        "angle_offset": 0.0,
-    })
+    inputs = _pack(
+        tex_col_module,
+        {
+            "r_D": D,
+            "r_E": 0.0,
+            "r_sort_den": sort_den,
+            "r_C": 0.0,
+            "angle_offset": 0.0,
+        },
+    )
     with torch.no_grad():
         out = tex_col_module(inputs)[0]
     tex_col_idx = out[0].item()

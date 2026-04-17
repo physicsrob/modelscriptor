@@ -74,7 +74,6 @@ from torchwright.ops.prefix_ops import prefix_sum
 from torchwright.ops.scalar_encoding import digit_to_scaled_scalar, scalar_to_embedding
 from torchwright.ops.sequence_ops import check_is_digit
 
-
 D_MODEL = 1024
 MAX_OUT = 5  # Kept small: each unrolled iteration is ~20 MLP layers deep.
 N_STAGES = 5
@@ -191,9 +190,7 @@ def create_network_parts(
             )
             count_so_far[d] = select(
                 is_d,
-                sum_nodes(
-                    [count_so_far[d], create_literal_value(torch.tensor([1.0]))]
-                ),
+                sum_nodes([count_so_far[d], create_literal_value(torch.tensor([1.0]))]),
                 count_so_far[d],
             )
 

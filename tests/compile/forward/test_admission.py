@@ -14,7 +14,10 @@ from torchwright.ops.inout_nodes import create_input
 
 def _linear(inp, d_out, name=""):
     return Linear(
-        inp, torch.zeros(len(inp), d_out), torch.zeros(d_out), name=name,
+        inp,
+        torch.zeros(len(inp), d_out),
+        torch.zeros(d_out),
+        name=name,
     )
 
 
@@ -43,8 +46,11 @@ def test_admission_completes_on_sibling_graph():
     output = _build_sibling_chain_graph(n_branches=8, branch_width=64)
 
     gated = forward_compile(
-        d=128, d_head=16, output_node=output,
-        verbose=False, device=None,
+        d=128,
+        d_head=16,
+        output_node=output,
+        verbose=False,
+        device=None,
         admission_control=True,
     )
     assert len(gated.layers) > 0
@@ -57,8 +63,11 @@ def test_admission_preserves_correctness_simple():
     y = Linear(x, w, torch.zeros(8))
 
     net = forward_compile(
-        d=64, d_head=16, output_node=y,
-        verbose=False, device=None,
+        d=64,
+        d_head=16,
+        output_node=y,
+        verbose=False,
+        device=None,
         admission_control=True,
     )
 
@@ -72,12 +81,20 @@ def test_admission_disabled_matches_baseline():
     """admission_control=False should be a no-op — identical compile."""
     output = _build_sibling_chain_graph(n_branches=5, branch_width=64)
     net_a = forward_compile(
-        d=128, d_head=16, output_node=output,
-        verbose=False, device=None, admission_control=False,
+        d=128,
+        d_head=16,
+        output_node=output,
+        verbose=False,
+        device=None,
+        admission_control=False,
     )
     net_b = forward_compile(
-        d=128, d_head=16, output_node=output,
-        verbose=False, device=None, admission_control=False,
+        d=128,
+        d_head=16,
+        output_node=output,
+        verbose=False,
+        device=None,
+        admission_control=False,
     )
     assert len(net_a.layers) == len(net_b.layers)
 
@@ -88,12 +105,20 @@ def test_admission_on_narrow_graph_is_noop():
     output = _build_sibling_chain_graph(n_branches=8, branch_width=4)
 
     baseline = forward_compile(
-        d=128, d_head=16, output_node=output,
-        verbose=False, device=None, admission_control=False,
+        d=128,
+        d_head=16,
+        output_node=output,
+        verbose=False,
+        device=None,
+        admission_control=False,
     )
     gated = forward_compile(
-        d=128, d_head=16, output_node=output,
-        verbose=False, device=None, admission_control=True,
+        d=128,
+        d_head=16,
+        output_node=output,
+        verbose=False,
+        device=None,
+        admission_control=True,
     )
     assert len(gated.layers) == len(baseline.layers)
 
@@ -117,13 +142,22 @@ def test_correctness_on_sibling_chain_graph():
     final = Linear(joined, w_final, torch.zeros(5), name="final")
 
     net_a = forward_compile(
-        d=256, d_head=32, output_node=final,
-        verbose=False, device=None, admission_control=False,
+        d=256,
+        d_head=32,
+        output_node=final,
+        verbose=False,
+        device=None,
+        admission_control=False,
     )
     net_b = forward_compile(
-        d=256, d_head=32, output_node=final,
-        verbose=False, device=None, admission_control=True,
-        admission_min_chains=3, admission_min_peak_width=16,
+        d=256,
+        d_head=32,
+        output_node=final,
+        verbose=False,
+        device=None,
+        admission_control=True,
+        admission_min_chains=3,
+        admission_min_peak_width=16,
     )
 
     # Both compilations should produce the same output for the same

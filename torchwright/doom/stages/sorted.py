@@ -54,7 +54,11 @@ from torchwright.graph.asserts import (
 )
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import (
-    add_const, add_scaled_nodes, clamp, compare, subtract,
+    add_const,
+    add_scaled_nodes,
+    clamp,
+    compare,
+    subtract,
 )
 from torchwright.ops.attention_ops import attend_argmin_above_integer
 from torchwright.ops.inout_nodes import create_literal_value
@@ -68,7 +72,6 @@ from torchwright.doom.wall_payload import (
     unpack_wall_payload,
 )
 
-
 # ---------------------------------------------------------------------------
 # Contract
 # ---------------------------------------------------------------------------
@@ -77,9 +80,9 @@ from torchwright.doom.wall_payload import (
 @dataclass
 class SortedInputs:
     # WALL-stage outputs (per-WALL-position Nodes read via attention).
-    sort_score: Node         # clean integer BSP rank at WALL positions
-    sort_value: Node         # packed wall payload (fed as attention value)
-    indicators_above: Node   # max_walls-wide thermometer key-side indicator
+    sort_score: Node  # clean integer BSP rank at WALL positions
+    sort_value: Node  # packed wall payload (fed as attention value)
+    indicators_above: Node  # max_walls-wide thermometer key-side indicator
 
     # BSP rank selected at the previous SORTED step (scalar, initialized
     # to -1 at the EOS seed).  Threshold for the next pick = prev_bsp_rank,
@@ -98,8 +101,8 @@ class SortedInputs:
 @dataclass
 class SortedOutputs:
     # Per-SORTED geometry pieces.
-    sel_wall_data: Node       # ax, ay, bx, by, tex_id  (5-wide)
-    sel_onehot: Node          # per-position wall-index one-hot of picked wall
+    sel_wall_data: Node  # ax, ay, bx, by, tex_id  (5-wide)
+    sel_onehot: Node  # per-position wall-index one-hot of picked wall
 
     # BSP rank of the selected wall — used by THINKING as the score
     # for its own argmin (picks walls in front-to-back order) and as the
@@ -134,7 +137,8 @@ def build_sorted(
 ) -> SortedOutputs:
     with annotate("sort/threshold"):
         threshold_onehot = _compute_threshold_onehot(
-            inputs.prev_bsp_rank, max_walls,
+            inputs.prev_bsp_rank,
+            max_walls,
         )
 
     with annotate("sort/attention"):
@@ -194,7 +198,8 @@ def _compute_threshold_onehot(prev_bsp_rank: Node, max_walls: int) -> Node:
     clamped_p1 = add_const(clamped, 1.0)
     onehot_bool = in_range(clamped, clamped_p1, max_walls)  # ±1
     ones = create_literal_value(
-        torch.ones(max_walls), name="threshold_ones",
+        torch.ones(max_walls),
+        name="threshold_ones",
     )
     return assert_onehot(
         add_scaled_nodes(0.5, onehot_bool, 0.5, ones),
@@ -202,7 +207,9 @@ def _compute_threshold_onehot(prev_bsp_rank: Node, max_walls: int) -> Node:
 
 
 def _argmin_above_and_derive(
-    inputs: SortedInputs, threshold_onehot: Node, max_walls: int,
+    inputs: SortedInputs,
+    threshold_onehot: Node,
+    max_walls: int,
 ):
     """Pick the smallest-BSP-rank renderable wall strictly above the
     threshold, and derive payload fields + exhaustion signal.
@@ -223,10 +230,14 @@ def _argmin_above_and_derive(
       near-ties.
     """
     checked_score = assert_distinct_across(
-        inputs.sort_score, inputs.is_wall, margin=0.8,
+        inputs.sort_score,
+        inputs.is_wall,
+        margin=0.8,
     )
     checked_score = assert_score_gap_at_least(
-        checked_score, inputs.is_wall, margin=1.0,
+        checked_score,
+        inputs.is_wall,
+        margin=1.0,
     )
 
     selected_sort = attend_argmin_above_integer(
@@ -241,7 +252,10 @@ def _argmin_above_and_derive(
     # WALL position (within atol).  Catches compile-side softmax
     # blending when keys tie.
     selected_sort = assert_picked_from(
-        selected_sort, inputs.sort_value, inputs.is_wall, atol=0.01,
+        selected_sort,
+        inputs.sort_value,
+        inputs.is_wall,
+        atol=0.01,
     )
 
     unpacked = unpack_wall_payload(selected_sort, max_walls)
@@ -277,18 +291,27 @@ def _argmin_above_and_derive(
     # ``_compute_threshold_onehot`` handles that cleanly (threshold
     # pins at max_walls - 1 and successive steps stay exhausted).
     sort_done_sentinel = create_literal_value(
-        torch.tensor([99.0]), name="sort_done_sentinel",
+        torch.tensor([99.0]),
+        name="sort_done_sentinel",
     )
     sel_bsp_rank_effective = select(
-        sort_done, sort_done_sentinel, raw_sel_bsp_rank,
+        sort_done,
+        sort_done_sentinel,
+        raw_sel_bsp_rank,
     )
 
     # Gate so non-SORTED positions contribute 0 to THINKING's attention.
     gated_render_data = cond_gate(
-        inputs.is_sorted, Concatenate([sel_render, sel_tex_id]),
+        inputs.is_sorted,
+        Concatenate([sel_render, sel_tex_id]),
     )
 
     return (
-        sel_wall_data, sel_onehot, gated_render_data,
-        sel_bsp_rank_effective, sort_done, vis_lo, vis_hi,
+        sel_wall_data,
+        sel_onehot,
+        gated_render_data,
+        sel_bsp_rank_effective,
+        sort_done,
+        vis_lo,
+        vis_hi,
     )

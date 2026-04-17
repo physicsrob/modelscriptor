@@ -68,6 +68,7 @@ def print_graph_stats(output_node, pos_encoding=None):
 
     # Group by top-level for subtotals
     from itertools import groupby
+
     def top_level(item):
         return item[0].split("/")[0]
 
@@ -80,7 +81,9 @@ def print_graph_stats(output_node, pos_encoding=None):
             gn = sum(s["nodes"] for _, s in group_list)
             gp = sum(s["params"] for _, s in group_list)
             gpct = 100.0 * gp / total_params if total_params else 0
-            print(f"  {'  ' + group_key + ' (total)':<35s} {gn:>7,} {gp:>12,} {gpct:>8.1f}%")
+            print(
+                f"  {'  ' + group_key + ' (total)':<35s} {gn:>7,} {gp:>12,} {gpct:>8.1f}%"
+            )
         print()
 
     print(f"  {'TOTAL':<35s} {total_nodes:>7,} {total_params:>12,} {'100.0%':>9s}")
@@ -127,8 +130,12 @@ def compile_game(
             compilation. Fuses consecutive Linear nodes to reduce layers.
     """
     graph_io, pos_encoding = build_game_graph(
-        config, textures, max_walls, max_coord,
-        move_speed, turn_speed,
+        config,
+        textures,
+        max_walls,
+        max_coord,
+        move_speed,
+        turn_speed,
         chunk_size=chunk_size,
         max_bsp_nodes=max_bsp_nodes,
     )
@@ -137,6 +144,7 @@ def compile_game(
     # later run their predicates against the compiled residual stream
     # via ``check_asserts_on_compiled`` without rebuilding the graph.
     from torchwright.graph.asserts import collect_asserts
+
     collected_asserts: list = []
     _seen_ids: set = set()
     for out_node in list(graph_io.overlaid_outputs.values()) + list(
@@ -150,6 +158,7 @@ def compile_game(
     # Run graph optimizations (Linear fusion)
     if optimize:
         from torchwright.graph.optimize import fuse_consecutive_linears
+
         # Collect all output nodes from both overlaid and overflow outputs
         output_nodes = set(graph_io.overlaid_outputs.values())
         output_nodes.update(graph_io.overflow_outputs.values())
@@ -187,8 +196,11 @@ def compile_game(
     module = compile_headless(
         pos_encoding,
         io=io,
-        d=d, d_head=d_head, max_layers=400,
-        device=device, verbose=verbose,
+        d=d,
+        d_head=d_head,
+        max_layers=400,
+        device=device,
+        verbose=verbose,
         extra_metadata={
             "chunk_size": chunk_size,
             "max_walls": max_walls,
@@ -252,7 +264,7 @@ def _build_row(compiled, max_walls, **kwargs):
             v = torch.tensor([v], device=device)
         if v.dim() == 1:
             v = v.unsqueeze(0)
-        row[:, start:start + width] = v.to(device)
+        row[:, start : start + width] = v.to(device)
     return row
 
 
@@ -305,8 +317,7 @@ def step_frame(
 
     # The prefill loop below iterates walls as dicts; convert once.
     walls = [
-        {"ax": s.ax, "ay": s.ay, "bx": s.bx, "by": s.by,
-         "tex_id": float(s.texture_id)}
+        {"ax": s.ax, "ay": s.ay, "bx": s.bx, "by": s.by, "tex_id": float(s.texture_id)}
         for s in subset.segments
     ]
 
@@ -366,7 +377,8 @@ def step_frame(
 
     def _common(**extra):
         return _build_row(
-            module, max_walls,
+            module,
+            max_walls,
             player_x=torch.tensor([px]),
             player_y=torch.tensor([py]),
             player_angle=torch.tensor([angle]),
@@ -393,12 +405,14 @@ def step_frame(
         tex_e8 = index_to_vector(tex_idx + TEX_E8_OFFSET)
         for col in range(tex_w):
             pixel_data = textures[tex_idx][col].flatten()
-            rows.append(_common(
-                token_type=E8_TEX_COL,
-                texture_id_e8=tex_e8,
-                tex_col_input=torch.tensor([float(col)]),
-                tex_pixels=torch.tensor(pixel_data, dtype=torch.float32),
-            ))
+            rows.append(
+                _common(
+                    token_type=E8_TEX_COL,
+                    texture_id_e8=tex_e8,
+                    tex_col_input=torch.tensor([float(col)]),
+                    tex_pixels=torch.tensor(pixel_data, dtype=torch.float32),
+                )
+            )
 
     # INPUT (controls only here)
     rows.append(_common(token_type=E8_INPUT, **input_kw))
@@ -415,13 +429,15 @@ def step_frame(
             nx, ny, d = plane.nx, plane.ny, plane.d
         else:
             nx, ny, d = 0.0, 0.0, 0.0
-        rows.append(_common(
-            token_type=E8_BSP_NODE,
-            bsp_plane_nx=torch.tensor([nx], dtype=torch.float32),
-            bsp_plane_ny=torch.tensor([ny], dtype=torch.float32),
-            bsp_plane_d=torch.tensor([d], dtype=torch.float32),
-            bsp_node_id_onehot=onehot,
-        ))
+        rows.append(
+            _common(
+                token_type=E8_BSP_NODE,
+                bsp_plane_nx=torch.tensor([nx], dtype=torch.float32),
+                bsp_plane_ny=torch.tensor([ny], dtype=torch.float32),
+                bsp_plane_d=torch.tensor([d], dtype=torch.float32),
+                bsp_node_id_onehot=onehot,
+            )
+        )
 
     # WALL × N — now each wall carries BSP rank coefficients precomputed
     # by the host.  Rank = dot(coeffs, side_P_vec) + const is evaluated
@@ -429,25 +445,29 @@ def step_frame(
     for i, w in enumerate(walls):
         if i < subset.seg_bsp_coeffs.shape[0]:
             coeffs = torch.tensor(
-                subset.seg_bsp_coeffs[i, :max_bsp_nodes], dtype=torch.float32,
+                subset.seg_bsp_coeffs[i, :max_bsp_nodes],
+                dtype=torch.float32,
             )
             const = torch.tensor(
-                [float(subset.seg_bsp_consts[i])], dtype=torch.float32,
+                [float(subset.seg_bsp_consts[i])],
+                dtype=torch.float32,
             )
         else:
             coeffs = torch.zeros(max_bsp_nodes, dtype=torch.float32)
             const = torch.zeros(1, dtype=torch.float32)
-        rows.append(_common(
-            token_type=E8_WALL,
-            wall_ax=torch.tensor([w["ax"]]),
-            wall_ay=torch.tensor([w["ay"]]),
-            wall_bx=torch.tensor([w["bx"]]),
-            wall_by=torch.tensor([w["by"]]),
-            wall_tex_id=torch.tensor([w["tex_id"]]),
-            wall_index=torch.tensor([float(i)]),
-            wall_bsp_coeffs=coeffs,
-            wall_bsp_const=const,
-        ))
+        rows.append(
+            _common(
+                token_type=E8_WALL,
+                wall_ax=torch.tensor([w["ax"]]),
+                wall_ay=torch.tensor([w["ay"]]),
+                wall_bx=torch.tensor([w["bx"]]),
+                wall_by=torch.tensor([w["by"]]),
+                wall_tex_id=torch.tensor([w["tex_id"]]),
+                wall_index=torch.tensor([float(i)]),
+                wall_bsp_coeffs=coeffs,
+                wall_bsp_const=const,
+            )
+        )
 
     # EOS
     rows.append(_common(token_type=E8_EOS))
@@ -479,7 +499,7 @@ def step_frame(
         for name in overlaid_names:
             in_s, w = in_by_name[name]
             out_s, _ = out_by_name[name]
-            row[0, in_s:in_s + w] = raw_out[0, out_s:out_s + w]
+            row[0, in_s : in_s + w] = raw_out[0, out_s : out_s + w]
         return row
 
     # --- Phase 1: Sort ---
@@ -490,14 +510,16 @@ def step_frame(
         step += 1
         prev = _out_to_input(out)
         # Diagnostics: read sort_feedback from compact output
-        raw_sf = out[0, sf_out_s:sf_out_s + d_sort_out].cpu().numpy()
+        raw_sf = out[0, sf_out_s : sf_out_s + d_sort_out].cpu().numpy()
         wall_data = raw_sf[8:13]
         s_rank = raw_sf[13]
         s_col_lo = raw_sf[14]
         s_col_hi = raw_sf[15]
-        onehot = raw_sf[16:16 + max_walls]
-        print(f"  sort[{k}]: wall=[{wall_data[0]:.2f},{wall_data[1]:.2f},{wall_data[2]:.2f},{wall_data[3]:.2f}] "
-              f"tex={wall_data[4]:.1f} rank={s_rank:.0f} cols=[{s_col_lo:.1f},{s_col_hi:.1f}) oh_max={np.argmax(onehot)}")
+        onehot = raw_sf[16 : 16 + max_walls]
+        print(
+            f"  sort[{k}]: wall=[{wall_data[0]:.2f},{wall_data[1]:.2f},{wall_data[2]:.2f},{wall_data[3]:.2f}] "
+            f"tex={wall_data[4]:.1f} rank={s_rank:.0f} cols=[{s_col_lo:.1f},{s_col_hi:.1f}) oh_max={np.argmax(onehot)}"
+        )
 
     t_sort = time.perf_counter() - t0
     print(f"  sort     {N} steps  kv={_kv_len(past)}  {t_sort*1000:.0f}ms")
@@ -512,11 +534,11 @@ def step_frame(
 
     # Seed: E8_THINKING + render_feedback with is_new_wall=+1, chunk_start=-1
     prev = torch.zeros(1, d_input, device=device)
-    prev[0, tt_off:tt_off + 8] = E8_THINKING.to(device)
+    prev[0, tt_off : tt_off + 8] = E8_THINKING.to(device)
     seed_rf = torch.zeros(d_render_fb, device=device)
-    seed_rf[max_walls + 1] = 1.0   # is_new_wall = +1
+    seed_rf[max_walls + 1] = 1.0  # is_new_wall = +1
     seed_rf[max_walls + 2] = -1.0  # chunk_start = sentinel
-    prev[0, rf_off:rf_off + d_render_fb] = seed_rf
+    prev[0, rf_off : rf_off + d_render_fb] = seed_rf
 
     max_render_steps = N * W * (H // cs + 1) + N + 10
     render_steps = 0
@@ -532,7 +554,7 @@ def step_frame(
         start_y = int(round(raw[start_out_s]))
         length = int(round(raw[length_out_s]))
         done = raw[done_out_s]
-        pix = raw[pix_out_s:pix_out_s + cs * 3].reshape(cs, 3)
+        pix = raw[pix_out_s : pix_out_s + cs * 3].reshape(cs, 3)
 
         # Bitblit with skip-filled (length=0 for THINKING tokens → no-op)
         for row_idx in range(length):
@@ -548,7 +570,7 @@ def step_frame(
         prev = _out_to_input(out)
 
         # Host-side termination: check render_mask from render_feedback
-        mask_vals = out[0, rf_out_s:rf_out_s + max_walls].cpu().numpy()
+        mask_vals = out[0, rf_out_s : rf_out_s + max_walls].cpu().numpy()
         n_masked = int(np.sum(np.round(mask_vals).clip(0, 1)))
         if n_masked >= N:
             break
@@ -571,7 +593,8 @@ def step_frame(
     )
 
     new_state = GameState(
-        x=px, y=py,
+        x=px,
+        y=py,
         angle=round(new_angle_raw) % 256,
         move_speed=state.move_speed,
         turn_speed=state.turn_speed,

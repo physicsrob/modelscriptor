@@ -23,7 +23,9 @@ def test_textured_column_fill_16_bands():
     wall_height = create_input("wh", 1)
 
     config = RenderConfig(
-        screen_width=8, screen_height=12, fov_columns=4,
+        screen_width=8,
+        screen_height=12,
+        fov_columns=4,
         trig_table=generate_trig_table(),
         ceiling_color=(0.0, 0.0, 0.0),
         floor_color=(0.5, 0.5, 0.5),
@@ -31,15 +33,26 @@ def test_textured_column_fill_16_bands():
 
     # 16 texture rows, all the same red color
     tex_colors = LiteralValue(
-        torch.tensor([0.9, 0.1, 0.1] * 16), name="tc",
+        torch.tensor([0.9, 0.1, 0.1] * 16),
+        name="tc",
     )
 
     output = _textured_column_fill(
-        wall_top, wall_bottom, wall_height, tex_colors, 16, config,
+        wall_top,
+        wall_bottom,
+        wall_height,
+        tex_colors,
+        16,
+        config,
     )
 
     module = compile_headless(
-        output, pos_encoding, d=2048, d_head=16, max_layers=200, verbose=False,
+        output,
+        pos_encoding,
+        d=2048,
+        d_head=16,
+        max_layers=200,
+        verbose=False,
     )
 
     # Wall from row 2 to row 10 (height=8)
@@ -51,6 +64,6 @@ def test_textured_column_fill_16_bands():
     # Wall rows should show the texture color, not big_offset garbage
     for row in range(2, 10):
         actual_r = result[row, 0]
-        assert abs(actual_r - 0.9) < 1.0, (
-            f"Row {row}: expected R~0.9, got {actual_r:.1f}"
-        )
+        assert (
+            abs(actual_r - 0.9) < 1.0
+        ), f"Row {row}: expected R~0.9, got {actual_r:.1f}"

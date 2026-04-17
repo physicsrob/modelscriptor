@@ -34,7 +34,6 @@ from torchwright.ops.logic_ops import bool_all_true, equals_vector
 from torchwright.ops.map_select import map_to_table, select
 from torchwright.ops.sequence_ops import output_sequence, remove_leading_0s
 
-
 D_MODEL = 256
 
 
@@ -69,8 +68,7 @@ def create_network_parts(
     # --- Normalize padding to "0" ---
     # Positions that read <bos> (shorter inputs) become "0".
     bits = [
-        map_to_table(b, {embed("1"): embed("1")}, default=embed("0"))
-        for b in bits_raw
+        map_to_table(b, {embed("1"): embed("1")}, default=embed("0")) for b in bits_raw
     ]
     is_one = [equals_vector(b, embed("1")) for b in bits_raw]
 

@@ -37,7 +37,6 @@ from torchwright.graph.asserts import (
 )
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -140,10 +139,13 @@ def test_assert_strictly_less_accepts_a_lt_b():
     # Returns a wrapper of b; thread it downstream.
     wrapped_b = assert_strictly_less(a, b)
     # Evaluate the wrapped b — should equal b's input.
-    out = _eval(wrapped_b, {
-        "a": torch.tensor([[1.0, 5.0]]),
-        "b": torch.tensor([[2.0, 10.0]]),
-    })
+    out = _eval(
+        wrapped_b,
+        {
+            "a": torch.tensor([[1.0, 5.0]]),
+            "b": torch.tensor([[2.0, 10.0]]),
+        },
+    )
     assert torch.allclose(out, torch.tensor([[2.0, 10.0]]))
 
 
@@ -152,10 +154,13 @@ def test_assert_strictly_less_rejects_a_ge_b():
     b = create_input("b", 2)
     wrapped_b = assert_strictly_less(a, b)
     with pytest.raises(AssertionError, match=r"a < b"):
-        _eval(wrapped_b, {
-            "a": torch.tensor([[1.0, 20.0]]),
-            "b": torch.tensor([[2.0, 10.0]]),   # b[1]=10 < a[1]=20
-        })
+        _eval(
+            wrapped_b,
+            {
+                "a": torch.tensor([[1.0, 20.0]]),
+                "b": torch.tensor([[2.0, 10.0]]),  # b[1]=10 < a[1]=20
+            },
+        )
 
 
 def test_assert_strictly_less_rejects_equal_at_zero_margin():
@@ -163,10 +168,13 @@ def test_assert_strictly_less_rejects_equal_at_zero_margin():
     b = create_input("b", 1)
     wrapped_b = assert_strictly_less(a, b, margin=0.0)
     with pytest.raises(AssertionError):
-        _eval(wrapped_b, {
-            "a": torch.tensor([[5.0]]),
-            "b": torch.tensor([[5.0]]),
-        })
+        _eval(
+            wrapped_b,
+            {
+                "a": torch.tensor([[5.0]]),
+                "b": torch.tensor([[5.0]]),
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -241,12 +249,22 @@ def _build_simple_graph(with_assert: bool):
 def test_compile_strips_asserts_and_preserves_output():
     pos_a, _, out_a = _build_simple_graph(with_assert=False)
     mod_a = compile_headless(
-        out_a, pos_a, d=256, d_head=16, max_layers=40, verbose=False,
+        out_a,
+        pos_a,
+        d=256,
+        d_head=16,
+        max_layers=40,
+        verbose=False,
     )
 
     pos_b, _, out_b = _build_simple_graph(with_assert=True)
     mod_b = compile_headless(
-        out_b, pos_b, d=256, d_head=16, max_layers=40, verbose=False,
+        out_b,
+        pos_b,
+        d=256,
+        d_head=16,
+        max_layers=40,
+        verbose=False,
     )
 
     # Same layer count (Asserts don't compile into layers).
@@ -259,16 +277,14 @@ def test_compile_strips_asserts_and_preserves_output():
     d_input_b = max(s + w for _, s, w in mod_b._input_specs)
     inp_a = torch.zeros(1, d_input_a)
     inp_b = torch.zeros(1, d_input_b)
-    for (specs, inp) in ((mod_a._input_specs, inp_a), (mod_b._input_specs, inp_b)):
+    for specs, inp in ((mod_a._input_specs, inp_a), (mod_b._input_specs, inp_b)):
         for name, start, width in specs:
             if name == "x":
-                inp[:, start:start + width] = x_val
+                inp[:, start : start + width] = x_val
     with torch.no_grad():
         y_a = mod_a(inp_a)
         y_b = mod_b(inp_b)
-    assert torch.allclose(y_a, y_b, atol=1e-4), (
-        f"Strip changed output: {y_a} vs {y_b}"
-    )
+    assert torch.allclose(y_a, y_b, atol=1e-4), f"Strip changed output: {y_a} vs {y_b}"
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +303,12 @@ def test_check_asserts_on_compiled_passes_when_invariant_holds():
     out = assert_in_range(clamped, -1.0, 1.0)
     asserts = collect_asserts(out)
     mod = compile_headless(
-        out, pos, d=256, d_head=16, max_layers=40, verbose=False,
+        out,
+        pos,
+        d=256,
+        d_head=16,
+        max_layers=40,
+        verbose=False,
     )
 
     # Build a valid input.
@@ -295,10 +316,11 @@ def test_check_asserts_on_compiled_passes_when_invariant_holds():
     inp = torch.zeros(1, d_input)
     for name, start, width in mod._input_specs:
         if name == "x":
-            inp[:, start:start + width] = 0.3
+            inp[:, start : start + width] = 0.3
     # Should not raise.
     check_asserts_on_compiled(
-        mod, asserts,
+        mod,
+        asserts,
         input_values={"x": torch.tensor([[0.3]])},
         n_pos=1,
     )
@@ -338,12 +360,19 @@ def test_check_asserts_on_compiled_raises_when_compiled_violates():
     # the compiled side.  GraphAnalyzer strips Asserts at compile time,
     # so compile succeeds without running the predicate.
     mod = compile_headless(
-        out, pos, d=256, d_head=16, max_layers=40, verbose=False,
+        out,
+        pos,
+        d=256,
+        d_head=16,
+        max_layers=40,
+        verbose=False,
     )
     with pytest.raises(AssertionError):
         check_asserts_on_compiled(
-            mod, asserts,
-            input_values={"x": inp_val}, n_pos=1,
+            mod,
+            asserts,
+            input_values={"x": inp_val},
+            n_pos=1,
         )
 
 
@@ -357,10 +386,14 @@ def test_distinct_across_accepts_distinct_valid_rows():
     value = create_input("value", 1)
     where = create_input("where", 1)
     wrapped = assert_distinct_across(value, where, margin=0.5)
-    _eval(wrapped, {
-        "value": torch.tensor([[0.0], [1.0], [2.0], [99.0]]),
-        "where": torch.tensor([[1.0], [1.0], [1.0], [-1.0]]),  # last row invalid
-    }, n_pos=4)
+    _eval(
+        wrapped,
+        {
+            "value": torch.tensor([[0.0], [1.0], [2.0], [99.0]]),
+            "where": torch.tensor([[1.0], [1.0], [1.0], [-1.0]]),  # last row invalid
+        },
+        n_pos=4,
+    )
 
 
 def test_distinct_across_rejects_tied_valid_rows():
@@ -369,10 +402,14 @@ def test_distinct_across_rejects_tied_valid_rows():
     where = create_input("where", 1)
     wrapped = assert_distinct_across(value, where, margin=0.5)
     with pytest.raises(AssertionError, match=r"valid-subset rows"):
-        _eval(wrapped, {
-            "value": torch.tensor([[1.0], [1.1], [99.0]]),
-            "where": torch.tensor([[1.0], [1.0], [-1.0]]),
-        }, n_pos=3)
+        _eval(
+            wrapped,
+            {
+                "value": torch.tensor([[1.0], [1.1], [99.0]]),
+                "where": torch.tensor([[1.0], [1.0], [-1.0]]),
+            },
+            n_pos=3,
+        )
 
 
 def test_distinct_across_ignores_invalid_rows():
@@ -380,10 +417,14 @@ def test_distinct_across_ignores_invalid_rows():
     value = create_input("value", 1)
     where = create_input("where", 1)
     wrapped = assert_distinct_across(value, where, margin=0.5)
-    _eval(wrapped, {
-        "value": torch.tensor([[5.0], [5.0], [5.0], [1.0]]),
-        "where": torch.tensor([[0.0], [0.0], [0.0], [1.0]]),  # only row 3 valid
-    }, n_pos=4)
+    _eval(
+        wrapped,
+        {
+            "value": torch.tensor([[5.0], [5.0], [5.0], [1.0]]),
+            "where": torch.tensor([[0.0], [0.0], [0.0], [1.0]]),  # only row 3 valid
+        },
+        n_pos=4,
+    )
 
 
 def test_distinct_across_zero_or_one_valid_row_passes():
@@ -392,15 +433,23 @@ def test_distinct_across_zero_or_one_valid_row_passes():
     where = create_input("where", 1)
     wrapped = assert_distinct_across(value, where, margin=0.5)
     # Zero valid
-    _eval(wrapped, {
-        "value": torch.tensor([[5.0], [5.0]]),
-        "where": torch.tensor([[0.0], [0.0]]),
-    }, n_pos=2)
+    _eval(
+        wrapped,
+        {
+            "value": torch.tensor([[5.0], [5.0]]),
+            "where": torch.tensor([[0.0], [0.0]]),
+        },
+        n_pos=2,
+    )
     # One valid
-    _eval(wrapped, {
-        "value": torch.tensor([[5.0], [5.0]]),
-        "where": torch.tensor([[1.0], [0.0]]),
-    }, n_pos=2)
+    _eval(
+        wrapped,
+        {
+            "value": torch.tensor([[5.0], [5.0]]),
+            "where": torch.tensor([[1.0], [0.0]]),
+        },
+        n_pos=2,
+    )
 
 
 def test_distinct_across_multi_dim_uses_l_infinity():
@@ -410,15 +459,23 @@ def test_distinct_across_multi_dim_uses_l_infinity():
     wrapped = assert_distinct_across(value, where, margin=0.5)
     # Rows [1, 0] and [1, 0.1] — L∞ distance 0.1 < margin 0.5 → fail.
     with pytest.raises(AssertionError):
-        _eval(wrapped, {
-            "value": torch.tensor([[1.0, 0.0], [1.0, 0.1]]),
-            "where": torch.tensor([[1.0], [1.0]]),
-        }, n_pos=2)
+        _eval(
+            wrapped,
+            {
+                "value": torch.tensor([[1.0, 0.0], [1.0, 0.1]]),
+                "where": torch.tensor([[1.0], [1.0]]),
+            },
+            n_pos=2,
+        )
     # Rows [1, 0] and [1, 2] — L∞ distance 2.0 → pass.
-    _eval(wrapped, {
-        "value": torch.tensor([[1.0, 0.0], [1.0, 2.0]]),
-        "where": torch.tensor([[1.0], [1.0]]),
-    }, n_pos=2)
+    _eval(
+        wrapped,
+        {
+            "value": torch.tensor([[1.0, 0.0], [1.0, 2.0]]),
+            "where": torch.tensor([[1.0], [1.0]]),
+        },
+        n_pos=2,
+    )
 
 
 def test_distinct_across_returns_value_width():
@@ -441,11 +498,15 @@ def test_picked_from_accepts_clean_pick():
     keys = create_input("keys", 1)
     wrapped = assert_picked_from(result, values, keys, atol=1e-3)
     # At every query row, result = [1.0, 2.0] — which matches value row 1 (valid key).
-    _eval(wrapped, {
-        "result": torch.tensor([[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]]),
-        "values": torch.tensor([[9.9, 9.9], [1.0, 2.0], [3.0, 4.0]]),
-        "keys":   torch.tensor([[0.0],      [1.0],      [0.0]]),  # only row 1 valid
-    }, n_pos=3)
+    _eval(
+        wrapped,
+        {
+            "result": torch.tensor([[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]]),
+            "values": torch.tensor([[9.9, 9.9], [1.0, 2.0], [3.0, 4.0]]),
+            "keys": torch.tensor([[0.0], [1.0], [0.0]]),  # only row 1 valid
+        },
+        n_pos=3,
+    )
 
 
 def test_picked_from_rejects_blend():
@@ -456,11 +517,15 @@ def test_picked_from_rejects_blend():
     wrapped = assert_picked_from(result, values, keys, atol=1e-2)
     # Valid values are 0.0 and 1.0; result = 0.5 matches neither within atol=0.01.
     with pytest.raises(AssertionError, match=r"doesn't match any value row"):
-        _eval(wrapped, {
-            "result": torch.tensor([[0.5]]),
-            "values": torch.tensor([[0.0]]),
-            "keys":   torch.tensor([[1.0]]),
-        }, n_pos=1)
+        _eval(
+            wrapped,
+            {
+                "result": torch.tensor([[0.5]]),
+                "values": torch.tensor([[0.0]]),
+                "keys": torch.tensor([[1.0]]),
+            },
+            n_pos=1,
+        )
 
 
 def test_picked_from_rejects_no_valid_keys():
@@ -470,11 +535,15 @@ def test_picked_from_rejects_no_valid_keys():
     keys = create_input("keys", 1)
     wrapped = assert_picked_from(result, values, keys, atol=1e-3)
     with pytest.raises(AssertionError, match=r"no valid key positions"):
-        _eval(wrapped, {
-            "result": torch.tensor([[0.5], [0.3]]),
-            "values": torch.tensor([[1.0], [2.0]]),
-            "keys":   torch.tensor([[0.0], [0.0]]),
-        }, n_pos=2)
+        _eval(
+            wrapped,
+            {
+                "result": torch.tensor([[0.5], [0.3]]),
+                "values": torch.tensor([[1.0], [2.0]]),
+                "keys": torch.tensor([[0.0], [0.0]]),
+            },
+            n_pos=2,
+        )
 
 
 def test_picked_from_accepts_duplicate_valid_values():
@@ -483,11 +552,15 @@ def test_picked_from_accepts_duplicate_valid_values():
     values = create_input("values", 1)
     keys = create_input("keys", 1)
     wrapped = assert_picked_from(result, values, keys, atol=1e-3)
-    _eval(wrapped, {
-        "result": torch.tensor([[3.0], [3.0]]),
-        "values": torch.tensor([[3.0], [3.0]]),   # two rows, same value
-        "keys":   torch.tensor([[1.0], [1.0]]),   # both valid
-    }, n_pos=2)
+    _eval(
+        wrapped,
+        {
+            "result": torch.tensor([[3.0], [3.0]]),
+            "values": torch.tensor([[3.0], [3.0]]),  # two rows, same value
+            "keys": torch.tensor([[1.0], [1.0]]),  # both valid
+        },
+        n_pos=2,
+    )
 
 
 def test_picked_from_width_mismatch_raises():
@@ -530,7 +603,9 @@ def test_approximate_integer_warns_instead_of_raising():
     from torchwright.graph.value_type import Guarantee
 
     inp = LiteralValue(torch.tensor([6.5]))  # non-integer
-    node = assert_matches_value_type(inp, NodeValueType.integer(0, 9, guarantee=Guarantee.APPROXIMATE))
+    node = assert_matches_value_type(
+        inp, NodeValueType.integer(0, 9, guarantee=Guarantee.APPROXIMATE)
+    )
     # Should not raise — just warn
     node.compute(1, {})
 
@@ -548,7 +623,9 @@ def test_approximate_sign_warns_instead_of_raising():
     from torchwright.graph.value_type import Guarantee
 
     inp = LiteralValue(torch.tensor([0.5]))  # not ±1
-    node = assert_matches_value_type(inp, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE))
+    node = assert_matches_value_type(
+        inp, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE)
+    )
     # Should not raise
     node.compute(1, {})
 
@@ -559,6 +636,8 @@ def test_require_integer_accepts_approximate():
     from torchwright.graph.asserts import require_integer
 
     inp = LiteralValue(torch.tensor([3.0]))
-    node = assert_matches_value_type(inp, NodeValueType.integer(0, 9, guarantee=Guarantee.APPROXIMATE))
+    node = assert_matches_value_type(
+        inp, NodeValueType.integer(0, 9, guarantee=Guarantee.APPROXIMATE)
+    )
     # Should not raise TypeError
     require_integer(node, "test")

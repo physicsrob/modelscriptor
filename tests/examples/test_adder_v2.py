@@ -10,6 +10,7 @@ from torchwright.ops.scalar_encoding import (
     scalar_to_embedding,
 )
 
+
 @pytest.fixture
 def embedding():
     vocab = list("0123456789+-=") + ["<eos>", "default"]

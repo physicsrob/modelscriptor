@@ -32,12 +32,11 @@ def add_scheduling_dependency(node: Node, depends_on: Node) -> None:
 def _current_node_id() -> int:
     """Snapshot the current global_node_id counter."""
     import torchwright.graph.node as _node_mod
+
     return _node_mod.global_node_id
 
 
-def _find_entry_nodes(
-    terminal: Node, lo: int, hi: int
-) -> List[Node]:
+def _find_entry_nodes(terminal: Node, lo: int, hi: int) -> List[Node]:
     """Non-Concatenate nodes in id-range [lo, hi) reachable backward
     from ``terminal`` whose flattened-input ids are all < lo.
 
@@ -46,6 +45,7 @@ def _find_entry_nodes(
     will naturally wait on their data inputs, so blocking at the entry
     blocks the whole iteration.
     """
+
     def in_range(n: Node) -> bool:
         return lo <= n.node_id < hi
 
@@ -69,9 +69,7 @@ def _find_entry_nodes(
         is_entry = True
         for inp in cur.inputs:
             flat = (
-                flatten_concat_nodes([inp])
-                if isinstance(inp, Concatenate)
-                else [inp]
+                flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
             )
             for leaf in flat:
                 if leaf.node_id >= lo:

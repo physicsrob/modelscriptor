@@ -55,13 +55,12 @@ from torchwright.ops.arithmetic_ops import (
 )
 from torchwright.ops.inout_nodes import create_input
 
-
 # ---------------------------------------------------------------------------
 # Bounds
 # ---------------------------------------------------------------------------
 
-MAX_COORD = 20.0              # world-space extent (matches DOOM default)
-MAX_DIFF = 2.0 * MAX_COORD    # |ex|, |ey|, |ax-px|, |py-ay| ≤ 2·max_coord
+MAX_COORD = 20.0  # world-space extent (matches DOOM default)
+MAX_DIFF = 2.0 * MAX_COORD  # |ex|, |ey|, |ax-px|, |py-ay| ≤ 2·max_coord
 MAX_PRODUCT = MAX_DIFF * MAX_DIFF  # ≈ 1600 (max |num_t| / 2 term)
 
 
@@ -77,13 +76,43 @@ MAX_PRODUCT = MAX_DIFF * MAX_DIFF  # ≈ 1600 (max |num_t| / 2 term)
 # ---------------------------------------------------------------------------
 
 _DIFF_BREAKPOINTS = [
-    -40.0, -30.0, -20.0, -15.0, -10.0, -7.0, -5.0, -3.0, -2.0, -1.0, -0.5,
+    -40.0,
+    -30.0,
+    -20.0,
+    -15.0,
+    -10.0,
+    -7.0,
+    -5.0,
+    -3.0,
+    -2.0,
+    -1.0,
+    -0.5,
     0.0,
-    0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0, 30.0, 40.0,
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    7.0,
+    10.0,
+    15.0,
+    20.0,
+    30.0,
+    40.0,
 ]
 
 _TRIG_BREAKPOINTS = [
-    -1.0, -0.9, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 0.9, 1.0,
+    -1.0,
+    -0.9,
+    -0.75,
+    -0.5,
+    -0.25,
+    0.0,
+    0.25,
+    0.5,
+    0.75,
+    0.9,
+    1.0,
 ]
 
 
@@ -142,14 +171,18 @@ def _parametric_segment_intersection(
     # den = ey · cos - ex · sin    (2 pos·trig products)
     # ------------------------------------------------------------------
     ey_cos = piecewise_linear_2d(
-        ey, ray_cos,
-        _DIFF_BREAKPOINTS, _TRIG_BREAKPOINTS,
+        ey,
+        ray_cos,
+        _DIFF_BREAKPOINTS,
+        _TRIG_BREAKPOINTS,
         lambda a, b: a * b,
         name="ey_cos",
     )
     ex_sin = piecewise_linear_2d(
-        ex, ray_sin,
-        _DIFF_BREAKPOINTS, _TRIG_BREAKPOINTS,
+        ex,
+        ray_sin,
+        _DIFF_BREAKPOINTS,
+        _TRIG_BREAKPOINTS,
         lambda a, b: a * b,
         name="ex_sin",
     )
@@ -171,14 +204,18 @@ def _parametric_segment_intersection(
     # in the outermost cells.
     # ------------------------------------------------------------------
     ey_dx = piecewise_linear_2d(
-        ey, dx,
-        _DIFF_BREAKPOINTS, _DIFF_BREAKPOINTS,
+        ey,
+        dx,
+        _DIFF_BREAKPOINTS,
+        _DIFF_BREAKPOINTS,
         lambda a, b: a * b,
         name="ey_dx",
     )
     ex_dy = piecewise_linear_2d(
-        ex, dy,
-        _DIFF_BREAKPOINTS, _DIFF_BREAKPOINTS,
+        ex,
+        dy,
+        _DIFF_BREAKPOINTS,
+        _DIFF_BREAKPOINTS,
         lambda a, b: a * b,
         name="ex_dy",
     )
@@ -188,14 +225,18 @@ def _parametric_segment_intersection(
     # num_u = dx · sin + dy · cos    (2 pos·trig products)
     # ------------------------------------------------------------------
     dx_sin = piecewise_linear_2d(
-        dx, ray_sin,
-        _DIFF_BREAKPOINTS, _TRIG_BREAKPOINTS,
+        dx,
+        ray_sin,
+        _DIFF_BREAKPOINTS,
+        _TRIG_BREAKPOINTS,
         lambda a, b: a * b,
         name="dx_sin",
     )
     dy_cos = piecewise_linear_2d(
-        dy, ray_cos,
-        _DIFF_BREAKPOINTS, _TRIG_BREAKPOINTS,
+        dy,
+        ray_cos,
+        _DIFF_BREAKPOINTS,
+        _TRIG_BREAKPOINTS,
         lambda a, b: a * b,
         name="dy_cos",
     )
@@ -225,8 +266,7 @@ def _numpy_reference(
     den = ey * ray_cos - ex * ray_sin
     num_t = wall_ax * ey - wall_ay * ex + ex * player_y - ey * player_x
     num_u = (
-        wall_ax * ray_sin - wall_ay * ray_cos
-        + player_y * ray_cos - player_x * ray_sin
+        wall_ax * ray_sin - wall_ay * ray_cos + player_y * ray_cos - player_x * ray_sin
     )
     return den, num_t, num_u
 
@@ -262,8 +302,14 @@ def _build_graph():
     wall_by = create_input("wall_by", 1)
 
     den, num_t, num_u = _parametric_segment_intersection(
-        player_x, player_y, ray_cos, ray_sin,
-        wall_ax, wall_ay, wall_bx, wall_by,
+        player_x,
+        player_y,
+        ray_cos,
+        ray_sin,
+        wall_ax,
+        wall_ay,
+        wall_bx,
+        wall_by,
     )
     return den, num_t, num_u
 
@@ -296,8 +342,14 @@ def _sweep_inputs(seed: int = 0xBEEF, n_pos: int = 16):
         "wall_by": torch.tensor(wall_by, dtype=torch.float32).unsqueeze(-1),
     }
     return inputs, (
-        player_x, player_y, ray_cos, ray_sin,
-        wall_ax, wall_ay, wall_bx, wall_by,
+        player_x,
+        player_y,
+        ray_cos,
+        ray_sin,
+        wall_ax,
+        wall_ay,
+        wall_bx,
+        wall_by,
     )
 
 
@@ -322,7 +374,7 @@ def test_parametric_matches_numpy_reference():
     """
     den_node, num_t_node, num_u_node = _build_graph()
     inputs, refs = _sweep_inputs(n_pos=32)
-    (px, py, rc, rs, ax, ay, bx, by) = refs
+    px, py, rc, rs, ax, ay, bx, by = refs
 
     den_ref, num_t_ref, num_u_ref = _numpy_reference(px, py, rc, rs, ax, ay, bx, by)
 
@@ -338,15 +390,15 @@ def test_parametric_matches_numpy_reference():
     num_t_got = num_t_cache[num_t_node].squeeze(-1).numpy()
     num_u_got = num_u_cache[num_u_node].squeeze(-1).numpy()
 
-    assert np.allclose(den_got, den_ref, atol=5.0), (
-        f"den mismatch (max err = {np.abs(den_got - den_ref).max():.3f})"
-    )
-    assert np.allclose(num_t_got, num_t_ref, atol=20.0), (
-        f"num_t mismatch (max err = {np.abs(num_t_got - num_t_ref).max():.3f})"
-    )
-    assert np.allclose(num_u_got, num_u_ref, atol=20.0), (
-        f"num_u mismatch (max err = {np.abs(num_u_got - num_u_ref).max():.3f})"
-    )
+    assert np.allclose(
+        den_got, den_ref, atol=5.0
+    ), f"den mismatch (max err = {np.abs(den_got - den_ref).max():.3f})"
+    assert np.allclose(
+        num_t_got, num_t_ref, atol=20.0
+    ), f"num_t mismatch (max err = {np.abs(num_t_got - num_t_ref).max():.3f})"
+    assert np.allclose(
+        num_u_got, num_u_ref, atol=20.0
+    ), f"num_u mismatch (max err = {np.abs(num_u_got - num_u_ref).max():.3f})"
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +433,9 @@ def test_probe_compiled_matches_oracle(which):
         verbose=False,
         atol=1.0,  # downstream nodes can be off by the signed_multiply budget
     )
-    assert report.first_divergent is None, (
-        f"probe reported divergence on {which}:\n{report.format_short()}"
-    )
+    assert (
+        report.first_divergent is None
+    ), f"probe reported divergence on {which}:\n{report.format_short()}"
 
 
 # ---------------------------------------------------------------------------
@@ -405,13 +457,15 @@ def _parse_layer_stats(stdout_text):
     for line in stdout_text.splitlines():
         m = _LAYER_LINE_RE.match(line)
         if m:
-            rows.append((
-                int(m.group(1)),
-                int(m.group(2)),
-                int(m.group(3).replace(",", "")),
-                int(m.group(4)),
-                int(m.group(5)),
-            ))
+            rows.append(
+                (
+                    int(m.group(1)),
+                    int(m.group(2)),
+                    int(m.group(3).replace(",", "")),
+                    int(m.group(4)),
+                    int(m.group(5)),
+                )
+            )
     return rows
 
 
@@ -482,12 +536,12 @@ def test_cost_report(tmp_path):
     # drift by more than ~50%.  A failure here doesn't necessarily
     # indicate a bug — it's a heads-up that the cost model underlying
     # the walls-as-tokens pitch just shifted.
-    assert total_ops < 80, (
-        f"parametric intersection grew past the workable budget:\n{report}"
-    )
-    assert n_layers < 10, (
-        f"parametric intersection layer count grew past expected:\n{report}"
-    )
-    assert peak_d < 60, (
-        f"parametric intersection peak residual width grew past expected:\n{report}"
-    )
+    assert (
+        total_ops < 80
+    ), f"parametric intersection grew past the workable budget:\n{report}"
+    assert (
+        n_layers < 10
+    ), f"parametric intersection layer count grew past expected:\n{report}"
+    assert (
+        peak_d < 60
+    ), f"parametric intersection peak residual width grew past expected:\n{report}"

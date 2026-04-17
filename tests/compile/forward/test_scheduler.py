@@ -227,9 +227,9 @@ def test_schedule_cancellation():
     # is the union of all cols to clear in this layer — check that x's
     # cols are present in that batch.
     cancel_targets = {c for op in cancel_ops for c in op.target_cols}
-    assert x_cols <= cancel_targets, (
-        f"expected x's cols {x_cols} within cancel targets {cancel_targets}"
-    )
+    assert (
+        x_cols <= cancel_targets
+    ), f"expected x's cols {x_cols} within cancel targets {cancel_targets}"
     assert not rmap.is_allocated(x)  # columns freed
 
 
@@ -459,9 +459,9 @@ def test_schedule_under_column_pressure():
     # check the merged target_cols for x's columns.
     cancel_ops = [op for op in attn_ops if op.op_type == "cancel"]
     cancel_targets = {c for op in cancel_ops for c in op.target_cols}
-    assert x_cols <= cancel_targets, (
-        f"expected x's cols {x_cols} within cancel targets {cancel_targets}"
-    )
+    assert (
+        x_cols <= cancel_targets
+    ), f"expected x's cols {x_cols} within cancel targets {cancel_targets}"
 
     # Relu chain should still be scheduled
     relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]

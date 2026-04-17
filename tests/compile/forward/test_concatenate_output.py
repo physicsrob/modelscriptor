@@ -25,7 +25,11 @@ def test_concatenate_output_node():
     output = Concatenate([r1, r2])
 
     module = compile_headless(
-        output, pos_encoding, d=512, d_head=16, verbose=False,
+        output,
+        pos_encoding,
+        d=512,
+        d_head=16,
+        verbose=False,
     )
 
     inp = torch.tensor([[1.0, 1.0], [0.0, 0.0]])

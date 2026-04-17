@@ -28,14 +28,16 @@ from torchwright.ops import (
 )
 from torchwright.ops.arithmetic_ops import clamp, subtract
 
-
 # ---------------------------------------------------------------------------
 # dynamic_extract
 # ---------------------------------------------------------------------------
 
 
 def _dynamic_extract_reference(
-    table: torch.Tensor, idx: torch.Tensor, n_entries: int, d_fill: int,
+    table: torch.Tensor,
+    idx: torch.Tensor,
+    n_entries: int,
+    d_fill: int,
 ) -> torch.Tensor:
     """Independent reference for dynamic_extract.
 
@@ -103,8 +105,14 @@ def test_dynamic_extract_every_index(n_entries, d_fill):
 
     # Compiled must match the oracle at every node (no divergence).
     report = probe_graph(
-        out_node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
-        d=1024, d_head=16, verbose=False, atol=5e-3,
+        out_node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=n_pos,
+        d=1024,
+        d_head=16,
+        verbose=False,
+        atol=5e-3,
     )
     assert report.first_divergent is None, (
         f"probe reported divergence on dynamic_extract "
@@ -131,8 +139,14 @@ def test_dynamic_extract_random_indices():
     assert torch.allclose(oracle, expected, atol=5e-3)
 
     report = probe_graph(
-        out_node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
-        d=1024, d_head=16, verbose=False, atol=5e-3,
+        out_node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=n_pos,
+        d=1024,
+        d_head=16,
+        verbose=False,
+        atol=5e-3,
     )
     assert report.first_divergent is None, report.format_short()
 
@@ -143,7 +157,10 @@ def test_dynamic_extract_random_indices():
 
 
 def _linear_bin_index_reference(
-    x: torch.Tensor, x_min: torch.Tensor, x_max: torch.Tensor, n_bins: int,
+    x: torch.Tensor,
+    x_min: torch.Tensor,
+    x_max: torch.Tensor,
+    n_bins: int,
 ) -> torch.Tensor:
     """Independent reference: ``clamp(floor((x - x_min) * n_bins / (x_max - x_min)))``."""
     v = (x - x_min) * n_bins / (x_max - x_min)
@@ -170,7 +187,10 @@ def _build_linear_bin_index_graph(
     x_min = create_input("x_min", 1)
     x_max = create_input("x_max", 1)
     out = linear_bin_index(
-        x, x_min, x_max, n_bins,
+        x,
+        x_min,
+        x_max,
+        n_bins,
         min_range=min_range,
         max_range=max_range,
         n_reciprocal_breakpoints=n_reciprocal_breakpoints,
@@ -216,14 +236,14 @@ def _sweep_inputs(x_min_val, x_max_val, n_bins):
 @pytest.mark.parametrize(
     "n_bins,x_min_val,x_max_val",
     [
-        (4,  0.0, 10.0),   # normal case, moderate bins
-        (8,  0.0, 10.0),
+        (4, 0.0, 10.0),  # normal case, moderate bins
+        (8, 0.0, 10.0),
         (16, 0.0, 10.0),
         (32, 0.0, 10.0),
-        (64, 0.0, 10.0),   # DOOM tex_h=64
-        (16, -5.0, 5.0),   # signed lower bound
-        (16, 100.0, 110.0),   # shifted far from origin
-        (16, 0.0, 1.5),    # small range near the reciprocal's min_range boundary
+        (64, 0.0, 10.0),  # DOOM tex_h=64
+        (16, -5.0, 5.0),  # signed lower bound
+        (16, 100.0, 110.0),  # shifted far from origin
+        (16, 0.0, 1.5),  # small range near the reciprocal's min_range boundary
         (16, 0.0, 100.0),  # wide range
     ],
 )
@@ -243,11 +263,13 @@ def test_linear_bin_index_centers_and_out_of_range(n_bins, x_min_val, x_max_val)
     cache = reference_eval(out_node, inputs, n_pos)
     oracle = cache[out_node].flatten()
     expected_mid = torch.arange(n_bins, dtype=torch.float32)
-    expected = torch.cat([
-        torch.tensor([0.0]),        # below -> clamped to 0
-        expected_mid,                # each bin center -> bin index
-        torch.tensor([n_bins - 1.0]),  # above -> clamped to n_bins-1
-    ])
+    expected = torch.cat(
+        [
+            torch.tensor([0.0]),  # below -> clamped to 0
+            expected_mid,  # each bin center -> bin index
+            torch.tensor([n_bins - 1.0]),  # above -> clamped to n_bins-1
+        ]
+    )
     assert torch.allclose(oracle, expected, atol=0.05), (
         f"oracle disagrees with expected bins "
         f"(n_bins={n_bins}, range=[{x_min_val}, {x_max_val}])\n"
@@ -263,8 +285,14 @@ def test_linear_bin_index_centers_and_out_of_range(n_bins, x_min_val, x_max_val)
     # the expected bins exactly above, so semantic correctness is
     # guarded.
     report = probe_graph(
-        out_node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
-        d=2048, d_head=16, verbose=False, atol=0.5,
+        out_node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=n_pos,
+        d=2048,
+        d_head=16,
+        verbose=False,
+        atol=0.5,
     )
     assert report.first_divergent is None, (
         f"probe reported divergence on linear_bin_index "
@@ -297,7 +325,10 @@ def test_linear_bin_index_non_integer_values():
     cache = reference_eval(out_node, inputs, n_pos)
     oracle = cache[out_node]
     expected = _linear_bin_index_reference(
-        xs, x_min, x_max, n_bins,
+        xs,
+        x_min,
+        x_max,
+        n_bins,
     )
     assert torch.allclose(oracle, expected, atol=0.05), (
         f"oracle disagrees:\n  oracle:   {oracle.flatten().tolist()}\n"
@@ -305,8 +336,14 @@ def test_linear_bin_index_non_integer_values():
     )
 
     report = probe_graph(
-        out_node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
-        d=2048, d_head=16, verbose=False, atol=0.5,
+        out_node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=n_pos,
+        d=2048,
+        d_head=16,
+        verbose=False,
+        atol=0.5,
     )
     assert report.first_divergent is None, report.format_short()
 
@@ -324,8 +361,8 @@ def test_linear_bin_index_into_dynamic_extract():
     world-space coordinate ``x`` inside ``[x_min, x_max)``, pick the
     matching texture row out of a runtime-supplied ``tex_column_colors``.
     """
-    n_bins = 16       # stand-in for tex_height
-    d_fill = 3        # RGB
+    n_bins = 16  # stand-in for tex_height
+    d_fill = 3  # RGB
     x_min_val, x_max_val = 0.0, 16.0
     min_r, max_r = _bounds_for(x_min_val, x_max_val)
 
@@ -335,9 +372,14 @@ def test_linear_bin_index_into_dynamic_extract():
     table = create_input("table", n_bins * d_fill)
 
     idx = linear_bin_index(
-        x, x_min, x_max, n_bins,
-        min_range=min_r, max_range=max_r,
-        n_reciprocal_breakpoints=48, mul_step=0.25,
+        x,
+        x_min,
+        x_max,
+        n_bins,
+        min_range=min_r,
+        max_range=max_r,
+        n_reciprocal_breakpoints=48,
+        mul_step=0.25,
     )
     rgb = dynamic_extract(table, idx, n_bins, d_fill)
 
@@ -356,16 +398,25 @@ def test_linear_bin_index_into_dynamic_extract():
     x_max_t = torch.full((n_pos, 1), x_max_val)
     table_t = torch.rand(n_pos, n_bins * d_fill, generator=rng)
     inputs = {
-        "x": xs, "x_min": x_min_t, "x_max": x_max_t, "table": table_t,
+        "x": xs,
+        "x_min": x_min_t,
+        "x_max": x_max_t,
+        "table": table_t,
     }
 
     # Reference: compute the expected bin per position, then extract the
     # corresponding slice.
     expected_idx = _linear_bin_index_reference(
-        xs, x_min_t, x_max_t, n_bins,
+        xs,
+        x_min_t,
+        x_max_t,
+        n_bins,
     )
     expected_rgb = _dynamic_extract_reference(
-        table_t, expected_idx, n_bins, d_fill,
+        table_t,
+        expected_idx,
+        n_bins,
+        d_fill,
     )
 
     cache = reference_eval(rgb, inputs, n_pos)
@@ -382,8 +433,14 @@ def test_linear_bin_index_into_dynamic_extract():
     # arithmetic, with the final RGB comparison above as the real
     # pass criterion.
     report = probe_graph(
-        rgb, pos_encoding=None, input_values=inputs, n_pos=n_pos,
-        d=2048, d_head=16, verbose=False, atol=0.5,
+        rgb,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=n_pos,
+        d=2048,
+        d_head=16,
+        verbose=False,
+        atol=0.5,
     )
     assert report.first_divergent is None, report.format_short()
 
@@ -416,7 +473,10 @@ def _build_linear_bin_index_hoisted(
     inv = reciprocal(clamped_range, min_value=min_range, max_value=max_range)
 
     out = linear_bin_index(
-        x, x_min, x_max, n_bins,
+        x,
+        x_min,
+        x_max,
+        n_bins,
         min_range=min_range,
         max_range=max_range,
         mul_step=mul_step,
@@ -453,11 +513,13 @@ def test_linear_bin_index_with_inv_range(n_bins, x_min_val, x_max_val):
     cache = reference_eval(out_node, inputs, n_pos)
     oracle = cache[out_node].flatten()
     expected_mid = torch.arange(n_bins, dtype=torch.float32)
-    expected = torch.cat([
-        torch.tensor([0.0]),
-        expected_mid,
-        torch.tensor([n_bins - 1.0]),
-    ])
+    expected = torch.cat(
+        [
+            torch.tensor([0.0]),
+            expected_mid,
+            torch.tensor([n_bins - 1.0]),
+        ]
+    )
     assert torch.allclose(oracle, expected, atol=0.05), (
         f"hoisted oracle disagrees with expected bins "
         f"(n_bins={n_bins}, range=[{x_min_val}, {x_max_val}])\n"
@@ -489,9 +551,14 @@ def test_linear_bin_index_shared_inv_range_multi_x():
     bin_nodes = []
     for x in x_nodes:
         idx = linear_bin_index(
-            x, x_min, x_max, n_bins,
-            min_range=min_r, max_range=max_r,
-            mul_step=0.25, inv_range=inv,
+            x,
+            x_min,
+            x_max,
+            n_bins,
+            min_range=min_r,
+            max_range=max_r,
+            mul_step=0.25,
+            inv_range=inv,
         )
         bin_nodes.append(idx)
 
@@ -530,9 +597,15 @@ def test_linear_bin_index_inv_range_probe():
     n_pos = x.shape[0]
 
     report = probe_graph(
-        out_node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
-        d=2048, d_head=16, verbose=False, atol=0.5,
+        out_node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=n_pos,
+        d=2048,
+        d_head=16,
+        verbose=False,
+        atol=0.5,
     )
-    assert report.first_divergent is None, (
-        f"probe divergence on hoisted inv_range:\n{report.format_short()}"
-    )
+    assert (
+        report.first_divergent is None
+    ), f"probe divergence on hoisted inv_range:\n{report.format_short()}"

@@ -29,7 +29,10 @@ def _verify_tensor_against_value_type(node: "Node", tensor: torch.Tensor) -> Non
 
     def _report(prop: str, msg: str, level: "Guarantee | bool") -> None:
         if level is Guarantee.APPROXIMATE:
-            print(f"WARNING: approximate {prop} transition-zone hit: {msg}", file=sys.stderr)
+            print(
+                f"WARNING: approximate {prop} transition-zone hit: {msg}",
+                file=sys.stderr,
+            )
         else:
             raise AssertionError(msg)
 
@@ -45,28 +48,38 @@ def _verify_tensor_against_value_type(node: "Node", tensor: torch.Tensor) -> Non
     if vt.is_integer:
         diff = (t - t.round()).abs().max().item()
         if diff > tol:
-            _report("integer",
-                    f"{name}: declared is_integer but observed max deviation {diff}",
-                    vt.is_integer)
+            _report(
+                "integer",
+                f"{name}: declared is_integer but observed max deviation {diff}",
+                vt.is_integer,
+            )
     if vt.is_binary:
         if not torch.all((t.round() == 0) | (t.round() == 1)).item():
-            _report("binary",
-                    f"{name}: declared is_binary but values outside {{0,1}}",
-                    vt.is_binary)
+            _report(
+                "binary",
+                f"{name}: declared is_binary but values outside {{0,1}}",
+                vt.is_binary,
+            )
     if vt.is_sign:
         if not torch.all((t.round() == -1) | (t.round() == 1)).item():
-            _report("sign",
-                    f"{name}: declared is_sign but values outside {{-1,+1}}",
-                    vt.is_sign)
+            _report(
+                "sign",
+                f"{name}: declared is_sign but values outside {{-1,+1}}",
+                vt.is_sign,
+            )
     if vt.is_one_hot:
         sums = t.round().sum(dim=-1)
         if not torch.all(sums == 1).item():
-            _report("one-hot",
-                    f"{name}: declared is_one_hot but per-row sum not equal to 1",
-                    vt.is_one_hot)
+            _report(
+                "one-hot",
+                f"{name}: declared is_one_hot but per-row sum not equal to 1",
+                vt.is_one_hot,
+            )
+
 
 _current_annotation: ContextVar[Optional[str]] = ContextVar(
-    "current_annotation", default=None,
+    "current_annotation",
+    default=None,
 )
 
 
@@ -119,7 +132,9 @@ class Node:
 
         def wrapped(self, n_pos, input_values, *args, **kw):
             result = original(self, n_pos, input_values, *args, **kw)
-            if os.environ.get("TW_VERIFY_VALUE_TYPES") and isinstance(result, torch.Tensor):
+            if os.environ.get("TW_VERIFY_VALUE_TYPES") and isinstance(
+                result, torch.Tensor
+            ):
                 _verify_tensor_against_value_type(self, result)
             return result
 

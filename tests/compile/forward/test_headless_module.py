@@ -30,8 +30,13 @@ def _export_and_load(output_node, pos_encoding, tmpdir):
 
     onnx_path = os.path.join(tmpdir, "model.onnx")
     compile_headless_to_onnx(
-        output_node, pos_encoding, onnx_path,
-        d=D, d_head=D_HEAD, max_seq_len=32, verbose=False,
+        output_node,
+        pos_encoding,
+        onnx_path,
+        d=D,
+        d_head=D_HEAD,
+        max_seq_len=32,
+        verbose=False,
     )
     return OnnxHeadlessModule(onnx_path)
 
@@ -73,9 +78,9 @@ def test_headless_onnx_select_matches_compute():
         inputs = torch.cat([a_vals, b_vals], dim=1)
         actual = module(inputs)
 
-    assert torch.allclose(actual, expected, atol=1e-4), (
-        f"max diff: {(actual - expected).abs().max().item():.6f}"
-    )
+    assert torch.allclose(
+        actual, expected, atol=1e-4
+    ), f"max diff: {(actual - expected).abs().max().item():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -100,9 +105,9 @@ def test_headless_onnx_signed_multiply():
         for (a_val, b_val), expected in test_cases:
             inputs = torch.tensor([[a_val, b_val]])
             result = module(inputs)
-            assert abs(result.item() - expected) < 0.5, (
-                f"{a_val} * {b_val}: expected {expected}, got {result.item():.2f}"
-            )
+            assert (
+                abs(result.item() - expected) < 0.5
+            ), f"{a_val} * {b_val}: expected {expected}, got {result.item():.2f}"
 
 
 # ---------------------------------------------------------------------------
@@ -126,9 +131,9 @@ def test_headless_onnx_compare():
         for x_val, expected in test_cases:
             inputs = torch.tensor([[x_val]])
             result = module(inputs)
-            assert abs(result.item() - expected) < 0.1, (
-                f"compare({x_val}, 0): expected {expected}, got {result.item():.2f}"
-            )
+            assert (
+                abs(result.item() - expected) < 0.1
+            ), f"compare({x_val}, 0): expected {expected}, got {result.item():.2f}"
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +152,9 @@ def test_headless_onnx_multi_position():
         expected = torch.tensor([[1.0], [-1.0], [1.0], [-1.0], [1.0]])
         actual = module(inputs)
 
-    assert torch.allclose(actual, expected, atol=0.1), (
-        f"multi-position mismatch: {actual.squeeze().tolist()}"
-    )
+    assert torch.allclose(
+        actual, expected, atol=0.1
+    ), f"multi-position mismatch: {actual.squeeze().tolist()}"
 
 
 # ---------------------------------------------------------------------------

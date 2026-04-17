@@ -15,7 +15,8 @@ from torchwright.doom.game import GameState, update_state
 from torchwright.doom.input import PlayerInput
 from torchwright.reference_renderer.render import render_frame
 from torchwright.reference_renderer.scenes import (
-    box_room_textured, multi_room_textured,
+    box_room_textured,
+    multi_room_textured,
 )
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
@@ -24,18 +25,20 @@ from torchwright.reference_renderer.types import RenderConfig, Segment
 def _make_alt_segments(half=5.0):
     """Build an alternative L-shaped room layout for level-swap demo."""
     return [
-        Segment(ax=half, ay=-half, bx=half, by=0.0,
-                color=(0.5, 0.5, 0.5), texture_id=0),
-        Segment(ax=half, ay=0.0, bx=0.0, by=0.0,
-                color=(0.5, 0.5, 0.5), texture_id=1),
-        Segment(ax=0.0, ay=0.0, bx=0.0, by=half,
-                color=(0.5, 0.5, 0.5), texture_id=2),
-        Segment(ax=0.0, ay=half, bx=-half, by=half,
-                color=(0.5, 0.5, 0.5), texture_id=3),
-        Segment(ax=-half, ay=half, bx=-half, by=-half,
-                color=(0.5, 0.5, 0.5), texture_id=0),
-        Segment(ax=-half, ay=-half, bx=half, by=-half,
-                color=(0.5, 0.5, 0.5), texture_id=1),
+        Segment(
+            ax=half, ay=-half, bx=half, by=0.0, color=(0.5, 0.5, 0.5), texture_id=0
+        ),
+        Segment(ax=half, ay=0.0, bx=0.0, by=0.0, color=(0.5, 0.5, 0.5), texture_id=1),
+        Segment(ax=0.0, ay=0.0, bx=0.0, by=half, color=(0.5, 0.5, 0.5), texture_id=2),
+        Segment(
+            ax=0.0, ay=half, bx=-half, by=half, color=(0.5, 0.5, 0.5), texture_id=3
+        ),
+        Segment(
+            ax=-half, ay=half, bx=-half, by=-half, color=(0.5, 0.5, 0.5), texture_id=0
+        ),
+        Segment(
+            ax=-half, ay=-half, bx=half, by=-half, color=(0.5, 0.5, 0.5), texture_id=1
+        ),
     ]
 
 
@@ -83,9 +86,12 @@ def play(
         segments_b = _make_alt_segments()
         max_walls = max(8, len(segments_a), len(segments_b))
 
-        print(f"Compiling game graph ({len(segments_a)} walls, max_walls={max_walls})...")
+        print(
+            f"Compiling game graph ({len(segments_a)} walls, max_walls={max_walls})..."
+        )
         module = compile_game(
-            config, textures,
+            config,
+            textures,
             max_walls=max_walls,
             max_coord=max_coord,
             d=2048,
@@ -96,8 +102,10 @@ def play(
         current_subset = [subset_a]  # mutable container for level-swap
 
         def frame_fn(state, inputs):
-            return step_frame(module, state, inputs, current_subset[0], config,
-                              textures=textures)
+            return step_frame(
+                module, state, inputs, current_subset[0], config, textures=textures
+            )
+
     else:
         current_subset = [None]
         trig_table = config.trig_table
@@ -105,7 +113,11 @@ def play(
         def frame_fn(state, inputs):
             new_state = update_state(state, inputs, segments, trig_table)
             frame = render_frame(
-                new_state.x, new_state.y, new_state.angle, segments, config,
+                new_state.x,
+                new_state.y,
+                new_state.angle,
+                segments,
+                config,
                 textures=textures,
             )
             return frame, new_state
@@ -174,20 +186,32 @@ def main():
     parser = argparse.ArgumentParser(description="Play DOOM in a transformer")
     parser.add_argument("--scene", choices=["box", "multi"], default="box")
     parser.add_argument(
-        "--mode", choices=["transformer", "reference"], default="transformer",
+        "--mode",
+        choices=["transformer", "reference"],
+        default="transformer",
         help="transformer: game logic + rendering in compiled transformer (default). "
-             "reference: pure Python implementation.",
+        "reference: pure Python implementation.",
     )
-    parser.add_argument("--wad", type=str, default="doom1.wad",
-                        help="Path to doom1.wad for DOOM textures")
-    parser.add_argument("--tex-size", type=int, default=8,
-                        help="Texture resolution (downscaled from WAD)")
+    parser.add_argument(
+        "--wad",
+        type=str,
+        default="doom1.wad",
+        help="Path to doom1.wad for DOOM textures",
+    )
+    parser.add_argument(
+        "--tex-size",
+        type=int,
+        default=8,
+        help="Texture resolution (downscaled from WAD)",
+    )
     parser.add_argument("--width", type=int, default=64)
     parser.add_argument("--height", type=int, default=80)
     parser.add_argument("--fov", type=int, default=32)
     parser.add_argument("--scale", type=int, default=8)
     parser.add_argument(
-        "--chunk-size", type=int, default=20,
+        "--chunk-size",
+        type=int,
+        default=20,
         help="Render chunk height (pixels per render token).",
     )
     args = parser.parse_args()
@@ -204,20 +228,31 @@ def main():
 
     if args.scene == "box":
         segments, textures = box_room_textured(
-            wad_path=args.wad, tex_size=args.tex_size,
+            wad_path=args.wad,
+            tex_size=args.tex_size,
         )
         start_x, start_y, start_angle = 0.0, 0.0, 0
         max_coord = 10.0
     else:
         segments, textures = multi_room_textured(
-            wad_path=args.wad, tex_size=args.tex_size,
+            wad_path=args.wad,
+            tex_size=args.tex_size,
         )
         start_x, start_y, start_angle = -8.0, 0.0, 0
         max_coord = 15.0
 
-    play(segments, config, start_x, start_y, start_angle,
-         max_coord=max_coord, scale=args.scale, mode=args.mode,
-         textures=textures, chunk_size=args.chunk_size)
+    play(
+        segments,
+        config,
+        start_x,
+        start_y,
+        start_angle,
+        max_coord=max_coord,
+        scale=args.scale,
+        mode=args.mode,
+        textures=textures,
+        chunk_size=args.chunk_size,
+    )
 
 
 if __name__ == "__main__":

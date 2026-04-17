@@ -35,7 +35,10 @@ def point_segment_distance(px: float, py: float, seg: Segment) -> float:
 
 
 def _point_clear(
-    px: float, py: float, segments: List[Segment], margin: float,
+    px: float,
+    py: float,
+    segments: List[Segment],
+    margin: float,
 ) -> bool:
     """Return True if (px, py) is at least *margin* away from all segments."""
     for seg in segments:
@@ -85,7 +88,11 @@ def resolve_collision(
 
 
 def _ray_hits_segment(
-    ox: float, oy: float, dx: float, dy: float, seg: Segment,
+    ox: float,
+    oy: float,
+    dx: float,
+    dy: float,
+    seg: Segment,
 ) -> bool:
     """Test if a movement ray crosses a wall segment.
 
@@ -123,7 +130,11 @@ def _ray_hits_segment(
 
 
 def ray_hits_any_segment(
-    ox: float, oy: float, dx: float, dy: float, segments: List[Segment],
+    ox: float,
+    oy: float,
+    dx: float,
+    dy: float,
+    segments: List[Segment],
 ) -> bool:
     """Return True if the movement ray (ox,oy)→(ox+dx,oy+dy) crosses any segment."""
     for seg in segments:
@@ -160,7 +171,11 @@ def resolve_collision_ray(
         return new_x, new_y
 
     # Wall sliding: try each axis independently
-    resolved_x = new_x if not ray_hits_any_segment(old_x, old_y, dx, 0.0, segments) else old_x
-    resolved_y = new_y if not ray_hits_any_segment(old_x, old_y, 0.0, dy, segments) else old_y
+    resolved_x = (
+        new_x if not ray_hits_any_segment(old_x, old_y, dx, 0.0, segments) else old_x
+    )
+    resolved_y = (
+        new_y if not ray_hits_any_segment(old_x, old_y, 0.0, dy, segments) else old_y
+    )
 
     return resolved_x, resolved_y

@@ -19,7 +19,9 @@ def main():
         sys.exit(1)
 
     output_node, pos_encoding, embedding = module.create_network_parts()
-    compile_to_onnx(output_node, pos_encoding, embedding, f"{name}.onnx", d=module.D_MODEL)
+    compile_to_onnx(
+        output_node, pos_encoding, embedding, f"{name}.onnx", d=module.D_MODEL
+    )
 
 
 if __name__ == "__main__":

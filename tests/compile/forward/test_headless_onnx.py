@@ -39,9 +39,7 @@ def _empty_past_feeds(per_layer_n_heads: list, d_head: int) -> dict:
 def _discover_meta(session):
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
-    per_layer_n_heads = [
-        int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)
-    ]
+    per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
     return n_layers, per_layer_n_heads, d_head
 
@@ -57,8 +55,13 @@ def _build_sample_graph():
 def _export(output_node, pos_encoding, tmpdir, name="model.onnx"):
     onnx_path = os.path.join(tmpdir, name)
     compile_headless_to_onnx(
-        output_node, pos_encoding, onnx_path,
-        d=D, d_head=D_HEAD, max_seq_len=32, verbose=False,
+        output_node,
+        pos_encoding,
+        onnx_path,
+        d=D,
+        d_head=D_HEAD,
+        max_seq_len=32,
+        verbose=False,
     )
     return onnx_path
 
@@ -74,11 +77,15 @@ def test_headless_onnx_prefill_matches_compute():
     b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0]])
 
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, pos_encoding=pos, verbose=False,
+        d=D,
+        d_head=D_HEAD,
+        output_node=out,
+        pos_encoding=pos,
+        verbose=False,
     )
-    expected = net.compute(
-        n_pos=4, input_values={"a": a_vals, "b": b_vals}
-    )[out].cpu().numpy()
+    expected = (
+        net.compute(n_pos=4, input_values={"a": a_vals, "b": b_vals})[out].cpu().numpy()
+    )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
@@ -90,9 +97,9 @@ def test_headless_onnx_prefill_matches_compute():
         feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
         onnx_out = session.run(["outputs"], feeds)[0]
 
-    assert np.allclose(onnx_out, expected, atol=1e-3), (
-        f"prefill diff: {np.abs(onnx_out - expected).max():.6f}"
-    )
+    assert np.allclose(
+        onnx_out, expected, atol=1e-3
+    ), f"prefill diff: {np.abs(onnx_out - expected).max():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +148,7 @@ def test_headless_onnx_chunked_decode_matches_full_prefill():
         chunk_out = session.run(["outputs"], feeds)[0]
 
     assert np.allclose(full_outputs[2:5], chunk_out, atol=1e-3), (
-        f"chunked decode diff: "
-        f"{np.abs(full_outputs[2:5] - chunk_out).max():.6f}"
+        f"chunked decode diff: " f"{np.abs(full_outputs[2:5] - chunk_out).max():.6f}"
     )
 
 
@@ -181,9 +187,9 @@ def test_headless_onnx_decode_step_matches_full_prefill():
             feeds[f"past_V_{i}"] = past_V[i]
         decode_out = session.run(["outputs"], feeds)[0]
 
-    assert np.allclose(full_outputs[-1], decode_out[0], atol=1e-3), (
-        f"decode seam diff: {np.abs(full_outputs[-1] - decode_out[0]).max():.6f}"
-    )
+    assert np.allclose(
+        full_outputs[-1], decode_out[0], atol=1e-3
+    ), f"decode seam diff: {np.abs(full_outputs[-1] - decode_out[0]).max():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -211,12 +217,12 @@ def test_onnx_headless_module_step_matches_full_call():
         prefill_out, past = module.step(inputs[:4], past)
         decode_out, past = module.step(inputs[4:5], past)
 
-    assert torch.allclose(full[:4], prefill_out, atol=1e-3), (
-        f"prefill portion diff: {(full[:4] - prefill_out).abs().max().item():.6f}"
-    )
-    assert torch.allclose(full[4], decode_out[0], atol=1e-3), (
-        f"decode row diff: {(full[4] - decode_out[0]).abs().max().item():.6f}"
-    )
+    assert torch.allclose(
+        full[:4], prefill_out, atol=1e-3
+    ), f"prefill portion diff: {(full[:4] - prefill_out).abs().max().item():.6f}"
+    assert torch.allclose(
+        full[4], decode_out[0], atol=1e-3
+    ), f"decode row diff: {(full[4] - decode_out[0]).abs().max().item():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -285,9 +291,9 @@ def test_compiled_headless_step_matches_call():
         full = module(inputs)
         step_out, _ = module.step(inputs, module.empty_past())
 
-    assert torch.allclose(full, step_out, atol=1e-4), (
-        f"step diff: {(full - step_out).abs().max().item():.6f}"
-    )
+    assert torch.allclose(
+        full, step_out, atol=1e-4
+    ), f"step diff: {(full - step_out).abs().max().item():.6f}"
 
 
 def test_compiled_headless_step_prefill_decode_matches_full():
@@ -307,12 +313,12 @@ def test_compiled_headless_step_prefill_decode_matches_full():
         prefill_out, past = module.step(inputs[:4], past)
         decode_out, past = module.step(inputs[4:5], past)
 
-    assert torch.allclose(full[:4], prefill_out, atol=1e-4), (
-        f"prefill diff: {(full[:4] - prefill_out).abs().max().item():.6f}"
-    )
-    assert torch.allclose(full[4], decode_out[0], atol=1e-4), (
-        f"decode diff: {(full[4] - decode_out[0]).abs().max().item():.6f}"
-    )
+    assert torch.allclose(
+        full[:4], prefill_out, atol=1e-4
+    ), f"prefill diff: {(full[:4] - prefill_out).abs().max().item():.6f}"
+    assert torch.allclose(
+        full[4], decode_out[0], atol=1e-4
+    ), f"decode diff: {(full[4] - decode_out[0]).abs().max().item():.6f}"
     # past_K should have grown to n_total = 5
     past_K, _ = past
     assert past_K[0].shape[1] == 5

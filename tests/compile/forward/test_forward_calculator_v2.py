@@ -32,7 +32,7 @@ def run_autoregressive(
         if next_token == "<eos>":
             break
         tokens.append(next_token)
-    return "".join(tokens[len(input_tokens):])
+    return "".join(tokens[len(input_tokens) :])
 
 
 def _compile(digits, d=D):

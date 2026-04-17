@@ -119,7 +119,9 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     )
     from torchwright.graph.value_type import Guarantee
 
-    return assert_matches_value_type(result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE))
+    return assert_matches_value_type(
+        result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE)
+    )
 
 
 def cond_add_vector(

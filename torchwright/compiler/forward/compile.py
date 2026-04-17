@@ -33,9 +33,7 @@ from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 
 
-def _effective_consumers(
-    graph: GraphAnalyzer, node: Node
-) -> Set[Node]:
+def _effective_consumers(graph: GraphAnalyzer, node: Node) -> Set[Node]:
     """Walk through Concatenate consumers transparently.
 
     Mirrors ``LayerScheduler._get_effective_consumers``: a Concatenate is
@@ -191,6 +189,7 @@ def forward_compile(
     # Unwrap any Assert keys in the overlays dict that were stripped above.
     if overlays:
         from torchwright.graph.misc import Assert
+
         unwrapped: dict = {}
         for k, v in overlays.items():
             while isinstance(k, Assert):
@@ -239,7 +238,11 @@ def forward_compile(
             )
 
     scheduler = LayerScheduler(
-        graph, d, d_head, pos_encoding, d_hidden=d_hidden,
+        graph,
+        d,
+        d_head,
+        pos_encoding,
+        d_hidden=d_hidden,
         clusters=clusters,
         admission_budget_fraction=admission_budget_fraction,
     )
@@ -386,13 +389,15 @@ def forward_compile(
             source_cols = residual_map.get_indices(out_node)
             # Subtract columns: same as target (the input columns)
             subtract_cols = target_cols
-            delta_ops.append(AttnHeadOp(
-                op_type="delta_transfer",
-                node=out_node,
-                target_cols=target_cols,
-                source_cols=source_cols,
-                subtract_cols=subtract_cols,
-            ))
+            delta_ops.append(
+                AttnHeadOp(
+                    op_type="delta_transfer",
+                    node=out_node,
+                    target_cols=target_cols,
+                    source_cols=source_cols,
+                    subtract_cols=subtract_cols,
+                )
+            )
         write_attn_sublayer(delta_layer, delta_ops, residual_map, pos_encoding)
         if verbose:
             print(f"  Delta transfer layer: {len(delta_ops)} overlays")

@@ -42,15 +42,24 @@ import torch
 from torchwright.graph import Concatenate, Node, annotate
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.inout_nodes import (
-    create_input, create_literal_value, create_pos_encoding,
+    create_input,
+    create_literal_value,
+    create_pos_encoding,
 )
 from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.map_select import select
 from torchwright.reference_renderer.types import RenderConfig
 
 from torchwright.doom.graph_constants import (
-    E8_BSP_NODE, E8_EOS, E8_INPUT, E8_RENDER, E8_SORTED_WALL,
-    E8_TEX_COL, E8_THINKING, E8_WALL, TEX_E8_OFFSET,
+    E8_BSP_NODE,
+    E8_EOS,
+    E8_INPUT,
+    E8_RENDER,
+    E8_SORTED_WALL,
+    E8_TEX_COL,
+    E8_THINKING,
+    E8_WALL,
+    TEX_E8_OFFSET,
 )
 
 # Re-export token constants for legacy callers that import them from
@@ -58,9 +67,16 @@ from torchwright.doom.graph_constants import (
 # authoritative definition; these re-exports are just a compatibility
 # surface.
 __all__ = [
-    "GameGraphIO", "build_game_graph",
-    "E8_INPUT", "E8_WALL", "E8_EOS", "E8_SORTED_WALL", "E8_RENDER",
-    "E8_TEX_COL", "E8_THINKING", "E8_BSP_NODE",
+    "GameGraphIO",
+    "build_game_graph",
+    "E8_INPUT",
+    "E8_WALL",
+    "E8_EOS",
+    "E8_SORTED_WALL",
+    "E8_RENDER",
+    "E8_TEX_COL",
+    "E8_THINKING",
+    "E8_BSP_NODE",
     "TEX_E8_OFFSET",
 ]
 from torchwright.doom.graph_utils import extract_from
@@ -72,7 +88,6 @@ from torchwright.doom.stages.sorted import SortedInputs, build_sorted
 from torchwright.doom.stages.tex_col import TexColInputs, build_tex_col
 from torchwright.doom.stages.thinking import ThinkingInputs, build_thinking
 from torchwright.doom.stages.wall import WallInputs, build_wall
-
 
 # ---------------------------------------------------------------------------
 # I/O contract
@@ -100,16 +115,18 @@ class GameGraphIO:
         Order: token_type, sort_feedback, render_feedback, pixels, col,
         start, length, done.
         """
-        return Concatenate([
-            self.overlaid_outputs["token_type"],
-            self.overlaid_outputs["sort_feedback"],
-            self.overlaid_outputs["render_feedback"],
-            self.overflow_outputs["pixels"],
-            self.overflow_outputs["col"],
-            self.overflow_outputs["start"],
-            self.overflow_outputs["length"],
-            self.overflow_outputs["done"],
-        ])
+        return Concatenate(
+            [
+                self.overlaid_outputs["token_type"],
+                self.overlaid_outputs["sort_feedback"],
+                self.overlaid_outputs["render_feedback"],
+                self.overflow_outputs["pixels"],
+                self.overflow_outputs["col"],
+                self.overflow_outputs["start"],
+                self.overflow_outputs["length"],
+                self.overflow_outputs["done"],
+            ]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +157,9 @@ def build_game_graph(
     pos_encoding = create_pos_encoding()
 
     inputs, fb_fields = _create_inputs(
-        max_walls=max_walls, tex_h=tex_h, max_bsp_nodes=max_bsp_nodes,
+        max_walls=max_walls,
+        tex_h=tex_h,
+        max_bsp_nodes=max_bsp_nodes,
     )
     tf = _detect_token_types(inputs["token_type"])
 
@@ -186,14 +205,19 @@ def build_game_graph(
     # ---------- WALL ----------
     wall_out = build_wall(
         WallInputs(
-            wall_ax=inputs["wall_ax"], wall_ay=inputs["wall_ay"],
-            wall_bx=inputs["wall_bx"], wall_by=inputs["wall_by"],
+            wall_ax=inputs["wall_ax"],
+            wall_ay=inputs["wall_ay"],
+            wall_bx=inputs["wall_bx"],
+            wall_by=inputs["wall_by"],
             wall_tex_id=inputs["wall_tex_id"],
             wall_index=inputs["wall_index"],
-            player_x=inputs["player_x"], player_y=inputs["player_y"],
+            player_x=inputs["player_x"],
+            player_y=inputs["player_y"],
             is_wall=tf["is_wall"],
-            vel_dx=input_out.vel_dx, vel_dy=input_out.vel_dy,
-            move_cos=input_out.move_cos, move_sin=input_out.move_sin,
+            vel_dx=input_out.vel_dx,
+            vel_dy=input_out.vel_dy,
+            move_cos=input_out.move_cos,
+            move_sin=input_out.move_sin,
             wall_bsp_coeffs=inputs["wall_bsp_coeffs"],
             wall_bsp_const=inputs["wall_bsp_const"],
             side_P_vec=bsp_out.side_P_vec,
@@ -205,15 +229,19 @@ def build_game_graph(
     )
 
     # ---------- EOS ----------
-    eos_out = build_eos(EosInputs(
-        is_wall=tf["is_wall"],
-        is_eos=tf["is_eos"],
-        collision=wall_out.collision,
-        player_x=inputs["player_x"], player_y=inputs["player_y"],
-        vel_dx=input_out.vel_dx, vel_dy=input_out.vel_dy,
-        new_angle=input_out.new_angle,
-        pos_encoding=pos_encoding,
-    ))
+    eos_out = build_eos(
+        EosInputs(
+            is_wall=tf["is_wall"],
+            is_eos=tf["is_eos"],
+            collision=wall_out.collision,
+            player_x=inputs["player_x"],
+            player_y=inputs["player_y"],
+            vel_dx=input_out.vel_dx,
+            vel_dy=input_out.vel_dy,
+            new_angle=input_out.new_angle,
+            pos_encoding=pos_encoding,
+        )
+    )
 
     # ---------- SORTED ----------
     sorted_out = build_sorted(
@@ -279,17 +307,23 @@ def build_game_graph(
     overlaid, overflow = _assemble_output(
         token_flags=tf,
         fb_fields=fb_fields,
-        eos_out=eos_out, input_out=input_out,
-        sorted_out=sorted_out, thinking_out=thinking_out,
+        eos_out=eos_out,
+        input_out=input_out,
+        sorted_out=sorted_out,
+        thinking_out=thinking_out,
         render_out=render_out,
-        max_walls=max_walls, chunk_size=cs,
+        max_walls=max_walls,
+        chunk_size=cs,
     )
 
-    return GameGraphIO(
-        inputs=inputs,
-        overlaid_outputs=overlaid,
-        overflow_outputs=overflow,
-    ), pos_encoding
+    return (
+        GameGraphIO(
+            inputs=inputs,
+            overlaid_outputs=overlaid,
+            overflow_outputs=overflow,
+        ),
+        pos_encoding,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +332,10 @@ def build_game_graph(
 
 
 def _create_inputs(
-    *, max_walls: int, tex_h: int, max_bsp_nodes: int,
+    *,
+    max_walls: int,
+    tex_h: int,
+    max_bsp_nodes: int,
 ) -> Tuple[Dict[str, Node], Dict[str, Node]]:
     """Create host-fed input nodes + unpack the overlaid feedback vectors.
 
@@ -313,9 +350,12 @@ def _create_inputs(
     inputs["player_y"] = create_input("player_y", 1)
     inputs["player_angle"] = create_input("player_angle", 1)
     for k in (
-        "input_forward", "input_backward",
-        "input_turn_left", "input_turn_right",
-        "input_strafe_left", "input_strafe_right",
+        "input_forward",
+        "input_backward",
+        "input_turn_left",
+        "input_turn_right",
+        "input_strafe_left",
+        "input_strafe_right",
     ):
         inputs[k] = create_input(k, 1)
     for k in ("wall_ax", "wall_ay", "wall_bx", "wall_by", "wall_tex_id", "wall_index"):
@@ -347,32 +387,68 @@ def _create_inputs(
     #   [16..16+max_walls)  sel_onehot (wall-index one-hot for THINKING)
     fields: Dict[str, Node] = {
         "prev_bsp_rank": extract_from(
-            sort_feedback, d_sort_out, 8 + 5, 1, "prev_bsp_rank",
+            sort_feedback,
+            d_sort_out,
+            8 + 5,
+            1,
+            "prev_bsp_rank",
         ),
         "render_mask": extract_from(
-            render_feedback, d_render_fb, 0, max_walls, "render_mask",
+            render_feedback,
+            d_render_fb,
+            0,
+            max_walls,
+            "render_mask",
         ),
         "render_col": extract_from(
-            render_feedback, d_render_fb, max_walls, 1, "render_col",
+            render_feedback,
+            d_render_fb,
+            max_walls,
+            1,
+            "render_col",
         ),
         "render_is_new_wall": extract_from(
-            render_feedback, d_render_fb, max_walls + 1, 1, "render_is_new_wall",
+            render_feedback,
+            d_render_fb,
+            max_walls + 1,
+            1,
+            "render_is_new_wall",
         ),
         "render_chunk_start": extract_from(
-            render_feedback, d_render_fb, max_walls + 2, 1, "render_chunk_start",
+            render_feedback,
+            d_render_fb,
+            max_walls + 2,
+            1,
+            "render_chunk_start",
         ),
         "fb_sort_den": extract_from(
-            render_feedback, d_render_fb, max_walls + 3, 1, "fb_sort_den",
+            render_feedback,
+            d_render_fb,
+            max_walls + 3,
+            1,
+            "fb_sort_den",
         ),
         "fb_C": extract_from(render_feedback, d_render_fb, max_walls + 4, 1, "fb_C"),
         "fb_D": extract_from(render_feedback, d_render_fb, max_walls + 5, 1, "fb_D"),
         "fb_E": extract_from(render_feedback, d_render_fb, max_walls + 6, 1, "fb_E"),
-        "fb_H_inv": extract_from(render_feedback, d_render_fb, max_walls + 7, 1, "fb_H_inv"),
-        "fb_tex_id": extract_from(render_feedback, d_render_fb, max_walls + 8, 1, "fb_tex_id"),
-        "fb_col_lo": extract_from(render_feedback, d_render_fb, max_walls + 9, 1, "fb_col_lo"),
-        "fb_col_hi": extract_from(render_feedback, d_render_fb, max_walls + 10, 1, "fb_col_hi"),
+        "fb_H_inv": extract_from(
+            render_feedback, d_render_fb, max_walls + 7, 1, "fb_H_inv"
+        ),
+        "fb_tex_id": extract_from(
+            render_feedback, d_render_fb, max_walls + 8, 1, "fb_tex_id"
+        ),
+        "fb_col_lo": extract_from(
+            render_feedback, d_render_fb, max_walls + 9, 1, "fb_col_lo"
+        ),
+        "fb_col_hi": extract_from(
+            render_feedback, d_render_fb, max_walls + 10, 1, "fb_col_hi"
+        ),
         "fb_onehot": extract_from(
-            render_feedback, d_render_fb, max_walls + 11, max_walls, "fb_onehot",
+            render_feedback,
+            d_render_fb,
+            max_walls + 11,
+            max_walls,
+            "fb_onehot",
         ),
     }
     return inputs, fields
@@ -421,11 +497,13 @@ def _assemble_output(
         zero_rf = create_literal_value(torch.zeros(d_render_fb), name="zero_rf")
         zero_sf = create_literal_value(torch.zeros(d_sort_out), name="zero_sf")
         zero_pixels = create_literal_value(
-            torch.zeros(chunk_size * 3), name="zero_pixels",
+            torch.zeros(chunk_size * 3),
+            name="zero_pixels",
         )
         pos_one = create_literal_value(torch.tensor([1.0]), name="pos_one_out")
         chunk_sentinel = create_literal_value(
-            torch.tensor([-1.0]), name="chunk_sentinel_out",
+            torch.tensor([-1.0]),
+            name="chunk_sentinel_out",
         )
 
         # THINKING's render_feedback output: seed the next block of RENDER
@@ -433,24 +511,34 @@ def _assemble_output(
         # unchanged (the advance_wall bit was added by the RENDER token
         # that transitioned to THINKING, then fed back through the
         # overlay — so fb_fields["render_mask"] already includes it).
-        thinking_render_fb = Concatenate([
-            fb_fields["render_mask"],
-            thinking_out.t_col_lo,     # render_col = first column of this wall
-            pos_one,                   # is_new_wall = +1
-            chunk_sentinel,            # chunk_start = -1 → start at wall_top
-            thinking_out.t_sort_den, thinking_out.t_C, thinking_out.t_D,
-            thinking_out.t_E, thinking_out.t_H_inv, thinking_out.t_tex_id,
-            thinking_out.t_col_lo, thinking_out.t_col_hi, thinking_out.t_onehot,
-        ])
+        thinking_render_fb = Concatenate(
+            [
+                fb_fields["render_mask"],
+                thinking_out.t_col_lo,  # render_col = first column of this wall
+                pos_one,  # is_new_wall = +1
+                chunk_sentinel,  # chunk_start = -1 → start at wall_top
+                thinking_out.t_sort_den,
+                thinking_out.t_C,
+                thinking_out.t_D,
+                thinking_out.t_E,
+                thinking_out.t_H_inv,
+                thinking_out.t_tex_id,
+                thinking_out.t_col_lo,
+                thinking_out.t_col_hi,
+                thinking_out.t_onehot,
+            ]
+        )
 
-        sort_feedback_out = Concatenate([
-            create_literal_value(E8_SORTED_WALL, name="sort_type"),
-            sorted_out.sel_wall_data,
-            sorted_out.sel_bsp_rank,
-            sorted_out.vis_lo,
-            sorted_out.vis_hi,
-            sorted_out.sel_onehot,
-        ])
+        sort_feedback_out = Concatenate(
+            [
+                create_literal_value(E8_SORTED_WALL, name="sort_type"),
+                sorted_out.sel_wall_data,
+                sorted_out.sel_bsp_rank,
+                sorted_out.vis_lo,
+                sorted_out.vis_hi,
+                sorted_out.sel_onehot,
+            ]
+        )
         assert len(sort_feedback_out) == d_sort_out, (
             f"sort_feedback_out width {len(sort_feedback_out)} != d_sort_out "
             f"{d_sort_out}; keep _assemble_output's Concatenate and "
@@ -462,17 +550,23 @@ def _assemble_output(
         # initialized to -1 so the first SORTED step sees
         # prev_bsp_rank=-1 → threshold slot 0 → picks any renderable
         # wall (all indicators_above[0] are 1).
-        eos_sort_seed = Concatenate([
-            create_literal_value(E8_SORTED_WALL, name="eos_sort_seed"),
-            eos_out.resolved_x, eos_out.resolved_y, input_out.new_angle,
-            create_literal_value(torch.zeros(2), name="eos_sort_pad1"),
-            create_literal_value(
-                torch.tensor([-1.0]), name="eos_prev_bsp_rank",
-            ),
-            create_literal_value(
-                torch.zeros(2 + max_walls), name="eos_sort_pad2",
-            ),
-        ])
+        eos_sort_seed = Concatenate(
+            [
+                create_literal_value(E8_SORTED_WALL, name="eos_sort_seed"),
+                eos_out.resolved_x,
+                eos_out.resolved_y,
+                input_out.new_angle,
+                create_literal_value(torch.zeros(2), name="eos_sort_pad1"),
+                create_literal_value(
+                    torch.tensor([-1.0]),
+                    name="eos_prev_bsp_rank",
+                ),
+                create_literal_value(
+                    torch.zeros(2 + max_walls),
+                    name="eos_sort_pad2",
+                ),
+            ]
+        )
         assert len(eos_sort_seed) == d_sort_out, (
             f"eos_sort_seed width {len(eos_sort_seed)} != d_sort_out "
             f"{d_sort_out}; pad widths must match sort_feedback_out layout."
@@ -487,24 +581,31 @@ def _assemble_output(
             token_flags["is_thinking"],
             create_literal_value(E8_RENDER, name="thinking_next_type"),
             select(
-                token_flags["is_render"], render_out.render_next_type,
+                token_flags["is_render"],
+                render_out.render_next_type,
                 select(
                     token_flags["is_sorted"],
                     create_literal_value(E8_SORTED_WALL, name="sort_next_type"),
                     select(
                         token_flags["is_eos"],
                         create_literal_value(E8_SORTED_WALL, name="eos_next_type"),
-                        zero_8))))
+                        zero_8,
+                    ),
+                ),
+            ),
+        )
 
         out_render_fb = select(
-            token_flags["is_thinking"], thinking_render_fb,
-            select(
-                token_flags["is_render"], render_out.next_render_feedback,
-                zero_rf))
+            token_flags["is_thinking"],
+            thinking_render_fb,
+            select(token_flags["is_render"], render_out.next_render_feedback, zero_rf),
+        )
 
         out_sort_fb = select(
-            token_flags["is_sorted"], sort_feedback_out,
-            select(token_flags["is_eos"], eos_sort_seed, zero_sf))
+            token_flags["is_sorted"],
+            sort_feedback_out,
+            select(token_flags["is_eos"], eos_sort_seed, zero_sf),
+        )
 
         out_pixels = select(token_flags["is_render"], render_out.pixels, zero_pixels)
         out_col = select(token_flags["is_render"], render_out.active_col, zero_1)

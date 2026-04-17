@@ -22,7 +22,6 @@ from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
 from torchwright.doom.stages.thinking import ThinkingInputs, build_thinking
 
-
 _MAX_WALLS = 4
 
 
@@ -46,19 +45,34 @@ def thinking_module():
             sel_bsp_rank=sel_bsp_rank,
             sel_onehot=sel_onehot,
             gated_render_data=gated_render_data,
-            vis_lo=vis_lo, vis_hi=vis_hi,
+            vis_lo=vis_lo,
+            vis_hi=vis_hi,
             render_mask=render_mask,
             is_sorted=is_sorted,
             pos_encoding=pos,
         ),
         max_walls=_MAX_WALLS,
     )
-    output = Concatenate([
-        out.t_sort_den, out.t_C, out.t_D, out.t_E, out.t_H_inv,
-        out.t_tex_id, out.t_col_lo, out.t_col_hi, out.t_onehot,
-    ])
+    output = Concatenate(
+        [
+            out.t_sort_den,
+            out.t_C,
+            out.t_D,
+            out.t_E,
+            out.t_H_inv,
+            out.t_tex_id,
+            out.t_col_lo,
+            out.t_col_hi,
+            out.t_onehot,
+        ]
+    )
     return compile_headless(
-        output, pos, d=1024, d_head=32, max_layers=40, verbose=False,
+        output,
+        pos,
+        d=1024,
+        d_head=32,
+        max_layers=40,
+        verbose=False,
     )
 
 
@@ -68,8 +82,9 @@ def _pack(module, rows: list[dict]) -> torch.Tensor:
     t = torch.zeros(T, d_input, dtype=torch.float32)
     for i, row in enumerate(rows):
         for name, start, width in module._input_specs:
-            t[i, start:start + width] = torch.tensor(
-                row[name], dtype=torch.float32,
+            t[i, start : start + width] = torch.tensor(
+                row[name],
+                dtype=torch.float32,
             ).reshape(width)
     return t
 
@@ -89,10 +104,14 @@ def _sorted_row(rank: int, tex_id: float, render_mask: List[float]) -> dict:
         "sel_bsp_rank": float(rank),
         "sel_onehot": _onehot(rank, _MAX_WALLS),
         "gated_render_data": [
-            float(rank), float(rank), float(rank), float(rank), float(rank),
+            float(rank),
+            float(rank),
+            float(rank),
+            float(rank),
+            float(rank),
             tex_id,
         ],
-        "vis_lo": float(10 * rank),       # identifiable per rank
+        "vis_lo": float(10 * rank),  # identifiable per rank
         "vis_hi": float(10 * rank + 5),
         "render_mask": render_mask,
         "is_sorted": 1.0,  # +1 = SORTED (matches equals_vector convention)
@@ -109,7 +128,8 @@ def _thinking_row(render_mask: List[float]) -> dict:
         "sel_bsp_rank": 99.0,
         "sel_onehot": [0.5] * _MAX_WALLS,
         "gated_render_data": [0.0] * 6,
-        "vis_lo": 0.0, "vis_hi": 0.0,
+        "vis_lo": 0.0,
+        "vis_hi": 0.0,
         "render_mask": render_mask,
         "is_sorted": -1.0,  # -1 = not SORTED (matches equals_vector convention)
     }
@@ -120,20 +140,25 @@ def _thinking_row(render_mask: List[float]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("render_mask,expected_rank", [
-    # No walls rendered yet → pick rank 0.
-    ([0.0, 0.0, 0.0, 0.0], 0),
-    # Rank 0 rendered → pick rank 1.
-    ([1.0, 0.0, 0.0, 0.0], 1),
-    # The mask >= 2 cases are intermittent in this minimal fixture:
-    # with only 4 SORTED positions + 1 receiver, the softmax of
-    # attend_argmin_unmasked becomes sensitive to the 0.5-biased
-    # position_onehot noise.  End-to-end coverage lives in
-    # tests/doom/test_bsp_rank_integration.py where the argmin runs
-    # over a realistic token sequence.
-])
+@pytest.mark.parametrize(
+    "render_mask,expected_rank",
+    [
+        # No walls rendered yet → pick rank 0.
+        ([0.0, 0.0, 0.0, 0.0], 0),
+        # Rank 0 rendered → pick rank 1.
+        ([1.0, 0.0, 0.0, 0.0], 1),
+        # The mask >= 2 cases are intermittent in this minimal fixture:
+        # with only 4 SORTED positions + 1 receiver, the softmax of
+        # attend_argmin_unmasked becomes sensitive to the 0.5-biased
+        # position_onehot noise.  End-to-end coverage lives in
+        # tests/doom/test_bsp_rank_integration.py where the argmin runs
+        # over a realistic token sequence.
+    ],
+)
 def test_thinking_picks_lowest_unmasked_rank(
-    thinking_module, render_mask, expected_rank,
+    thinking_module,
+    render_mask,
+    expected_rank,
 ):
     """attend_argmin_unmasked must pick the SORTED with lowest unmasked sel_bsp_rank."""
     # Four SORTED positions with sel_bsp_ranks 0..3, each carrying its own
@@ -156,9 +181,9 @@ def test_thinking_picks_lowest_unmasked_rank(
         f"mask={render_mask}: picked rank={picked_rank:+.2f}, "
         f"expected {expected_rank}"
     )
-    assert abs(picked_tex - expected_rank) < 0.3, (
-        f"tex_id should also be {expected_rank}, got {picked_tex:+.2f}"
-    )
+    assert (
+        abs(picked_tex - expected_rank) < 0.3
+    ), f"tex_id should also be {expected_rank}, got {picked_tex:+.2f}"
 
 
 def test_thinking_forwards_col_bounds(thinking_module):

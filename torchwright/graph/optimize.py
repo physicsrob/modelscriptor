@@ -112,8 +112,10 @@ def fuse_consecutive_linears(
 
         if verbose:
             ann = l2.annotation or "(none)"
-            print(f"  {ann}: {d_in}x{d_mid}x{d_out} -> {d_in}x{d_out} "
-                  f"({old_params:,} -> {new_params:,} params)")
+            print(
+                f"  {ann}: {d_in}x{d_mid}x{d_out} -> {d_in}x{d_out} "
+                f"({old_params:,} -> {new_params:,} params)"
+            )
 
         # Mutate L2 in place to become the fused Linear
         # This preserves L2's identity so consumers and output_nodes stay valid

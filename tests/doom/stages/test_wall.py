@@ -19,7 +19,6 @@ from torchwright.reference_renderer.types import RenderConfig, Segment
 
 from torchwright.doom.stages.wall import WallInputs, build_wall
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -31,7 +30,9 @@ _MAX_WALLS = 4
 def _tiny_config() -> RenderConfig:
     # Small screen to keep compile fast; collision doesn't depend on W/H.
     return RenderConfig(
-        screen_width=16, screen_height=16, fov_columns=32,
+        screen_width=16,
+        screen_height=16,
+        fov_columns=32,
         trig_table=generate_trig_table(),
         ceiling_color=(0.2, 0.2, 0.2),
         floor_color=(0.4, 0.4, 0.4),
@@ -72,13 +73,19 @@ def wall_collision_module():
 
     outputs = build_wall(
         WallInputs(
-            wall_ax=wall_ax, wall_ay=wall_ay,
-            wall_bx=wall_bx, wall_by=wall_by,
-            wall_tex_id=wall_tex_id, wall_index=wall_index,
-            player_x=player_x, player_y=player_y,
+            wall_ax=wall_ax,
+            wall_ay=wall_ay,
+            wall_bx=wall_bx,
+            wall_by=wall_by,
+            wall_tex_id=wall_tex_id,
+            wall_index=wall_index,
+            player_x=player_x,
+            player_y=player_y,
             is_wall=is_wall,
-            vel_dx=vel_dx, vel_dy=vel_dy,
-            move_cos=move_cos, move_sin=move_sin,
+            vel_dx=vel_dx,
+            vel_dy=vel_dy,
+            move_cos=move_cos,
+            move_sin=move_sin,
             wall_bsp_coeffs=wall_bsp_coeffs,
             wall_bsp_const=wall_bsp_const,
             side_P_vec=side_P_vec,
@@ -88,14 +95,21 @@ def wall_collision_module():
         max_coord=_MAX_COORD,
         max_bsp_nodes=_MAX_BSP_NODES,
     )
-    out = Concatenate([
-        outputs.collision.hit_full,
-        outputs.collision.hit_x,
-        outputs.collision.hit_y,
-        outputs.is_renderable,
-    ])
+    out = Concatenate(
+        [
+            outputs.collision.hit_full,
+            outputs.collision.hit_x,
+            outputs.collision.hit_y,
+            outputs.is_renderable,
+        ]
+    )
     return compile_headless(
-        out, pos, d=1024, d_head=16, max_layers=50, verbose=False,
+        out,
+        pos,
+        d=1024,
+        d_head=16,
+        max_layers=50,
+        verbose=False,
     )
 
 
@@ -129,13 +143,19 @@ def wall_sort_value_module():
 
     outputs = build_wall(
         WallInputs(
-            wall_ax=wall_ax, wall_ay=wall_ay,
-            wall_bx=wall_bx, wall_by=wall_by,
-            wall_tex_id=wall_tex_id, wall_index=wall_index,
-            player_x=player_x, player_y=player_y,
+            wall_ax=wall_ax,
+            wall_ay=wall_ay,
+            wall_bx=wall_bx,
+            wall_by=wall_by,
+            wall_tex_id=wall_tex_id,
+            wall_index=wall_index,
+            player_x=player_x,
+            player_y=player_y,
             is_wall=is_wall,
-            vel_dx=vel_dx, vel_dy=vel_dy,
-            move_cos=move_cos, move_sin=move_sin,
+            vel_dx=vel_dx,
+            vel_dy=vel_dy,
+            move_cos=move_cos,
+            move_sin=move_sin,
             wall_bsp_coeffs=wall_bsp_coeffs,
             wall_bsp_const=wall_bsp_const,
             side_P_vec=side_P_vec,
@@ -146,7 +166,12 @@ def wall_sort_value_module():
         max_bsp_nodes=_MAX_BSP_NODES,
     )
     return compile_headless(
-        outputs.sort_value, pos, d=1024, d_head=32, max_layers=80, verbose=False,
+        outputs.sort_value,
+        pos,
+        d=1024,
+        d_head=32,
+        max_layers=80,
+        verbose=False,
     )
 
 
@@ -163,8 +188,9 @@ def _pack(module, values: dict) -> torch.Tensor:
     for name, start, width in module._input_specs:
         if name not in values:
             continue
-        row[0, start:start + width] = torch.tensor(
-            values[name], dtype=torch.float32,
+        row[0, start : start + width] = torch.tensor(
+            values[name],
+            dtype=torch.float32,
         ).reshape(width)
     return row
 
@@ -173,93 +199,151 @@ def _pack(module, values: dict) -> torch.Tensor:
 # Collision-flag behavior
 # ---------------------------------------------------------------------------
 
+
 # Velocities must stay within VEL_BP = [-0.7, 0.7] — the compiled graph's
 # domain is per-frame movement (move_speed ≈ 0.3), not arbitrary rays.
-@pytest.mark.parametrize("scenario", [
-    # Wall right in front, within one frame's reach.
-    dict(
-        name="head_on_hit",
-        px=0.0, py=0.0, vel_dx=0.3, vel_dy=0.0,
-        ax=0.2, ay=-1.0, bx=0.2, by=1.0,
-        # t = 0.2/0.3 = 0.67 (hit); u = 0.5 (hit).
-        expect_full=True, expect_x=True, expect_y=False,
-    ),
-    # Wall further than the velocity reaches: miss.
-    dict(
-        name="miss_too_far",
-        px=0.0, py=0.0, vel_dx=0.3, vel_dy=0.0,
-        ax=5.0, ay=-1.0, bx=5.0, by=1.0,
-        expect_full=False, expect_x=False, expect_y=False,
-    ),
-    # Wall segment off to the side: u out of [0,1].
-    dict(
-        name="miss_wall_sideways",
-        px=0.0, py=0.0, vel_dx=0.3, vel_dy=0.0,
-        ax=0.2, ay=3.0, bx=0.2, by=5.0,
-        expect_full=False, expect_x=False, expect_y=False,
-    ),
-    # Diagonal velocity through a vertical wall close in.
-    dict(
-        name="oblique_hit",
-        px=0.0, py=0.0, vel_dx=0.3, vel_dy=0.3,
-        ax=0.15, ay=-1.0, bx=0.15, by=1.0,
-        # den = 0.6; num_t = 0.3; t = 0.5.  num_u = 0.345; u = 0.575 (hit).
-        expect_full=True, expect_x=True, expect_y=False,
-    ),
-    # Moving straight back: shouldn't hit a wall in front.
-    dict(
-        name="backward_no_hit",
-        px=0.0, py=0.0, vel_dx=-0.3, vel_dy=0.0,
-        ax=0.2, ay=-1.0, bx=0.2, by=1.0,
-        expect_full=False, expect_x=False, expect_y=False,
-    ),
-])
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        # Wall right in front, within one frame's reach.
+        dict(
+            name="head_on_hit",
+            px=0.0,
+            py=0.0,
+            vel_dx=0.3,
+            vel_dy=0.0,
+            ax=0.2,
+            ay=-1.0,
+            bx=0.2,
+            by=1.0,
+            # t = 0.2/0.3 = 0.67 (hit); u = 0.5 (hit).
+            expect_full=True,
+            expect_x=True,
+            expect_y=False,
+        ),
+        # Wall further than the velocity reaches: miss.
+        dict(
+            name="miss_too_far",
+            px=0.0,
+            py=0.0,
+            vel_dx=0.3,
+            vel_dy=0.0,
+            ax=5.0,
+            ay=-1.0,
+            bx=5.0,
+            by=1.0,
+            expect_full=False,
+            expect_x=False,
+            expect_y=False,
+        ),
+        # Wall segment off to the side: u out of [0,1].
+        dict(
+            name="miss_wall_sideways",
+            px=0.0,
+            py=0.0,
+            vel_dx=0.3,
+            vel_dy=0.0,
+            ax=0.2,
+            ay=3.0,
+            bx=0.2,
+            by=5.0,
+            expect_full=False,
+            expect_x=False,
+            expect_y=False,
+        ),
+        # Diagonal velocity through a vertical wall close in.
+        dict(
+            name="oblique_hit",
+            px=0.0,
+            py=0.0,
+            vel_dx=0.3,
+            vel_dy=0.3,
+            ax=0.15,
+            ay=-1.0,
+            bx=0.15,
+            by=1.0,
+            # den = 0.6; num_t = 0.3; t = 0.5.  num_u = 0.345; u = 0.575 (hit).
+            expect_full=True,
+            expect_x=True,
+            expect_y=False,
+        ),
+        # Moving straight back: shouldn't hit a wall in front.
+        dict(
+            name="backward_no_hit",
+            px=0.0,
+            py=0.0,
+            vel_dx=-0.3,
+            vel_dy=0.0,
+            ax=0.2,
+            ay=-1.0,
+            bx=0.2,
+            by=1.0,
+            expect_full=False,
+            expect_x=False,
+            expect_y=False,
+        ),
+    ],
+)
 def test_collision_flags_match_reference(wall_collision_module, scenario):
     """Each (hit_full, hit_x, hit_y) flag must agree with reference _ray_hits_segment."""
     seg = Segment(
-        ax=scenario["ax"], ay=scenario["ay"],
-        bx=scenario["bx"], by=scenario["by"],
+        ax=scenario["ax"],
+        ay=scenario["ay"],
+        bx=scenario["bx"],
+        by=scenario["by"],
         color=(1, 0, 0),
     )
     ref_full = _ray_hits_segment(
-        scenario["px"], scenario["py"],
-        scenario["vel_dx"], scenario["vel_dy"], seg,
+        scenario["px"],
+        scenario["py"],
+        scenario["vel_dx"],
+        scenario["vel_dy"],
+        seg,
     )
     ref_x = _ray_hits_segment(
-        scenario["px"], scenario["py"],
-        scenario["vel_dx"], 0.0, seg,
+        scenario["px"],
+        scenario["py"],
+        scenario["vel_dx"],
+        0.0,
+        seg,
     )
     ref_y = _ray_hits_segment(
-        scenario["px"], scenario["py"],
-        0.0, scenario["vel_dy"], seg,
+        scenario["px"],
+        scenario["py"],
+        0.0,
+        scenario["vel_dy"],
+        seg,
     )
     # Sanity: the parametrized "expect_*" flags match the reference.
     assert ref_full == scenario["expect_full"]
     assert ref_x == scenario["expect_x"]
     assert ref_y == scenario["expect_y"]
 
-    inputs = _pack(wall_collision_module, {
-        "is_wall": 1.0,
-        "player_x": scenario["px"], "player_y": scenario["py"],
-        "vel_dx": scenario["vel_dx"], "vel_dy": scenario["vel_dy"],
-        "wall_ax": scenario["ax"], "wall_ay": scenario["ay"],
-        "wall_bx": scenario["bx"], "wall_by": scenario["by"],
-    })
+    inputs = _pack(
+        wall_collision_module,
+        {
+            "is_wall": 1.0,
+            "player_x": scenario["px"],
+            "player_y": scenario["py"],
+            "vel_dx": scenario["vel_dx"],
+            "vel_dy": scenario["vel_dy"],
+            "wall_ax": scenario["ax"],
+            "wall_ay": scenario["ay"],
+            "wall_bx": scenario["bx"],
+            "wall_by": scenario["by"],
+        },
+    )
     with torch.no_grad():
         out = wall_collision_module(inputs)[0]
     hit_full = out[0].item() > 0.0
     hit_x = out[1].item() > 0.0
     hit_y = out[2].item() > 0.0
 
-    assert hit_full == ref_full, (
-        f"{scenario['name']}: hit_full={hit_full} but reference={ref_full}"
-    )
-    assert hit_x == ref_x, (
-        f"{scenario['name']}: hit_x={hit_x} but reference={ref_x}"
-    )
-    assert hit_y == ref_y, (
-        f"{scenario['name']}: hit_y={hit_y} but reference={ref_y}"
-    )
+    assert (
+        hit_full == ref_full
+    ), f"{scenario['name']}: hit_full={hit_full} but reference={ref_full}"
+    assert hit_x == ref_x, f"{scenario['name']}: hit_x={hit_x} but reference={ref_x}"
+    assert hit_y == ref_y, f"{scenario['name']}: hit_y={hit_y} but reference={ref_y}"
 
 
 def test_is_renderable_output(wall_collision_module):
@@ -267,71 +351,107 @@ def test_is_renderable_output(wall_collision_module):
     and -1 at non-WALL token positions.
     """
     # Head-on wall (vertical wall in front, player facing +x).
-    head_on = _pack(wall_collision_module, {
-        "is_wall": 1.0,
-        "player_x": 0.0, "player_y": 0.0,
-        "move_cos": 1.0, "move_sin": 0.0,
-        "vel_dx": 0.0, "vel_dy": 0.0,
-        "wall_ax": 2.0, "wall_ay": -1.0,
-        "wall_bx": 2.0, "wall_by": 1.0,
-        "wall_tex_id": 0.0, "wall_index": 0.0,
-        "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
-        "wall_bsp_const": 0.0,
-        "side_P_vec": [0.0] * _MAX_BSP_NODES,
-    })
+    head_on = _pack(
+        wall_collision_module,
+        {
+            "is_wall": 1.0,
+            "player_x": 0.0,
+            "player_y": 0.0,
+            "move_cos": 1.0,
+            "move_sin": 0.0,
+            "vel_dx": 0.0,
+            "vel_dy": 0.0,
+            "wall_ax": 2.0,
+            "wall_ay": -1.0,
+            "wall_bx": 2.0,
+            "wall_by": 1.0,
+            "wall_tex_id": 0.0,
+            "wall_index": 0.0,
+            "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
+            "wall_bsp_const": 0.0,
+            "side_P_vec": [0.0] * _MAX_BSP_NODES,
+        },
+    )
     with torch.no_grad():
         out = wall_collision_module(head_on)[0]
-    assert out[3].item() > 0.5, f"head-on wall should be renderable, got {out[3].item():+.3f}"
+    assert (
+        out[3].item() > 0.5
+    ), f"head-on wall should be renderable, got {out[3].item():+.3f}"
 
     # Parallel wall (horizontal wall in front, player facing +x).
     # Wall runs along x-axis in front of player; sort_den ≈ 0.
-    parallel = _pack(wall_collision_module, {
-        "is_wall": 1.0,
-        "player_x": 0.0, "player_y": 0.0,
-        "move_cos": 1.0, "move_sin": 0.0,
-        "vel_dx": 0.0, "vel_dy": 0.0,
-        "wall_ax": 2.0, "wall_ay": 2.0,
-        "wall_bx": 4.0, "wall_by": 2.0,
-        "wall_tex_id": 0.0, "wall_index": 0.0,
-        "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
-        "wall_bsp_const": 0.0,
-        "side_P_vec": [0.0] * _MAX_BSP_NODES,
-    })
+    parallel = _pack(
+        wall_collision_module,
+        {
+            "is_wall": 1.0,
+            "player_x": 0.0,
+            "player_y": 0.0,
+            "move_cos": 1.0,
+            "move_sin": 0.0,
+            "vel_dx": 0.0,
+            "vel_dy": 0.0,
+            "wall_ax": 2.0,
+            "wall_ay": 2.0,
+            "wall_bx": 4.0,
+            "wall_by": 2.0,
+            "wall_tex_id": 0.0,
+            "wall_index": 0.0,
+            "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
+            "wall_bsp_const": 0.0,
+            "side_P_vec": [0.0] * _MAX_BSP_NODES,
+        },
+    )
     with torch.no_grad():
         out = wall_collision_module(parallel)[0]
-    assert out[3].item() < -0.5, (
-        f"parallel wall should be non-renderable, got {out[3].item():+.3f}"
-    )
+    assert (
+        out[3].item() < -0.5
+    ), f"parallel wall should be non-renderable, got {out[3].item():+.3f}"
 
     # Non-WALL token position (is_wall=0).
-    non_wall = _pack(wall_collision_module, {
-        "is_wall": 0.0,
-        "player_x": 0.0, "player_y": 0.0,
-        "move_cos": 1.0, "move_sin": 0.0,
-        "vel_dx": 0.0, "vel_dy": 0.0,
-        "wall_ax": 2.0, "wall_ay": -1.0,
-        "wall_bx": 2.0, "wall_by": 1.0,
-        "wall_tex_id": 0.0, "wall_index": 0.0,
-        "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
-        "wall_bsp_const": 0.0,
-        "side_P_vec": [0.0] * _MAX_BSP_NODES,
-    })
+    non_wall = _pack(
+        wall_collision_module,
+        {
+            "is_wall": 0.0,
+            "player_x": 0.0,
+            "player_y": 0.0,
+            "move_cos": 1.0,
+            "move_sin": 0.0,
+            "vel_dx": 0.0,
+            "vel_dy": 0.0,
+            "wall_ax": 2.0,
+            "wall_ay": -1.0,
+            "wall_bx": 2.0,
+            "wall_by": 1.0,
+            "wall_tex_id": 0.0,
+            "wall_index": 0.0,
+            "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
+            "wall_bsp_const": 0.0,
+            "side_P_vec": [0.0] * _MAX_BSP_NODES,
+        },
+    )
     with torch.no_grad():
         out = wall_collision_module(non_wall)[0]
-    assert out[3].item() < -0.5, (
-        f"non-WALL position should be non-renderable, got {out[3].item():+.3f}"
-    )
+    assert (
+        out[3].item() < -0.5
+    ), f"non-WALL position should be non-renderable, got {out[3].item():+.3f}"
 
 
 def test_non_wall_positions_always_miss(wall_collision_module):
     """With is_wall=0, all three hit flags should be gated to -1 (miss)."""
-    inputs = _pack(wall_collision_module, {
-        "is_wall": 0.0,
-        "player_x": 0.0, "player_y": 0.0,
-        "vel_dx": 0.3, "vel_dy": 0.0,
-        "wall_ax": 0.2, "wall_ay": -1.0,
-        "wall_bx": 0.2, "wall_by": 1.0,
-    })
+    inputs = _pack(
+        wall_collision_module,
+        {
+            "is_wall": 0.0,
+            "player_x": 0.0,
+            "player_y": 0.0,
+            "vel_dx": 0.3,
+            "vel_dy": 0.0,
+            "wall_ax": 0.2,
+            "wall_ay": -1.0,
+            "wall_bx": 0.2,
+            "wall_by": 1.0,
+        },
+    )
     with torch.no_grad():
         out = wall_collision_module(inputs)[0]
     for i, name in enumerate(("hit_full", "hit_x", "hit_y")):
@@ -372,18 +492,27 @@ def test_sort_value_north_wall_clean_at_angle_192(wall_sort_value_module):
     # North wall of the synthetic box room: (5, 5) → (-5, 5), wall_index=1.
     # Player at origin; at DOOM angle=192 (facing south, -y direction),
     # cos(270°)=0, sin(270°)=-1.
-    inputs = _pack(wall_sort_value_module, {
-        "is_wall": 1.0,
-        "player_x": 0.0, "player_y": 0.0,
-        "move_cos": 0.0, "move_sin": -1.0,
-        "vel_dx": 0.0, "vel_dy": 0.0,
-        "wall_ax": 5.0, "wall_ay": 5.0,
-        "wall_bx": -5.0, "wall_by": 5.0,
-        "wall_tex_id": 1.0, "wall_index": 1.0,
-        "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
-        "wall_bsp_const": 0.0,
-        "side_P_vec": [0.0] * _MAX_BSP_NODES,
-    })
+    inputs = _pack(
+        wall_sort_value_module,
+        {
+            "is_wall": 1.0,
+            "player_x": 0.0,
+            "player_y": 0.0,
+            "move_cos": 0.0,
+            "move_sin": -1.0,
+            "vel_dx": 0.0,
+            "vel_dy": 0.0,
+            "wall_ax": 5.0,
+            "wall_ay": 5.0,
+            "wall_bx": -5.0,
+            "wall_by": 5.0,
+            "wall_tex_id": 1.0,
+            "wall_index": 1.0,
+            "wall_bsp_coeffs": [0.0] * _MAX_BSP_NODES,
+            "wall_bsp_const": 0.0,
+            "side_P_vec": [0.0] * _MAX_BSP_NODES,
+        },
+    )
     with torch.no_grad():
         out = wall_sort_value_module(inputs)[0]
 

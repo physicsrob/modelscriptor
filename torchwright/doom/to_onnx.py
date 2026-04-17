@@ -34,26 +34,45 @@ def main():
         description="Compile the DOOM v2 game graph and save it to ONNX",
     )
     parser.add_argument("--scene", choices=["box", "multi"], default="box")
-    parser.add_argument("--wad", type=str, default="doom1.wad",
-                        help="Path to doom1.wad for DOOM textures")
-    parser.add_argument("--tex-size", type=int, default=64,
-                        help="Texture resolution (downscaled from WAD)")
+    parser.add_argument(
+        "--wad",
+        type=str,
+        default="doom1.wad",
+        help="Path to doom1.wad for DOOM textures",
+    )
+    parser.add_argument(
+        "--tex-size",
+        type=int,
+        default=64,
+        help="Texture resolution (downscaled from WAD)",
+    )
     parser.add_argument("--width", type=int, default=160)
     parser.add_argument("--height", type=int, default=100)
     parser.add_argument("--fov", type=int, default=32)
-    parser.add_argument("--max-walls", type=int, default=8,
-                        help="Maximum number of wall tokens per frame")
     parser.add_argument(
-        "--chunk-size", type=int, default=20,
+        "--max-walls",
+        type=int,
+        default=8,
+        help="Maximum number of wall tokens per frame",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=20,
         help="Render chunk height (pixels per render token).",
     )
     parser.add_argument(
-        "--d", type=int, default=2048,
+        "--d",
+        type=int,
+        default=2048,
         help="Residual stream width.",
     )
     parser.add_argument("--d-head", type=int, default=32)
     parser.add_argument(
-        "-o", "--output", type=str, default=None,
+        "-o",
+        "--output",
+        type=str,
+        default=None,
         help="Output .onnx path. Default: doom_game_v2_<scene>.onnx",
     )
     args = parser.parse_args()
@@ -72,21 +91,25 @@ def main():
 
     if args.scene == "box":
         segments, textures = box_room_textured(
-            wad_path=args.wad, tex_size=args.tex_size,
+            wad_path=args.wad,
+            tex_size=args.tex_size,
         )
         max_coord = 10.0
     else:
         segments, textures = multi_room_textured(
-            wad_path=args.wad, tex_size=args.tex_size,
+            wad_path=args.wad,
+            tex_size=args.tex_size,
         )
         max_coord = 15.0
 
     print(f"Building game graph (d={args.d}, max_walls={args.max_walls})...")
     graph_io, pos_encoding = build_game_graph(
-        config, textures,
+        config,
+        textures,
         max_walls=args.max_walls,
         max_coord=max_coord,
-        move_speed=0.3, turn_speed=4,
+        move_speed=0.3,
+        turn_speed=4,
         chunk_size=args.chunk_size,
     )
     output_node = graph_io.concat_output()

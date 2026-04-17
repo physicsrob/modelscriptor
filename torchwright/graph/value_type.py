@@ -17,7 +17,6 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Optional, Union
 
-
 _INF = math.inf
 
 

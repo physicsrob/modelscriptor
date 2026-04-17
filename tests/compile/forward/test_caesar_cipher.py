@@ -79,9 +79,9 @@ def test_caesar_cipher():
     ]
     for shift, plaintext, expected in test_cases:
         # Verify reference matches expected
-        assert _caesar(plaintext, int(shift)) == expected, (
-            f"Reference mismatch for shift={shift}, text={plaintext}"
-        )
+        assert (
+            _caesar(plaintext, int(shift)) == expected
+        ), f"Reference mismatch for shift={shift}, text={plaintext}"
         tokens = ["<bos>", shift] + list(plaintext) + ["\n"]
         result = run_autoregressive(net, output_node, embedding, tokens)
         assert result == expected, (

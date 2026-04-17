@@ -53,4 +53,6 @@ def pytest_sessionfinish(session, exitstatus):
     if torch.cuda.is_available():
         peak = torch.cuda.max_memory_allocated() / 2**30
         reserved = torch.cuda.max_memory_reserved() / 2**30
-        print(f"\n[gpu] peak allocated: {peak:.2f} GiB, peak reserved: {reserved:.2f} GiB")
+        print(
+            f"\n[gpu] peak allocated: {peak:.2f} GiB, peak reserved: {reserved:.2f} GiB"
+        )

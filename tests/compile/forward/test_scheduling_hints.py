@@ -19,7 +19,10 @@ from torchwright.ops.inout_nodes import create_input
 
 def _linear(inp, d_out, name=""):
     return Linear(
-        inp, torch.zeros(len(inp), d_out), torch.zeros(d_out), name=name,
+        inp,
+        torch.zeros(len(inp), d_out),
+        torch.zeros(d_out),
+        name=name,
     )
 
 
@@ -103,8 +106,7 @@ def test_sequential_scope_finds_deep_entry_nodes():
     # should carry a scheduling dep on terminals[0].
     graph = GraphAnalyzer(Concatenate(terminals))
     entries = [
-        n for n in graph.get_all_nodes()
-        if terminals[0] in n.scheduling_predecessors
+        n for n in graph.get_all_nodes() if terminals[0] in n.scheduling_predecessors
     ]
     # Exactly one entry per iteration (the first Linear in the chain).
     assert len(entries) == 1
@@ -126,8 +128,11 @@ def test_sequential_scope_does_not_deadlock_compile():
     out = Concatenate(rows)
 
     net = forward_compile(
-        d=64, d_head=16, output_node=out,
-        verbose=False, device=None,
+        d=64,
+        d_head=16,
+        output_node=out,
+        verbose=False,
+        device=None,
     )
     assert len(net.layers) > 0
 

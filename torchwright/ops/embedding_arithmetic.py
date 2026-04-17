@@ -24,7 +24,6 @@ from torchwright.ops.arithmetic_ops import concat, compare, sum_nodes
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.map_select import map_to_table, select
 
-
 # ---------------------------------------------------------------------------
 # Addition
 # ---------------------------------------------------------------------------

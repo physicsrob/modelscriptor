@@ -154,7 +154,7 @@ def _wall_height_lookup(
     #    the reciprocal across the whole range.
     n_bp = 48
     ratio = (max_dist / min_dist) ** (1.0 / (n_bp - 1))
-    bps: List[float] = [min_dist * (ratio ** k) for k in range(n_bp)]
+    bps: List[float] = [min_dist * (ratio**k) for k in range(n_bp)]
     bps[0] = min_dist
     bps[-1] = max_dist
     inv_perp_dist = piecewise_linear(
@@ -745,7 +745,9 @@ def _textured_column_fill(
 
     # --- Base (non-wall) column: floor below wall_bottom, ceiling above ---
     with annotate("base"):
-        ceil_node = LiteralValue(torch.tensor(list(config.ceiling_color)), name="ceiling")
+        ceil_node = LiteralValue(
+            torch.tensor(list(config.ceiling_color)), name="ceiling"
+        )
         floor_node = LiteralValue(torch.tensor(list(config.floor_color)), name="floor")
         wall_top_local = subtract(wall_top, patch_row_start)
         wall_bottom_local = subtract(wall_bottom, patch_row_start)
@@ -757,7 +759,11 @@ def _textured_column_fill(
         )
         floor_masks = in_range(wall_bottom_local, h_local, rows_per_patch)
         base = broadcast_select(
-            floor_masks, floor_node, ceil_node, rows_per_patch, 3,
+            floor_masks,
+            floor_node,
+            ceil_node,
+            rows_per_patch,
+            3,
         )
 
     # --- Textured wall: per-screen-row texture sampling ---
@@ -782,7 +788,9 @@ def _textured_column_fill(
     range_ = subtract(wall_bottom, wall_top)
     clamped_range = clamp(range_, min_wall_height, max_wall_height)
     inv_range = reciprocal(
-        clamped_range, min_value=min_wall_height, max_value=max_wall_height,
+        clamped_range,
+        min_value=min_wall_height,
+        max_value=max_wall_height,
     )
     per_row_step = multiply_const(inv_range, float(tex_height))
 
@@ -810,11 +818,16 @@ def _textured_column_fill(
             )
             clamped_bin_f = clamp(bin_f, 0.0, float(tex_height) - 0.5)
             tex_row_idx = floor_int(
-                clamped_bin_f, min_value=0, max_value=tex_height - 1,
+                clamped_bin_f,
+                min_value=0,
+                max_value=tex_height - 1,
                 sharpness=100,
             )
             row_rgb = dynamic_extract(
-                tex_column_colors, tex_row_idx, tex_height, 3,
+                tex_column_colors,
+                tex_row_idx,
+                tex_height,
+                3,
             )
             return row_rgb
 
@@ -825,8 +838,7 @@ def _textured_column_fill(
     # deps so at most ``tex_sample_batch_size`` rows are in flight at
     # once, keeping peak residual usage within budget.
     row_rgbs: List[Node] = sequential_scope(
-        [lambda y_idx=y_idx: _build_tex_row(y_idx)
-         for y_idx in range(rows_per_patch)],
+        [lambda y_idx=y_idx: _build_tex_row(y_idx) for y_idx in range(rows_per_patch)],
         batch_size=tex_sample_batch_size,
     )
 
@@ -836,7 +848,11 @@ def _textured_column_fill(
     with annotate("composite"):
         wall_masks = in_range(wall_top_local, wall_bottom_local, rows_per_patch)
         return broadcast_select(
-            wall_masks, textured_wall, base, rows_per_patch, 3,
+            wall_masks,
+            textured_wall,
+            base,
+            rows_per_patch,
+            3,
         )
 
 

@@ -60,9 +60,13 @@ def test_compile_with_small_d_hidden():
     )
 
     module = compile_headless(
-        out_node, pos,
-        d=32, d_head=8, d_hidden=8,
-        device="cpu", verbose=False,
+        out_node,
+        pos,
+        d=32,
+        d_head=8,
+        d_hidden=8,
+        device="cpu",
+        verbose=False,
     )
 
     assert module._net.d == 32
@@ -76,9 +80,9 @@ def test_compile_with_small_d_hidden():
     x = torch.tensor([[0.5, -1.0, 2.0, 0.25]])
     expected = out_node.compute(n_pos=1, input_values={"x": x})
     actual = module(x)
-    assert torch.allclose(actual, expected, atol=1e-3), (
-        f"max diff: {(actual - expected).abs().max().item():.6f}"
-    )
+    assert torch.allclose(
+        actual, expected, atol=1e-3
+    ), f"max diff: {(actual - expected).abs().max().item():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -97,9 +101,13 @@ def test_compile_with_d_hidden_larger_than_d():
     # d=32 is smaller than the chain's hidden width (48) — impossible
     # before the decoupling (the scheduler's pool was ``self.d``).
     module = compile_headless(
-        out_node, pos,
-        d=32, d_head=8, d_hidden=64,
-        device="cpu", verbose=False,
+        out_node,
+        pos,
+        d=32,
+        d_head=8,
+        d_hidden=64,
+        device="cpu",
+        verbose=False,
     )
 
     assert module._net.d == 32
@@ -111,9 +119,9 @@ def test_compile_with_d_hidden_larger_than_d():
     x = torch.tensor([[0.5, -1.0, 2.0, 0.25]])
     expected = out_node.compute(n_pos=1, input_values={"x": x})
     actual = module(x)
-    assert torch.allclose(actual, expected, atol=1e-3), (
-        f"max diff: {(actual - expected).abs().max().item():.6f}"
-    )
+    assert torch.allclose(
+        actual, expected, atol=1e-3
+    ), f"max diff: {(actual - expected).abs().max().item():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -122,19 +130,24 @@ def test_compile_with_d_hidden_larger_than_d():
 
 
 def test_compile_default_d_hidden_equals_d():
-    out_node, pos, _ = _build_relu_chain_graph(
-        d_input=4, d_hidden_chain=4, d_output=2
-    )
+    out_node, pos, _ = _build_relu_chain_graph(d_input=4, d_hidden_chain=4, d_output=2)
 
     net_default = forward_compile(
-        d=32, d_head=8,
-        output_node=out_node, pos_encoding=pos,
-        device="cpu", verbose=False,
+        d=32,
+        d_head=8,
+        output_node=out_node,
+        pos_encoding=pos,
+        device="cpu",
+        verbose=False,
     )
     net_explicit = forward_compile(
-        d=32, d_head=8, d_hidden=32,
-        output_node=out_node, pos_encoding=pos,
-        device="cpu", verbose=False,
+        d=32,
+        d_head=8,
+        d_hidden=32,
+        output_node=out_node,
+        pos_encoding=pos,
+        device="cpu",
+        verbose=False,
     )
 
     assert net_default.d_hidden == net_default.d == 32

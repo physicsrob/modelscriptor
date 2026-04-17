@@ -13,10 +13,16 @@ from torchwright.reference_renderer.scenes import box_room
 
 def main():
     parser = argparse.ArgumentParser(description="Render the box room to a PNG file.")
-    parser.add_argument("output", nargs="?", default="box_room.png", help="Output PNG path")
+    parser.add_argument(
+        "output", nargs="?", default="box_room.png", help="Output PNG path"
+    )
     parser.add_argument("--width", type=int, default=320, help="Screen width in pixels")
-    parser.add_argument("--height", type=int, default=200, help="Screen height in pixels")
-    parser.add_argument("--fov", type=int, default=64, help="FOV in angle indices (64 ≈ 90°)")
+    parser.add_argument(
+        "--height", type=int, default=200, help="Screen height in pixels"
+    )
+    parser.add_argument(
+        "--fov", type=int, default=64, help="FOV in angle indices (64 ≈ 90°)"
+    )
     parser.add_argument("--angle", type=int, default=0, help="Player angle (0-255)")
     args = parser.parse_args()
 

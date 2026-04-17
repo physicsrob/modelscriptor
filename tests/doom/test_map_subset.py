@@ -22,10 +22,10 @@ from torchwright.doom.map_subset import (
 )
 from torchwright.doom.wad import WADReader
 from torchwright.reference_renderer.scenes import (
-    box_room_textured, multi_room_textured,
+    box_room_textured,
+    multi_room_textured,
 )
 from torchwright.reference_renderer.types import Segment
-
 
 # E1M1's canonical player spawn (Doomguy, THING type 1).  We don't
 # parse THINGS yet, but this is the well-known coordinate.
@@ -41,9 +41,13 @@ E1M1_START = (1056.0, -3616.0)
 def subset_default() -> MapSubset:
     """Default subset at E1M1's start position."""
     return load_map_subset(
-        "doom1.wad", "E1M1",
-        px=E1M1_START[0], py=E1M1_START[1],
-        max_walls=32, max_textures=8, max_bsp_nodes=64,
+        "doom1.wad",
+        "E1M1",
+        px=E1M1_START[0],
+        py=E1M1_START[1],
+        max_walls=32,
+        max_textures=8,
+        max_bsp_nodes=64,
     )
 
 
@@ -68,9 +72,12 @@ def test_loads_nonempty_subset(subset_default: MapSubset) -> None:
 def test_subset_respects_max_walls() -> None:
     for n in (4, 8, 16, 32):
         s = load_map_subset(
-            "doom1.wad", "E1M1",
-            px=E1M1_START[0], py=E1M1_START[1],
-            max_walls=n, max_bsp_nodes=64,
+            "doom1.wad",
+            "E1M1",
+            px=E1M1_START[0],
+            py=E1M1_START[1],
+            max_walls=n,
+            max_bsp_nodes=64,
         )
         assert len(s.segments) <= n
         assert s.seg_bsp_coeffs.shape[0] == len(s.segments)
@@ -78,9 +85,12 @@ def test_subset_respects_max_walls() -> None:
 
 def test_coeffs_shape_matches_max_bsp_nodes() -> None:
     s = load_map_subset(
-        "doom1.wad", "E1M1",
-        px=E1M1_START[0], py=E1M1_START[1],
-        max_walls=16, max_bsp_nodes=64,
+        "doom1.wad",
+        "E1M1",
+        px=E1M1_START[0],
+        py=E1M1_START[1],
+        max_walls=16,
+        max_bsp_nodes=64,
     )
     assert s.seg_bsp_coeffs.shape[1] == 64
     # Number of real BSP nodes ≤ max_bsp_nodes
@@ -90,9 +100,12 @@ def test_coeffs_shape_matches_max_bsp_nodes() -> None:
 def test_too_small_max_bsp_nodes_raises() -> None:
     with pytest.raises(ValueError, match="BSP subtree"):
         load_map_subset(
-            "doom1.wad", "E1M1",
-            px=E1M1_START[0], py=E1M1_START[1],
-            max_walls=32, max_bsp_nodes=2,  # impossibly small
+            "doom1.wad",
+            "E1M1",
+            px=E1M1_START[0],
+            py=E1M1_START[1],
+            max_walls=32,
+            max_bsp_nodes=2,  # impossibly small
         )
 
 
@@ -104,9 +117,12 @@ def test_too_small_max_bsp_nodes_raises() -> None:
 def test_selected_segs_are_closest(raw_e1m1) -> None:
     """Returned segs are a subset of the closest segs by midpoint distance."""
     s = load_map_subset(
-        "doom1.wad", "E1M1",
-        px=E1M1_START[0], py=E1M1_START[1],
-        max_walls=8, max_bsp_nodes=64,
+        "doom1.wad",
+        "E1M1",
+        px=E1M1_START[0],
+        py=E1M1_START[1],
+        max_walls=8,
+        max_bsp_nodes=64,
     )
     # Compute distance to each selected seg's midpoint
     selected_dists = []
@@ -157,9 +173,9 @@ def test_coefficients_match_bsp_nodes_length(subset_default: MapSubset) -> None:
     BSP nodes; padding columns are exact zeros."""
     real_count = len(subset_default.bsp_nodes)
     padding = subset_default.seg_bsp_coeffs[:, real_count:]
-    assert np.all(padding == 0.0), (
-        "padding columns should be zero so they contribute nothing to rank"
-    )
+    assert np.all(
+        padding == 0.0
+    ), "padding columns should be zero so they contribute nothing to rank"
 
 
 def test_coefficients_sparse(subset_default: MapSubset) -> None:
@@ -182,6 +198,7 @@ def test_plane_passes_through_node_point(raw_e1m1) -> None:
     """For each BSP node, the (nx, ny, d) plane passes through DOOM's
     original (px, py) — a sanity check on the encoding."""
     from torchwright.doom.map_subset import _make_plane
+
     for node in raw_e1m1.nodes:
         plane = _make_plane(node)
         raw = plane.nx * node.px + plane.ny * node.py + plane.d
@@ -197,6 +214,7 @@ def test_plane_sign_matches_doom_side_classification(raw_e1m1) -> None:
         dx_node * (y - py_node) < dy_node * (x - px_node)
     """
     from torchwright.doom.map_subset import _make_plane
+
     rng = np.random.default_rng(0)
     # Test a handful of nodes at a few points each
     for node in raw_e1m1.nodes[:20]:
@@ -205,9 +223,7 @@ def test_plane_sign_matches_doom_side_classification(raw_e1m1) -> None:
             x = rng.uniform(-5000, 5000)
             y = rng.uniform(-5000, 5000)
             ours = side_P(plane, x, y)  # 1 = front
-            doom_front = (
-                node.dx * (y - node.py) < node.dy * (x - node.px)
-            )
+            doom_front = node.dx * (y - node.py) < node.dy * (x - node.px)
             assert bool(ours) == bool(doom_front), (
                 f"node (px={node.px},py={node.py},dx={node.dx},dy={node.dy}) "
                 f"at point ({x}, {y}): ours={ours}, doom_front={doom_front}"
@@ -240,7 +256,8 @@ def _rank_order(subset: MapSubset, px: float, py: float) -> List[int]:
 
 
 def test_rank_formula_matches_bsp_traversal(
-    subset_default: MapSubset, raw_e1m1,
+    subset_default: MapSubset,
+    raw_e1m1,
 ) -> None:
     """Sort selected segs by rank; must equal filtered BSP traversal.
 
@@ -248,12 +265,15 @@ def test_rank_formula_matches_bsp_traversal(
     """
     selected_set = set(subset_default.original_seg_indices)
     reference = bsp_traversal_order(
-        raw_e1m1, E1M1_START[0], E1M1_START[1], selected_set,
+        raw_e1m1,
+        E1M1_START[0],
+        E1M1_START[1],
+        selected_set,
     )
     computed = _rank_order(subset_default, E1M1_START[0], E1M1_START[1])
-    assert computed == reference, (
-        f"\nrank-sorted segs: {computed}\nBSP traversal:    {reference}"
-    )
+    assert (
+        computed == reference
+    ), f"\nrank-sorted segs: {computed}\nBSP traversal:    {reference}"
 
 
 def test_rank_formula_at_multiple_positions(raw_e1m1) -> None:
@@ -267,11 +287,14 @@ def test_rank_formula_at_multiple_positions(raw_e1m1) -> None:
         (1500.0, -3300.0),
         (2000.0, -3000.0),
     ]
-    for (px, py) in test_positions:
+    for px, py in test_positions:
         subset = load_map_subset(
-            "doom1.wad", "E1M1",
-            px=px, py=py,
-            max_walls=16, max_bsp_nodes=64,
+            "doom1.wad",
+            "E1M1",
+            px=px,
+            py=py,
+            max_walls=16,
+            max_bsp_nodes=64,
         )
         selected_set = set(subset.original_seg_indices)
         reference = bsp_traversal_order(raw_e1m1, px, py, selected_set)
@@ -290,14 +313,20 @@ def test_rank_orders_differ_between_positions(raw_e1m1) -> None:
     tests the full pipeline, not just the rank computation.
     """
     subset_a = load_map_subset(
-        "doom1.wad", "E1M1",
-        px=1000.0, py=-3500.0,
-        max_walls=8, max_bsp_nodes=64,
+        "doom1.wad",
+        "E1M1",
+        px=1000.0,
+        py=-3500.0,
+        max_walls=8,
+        max_bsp_nodes=64,
     )
     subset_b = load_map_subset(
-        "doom1.wad", "E1M1",
-        px=3000.0, py=-3000.0,
-        max_walls=8, max_bsp_nodes=64,
+        "doom1.wad",
+        "E1M1",
+        px=3000.0,
+        py=-3000.0,
+        max_walls=8,
+        max_bsp_nodes=64,
     )
     order_a = _rank_order(subset_a, 1000.0, -3500.0)
     order_b = _rank_order(subset_b, 3000.0, -3000.0)
@@ -318,9 +347,14 @@ def test_textures_capped(subset_default: MapSubset) -> None:
 
 def test_texture_shape() -> None:
     s = load_map_subset(
-        "doom1.wad", "E1M1",
-        px=E1M1_START[0], py=E1M1_START[1],
-        max_walls=32, max_textures=4, tex_size=16, max_bsp_nodes=64,
+        "doom1.wad",
+        "E1M1",
+        px=E1M1_START[0],
+        py=E1M1_START[1],
+        max_walls=32,
+        max_textures=4,
+        tex_size=16,
+        max_bsp_nodes=64,
     )
     assert len(s.textures) <= 4
     for tex in s.textures:
@@ -348,36 +382,52 @@ def _synthetic_box_mapdata():
     This is useful for direct manual verification of rank values.
     """
     from torchwright.doom.wad import (
-        BspNode, Linedef, MapData, Seg, Sector, Sidedef, Subsector, Vertex,
+        BspNode,
+        Linedef,
+        MapData,
+        Seg,
+        Sector,
+        Sidedef,
+        Subsector,
+        Vertex,
     )
+
     vertices = [
-        Vertex(10, -10), Vertex(10, 10),     # east wall
-        Vertex(-10, 10), Vertex(-10, -10),   # west wall
+        Vertex(10, -10),
+        Vertex(10, 10),  # east wall
+        Vertex(-10, 10),
+        Vertex(-10, -10),  # west wall
     ]
     sectors = [
-        Sector(floor_h=0, ceiling_h=128,
-               floor_tex="FLAT", ceiling_tex="FLAT",
-               light=255, special=0, tag=0),
+        Sector(
+            floor_h=0,
+            ceiling_h=128,
+            floor_tex="FLAT",
+            ceiling_tex="FLAT",
+            light=255,
+            special=0,
+            tag=0,
+        ),
     ]
     sidedefs = [
-        Sidedef(x_offset=0, y_offset=0, upper="-", lower="-",
-                middle="WALL0", sector=0),
-        Sidedef(x_offset=0, y_offset=0, upper="-", lower="-",
-                middle="WALL1", sector=0),
-        Sidedef(x_offset=0, y_offset=0, upper="-", lower="-",
-                middle="WALL2", sector=0),
-        Sidedef(x_offset=0, y_offset=0, upper="-", lower="-",
-                middle="WALL3", sector=0),
+        Sidedef(x_offset=0, y_offset=0, upper="-", lower="-", middle="WALL0", sector=0),
+        Sidedef(x_offset=0, y_offset=0, upper="-", lower="-", middle="WALL1", sector=0),
+        Sidedef(x_offset=0, y_offset=0, upper="-", lower="-", middle="WALL2", sector=0),
+        Sidedef(x_offset=0, y_offset=0, upper="-", lower="-", middle="WALL3", sector=0),
     ]
     linedefs = [
-        Linedef(v1=0, v2=1, flags=0, special=0, tag=0,
-                front_sidedef=0, back_sidedef=-1),  # east
-        Linedef(v1=1, v2=2, flags=0, special=0, tag=0,
-                front_sidedef=1, back_sidedef=-1),  # north
-        Linedef(v1=2, v2=3, flags=0, special=0, tag=0,
-                front_sidedef=2, back_sidedef=-1),  # west
-        Linedef(v1=3, v2=0, flags=0, special=0, tag=0,
-                front_sidedef=3, back_sidedef=-1),  # south
+        Linedef(
+            v1=0, v2=1, flags=0, special=0, tag=0, front_sidedef=0, back_sidedef=-1
+        ),  # east
+        Linedef(
+            v1=1, v2=2, flags=0, special=0, tag=0, front_sidedef=1, back_sidedef=-1
+        ),  # north
+        Linedef(
+            v1=2, v2=3, flags=0, special=0, tag=0, front_sidedef=2, back_sidedef=-1
+        ),  # west
+        Linedef(
+            v1=3, v2=0, flags=0, special=0, tag=0, front_sidedef=3, back_sidedef=-1
+        ),  # south
     ]
     # Four segs, one per wall
     segs = [
@@ -425,29 +475,47 @@ def _synthetic_box_mapdata():
     #   nw_se: front = ss 2 (west wall, y<0), back = ss 1 (north wall, y>0)
 
     from torchwright.doom.wad import SUBSECTOR_FLAG
+
     ne_sw = BspNode(
-        px=0, py=0, dx=1, dy=0,
-        front_bbox=(0, -10, 0, 10), back_bbox=(10, 0, 0, 10),
-        front_child=SUBSECTOR_FLAG | 3,   # ss 3 (south)
-        back_child=SUBSECTOR_FLAG | 0,    # ss 0 (east, NE)
+        px=0,
+        py=0,
+        dx=1,
+        dy=0,
+        front_bbox=(0, -10, 0, 10),
+        back_bbox=(10, 0, 0, 10),
+        front_child=SUBSECTOR_FLAG | 3,  # ss 3 (south)
+        back_child=SUBSECTOR_FLAG | 0,  # ss 0 (east, NE)
     )
     nw_se = BspNode(
-        px=0, py=0, dx=1, dy=0,
-        front_bbox=(0, -10, -10, 0), back_bbox=(10, 0, -10, 0),
-        front_child=SUBSECTOR_FLAG | 2,   # ss 2 (west)
-        back_child=SUBSECTOR_FLAG | 1,    # ss 1 (north)
+        px=0,
+        py=0,
+        dx=1,
+        dy=0,
+        front_bbox=(0, -10, -10, 0),
+        back_bbox=(10, 0, -10, 0),
+        front_child=SUBSECTOR_FLAG | 2,  # ss 2 (west)
+        back_child=SUBSECTOR_FLAG | 1,  # ss 1 (north)
     )
     root = BspNode(
-        px=0, py=0, dx=0, dy=1,
-        front_bbox=(10, -10, 0, 10), back_bbox=(10, -10, -10, 0),
-        front_child=0,   # ne_sw
-        back_child=1,    # nw_se
+        px=0,
+        py=0,
+        dx=0,
+        dy=1,
+        front_bbox=(10, -10, 0, 10),
+        back_bbox=(10, -10, -10, 0),
+        front_child=0,  # ne_sw
+        back_child=1,  # nw_se
     )
     nodes = [ne_sw, nw_se, root]
     return MapData(
         name="SYNTH",
-        vertices=vertices, linedefs=linedefs, sidedefs=sidedefs,
-        sectors=sectors, segs=segs, subsectors=subsectors, nodes=nodes,
+        vertices=vertices,
+        linedefs=linedefs,
+        sidedefs=sidedefs,
+        sectors=sectors,
+        segs=segs,
+        subsectors=subsectors,
+        nodes=nodes,
     )
 
 
@@ -476,33 +544,44 @@ def test_synthetic_box_rank_matches_traversal() -> None:
     # The load_map_subset API needs a WAD path; test the core math
     # directly using the building blocks.
     from torchwright.doom.map_subset import (
-        _make_plane, _walk_paths, _count_selected_in_subtree,
-        _compute_coefficients, _build_seg_to_subsector,
+        _make_plane,
+        _walk_paths,
+        _count_selected_in_subtree,
+        _compute_coefficients,
+        _build_seg_to_subsector,
     )
 
     md = _synthetic_box_mapdata()
-    selected_orig = [0, 1, 2, 3]   # all four segs
+    selected_orig = [0, 1, 2, 3]  # all four segs
     selected_set = set(selected_orig)
     seg_to_ss = _build_seg_to_subsector(md)
     paths = _walk_paths(md, len(md.nodes) - 1)
 
     subset_node_ids: Set[int] = set()
     for ss in {seg_to_ss[s] for s in selected_orig}:
-        for (n, _) in paths[ss]:
+        for n, _ in paths[ss]:
             subset_node_ids.add(n)
     sorted_old = sorted(subset_node_ids)
     old_to_new = {old: new for new, old in enumerate(sorted_old)}
     bsp_nodes = [_make_plane(md.nodes[o]) for o in sorted_old]
 
     _ss, fc, bc = _count_selected_in_subtree(
-        md, selected_set, len(md.nodes) - 1,
+        md,
+        selected_set,
+        len(md.nodes) - 1,
     )
     coeffs, consts = _compute_coefficients(
-        md, selected_orig, seg_to_ss, paths, fc, bc, old_to_new,
+        md,
+        selected_orig,
+        seg_to_ss,
+        paths,
+        fc,
+        bc,
+        old_to_new,
         max_bsp_nodes=len(sorted_old),
     )
 
-    for (px, py) in [(5, 5), (-5, -5), (7, -3), (-2, 4)]:
+    for px, py in [(5, 5), (-5, -5), (7, -3), (-2, 4)]:
         reference = bsp_traversal_order(md, px, py, selected_set)
         side_P_vec = np.array(
             [float(side_P(p, px, py)) for p in bsp_nodes]
@@ -514,8 +593,7 @@ def test_synthetic_box_rank_matches_traversal() -> None:
         order = np.lexsort((seg_idx_arr, ranks))
         computed = [selected_orig[i] for i in order]
         assert computed == reference, (
-            f"at ({px}, {py}): got {computed}, expected {reference}\n"
-            f"ranks: {ranks}"
+            f"at ({px}, {py}): got {computed}, expected {reference}\n" f"ranks: {ranks}"
         )
 
 
@@ -564,7 +642,8 @@ def _rank_order_scene(subset: MapSubset, px: float, py: float) -> List[int]:
 def test_build_scene_subset_nonempty() -> None:
     """box_room scene builds a non-empty subset with real BSP nodes."""
     segments, textures = box_room_textured(
-        wad_path="doom1.wad", tex_size=8,
+        wad_path="doom1.wad",
+        tex_size=8,
     )
     subset = build_scene_subset(segments, textures)
     assert len(subset.segments) == len(segments)
@@ -576,7 +655,8 @@ def test_build_scene_subset_coeffs_shape() -> None:
     """Coefficient matrix has shape (N, max_bsp_nodes); exactly N-1
     columns contain nonzero entries; the rest are pure zero padding."""
     segments, textures = box_room_textured(
-        wad_path="doom1.wad", tex_size=8,
+        wad_path="doom1.wad",
+        tex_size=8,
     )
     subset = build_scene_subset(segments, textures, max_bsp_nodes=16)
     N = len(segments)
@@ -596,30 +676,32 @@ def test_build_scene_subset_rank_matches_python_traversal() -> None:
     that a straightforward front-to-back BSP walk would produce.
     """
     segments, textures = box_room_textured(
-        wad_path="doom1.wad", tex_size=8,
+        wad_path="doom1.wad",
+        tex_size=8,
     )
     subset = build_scene_subset(segments, textures, max_bsp_nodes=16)
     # Rebuild the tree with the same construction logic for reference.
     tree = _build_balanced_bsp(list(range(len(segments))), segments, depth=0)
 
     test_positions = [
-        (0.0, 0.0),     # center
-        (3.0, 2.0),     # off-center
-        (-2.5, 4.0),    # another quadrant
-        (4.9, -4.9),    # near a corner
+        (0.0, 0.0),  # center
+        (3.0, 2.0),  # off-center
+        (-2.5, 4.0),  # another quadrant
+        (4.9, -4.9),  # near a corner
     ]
-    for (px, py) in test_positions:
+    for px, py in test_positions:
         reference = _traverse_scene_tree(tree, px, py)
         computed = _rank_order_scene(subset, px, py)
-        assert computed == reference, (
-            f"at ({px}, {py}): rank order {computed} != tree DFS {reference}"
-        )
+        assert (
+            computed == reference
+        ), f"at ({px}, {py}): rank order {computed} != tree DFS {reference}"
 
 
 def test_build_scene_subset_multi_room() -> None:
     """22-seg multi_room scene: 21 BSP nodes, rank well-defined."""
     segments, textures = multi_room_textured(
-        wad_path="doom1.wad", tex_size=8,
+        wad_path="doom1.wad",
+        tex_size=8,
     )
     assert len(segments) == 22
     subset = build_scene_subset(segments, textures, max_bsp_nodes=48)
@@ -629,7 +711,7 @@ def test_build_scene_subset_multi_room() -> None:
     # Sample positions in each room; rank produces a permutation of
     # 0..N-1.  (A valid traversal visits each seg exactly once.)
     tree = _build_balanced_bsp(list(range(len(segments))), segments, depth=0)
-    for (px, py) in [(-8.0, 0.0), (8.0, 0.0), (0.0, 0.0)]:
+    for px, py in [(-8.0, 0.0), (8.0, 0.0), (0.0, 0.0)]:
         computed = _rank_order_scene(subset, px, py)
         reference = _traverse_scene_tree(tree, px, py)
         assert computed == reference, f"at ({px},{py}): {computed} != {reference}"
@@ -638,8 +720,7 @@ def test_build_scene_subset_multi_room() -> None:
 
 def test_build_scene_subset_single_seg() -> None:
     """N=1 edge case: no BSP nodes, zero coefficients, trivial rank."""
-    segments = [Segment(ax=0, ay=0, bx=1, by=0,
-                        color=(0.5, 0.5, 0.5), texture_id=0)]
+    segments = [Segment(ax=0, ay=0, bx=1, by=0, color=(0.5, 0.5, 0.5), texture_id=0)]
     textures = [np.zeros((8, 8, 3), dtype=np.float64)]
     subset = build_scene_subset(segments, textures, max_bsp_nodes=16)
     assert len(subset.bsp_nodes) == 0
@@ -652,8 +733,7 @@ def test_build_scene_subset_too_many_segs_raises() -> None:
     """N > max_bsp_nodes + 1 is rejected with a helpful ValueError."""
     # 8 segs would need 7 nodes; max_bsp_nodes=4 is too small.
     segments = [
-        Segment(ax=i, ay=0, bx=i + 1, by=0,
-                color=(0.5, 0.5, 0.5), texture_id=0)
+        Segment(ax=i, ay=0, bx=i + 1, by=0, color=(0.5, 0.5, 0.5), texture_id=0)
         for i in range(8)
     ]
     textures: List[np.ndarray] = []

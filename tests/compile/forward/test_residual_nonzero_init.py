@@ -15,7 +15,9 @@ from torchwright.ops.arithmetic_ops import add, add_const, multiply_const, relu_
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
 
-def _patch_noisy_init(monkeypatch, noise_seed: int = 42, scale: float = 0.3, bias: float = 0.2):
+def _patch_noisy_init(
+    monkeypatch, noise_seed: int = 42, scale: float = 0.3, bias: float = 0.2
+):
     """Replace HeadlessTransformer.get_input_res_stream with a version that
     starts with *noise* in every residual column that is not explicitly
     overwritten by an input / literal / pos / embedding assignment.
@@ -34,10 +36,17 @@ def _patch_noisy_init(monkeypatch, noise_seed: int = 42, scale: float = 0.3, bia
             assigned_cols.update(int(i) for i in indices)
         unused = [c for c in range(self.d) if c not in assigned_cols]
         g = torch.Generator(device=res_stream.device).manual_seed(noise_seed)
-        noise = torch.randn(
-            res_stream.shape[0], len(unused),
-            generator=g, device=res_stream.device, dtype=res_stream.dtype,
-        ) * scale + bias
+        noise = (
+            torch.randn(
+                res_stream.shape[0],
+                len(unused),
+                generator=g,
+                device=res_stream.device,
+                dtype=res_stream.dtype,
+            )
+            * scale
+            + bias
+        )
         res_stream[:, unused] = noise
         return res_stream
 
@@ -70,9 +79,9 @@ def test_nonzero_init_intermediate_col(monkeypatch):
 
     clean, noisy = _run_clean_and_noisy(module, inp, monkeypatch)
     assert torch.allclose(clean, expected, atol=0.1)
-    assert torch.allclose(noisy, expected, atol=0.1), (
-        f"noisy init broke output: got {noisy}, expected {expected}"
-    )
+    assert torch.allclose(
+        noisy, expected, atol=0.1
+    ), f"noisy init broke output: got {noisy}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +116,9 @@ def test_nonzero_init_overflow_output(monkeypatch):
     clean_b = module.output_slice("b", clean)
     noisy_b = module.output_slice("b", noisy)
     assert torch.allclose(clean_b, expected_y, atol=0.1)
-    assert torch.allclose(noisy_b, expected_y, atol=0.1), (
-        f"noisy init broke overflow output: got {noisy_b}, expected {expected_y}"
-    )
+    assert torch.allclose(
+        noisy_b, expected_y, atol=0.1
+    ), f"noisy init broke overflow output: got {noisy_b}, expected {expected_y}"
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +140,6 @@ def test_nonzero_init_mlp_path(monkeypatch):
 
     clean, noisy = _run_clean_and_noisy(module, inp, monkeypatch)
     assert torch.allclose(clean, expected, atol=0.1)
-    assert torch.allclose(noisy, expected, atol=0.1), (
-        f"noisy init broke MLP output: got {noisy}, expected {expected}"
-    )
+    assert torch.allclose(
+        noisy, expected, atol=0.1
+    ), f"noisy init broke MLP output: got {noisy}, expected {expected}"

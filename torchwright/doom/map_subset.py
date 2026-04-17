@@ -45,7 +45,6 @@ from torchwright.doom.wad import (
     _pick_seg_texture,
 )
 
-
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -136,9 +135,7 @@ def _decode_child(child_ref: int) -> Tuple[bool, int]:
     return False, child_ref
 
 
-def _walk_paths(
-    md: MapData, root_node_idx: int
-) -> Dict[int, List[Tuple[int, int]]]:
+def _walk_paths(md: MapData, root_node_idx: int) -> Dict[int, List[Tuple[int, int]]]:
     """Return, for every subsector, its path from the BSP root.
 
     A path is a list of ``(node_idx, side)`` pairs where ``side`` is
@@ -185,7 +182,8 @@ def _count_selected_in_subtree(
                 return ss_count[idx]
             ss = md.subsectors[idx]
             c = sum(
-                1 for s in range(ss.first_seg, ss.first_seg + ss.seg_count)
+                1
+                for s in range(ss.first_seg, ss.first_seg + ss.seg_count)
                 if s in selected_seg_indices
             )
             ss_count[idx] = c
@@ -223,7 +221,10 @@ def _seg_midpoint(md: MapData, seg_idx: int) -> Tuple[float, float]:
 
 
 def _select_closest_segs(
-    md: MapData, px: float, py: float, max_walls: int,
+    md: MapData,
+    px: float,
+    py: float,
+    max_walls: int,
 ) -> List[int]:
     """Return original seg indices of up to ``max_walls`` closest segs."""
     ranked: List[Tuple[float, int]] = []
@@ -286,7 +287,7 @@ def _compute_coefficients(
     for row, W_idx in enumerate(selected_seg_indices):
         ss_idx = seg_to_ss[W_idx]
         path = paths[ss_idx]
-        for (old_node_idx, side_W) in path:
+        for old_node_idx, side_W in path:
             new_id = old_to_new_node.get(old_node_idx)
             if new_id is None:
                 # Ancestor not in subset — shouldn't happen, but guard
@@ -375,7 +376,8 @@ def _build_balanced_bsp(
 
 
 def _flatten_bsp_tree(
-    root: _BspTreeNode, n_segs: int,
+    root: _BspTreeNode,
+    n_segs: int,
 ) -> Tuple[
     List[BspNodeSubset],
     Dict[int, List[Tuple[int, int]]],
@@ -421,9 +423,7 @@ def _flatten_bsp_tree(
         return fc + bc
 
     total = visit(root, [])
-    assert total == n_segs, (
-        f"flattened tree seg count {total} != expected {n_segs}"
-    )
+    assert total == n_segs, f"flattened tree seg count {total} != expected {n_segs}"
     return bsp_nodes, paths, front_counts, back_counts
 
 
@@ -444,7 +444,7 @@ def _compute_scene_coefficients(
     coeffs = np.zeros((n_segs, max_bsp_nodes), dtype=np.float64)
     consts = np.zeros(n_segs, dtype=np.float64)
     for seg_idx in range(n_segs):
-        for (node_id, side_W) in paths[seg_idx]:
+        for node_id, side_W in paths[seg_idx]:
             if side_W == 0:
                 bc = back_counts[node_id]
                 coeffs[seg_idx, node_id] = -float(bc)
@@ -491,7 +491,11 @@ def build_scene_subset(
     root = _build_balanced_bsp(list(range(N)), segments, depth=0)
     bsp_nodes, paths, front_counts, back_counts = _flatten_bsp_tree(root, N)
     coeffs, consts = _compute_scene_coefficients(
-        N, paths, front_counts, back_counts, max_bsp_nodes,
+        N,
+        paths,
+        front_counts,
+        back_counts,
+        max_bsp_nodes,
     )
     return MapSubset(
         segments=list(segments),
@@ -546,22 +550,20 @@ def load_map_subset(
     selected_orig: List[int] = _select_closest_segs(md, px, py, max_walls)
     selected_set: Set[int] = set(selected_orig)
     if not selected_orig:
-        raise ValueError(
-            f"no valid segs found near ({px}, {py}) in {map_name!r}"
-        )
+        raise ValueError(f"no valid segs found near ({px}, {py}) in {map_name!r}")
 
     # --- 2. Map segs to subsectors + collect selected subsectors ---
     seg_to_ss = _build_seg_to_subsector(md)
     selected_subsectors: Set[int] = {seg_to_ss[s] for s in selected_orig}
 
     # --- 3. Walk the BSP tree ---
-    root_idx = len(md.nodes) - 1   # DOOM convention: root is last node
+    root_idx = len(md.nodes) - 1  # DOOM convention: root is last node
     paths = _walk_paths(md, root_idx)
 
     # --- 4. Extract minimal subtree ---
     subset_node_ids: Set[int] = set()
     for ss in selected_subsectors:
-        for (node_idx, _side) in paths[ss]:
+        for node_idx, _side in paths[ss]:
             subset_node_ids.add(node_idx)
     if len(subset_node_ids) > max_bsp_nodes:
         raise ValueError(
@@ -582,14 +584,21 @@ def load_map_subset(
 
     # --- 5. Count selected segs in each subtree ---
     _ss_count, front_count, back_count = _count_selected_in_subtree(
-        md, selected_set, root_idx,
+        md,
+        selected_set,
+        root_idx,
     )
 
     # --- 6. Compute coefficients per seg ---
     coeffs, consts = _compute_coefficients(
-        md, selected_orig, seg_to_ss, paths,
-        front_count, back_count,
-        old_to_new_node, max_bsp_nodes,
+        md,
+        selected_orig,
+        seg_to_ss,
+        paths,
+        front_count,
+        back_count,
+        old_to_new_node,
+        max_bsp_nodes,
     )
 
     # --- 7. Convert selected segs to Segment objects ---
@@ -608,11 +617,16 @@ def load_map_subset(
         v1 = md.vertices[seg.v1]
         v2 = md.vertices[seg.v2]
         color = sector_color(sd.sector)
-        segments.append(Segment(
-            ax=float(v1.x), ay=float(v1.y),
-            bx=float(v2.x), by=float(v2.y),
-            color=color, texture_id=tex_id,
-        ))
+        segments.append(
+            Segment(
+                ax=float(v1.x),
+                ay=float(v1.y),
+                bx=float(v2.x),
+                by=float(v2.y),
+                color=color,
+                texture_id=tex_id,
+            )
+        )
 
     # --- 8. Load textures, capped at max_textures ---
     # Prioritize by appearance order (closer segs saw them first).
@@ -629,9 +643,7 @@ def load_map_subset(
 
     # Remap texture ids so that only kept textures get valid ids; the
     # rest become -1 (so the renderer falls back to solid color).
-    new_name_to_id: Dict[str, int] = {
-        name: i for i, name in enumerate(kept_names)
-    }
+    new_name_to_id: Dict[str, int] = {name: i for i, name in enumerate(kept_names)}
     remapped: List[Segment] = []
     for seg in segments:
         if seg.texture_id < 0:
@@ -639,10 +651,16 @@ def load_map_subset(
             continue
         old_name = _reverse_lookup(name_to_id, seg.texture_id)
         new_id = new_name_to_id.get(old_name, -1)
-        remapped.append(Segment(
-            ax=seg.ax, ay=seg.ay, bx=seg.bx, by=seg.by,
-            color=seg.color, texture_id=new_id,
-        ))
+        remapped.append(
+            Segment(
+                ax=seg.ax,
+                ay=seg.ay,
+                bx=seg.bx,
+                by=seg.by,
+                color=seg.color,
+                texture_id=new_id,
+            )
+        )
     segments = remapped
 
     return MapSubset(

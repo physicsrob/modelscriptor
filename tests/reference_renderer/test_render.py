@@ -143,9 +143,9 @@ def test_through_doorway(config):
     center_row = config.screen_height // 2
     # Should see ceiling or floor, not wall
     pixel = tuple(frame[center_row, center_col].tolist())
-    assert pixel == config.ceiling_color or pixel == config.floor_color, (
-        f"Center column through doorway should not show wall, got {pixel}"
-    )
+    assert (
+        pixel == config.ceiling_color or pixel == config.floor_color
+    ), f"Center column through doorway should not show wall, got {pixel}"
 
 
 # ── Test 6: Parallel ray ──────────────────────────────────────────
@@ -164,9 +164,9 @@ def test_parallel_ray(config):
     center_row = config.screen_height // 2
     # Center column should show ceiling/floor, not wall
     pixel = tuple(frame[center_row, center_col].tolist())
-    assert pixel == config.floor_color, (
-        f"Parallel ray should not hit segment, got {pixel}"
-    )
+    assert (
+        pixel == config.floor_color
+    ), f"Parallel ray should not hit segment, got {pixel}"
 
 
 # ── Test 7: Behind player ─────────────────────────────────────────
@@ -183,9 +183,9 @@ def test_behind_player(config):
     center_col = config.screen_width // 2
     center_row = config.screen_height // 2
     pixel = tuple(frame[center_row, center_col].tolist())
-    assert pixel == config.floor_color, (
-        f"Wall behind player should not render, got {pixel}"
-    )
+    assert (
+        pixel == config.floor_color
+    ), f"Wall behind player should not render, got {pixel}"
 
 
 # ── Test 8: Multiple depths ───────────────────────────────────────
@@ -269,9 +269,7 @@ def test_box_room_render(config):
             colors_seen.add(pixel)
 
     wall_colors = {seg.color for seg in segments}
-    assert colors_seen == wall_colors, (
-        f"Expected all 4 wall colors, saw {colors_seen}"
-    )
+    assert colors_seen == wall_colors, f"Expected all 4 wall colors, saw {colors_seen}"
 
 
 # ── PNG output tests ───────────────────────────────────────────────
@@ -289,6 +287,7 @@ def test_save_png(config, tmp_path):
     assert path.stat().st_size > 0
 
     from PIL import Image
+
     img = Image.open(path)
     assert img.size == (config.screen_width, config.screen_height)
     assert img.mode == "RGB"

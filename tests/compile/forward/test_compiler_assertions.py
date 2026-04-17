@@ -28,7 +28,6 @@ from torchwright.graph import Attn, Linear
 from torchwright.graph.misc import InputNode, LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding, attention_hardness
 
-
 D = 64
 D_HEAD = 16
 
@@ -50,7 +49,9 @@ def test_D_allocate_rejects_overlap_with_live_node():
     rmap._free |= set(a_cols)
 
     b = InputNode("b", 4)
-    with pytest.raises(AssertionError, match=r"free set proposed columns already owned"):
+    with pytest.raises(
+        AssertionError, match=r"free set proposed columns already owned"
+    ):
         rmap.allocate(b)
 
 
@@ -95,7 +96,9 @@ def test_C_literal_write_rejects_truncation():
     layer = TransformerLayer(D, D_HEAD)
     lit = LiteralValue(torch.tensor([1.0, 2.0, 3.0, 4.0]), name="lit")
     # Only 2 target cols, but value has 4 entries — would silently drop.
-    bogus = MLPOp(op_type="compute_literal_value", node=lit, target_cols=[0, 1], mlp_slots=[])
+    bogus = MLPOp(
+        op_type="compute_literal_value", node=lit, target_cols=[0, 1], mlp_slots=[]
+    )
     with pytest.raises(AssertionError, match=r"Literal truncation would drop values"):
         _write_compute_literal_value(layer.mlp, bogus)
 

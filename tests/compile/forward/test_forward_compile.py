@@ -541,9 +541,13 @@ def _build_attn(x_q, x_k, x_v, d_qk, d_v, d_out):
     v_mat = torch.randn(len(x_v), d_v)
     o_mat = torch.randn(d_v, d_out)
     return Attn(
-        query_in=x_q, key_in=x_k, value_in=x_v,
-        query_matrix=q_mat, key_matrix=k_mat,
-        value_matrix=v_mat, output_matrix=o_mat,
+        query_in=x_q,
+        key_in=x_k,
+        value_in=x_v,
+        query_matrix=q_mat,
+        key_matrix=k_mat,
+        value_matrix=v_mat,
+        output_matrix=o_mat,
     )
 
 
@@ -559,8 +563,11 @@ def test_compile_rejects_d_qk_too_large():
 
     with pytest.raises(AssertionError, match="d_qk"):
         forward_compile(
-            d=256, d_head=16, output_node=out,
-            pos_encoding=pos, verbose=False,
+            d=256,
+            d_head=16,
+            output_node=out,
+            pos_encoding=pos,
+            verbose=False,
         )
 
 
@@ -592,8 +599,12 @@ def test_compile_split_vo_large_ratio():
     out = _build_attn(x, x, x, d_qk=2, d_v=64, d_out=8)
 
     net = forward_compile(
-        d=256, d_head=8, output_node=out,
-        pos_encoding=pos, verbose=False, max_layers=10,
+        d=256,
+        d_head=8,
+        output_node=out,
+        pos_encoding=pos,
+        verbose=False,
+        max_layers=10,
     )
     result = net.compute(4, {"x": torch.randn(4, 8)})
     expected = out.compute(4, {"x": result[x].cpu()})
@@ -624,7 +635,8 @@ def test_compile_split_vo_different_inputs():
     out = _build_attn(qk_in, qk_in, v_in, d_qk=4, d_v=32, d_out=6)
 
     _verify(
-        out, n_pos=4,
+        out,
+        n_pos=4,
         input_values={"qk": torch.randn(4, 6), "v": torch.randn(4, 8)},
         max_layers=10,
     )

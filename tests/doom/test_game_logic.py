@@ -182,7 +182,10 @@ class TestMovementWithCollision:
         state = GameState(x=0, y=0, angle=0, move_speed=0.5)
         for _ in range(100):
             state = update_state(
-                state, PlayerInput(forward=True), box_segments, trig_table,
+                state,
+                PlayerInput(forward=True),
+                box_segments,
+                trig_table,
             )
         # Should be near the east wall (x=5) minus margin
         assert state.x < 5.0
@@ -194,7 +197,10 @@ class TestMovementWithCollision:
             state = GameState(x=0, y=0, angle=start_angle, move_speed=0.5)
             for _ in range(100):
                 state = update_state(
-                    state, PlayerInput(forward=True), box_segments, trig_table,
+                    state,
+                    PlayerInput(forward=True),
+                    box_segments,
+                    trig_table,
                 )
             assert -5.0 < state.x < 5.0, f"Escaped at angle {start_angle}"
             assert -5.0 < state.y < 5.0, f"Escaped at angle {start_angle}"
@@ -205,7 +211,10 @@ class TestMovementWithCollision:
         state = GameState(x=-8, y=0, angle=0, move_speed=0.3)
         for _ in range(200):
             state = update_state(
-                state, PlayerInput(forward=True), multi_segments, trig_table,
+                state,
+                PlayerInput(forward=True),
+                multi_segments,
+                trig_table,
             )
         # Should have passed through corridor into room B
         assert state.x > 4.0, f"Didn't reach room B: x={state.x}"
@@ -221,7 +230,10 @@ class TestStateCarry:
         n_frames = 10
         for _ in range(n_frames):
             state = update_state(
-                state, PlayerInput(forward=True), [], trig_table,
+                state,
+                PlayerInput(forward=True),
+                [],
+                trig_table,
             )
         expected_x = 0.5 * n_frames * float(trig_table[0, 0])
         assert state.x == pytest.approx(expected_x, abs=1e-6)
