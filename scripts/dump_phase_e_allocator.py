@@ -803,6 +803,196 @@ def main():
                 f"compiled~{r.compiled_mean:+.4f}  oracle~{r.oracle_mean:+.4f}"
             )
 
+    print("\n=== Block 7: approximate-gate call sites by M ===")
+    # After the big_offset refactor, each cond_gate / select derives its
+    # M from its input's value_type (scaled by GATE_OFFSET_SAFETY_FACTOR).
+    # Large M → large M·ε_cond error on the approximate path.  Enumerate
+    # every approximate gate's output Linear, compute the M that was
+    # baked in, and show the fp32 error next to it so we can see which
+    # call sites are the actual offenders.
+    try:
+        from torchwright.ops.logic_ops import (
+            _GATE_OFFSET_SAFETY_FACTOR as _SAFETY,
+        )
+    except ImportError:
+        _SAFETY = 2.0
+    try:
+        from torchwright.ops.const import step_sharpness as _STEP_SHARPNESS
+    except ImportError:
+        _STEP_SHARPNESS = 10.0
+
+    def _gate_M(node):
+        """Estimate the M baked into a *_linear2 gate-output node.
+        For cond_gate: M = safety * max|inp.value_type|.  The output's
+        value_range is [min(0, inp.lo), max(0, inp.hi)], so recovering
+        max|inp| from the output range works for cond_gate (≈ max(|range|)).
+        For select: output range covers both branches; max|range| is a
+        good proxy for M since the gate routes up to max of either branch.
+        Multiplied by GATE_OFFSET_SAFETY_FACTOR (= 2 by default).
+        """
+        r = node.value_type.value_range
+        import math as _m
+
+        if not _m.isfinite(r.lo) or not _m.isfinite(r.hi):
+            return float("inf")
+        return _SAFETY * max(abs(r.lo), abs(r.hi))
+
+    gate_records = []
+    for n in all_graph_nodes:
+        if not isinstance(n, Linear):
+            continue
+        nm = n.name or ""
+        if ("select_linear2" not in nm) and ("cond_gate_linear2" not in nm):
+            continue
+        rec = report.per_node.get(n)  # fp32 report from Block 4
+        rec_f64 = report_f64.per_node.get(n) if "report_f64" in dir() else None
+        M_est = _gate_M(n)
+        predicted_err = M_est / _STEP_SHARPNESS
+        gate_records.append(
+            {
+                "node": n,
+                "M": M_est,
+                "predicted_err": predicted_err,
+                "fp32_err": rec.max_abs_error if rec else None,
+                "fp64_err": rec_f64.max_abs_error if rec_f64 else None,
+            }
+        )
+    print(f"  Found {len(gate_records)} approximate *_linear2 gate outputs.")
+
+    # Sort by M descending (big-M sites are the actual offenders; fp32
+    # errors are scene-dependent but M is static).
+    gate_records.sort(key=lambda r: -(r["M"] if r["M"] != float("inf") else 1e20))
+    print(
+        f"\n  Top 15 by M  "
+        f"(predicted_err = M / step_sharpness; step_sharpness={_STEP_SHARPNESS}):"
+    )
+    print(
+        f"  {'id':>6}  {'M':>12}  {'pred|Δ|':>10}  "
+        f"{'fp32|Δ|':>10}  {'fp64|Δ|':>10}   name"
+    )
+    for r in gate_records[:15]:
+        n = r["node"]
+        nm = (n.name or "")[:30]
+        M = r["M"]
+        pred = r["predicted_err"]
+        fp32 = r["fp32_err"]
+        fp64 = r["fp64_err"]
+        pred_s = f"{pred:>10.2f}" if pred < float("inf") else "       inf"
+        fp32_s = f"{fp32:>10.2f}" if fp32 is not None else "         -"
+        fp64_s = f"{fp64:>10.2e}" if fp64 is not None else "         -"
+        print(f"  {n.node_id:>6}  {M:>12.2f}  {pred_s}  {fp32_s}  {fp64_s}   {nm}")
+
+    # For the top-3 biggest-M sites, walk back through the select's
+    # Linear→ReLU→Linear chain to find the true/false branch nodes
+    # and their declared value_types.
+    print(
+        "\n  Walking back from the top-3 biggest-M sites to find the "
+        "true/false branches whose loose value_type is setting M:"
+    )
+
+    def _find_branches(select_linear2_node):
+        """Walk: select_linear2 -> its Linear's input is a ReLU whose input
+        is a Linear whose input is a Concatenate([cond, true, false])."""
+        l2 = select_linear2_node
+        if not l2.inputs:
+            return None
+        relu = l2.inputs[0]
+        if not isinstance(relu, ReLU) or not relu.inputs:
+            return None
+        l1 = relu.inputs[0]
+        if not isinstance(l1, Linear) or not l1.inputs:
+            return None
+        concat = l1.inputs[0]
+        if not isinstance(concat, Concatenate):
+            return None
+        branches = concat.inputs
+        return branches
+
+    for r in gate_records[:3]:
+        n = r["node"]
+        print(f"\n  --- id={n.node_id} (M={r['M']:.2f}):")
+        branches = _find_branches(n)
+        if branches is None:
+            print("    (could not extract branches — non-standard structure)")
+            continue
+        for i, b in enumerate(branches):
+            vr = b.value_type.value_range
+            name_str = (b.name or "").strip() or f"<anonymous id={b.node_id}>"
+            if isinstance(b, Concatenate):
+                # Walk leaves for detail.
+                leaves = flatten_concat_nodes([b])
+                print(
+                    f"    branch[{i}] ({type(b).__name__}): "
+                    f"width={len(b)} with {len(leaves)} leaves"
+                )
+                # Show leaves with widest ranges.
+                leaf_ranges = []
+                for lf in leaves:
+                    lr = lf.value_type.value_range
+                    m = max(abs(lr.lo), abs(lr.hi))
+                    leaf_ranges.append((m, lf, lr))
+                leaf_ranges.sort(key=lambda t: -t[0])
+                for m, lf, lr in leaf_ranges[:3]:
+                    print(
+                        f"      leaf max|range|={m:>12.2f}  "
+                        f"[{lr.lo:+.2f}, {lr.hi:+.2f}]  "
+                        f"{type(lf).__name__}  name={lf.name!r}  "
+                        f"id={lf.node_id}"
+                    )
+            else:
+                m = max(abs(vr.lo), abs(vr.hi))
+                print(
+                    f"    branch[{i}] max|range|={m:>12.2f}  "
+                    f"[{vr.lo:+.2f}, {vr.hi:+.2f}]  "
+                    f"{type(b).__name__}  name={name_str}  id={b.node_id}"
+                )
+
+    # Scan ALL graph nodes for the widest declared ranges — useful for
+    # seeing whether a handful of parent nodes are polluting many
+    # downstream consumers.
+    print("\n  Top 15 widest declared value_ranges in the graph:")
+    import math as _math
+
+    range_recs = []
+    for _n in all_graph_nodes:
+        vr = _n.value_type.value_range
+        if not (_math.isfinite(vr.lo) and _math.isfinite(vr.hi)):
+            continue
+        m = max(abs(vr.lo), abs(vr.hi))
+        range_recs.append((m, _n, vr))
+    range_recs.sort(key=lambda t: -t[0])
+    seen_names = set()
+    shown = 0
+    for m, _n, vr in range_recs:
+        # Dedupe by (type, name) so we don't see 1000 copies of the same op.
+        key = (type(_n).__name__, _n.name or "")
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        print(
+            f"    max|range|={m:>12.2f}  [{vr.lo:+.2f}, {vr.hi:+.2f}]  "
+            f"{type(_n).__name__}  name={_n.name!r}  id={_n.node_id}"
+        )
+        shown += 1
+        if shown >= 15:
+            break
+
+    # Also: histogram of M across all approximate gates.
+    import statistics
+
+    Ms = [r["M"] for r in gate_records if r["M"] < float("inf")]
+    if Ms:
+        print(
+            f"\n  Distribution of M across {len(Ms)} approximate gates: "
+            f"min={min(Ms):.2f}  median={statistics.median(Ms):.2f}  "
+            f"max={max(Ms):.2f}  mean={statistics.mean(Ms):.2f}"
+        )
+        buckets = [(0, 2), (2, 10), (10, 100), (100, 1000), (1000, 1e6)]
+        print("  Bucketed count:")
+        for lo, hi in buckets:
+            count = sum(1 for m in Ms if lo <= m < hi)
+            print(f"    M ∈ [{lo:>6g}, {hi:<7g}):  {count}")
+
 
 if __name__ == "__main__":
     main()
