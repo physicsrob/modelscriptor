@@ -317,5 +317,8 @@ def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
 
     vt = _cond_gate_output_type(cond, inp)
     if vt != NodeValueType.unknown():
-        result = assert_matches_value_type(result, vt)
+        from torchwright.ops.const import step_sharpness
+
+        gate_atol = max(1e-3, M / step_sharpness) if approximate else 1e-3
+        result = assert_matches_value_type(result, vt, atol=gate_atol)
     return result
