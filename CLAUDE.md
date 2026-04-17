@@ -183,6 +183,12 @@ All flags (`--width`, `--height`, `--fps`, `--scale`, `--d`, `--d-head`,
 - NEVER pipe `make walkthrough` through `tail`, `head`, or any other
   output-truncating filter.  The user always wants to see the full
   output.
+- NEVER re-run `make walkthrough` just because you lost output (e.g.
+  you piped through `| tail -10` and now want to grep).  If the code
+  hasn't changed, the previous run's full output is in the log file —
+  `make walkthrough` prints its path at the start and end, and
+  `/tmp/torchwright-walkthrough.log` symlinks to the latest run.
+  Grep that file instead of spending another render cycle.
 
 # Running scripts on GPU
 
@@ -225,6 +231,12 @@ against.
   `tests/` if it's really a test) and run it via `make modal-run`.
 - NEVER duplicate the Modal image definition.  Import `IMAGE` from
   `modal_image.py`.
+- NEVER re-run `make modal-run` just because you lost output (e.g.
+  you piped through `| tail -10` and now want to grep).  If the
+  script hasn't changed, the previous run's full output is in the
+  log file — `make modal-run` prints its path at the start and end,
+  and `/tmp/torchwright-modal-run.log` symlinks to the latest run.
+  Grep that file instead of spending another Modal round-trip.
 
 # Doctrine
 
