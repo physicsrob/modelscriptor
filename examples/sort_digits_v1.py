@@ -79,7 +79,6 @@ from torchwright.ops.map_select import in_range, select
 from torchwright.ops.scalar_encoding import digit_to_scaled_scalar
 from torchwright.ops.sequence_ops import check_is_digit
 
-
 D_MODEL = 384
 MAX_OUT = 10
 # The 10 thresholds our indicator basis covers: d ∈ {-1, 0, 1, …, 8}.

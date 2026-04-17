@@ -23,7 +23,6 @@ from torchwright.reference_renderer.scenes import box_room_textured, multi_room_
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
-
 # ---------------------------------------------------------------------------
 # Wall distance sensing
 # ---------------------------------------------------------------------------
@@ -91,12 +90,19 @@ class WalkthroughController:
 
         # WALKING -- check if we should turn
         dist = forward_wall_distance(
-            state.x, state.y, state.angle, self.segments, self.trig_table,
+            state.x,
+            state.y,
+            state.angle,
+            self.segments,
+            self.trig_table,
         )
 
         stuck = False
         if self._prev_x is not None:
-            if abs(state.x - self._prev_x) < 0.01 and abs(state.y - self._prev_y) < 0.01:
+            if (
+                abs(state.x - self._prev_x) < 0.01
+                and abs(state.y - self._prev_y) < 0.01
+            ):
                 stuck = True
 
         self._prev_x = state.x
@@ -132,7 +138,9 @@ def generate_walkthrough(
     """
     state = GameState(x=start_x, y=start_y, angle=start_angle)
     controller = WalkthroughController(
-        segments, config.trig_table, wall_threshold=wall_threshold,
+        segments,
+        config.trig_table,
+        wall_threshold=wall_threshold,
     )
 
     frames: List[np.ndarray] = []
@@ -161,8 +169,10 @@ def generate_walkthrough(
 
     total_time = time.perf_counter() - t_start
     avg_ms = sum(frame_times) / len(frame_times) * 1000
-    print(f"  {total_frames} frames in {total_time:.1f}s "
-          f"(avg {avg_ms:.0f}ms, {1000/avg_ms:.1f} fps)")
+    print(
+        f"  {total_frames} frames in {total_time:.1f}s "
+        f"(avg {avg_ms:.0f}ms, {1000/avg_ms:.1f} fps)"
+    )
 
     return frames
 
@@ -204,32 +214,52 @@ def save_gif(
 def main():
     parser = argparse.ArgumentParser(description="Generate a DOOM walkthrough GIF")
     parser.add_argument(
-        "output", nargs="?", default="walkthrough.gif", help="Output GIF path",
+        "output",
+        nargs="?",
+        default="walkthrough.gif",
+        help="Output GIF path",
     )
     parser.add_argument("--scene", choices=["box", "multi"], default="box")
     parser.add_argument(
-        "--mode", choices=["transformer", "reference"], default="transformer",
+        "--mode",
+        choices=["transformer", "reference"],
+        default="transformer",
         help="transformer: compiled transformer (default). "
-             "reference: pure Python implementation.",
+        "reference: pure Python implementation.",
     )
-    parser.add_argument("--wad", type=str, default="doom1.wad",
-                        help="Path to doom1.wad for DOOM textures")
+    parser.add_argument(
+        "--wad",
+        type=str,
+        default="doom1.wad",
+        help="Path to doom1.wad for DOOM textures",
+    )
     parser.add_argument("--tex-size", type=int, default=8)
     parser.add_argument("--width", type=int, default=64)
     parser.add_argument("--height", type=int, default=80)
     parser.add_argument("--fov", type=int, default=32)
     parser.add_argument("--frames", type=int, default=300)
     parser.add_argument("--fps", type=int, default=10)
-    parser.add_argument("--scale", type=int, default=4,
-                        help="Nearest-neighbor upscale factor for output")
-    parser.add_argument("--wall-threshold", type=float, default=1.5,
-                        help="Distance to wall that triggers a turn")
     parser.add_argument(
-        "--chunk-size", type=int, default=20,
+        "--scale",
+        type=int,
+        default=4,
+        help="Nearest-neighbor upscale factor for output",
+    )
+    parser.add_argument(
+        "--wall-threshold",
+        type=float,
+        default=1.5,
+        help="Distance to wall that triggers a turn",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=20,
         help="Render chunk height (pixels per render token).",
     )
-    parser.add_argument("--d", type=int, default=2048,
-                        help="Residual stream width (d_model).")
+    parser.add_argument(
+        "--d", type=int, default=2048, help="Residual stream width (d_model)."
+    )
     args = parser.parse_args()
 
     trig_table = generate_trig_table()
@@ -244,13 +274,15 @@ def main():
 
     if args.scene == "box":
         segments, textures = box_room_textured(
-            wad_path=args.wad, tex_size=args.tex_size,
+            wad_path=args.wad,
+            tex_size=args.tex_size,
         )
         start_x, start_y, start_angle = 0.0, 0.0, 0
         max_coord = 10.0
     else:
         segments, textures = multi_room_textured(
-            wad_path=args.wad, tex_size=args.tex_size,
+            wad_path=args.wad,
+            tex_size=args.tex_size,
         )
         start_x, start_y, start_angle = -8.0, 0.0, 0
         max_coord = 15.0
@@ -261,7 +293,8 @@ def main():
 
         print(f"Compiling game graph (walls-as-tokens, {len(segments)} walls)...")
         module = compile_game(
-            config, textures,
+            config,
+            textures,
             max_walls=max(8, len(segments)),
             max_coord=max_coord,
             d=args.d,
@@ -270,22 +303,35 @@ def main():
         subset = build_scene_subset(segments, textures)
 
         def frame_fn(state, inputs):
-            return step_frame(module, state, inputs, subset, config,
-                              textures=textures)
+            return step_frame(module, state, inputs, subset, config, textures=textures)
+
     else:
+
         def frame_fn(state, inputs):
             new_state = update_state(state, inputs, segments, trig_table)
             frame = render_frame(
-                new_state.x, new_state.y, new_state.angle, segments, config,
+                new_state.x,
+                new_state.y,
+                new_state.angle,
+                segments,
+                config,
                 textures=textures,
             )
             return frame, new_state
 
-    print(f"Generating {args.frames} frames at {args.width}x{args.height} "
-          f"({args.mode})...")
+    print(
+        f"Generating {args.frames} frames at {args.width}x{args.height} "
+        f"({args.mode})..."
+    )
     frames = generate_walkthrough(
-        segments, config, frame_fn, start_x, start_y, start_angle,
-        total_frames=args.frames, wall_threshold=args.wall_threshold,
+        segments,
+        config,
+        frame_fn,
+        start_x,
+        start_y,
+        start_angle,
+        total_frames=args.frames,
+        wall_threshold=args.wall_threshold,
     )
 
     print(f"Saving {args.output} (scale={args.scale}x, fps={args.fps})...")

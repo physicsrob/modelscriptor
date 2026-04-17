@@ -24,7 +24,6 @@ from torchwright.graph import Concatenate
 from torchwright.ops.arithmetic_ops import mod_const, thermometer_floor_div
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
-
 # (divisor, max_value)
 #   (2, 32)    — baseline, matches existing test_arithmetic_ops max scale
 #   (10, 100)  — first step into divisor=10 territory
@@ -59,8 +58,12 @@ def _compile_unary(op_fn, input_name: str = "x", d: int = 1024):
     y = op_fn(x)
     output = Concatenate([y])
     return compile_headless(
-        output, pos_encoding,
-        d=d, d_head=16, max_layers=20, verbose=False,
+        output,
+        pos_encoding,
+        d=d,
+        d_head=16,
+        max_layers=20,
+        verbose=False,
     )
 
 
@@ -80,7 +83,8 @@ def test_thermometer_floor_div_exhaustive(divisor, max_value):
     )
     outputs = _run_module_on_integer_range(module, max_value)
     expected = torch.tensor(
-        [v // divisor for v in range(max_value + 1)], dtype=outputs.dtype,
+        [v // divisor for v in range(max_value + 1)],
+        dtype=outputs.dtype,
     )
     diff = (outputs - expected).abs()
     max_err = diff.max().item()
@@ -100,7 +104,8 @@ def test_mod_const_exhaustive(divisor, max_value):
     )
     outputs = _run_module_on_integer_range(module, max_value)
     expected = torch.tensor(
-        [v % divisor for v in range(max_value + 1)], dtype=outputs.dtype,
+        [v % divisor for v in range(max_value + 1)],
+        dtype=outputs.dtype,
     )
     diff = (outputs - expected).abs()
     max_err = diff.max().item()

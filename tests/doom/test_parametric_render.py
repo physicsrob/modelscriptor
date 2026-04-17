@@ -59,7 +59,6 @@ from torchwright.reference_renderer.types import RenderConfig, Segment
 
 from tests._utils.image_compare import compare_images
 
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -68,16 +67,61 @@ MAX_COORD = 20.0
 BIG_DISTANCE = 1000.0
 _SQUARE_MAX_ABS = 40.0
 _SQRT_BREAKPOINTS = [
-    0.0, 0.25, 1.0, 2.0, 4.0, 9.0, 16.0, 25.0, 36.0, 49.0,
-    64.0, 100.0, 225.0, 400.0, 900.0, 1600.0, 3200.0,
+    0.0,
+    0.25,
+    1.0,
+    2.0,
+    4.0,
+    9.0,
+    16.0,
+    25.0,
+    36.0,
+    49.0,
+    64.0,
+    100.0,
+    225.0,
+    400.0,
+    900.0,
+    1600.0,
+    3200.0,
 ]
 _DIFF_BREAKPOINTS = [
-    -40.0, -30.0, -20.0, -15.0, -10.0, -7.0, -5.0, -3.0, -2.0, -1.0, -0.5,
+    -40.0,
+    -30.0,
+    -20.0,
+    -15.0,
+    -10.0,
+    -7.0,
+    -5.0,
+    -3.0,
+    -2.0,
+    -1.0,
+    -0.5,
     0.0,
-    0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0, 30.0, 40.0,
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    7.0,
+    10.0,
+    15.0,
+    20.0,
+    30.0,
+    40.0,
 ]
 _TRIG_BREAKPOINTS = [
-    -1.0, -0.9, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 0.9, 1.0,
+    -1.0,
+    -0.9,
+    -0.75,
+    -0.5,
+    -0.25,
+    0.0,
+    0.25,
+    0.5,
+    0.75,
+    0.9,
+    1.0,
 ]
 
 
@@ -87,8 +131,14 @@ _TRIG_BREAKPOINTS = [
 
 
 def _parametric_segment_intersection(
-    player_x, player_y, ray_cos, ray_sin,
-    wall_ax, wall_ay, wall_bx, wall_by,
+    player_x,
+    player_y,
+    ray_cos,
+    ray_sin,
+    wall_ax,
+    wall_ay,
+    wall_bx,
+    wall_by,
 ):
     """(den, num_t, num_u) from runtime wall endpoints."""
     ex = subtract(wall_bx, wall_ax)
@@ -96,22 +146,48 @@ def _parametric_segment_intersection(
     dx = subtract(wall_ax, player_x)
     dy = subtract(player_y, wall_ay)
 
-    ey_cos = piecewise_linear_2d(ey, ray_cos, _DIFF_BREAKPOINTS, _TRIG_BREAKPOINTS,
-                                  lambda a, b: a * b, name="ey_cos")
-    ex_sin = piecewise_linear_2d(ex, ray_sin, _DIFF_BREAKPOINTS, _TRIG_BREAKPOINTS,
-                                  lambda a, b: a * b, name="ex_sin")
+    ey_cos = piecewise_linear_2d(
+        ey,
+        ray_cos,
+        _DIFF_BREAKPOINTS,
+        _TRIG_BREAKPOINTS,
+        lambda a, b: a * b,
+        name="ey_cos",
+    )
+    ex_sin = piecewise_linear_2d(
+        ex,
+        ray_sin,
+        _DIFF_BREAKPOINTS,
+        _TRIG_BREAKPOINTS,
+        lambda a, b: a * b,
+        name="ex_sin",
+    )
     den = subtract(ey_cos, ex_sin)
 
-    ey_dx = piecewise_linear_2d(ey, dx, _DIFF_BREAKPOINTS, _DIFF_BREAKPOINTS,
-                                 lambda a, b: a * b, name="ey_dx")
-    ex_dy = piecewise_linear_2d(ex, dy, _DIFF_BREAKPOINTS, _DIFF_BREAKPOINTS,
-                                 lambda a, b: a * b, name="ex_dy")
+    ey_dx = piecewise_linear_2d(
+        ey, dx, _DIFF_BREAKPOINTS, _DIFF_BREAKPOINTS, lambda a, b: a * b, name="ey_dx"
+    )
+    ex_dy = piecewise_linear_2d(
+        ex, dy, _DIFF_BREAKPOINTS, _DIFF_BREAKPOINTS, lambda a, b: a * b, name="ex_dy"
+    )
     num_t = add(ey_dx, ex_dy)
 
-    dx_sin = piecewise_linear_2d(dx, ray_sin, _DIFF_BREAKPOINTS, _TRIG_BREAKPOINTS,
-                                  lambda a, b: a * b, name="dx_sin")
-    dy_cos = piecewise_linear_2d(dy, ray_cos, _DIFF_BREAKPOINTS, _TRIG_BREAKPOINTS,
-                                  lambda a, b: a * b, name="dy_cos")
+    dx_sin = piecewise_linear_2d(
+        dx,
+        ray_sin,
+        _DIFF_BREAKPOINTS,
+        _TRIG_BREAKPOINTS,
+        lambda a, b: a * b,
+        name="dx_sin",
+    )
+    dy_cos = piecewise_linear_2d(
+        dy,
+        ray_cos,
+        _DIFF_BREAKPOINTS,
+        _TRIG_BREAKPOINTS,
+        lambda a, b: a * b,
+        name="dy_cos",
+    )
     num_u = add(dx_sin, dy_cos)
 
     return den, num_t, num_u
@@ -131,7 +207,7 @@ def _den_to_angle_data(den: Node) -> Tuple[Node, Node, Node]:
     Cost: ~4 MLP sublayers (compare + abs + reciprocal + select).
     """
     epsilon = 0.01
-    sign_den = compare(den, 0.0)          # +1 if den > 0, -1 if < 0
+    sign_den = compare(den, 0.0)  # +1 if den > 0, -1 if < 0
     abs_den = abs(den)
     inv_abs_den = reciprocal(
         abs_den,
@@ -179,9 +255,12 @@ def _parametric_distance_and_texinfo(
 
     abs_inv_den = select(sign_den, signed_inv_den, negate(signed_inv_den))
     dist = signed_multiply(
-        adj_num_t, abs_inv_den,
-        max_abs1=max_num_t, max_abs2=max_inv_den,
-        step=1.0, max_abs_output=BIG_DISTANCE,
+        adj_num_t,
+        abs_inv_den,
+        max_abs1=max_num_t,
+        max_abs2=max_inv_den,
+        step=1.0,
+        max_abs_output=BIG_DISTANCE,
     )
 
     is_valid = bool_all_true([is_den_nonzero, is_t_pos, is_u_ge_0, is_u_le_den])
@@ -231,22 +310,38 @@ def build_parametric_render_graph(
 
     # Stage 1-2: Parametric intersection
     den, num_t, num_u = _parametric_segment_intersection(
-        player_x, player_y, ray_cos, ray_sin,
-        wall_ax, wall_ay, wall_bx, wall_by,
+        player_x,
+        player_y,
+        ray_cos,
+        ray_sin,
+        wall_ax,
+        wall_ay,
+        wall_bx,
+        wall_by,
     )
 
     # Stage 3: Den → angle data
     signed_inv_den, abs_den, sign_den = _den_to_angle_data(den)
 
     # Stage 4: Distance + validity
-    dist, adj_num_u, abs_den_out, tex_id_out, is_valid = _parametric_distance_and_texinfo(
-        num_t, num_u, signed_inv_den, abs_den, sign_den,
-        wall_tex_id, max_coord,
+    dist, adj_num_u, abs_den_out, tex_id_out, is_valid = (
+        _parametric_distance_and_texinfo(
+            num_t,
+            num_u,
+            signed_inv_den,
+            abs_den,
+            sign_den,
+            wall_tex_id,
+            max_coord,
+        )
     )
 
     # Stage 5: Wall height
     wall_top, wall_bottom, wall_height = _wall_height_lookup(
-        dist, perp_cos, config, max_coord,
+        dist,
+        perp_cos,
+        config,
+        max_coord,
     )
 
     # Stage 6: u normalization → texture column index
@@ -274,8 +369,12 @@ def build_parametric_render_graph(
 
     # Stage 8: Textured column fill
     pixels = _textured_column_fill(
-        wall_top, wall_bottom, wall_height,
-        tex_column_colors, tex_h, config,
+        wall_top,
+        wall_bottom,
+        wall_height,
+        tex_column_colors,
+        tex_h,
+        config,
         max_coord=max_coord,
         rows_per_patch=rp,
     )
@@ -301,7 +400,11 @@ def _test_config(screen_height=40, screen_width=40, fov=32):
 
 
 def _make_inputs(
-    px, py, ray_angle, config, wall,
+    px,
+    py,
+    ray_angle,
+    config,
+    wall,
 ) -> Tuple[dict, float, float]:
     """Build input dict for one position + return (ray_cos, ray_sin, perp_cos)."""
     trig = config.trig_table
@@ -348,8 +451,14 @@ def test_parametric_render_hits_wall():
     # Player at origin, wall at x=5 (perpendicular to view direction).
     px, py = 0.0, 0.0
     wall = {"ax": 5.0, "ay": -3.0, "bx": 5.0, "by": 3.0, "tex_id": 0.0}
-    seg = Segment(ax=wall["ax"], ay=wall["ay"], bx=wall["bx"], by=wall["by"],
-                  color=(0.8, 0.2, 0.1), texture_id=int(wall["tex_id"]))
+    seg = Segment(
+        ax=wall["ax"],
+        ay=wall["ay"],
+        bx=wall["bx"],
+        by=wall["by"],
+        color=(0.8, 0.2, 0.1),
+        texture_id=int(wall["tex_id"]),
+    )
 
     # Ray straight ahead (column = center of screen)
     col = config.screen_width // 2
@@ -364,15 +473,21 @@ def test_parametric_render_hits_wall():
 
     # Reference output
     ref_frame = render_column(
-        col, px, py, 0, [seg], config, textures=textures,
+        col,
+        px,
+        py,
+        0,
+        [seg],
+        config,
+        textures=textures,
     )
 
     # Wall region should be textured, not blank
     H = config.screen_height
     wall_region = got_frame[H // 4 : 3 * H // 4]
-    assert wall_region.max() > 0.01, (
-        "wall region appears blank — intersection might have missed"
-    )
+    assert (
+        wall_region.max() > 0.01
+    ), "wall region appears blank — intersection might have missed"
 
     compare_images(got_frame[:, None, :], ref_frame[:, None, :]).assert_matches()
 
@@ -399,14 +514,14 @@ def test_parametric_render_misses_wall():
     floor = np.array(config.floor_color)
 
     # Top quarter should be ceiling-ish, bottom quarter floor-ish.
-    top = got[:H // 4]
-    bottom = got[3 * H // 4:]
-    assert np.allclose(top, ceiling, atol=0.1), (
-        f"top pixels {top[0]} don't match ceiling {ceiling}"
-    )
-    assert np.allclose(bottom, floor, atol=0.1), (
-        f"bottom pixels {bottom[0]} don't match floor {floor}"
-    )
+    top = got[: H // 4]
+    bottom = got[3 * H // 4 :]
+    assert np.allclose(
+        top, ceiling, atol=0.1
+    ), f"top pixels {top[0]} don't match ceiling {ceiling}"
+    assert np.allclose(
+        bottom, floor, atol=0.1
+    ), f"bottom pixels {bottom[0]} don't match floor {floor}"
 
 
 def test_parametric_render_two_columns():
@@ -421,8 +536,14 @@ def test_parametric_render_two_columns():
 
     px, py = 0.0, 0.0
     wall = {"ax": 4.0, "ay": -5.0, "bx": 4.0, "by": 5.0, "tex_id": 1.0}
-    seg = Segment(ax=wall["ax"], ay=wall["ay"], bx=wall["bx"], by=wall["by"],
-                  color=(0.8, 0.2, 0.1), texture_id=int(wall["tex_id"]))
+    seg = Segment(
+        ax=wall["ax"],
+        ay=wall["ay"],
+        bx=wall["bx"],
+        by=wall["by"],
+        color=(0.8, 0.2, 0.1),
+        texture_id=int(wall["tex_id"]),
+    )
 
     trig = config.trig_table
     # Two columns: center and slightly off-center
@@ -430,10 +551,21 @@ def test_parametric_render_two_columns():
     n_pos = len(cols)
 
     # Build batched inputs
-    inputs = {name: torch.zeros(n_pos, 1) for name in [
-        "player_x", "player_y", "ray_cos", "ray_sin", "perp_cos",
-        "wall_ax", "wall_ay", "wall_bx", "wall_by", "wall_tex_id",
-    ]}
+    inputs = {
+        name: torch.zeros(n_pos, 1)
+        for name in [
+            "player_x",
+            "player_y",
+            "ray_cos",
+            "ray_sin",
+            "perp_cos",
+            "wall_ax",
+            "wall_ay",
+            "wall_bx",
+            "wall_by",
+            "wall_tex_id",
+        ]
+    }
     for j, col in enumerate(cols):
         col_offset = col - config.screen_width // 2
         ray_angle = (0 + col_offset * config.fov_columns // config.screen_width) % 256
@@ -482,6 +614,6 @@ def test_probe_parametric_render():
         verbose=False,
         atol=1.0,
     )
-    assert report.first_divergent is None, (
-        f"probe reported divergence:\n{report.format_short()}"
-    )
+    assert (
+        report.first_divergent is None
+    ), f"probe reported divergence:\n{report.format_short()}"

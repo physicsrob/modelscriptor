@@ -49,8 +49,12 @@ def test_select_exact_branch_preserves_small_inputs():
     cond_input = create_input("cond", 1)
     t = create_input("t", 1)
     f = create_input("f", 1)
-    t_bounded = assert_matches_value_type(t, NodeValueType(value_range=Range(-1.0, 1.0)))
-    f_bounded = assert_matches_value_type(f, NodeValueType(value_range=Range(-1.0, 1.0)))
+    t_bounded = assert_matches_value_type(
+        t, NodeValueType(value_range=Range(-1.0, 1.0))
+    )
+    f_bounded = assert_matches_value_type(
+        f, NodeValueType(value_range=Range(-1.0, 1.0))
+    )
     out = select(cond_input, t_bounded, f_bounded, approximate=False)
 
     t_val = torch.tensor([[1.0e-5]])
@@ -88,8 +92,12 @@ def test_broadcast_select_exact_branch():
     masks_input = create_input("masks", n_slots)
     t = create_input("t", d_fill)
     f = create_input("f", d_fill)
-    t_bounded = assert_matches_value_type(t, NodeValueType(value_range=Range(-1.0, 1.0)))
-    f_bounded = assert_matches_value_type(f, NodeValueType(value_range=Range(-1.0, 1.0)))
+    t_bounded = assert_matches_value_type(
+        t, NodeValueType(value_range=Range(-1.0, 1.0))
+    )
+    f_bounded = assert_matches_value_type(
+        f, NodeValueType(value_range=Range(-1.0, 1.0))
+    )
     out = broadcast_select(
         masks_input, t_bounded, f_bounded, n_slots, d_fill, approximate=False
     )

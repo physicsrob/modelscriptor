@@ -89,7 +89,8 @@ def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> List[
             # Declare the tight [0, 9] range so downstream ops see it.
             digits.append(
                 assert_matches_value_type(
-                    remainder, NodeValueType(value_range=Range(0.0, 9.0)),
+                    remainder,
+                    NodeValueType(value_range=Range(0.0, 9.0)),
                 )
             )
         else:
@@ -101,7 +102,8 @@ def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> List[
             # it on subsequent iterations.
             remainder = add_scaled_nodes(1.0, remainder, -float(place), digit)
             remainder = assert_matches_value_type(
-                remainder, NodeValueType(value_range=Range(0.0, float(place - 1))),
+                remainder,
+                NodeValueType(value_range=Range(0.0, float(place - 1))),
             )
             max_value = place - 1
     return digits

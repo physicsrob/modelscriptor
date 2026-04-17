@@ -22,7 +22,9 @@ from tests._utils.image_compare import compare_images
 def _box_room_config():
     trig = generate_trig_table()
     return RenderConfig(
-        screen_width=16, screen_height=20, fov_columns=16,
+        screen_width=16,
+        screen_height=20,
+        fov_columns=16,
         trig_table=trig,
         ceiling_color=(0.2, 0.2, 0.2),
         floor_color=(0.4, 0.4, 0.4),
@@ -31,14 +33,18 @@ def _box_room_config():
 
 def _box_room_segments(half=5.0):
     return [
-        Segment(ax=half, ay=-half, bx=half, by=half,
-                color=(0.8, 0.2, 0.1), texture_id=0),
-        Segment(ax=-half, ay=-half, bx=-half, by=half,
-                color=(0.8, 0.2, 0.1), texture_id=1),
-        Segment(ax=-half, ay=half, bx=half, by=half,
-                color=(0.8, 0.2, 0.1), texture_id=2),
-        Segment(ax=-half, ay=-half, bx=half, by=-half,
-                color=(0.8, 0.2, 0.1), texture_id=3),
+        Segment(
+            ax=half, ay=-half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=0
+        ),
+        Segment(
+            ax=-half, ay=-half, bx=-half, by=half, color=(0.8, 0.2, 0.1), texture_id=1
+        ),
+        Segment(
+            ax=-half, ay=half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=2
+        ),
+        Segment(
+            ax=-half, ay=-half, bx=half, by=-half, color=(0.8, 0.2, 0.1), texture_id=3
+        ),
     ]
 
 
@@ -47,7 +53,13 @@ def _ref_frame(px, py, angle, segs, config, textures):
     frame = np.zeros((H, W, 3), dtype=np.float64)
     for col in range(W):
         frame[:, col, :] = render_column(
-            col, px, py, int(angle), segs, config, textures=textures,
+            col,
+            px,
+            py,
+            int(angle),
+            segs,
+            config,
+            textures=textures,
         )
     return frame
 
@@ -67,7 +79,12 @@ class TestTexCol:
     def module(self, box_room):
         config, textures, subset, segs = box_room
         return compile_game(
-            config, textures, max_walls=8, d=2048, d_head=32, verbose=False,
+            config,
+            textures,
+            max_walls=8,
+            d=2048,
+            d_head=32,
+            verbose=False,
         )
 
     def test_renders_box_room(self, module, box_room):
@@ -77,8 +94,7 @@ class TestTexCol:
         state = GameState(x=0.0, y=0.0, angle=0, move_speed=0.3, turn_speed=4)
         inputs = PlayerInput()
 
-        frame, _ = step_frame(module, state, inputs, subset, config,
-                              textures=textures)
+        frame, _ = step_frame(module, state, inputs, subset, config, textures=textures)
         ref = _ref_frame(0.0, 0.0, 0, segs, config, textures)
 
         assert frame.max() > 0.1, "frame appears blank"
@@ -93,8 +109,7 @@ class TestTexCol:
         state = GameState(x=0.0, y=0.0, angle=angle, move_speed=0.3, turn_speed=4)
         inputs = PlayerInput()
 
-        frame, _ = step_frame(module, state, inputs, subset, config,
-                              textures=textures)
+        frame, _ = step_frame(module, state, inputs, subset, config, textures=textures)
         ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
 
         compare_images(frame, ref).assert_matches()

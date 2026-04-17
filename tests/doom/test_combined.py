@@ -42,7 +42,11 @@ from torchwright.ops.arithmetic_ops import (
 )
 from torchwright.ops.arithmetic_ops import max as elementwise_max
 from torchwright.ops.attention_ops import attend_argmin_unmasked
-from torchwright.ops.inout_nodes import create_input, create_literal_value, create_pos_encoding
+from torchwright.ops.inout_nodes import (
+    create_input,
+    create_literal_value,
+    create_pos_encoding,
+)
 from torchwright.ops.logic_ops import bool_all_true, cond_gate, equals_vector
 from torchwright.ops.map_select import in_range, select
 
@@ -58,7 +62,6 @@ from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
 from tests._utils.image_compare import compare_images
-
 
 # ---------------------------------------------------------------------------
 # Token types
@@ -84,8 +87,29 @@ MAX_COORD = 20.0
 BIG_DISTANCE = 1000.0
 
 _DIFF_BP = [
-    -40, -30, -20, -15, -10, -7, -5, -3, -2, -1, -0.5,
-    0, 0.5, 1, 2, 3, 5, 7, 10, 15, 20, 30, 40,
+    -40,
+    -30,
+    -20,
+    -15,
+    -10,
+    -7,
+    -5,
+    -3,
+    -2,
+    -1,
+    -0.5,
+    0,
+    0.5,
+    1,
+    2,
+    3,
+    5,
+    7,
+    10,
+    15,
+    20,
+    30,
+    40,
 ]
 _TRIG_BP = [-1, -0.9, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 0.9, 1]
 _SQRT_BP = [0, 0.25, 1, 2, 4, 9, 16, 25, 36, 49, 64, 100, 225, 400, 900, 1600, 3200]
@@ -150,8 +174,9 @@ def build_combined_graph(
     dx_sq = square_signed(w_dx, max_abs=40.0, step=1.0)
     dy_sq = square_signed(w_dy, max_abs=40.0, step=1.0)
     dist_sq = add(dx_sq, dy_sq)
-    wall_dist = piecewise_linear(dist_sq, _SQRT_BP,
-                                  lambda x: math.sqrt(max(0, x)), name="wall_dist")
+    wall_dist = piecewise_linear(
+        dist_sq, _SQRT_BP, lambda x: math.sqrt(max(0, x)), name="wall_dist"
+    )
 
     # Sentinel score for non-wall positions
     sentinel = create_literal_value(torch.tensor([99.0]), name="sentinel")
@@ -166,11 +191,19 @@ def build_combined_graph(
     position_onehot = add_scaled_nodes(0.5, onehot_bool, 0.5, ones_oh)
 
     # Pack wall value for sort: geometry + angular info + onehot
-    wall_value_for_sort = Concatenate([
-        wall_ax, wall_ay, wall_bx, wall_by, wall_tex_id,
-        w_dx, w_dy, wall_dist,
-        position_onehot,
-    ])
+    wall_value_for_sort = Concatenate(
+        [
+            wall_ax,
+            wall_ay,
+            wall_bx,
+            wall_by,
+            wall_tex_id,
+            w_dx,
+            w_dy,
+            wall_dist,
+            position_onehot,
+        ]
+    )
     # Value layout: [0:5] = wall_data, [5:7] = (dx, dy), [7] = dist,
     # [8:8+max_walls] = onehot.  Total: 8 + max_walls.
 
@@ -188,6 +221,7 @@ def build_combined_graph(
     # selected_sort: width = 8 + max_walls
     # Extract sub-fields from selected_sort
     d_sort_val = 8 + max_walls
+
     def _extract_from(node, d_total, start, width, name):
         m = torch.zeros(d_total, width)
         for i in range(width):
@@ -224,6 +258,7 @@ def build_combined_graph(
     ray_angle_raw = add(player_angle, angle_offset)
     ray_angle_shifted = add_const(ray_angle_raw, 256.0)
     from torchwright.ops.arithmetic_ops import mod_const
+
     ray_angle = mod_const(ray_angle_shifted, 256, 512 + fov)
 
     # Trig for this ray
@@ -250,16 +285,18 @@ def build_combined_graph(
     is_sorted_01 = bool_to_01(is_sorted)
 
     # Build the render attention input: combine query-side and key-side features
-    render_attn_in = Concatenate([
-        gated_ray_cos,           # query side: ray direction
-        gated_ray_sin,
-        is_render_01,            # query side: bias term
-        gated_dx,                # key side: wall angular position
-        gated_dy,
-        gated_dist,              # key side: wall distance
-        is_sorted_01,            # key side: wall bias flag
-        gated_wall_data,         # value side: wall geometry
-    ])
+    render_attn_in = Concatenate(
+        [
+            gated_ray_cos,  # query side: ray direction
+            gated_ray_sin,
+            is_render_01,  # query side: bias term
+            gated_dx,  # key side: wall angular position
+            gated_dy,
+            gated_dist,  # key side: wall distance
+            is_sorted_01,  # key side: wall bias flag
+            gated_wall_data,  # value side: wall geometry
+        ]
+    )
 
     d_attn_in = len(render_attn_in)
     s_ray_cos = 0
@@ -316,22 +353,34 @@ def build_combined_graph(
     dx_r = subtract(r_wall_ax, player_x)
     dy_r = subtract(player_y, r_wall_ay)
 
-    ey_cos = piecewise_linear_2d(ey, ray_cos, _DIFF_BP, _TRIG_BP, lambda a,b: a*b, name="r_ey_cos")
-    ex_sin = piecewise_linear_2d(ex, ray_sin, _DIFF_BP, _TRIG_BP, lambda a,b: a*b, name="r_ex_sin")
+    ey_cos = piecewise_linear_2d(
+        ey, ray_cos, _DIFF_BP, _TRIG_BP, lambda a, b: a * b, name="r_ey_cos"
+    )
+    ex_sin = piecewise_linear_2d(
+        ex, ray_sin, _DIFF_BP, _TRIG_BP, lambda a, b: a * b, name="r_ex_sin"
+    )
     den = subtract(ey_cos, ex_sin)
 
-    ey_dx = piecewise_linear_2d(ey, dx_r, _DIFF_BP, _DIFF_BP, lambda a,b: a*b, name="r_ey_dx")
-    ex_dy = piecewise_linear_2d(ex, dy_r, _DIFF_BP, _DIFF_BP, lambda a,b: a*b, name="r_ex_dy")
+    ey_dx = piecewise_linear_2d(
+        ey, dx_r, _DIFF_BP, _DIFF_BP, lambda a, b: a * b, name="r_ey_dx"
+    )
+    ex_dy = piecewise_linear_2d(
+        ex, dy_r, _DIFF_BP, _DIFF_BP, lambda a, b: a * b, name="r_ex_dy"
+    )
     num_t = add(ey_dx, ex_dy)
 
-    dx_sin = piecewise_linear_2d(dx_r, ray_sin, _DIFF_BP, _TRIG_BP, lambda a,b: a*b, name="r_dx_sin")
-    dy_cos = piecewise_linear_2d(dy_r, ray_cos, _DIFF_BP, _TRIG_BP, lambda a,b: a*b, name="r_dy_cos")
+    dx_sin = piecewise_linear_2d(
+        dx_r, ray_sin, _DIFF_BP, _TRIG_BP, lambda a, b: a * b, name="r_dx_sin"
+    )
+    dy_cos = piecewise_linear_2d(
+        dy_r, ray_cos, _DIFF_BP, _TRIG_BP, lambda a, b: a * b, name="r_dy_cos"
+    )
     num_u = add(dx_sin, dy_cos)
 
     # Den → angle data
     sign_den = compare(den, 0.0)
     abs_den = abs(den)
-    inv_abs_den = reciprocal(abs_den, min_value=0.01, max_value=2.0*max_coord)
+    inv_abs_den = reciprocal(abs_den, min_value=0.01, max_value=2.0 * max_coord)
     signed_inv_den = select(sign_den, inv_abs_den, negate(inv_abs_den))
 
     # Distance
@@ -343,14 +392,22 @@ def build_combined_graph(
     u_minus_den = subtract(abs_den, adj_num_u)
     is_u_le_den = compare(u_minus_den, -0.05)
     abs_inv = select(sign_den, signed_inv_den, negate(signed_inv_den))
-    dist_r = signed_multiply(adj_num_t, abs_inv, max_abs1=800, max_abs2=100,
-                              step=1.0, max_abs_output=BIG_DISTANCE)
+    dist_r = signed_multiply(
+        adj_num_t,
+        abs_inv,
+        max_abs1=800,
+        max_abs2=100,
+        step=1.0,
+        max_abs_output=BIG_DISTANCE,
+    )
     is_valid = bool_all_true([is_den_nz, is_t_pos, is_u_ge0, is_u_le_den])
     big = create_literal_value(torch.tensor([BIG_DISTANCE]), name="big")
     dist_r = select(is_valid, dist_r, big)
 
     # Wall height
-    wall_top, wall_bottom, wall_height = _wall_height_lookup(dist_r, perp_cos, config, max_coord)
+    wall_top, wall_bottom, wall_height = _wall_height_lookup(
+        dist_r, perp_cos, config, max_coord
+    )
 
     # Texture column
     tex_col_idx = _u_norm_lookup(adj_num_u, abs_den, tex_w, max_coord)
@@ -367,38 +424,57 @@ def build_combined_graph(
         return [0.0] * (tex_h * 3)
 
     tex_column_colors = piecewise_linear(
-        flat_key, [float(k) for k in range(n_keys)],
-        _tex_col_vals, name="tex_col_lookup",
+        flat_key,
+        [float(k) for k in range(n_keys)],
+        _tex_col_vals,
+        name="tex_col_lookup",
     )
 
     # Column fill
     patch_row_start = multiply_const(patch_idx, float(H))  # rp=H for now (full column)
     pixels = _textured_column_fill(
-        wall_top, wall_bottom, wall_height,
-        tex_column_colors, tex_h, config, max_coord=max_coord,
+        wall_top,
+        wall_bottom,
+        wall_height,
+        tex_column_colors,
+        tex_h,
+        config,
+        max_coord=max_coord,
     )
 
     # --- Output: gated by token type ---
     # At SORTED_WALL positions: emit sort output (for host mask update)
-    sort_output = Concatenate([
-        create_literal_value(E8_SORTED_WALL, name="sort_type"),
-        sel_wall_data,
-        sel_onehot,
-    ])
+    sort_output = Concatenate(
+        [
+            create_literal_value(E8_SORTED_WALL, name="sort_type"),
+            sel_wall_data,
+            sel_onehot,
+        ]
+    )
     # At RENDER positions: emit pixels
-    render_output = Concatenate([
-        create_literal_value(E8_RENDER, name="render_type"),
-        pixels,
-    ])
+    render_output = Concatenate(
+        [
+            create_literal_value(E8_RENDER, name="render_type"),
+            pixels,
+        ]
+    )
     # Pad to same width
     d_sort_out = 8 + 5 + max_walls
     d_render_out = 8 + H * 3
     d_out = max(d_sort_out, d_render_out)
 
-    sort_padded = Concatenate([sort_output, create_literal_value(
-        torch.zeros(d_out - d_sort_out), name="sort_pad")])
-    render_padded = Concatenate([render_output, create_literal_value(
-        torch.zeros(d_out - d_render_out), name="render_pad")])
+    sort_padded = Concatenate(
+        [
+            sort_output,
+            create_literal_value(torch.zeros(d_out - d_sort_out), name="sort_pad"),
+        ]
+    )
+    render_padded = Concatenate(
+        [
+            render_output,
+            create_literal_value(torch.zeros(d_out - d_render_out), name="render_pad"),
+        ]
+    )
 
     output = select(is_render, render_padded, sort_padded)
 
@@ -436,7 +512,7 @@ def _build_row(compiled, max_walls, **kwargs):
             v = torch.tensor([v])
         if v.dim() == 1:
             v = v.unsqueeze(0)
-        row[:, start:start + width] = v
+        row[:, start : start + width] = v
     return row
 
 
@@ -459,9 +535,12 @@ def test_combined_renders_box_room():
     renderer for the box room scene.
     """
     config = RenderConfig(
-        screen_width=16, screen_height=20, fov_columns=16,
+        screen_width=16,
+        screen_height=20,
+        fov_columns=16,
         trig_table=generate_trig_table(),
-        ceiling_color=(0.2, 0.2, 0.2), floor_color=(0.4, 0.4, 0.4),
+        ceiling_color=(0.2, 0.2, 0.2),
+        floor_color=(0.4, 0.4, 0.4),
     )
     textures = default_texture_atlas()
     max_walls = 8
@@ -471,50 +550,68 @@ def test_combined_renders_box_room():
     # Box room: 4 walls
     h = 5.0
     walls = [
-        {"ax": h, "ay": -h, "bx": h, "by": h, "tex_id": 0.0},    # east
-        {"ax": -h, "ay": -h, "bx": -h, "by": h, "tex_id": 1.0},   # west
-        {"ax": -h, "ay": h, "bx": h, "by": h, "tex_id": 2.0},     # north
-        {"ax": -h, "ay": -h, "bx": h, "by": -h, "tex_id": 3.0},   # south
+        {"ax": h, "ay": -h, "bx": h, "by": h, "tex_id": 0.0},  # east
+        {"ax": -h, "ay": -h, "bx": -h, "by": h, "tex_id": 1.0},  # west
+        {"ax": -h, "ay": h, "bx": h, "by": h, "tex_id": 2.0},  # north
+        {"ax": -h, "ay": -h, "bx": h, "by": -h, "tex_id": 3.0},  # south
     ]
-    segs = [Segment(ax=w["ax"], ay=w["ay"], bx=w["bx"], by=w["by"],
-                     color=(0.8, 0.2, 0.1), texture_id=int(w["tex_id"]))
-            for w in walls]
+    segs = [
+        Segment(
+            ax=w["ax"],
+            ay=w["ay"],
+            bx=w["bx"],
+            by=w["by"],
+            color=(0.8, 0.2, 0.1),
+            texture_id=int(w["tex_id"]),
+        )
+        for w in walls
+    ]
     N = len(walls)
 
     px, py, player_angle = 0.0, 0.0, 0.0
 
     output_node, pos_encoding = build_combined_graph(config, textures, max_walls)
     compiled = compile_headless(
-        output_node, pos_encoding,
-        d=2048, d_head=32, max_layers=400, verbose=False,
+        output_node,
+        pos_encoding,
+        d=2048,
+        d_head=32,
+        max_layers=400,
+        verbose=False,
     )
 
     past = compiled.empty_past()
     step = 0
 
     # Prefill: START
-    row = _build_row(compiled, max_walls,
-                     token_type=E8_START,
-                     player_x=torch.tensor([px]),
-                     player_y=torch.tensor([py]),
-                     player_angle=torch.tensor([player_angle]))
+    row = _build_row(
+        compiled,
+        max_walls,
+        token_type=E8_START,
+        player_x=torch.tensor([px]),
+        player_y=torch.tensor([py]),
+        player_angle=torch.tensor([player_angle]),
+    )
     with torch.no_grad():
         out, past = compiled.step(row, past, past_len=step)
     step += 1
 
     # Prefill: WALL × N (host feeds player state + wall_index at every position)
     for i, w in enumerate(walls):
-        row = _build_row(compiled, max_walls,
-                         token_type=E8_WALL,
-                         player_x=torch.tensor([px]),
-                         player_y=torch.tensor([py]),
-                         player_angle=torch.tensor([player_angle]),
-                         wall_ax=torch.tensor([w["ax"]]),
-                         wall_ay=torch.tensor([w["ay"]]),
-                         wall_bx=torch.tensor([w["bx"]]),
-                         wall_by=torch.tensor([w["by"]]),
-                         wall_tex_id=torch.tensor([w["tex_id"]]),
-                         wall_index=torch.tensor([float(i)]))
+        row = _build_row(
+            compiled,
+            max_walls,
+            token_type=E8_WALL,
+            player_x=torch.tensor([px]),
+            player_y=torch.tensor([py]),
+            player_angle=torch.tensor([player_angle]),
+            wall_ax=torch.tensor([w["ax"]]),
+            wall_ay=torch.tensor([w["ay"]]),
+            wall_bx=torch.tensor([w["bx"]]),
+            wall_by=torch.tensor([w["by"]]),
+            wall_tex_id=torch.tensor([w["tex_id"]]),
+            wall_index=torch.tensor([float(i)]),
+        )
         with torch.no_grad():
             out, past = compiled.step(row, past, past_len=step)
         step += 1
@@ -529,12 +626,15 @@ def test_combined_renders_box_room():
     onehot_sl = slice(8 + 5, 8 + 5 + max_walls)
     mask = np.zeros(max_walls)
     for k in range(N):
-        row = _build_row(compiled, max_walls,
-                         token_type=E8_SORTED_WALL,
-                         player_x=torch.tensor([px]),
-                         player_y=torch.tensor([py]),
-                         player_angle=torch.tensor([player_angle]),
-                         sort_mask=torch.tensor(mask, dtype=torch.float32))
+        row = _build_row(
+            compiled,
+            max_walls,
+            token_type=E8_SORTED_WALL,
+            player_x=torch.tensor([px]),
+            player_y=torch.tensor([py]),
+            player_angle=torch.tensor([player_angle]),
+            sort_mask=torch.tensor(mask, dtype=torch.float32),
+        )
         with torch.no_grad():
             out, past = compiled.step(row, past, past_len=step)
         step += 1
@@ -545,13 +645,16 @@ def test_combined_renders_box_room():
     frame = np.zeros((H, W, 3), dtype=np.float32)
     pixel_sl = slice(8, 8 + H * 3)
     for col in range(W):
-        row = _build_row(compiled, max_walls,
-                         token_type=E8_RENDER,
-                         player_x=torch.tensor([px]),
-                         player_y=torch.tensor([py]),
-                         player_angle=torch.tensor([player_angle]),
-                         col_idx=torch.tensor([float(col)]),
-                         patch_idx=torch.tensor([0.0]))
+        row = _build_row(
+            compiled,
+            max_walls,
+            token_type=E8_RENDER,
+            player_x=torch.tensor([px]),
+            player_y=torch.tensor([py]),
+            player_angle=torch.tensor([player_angle]),
+            col_idx=torch.tensor([float(col)]),
+            patch_idx=torch.tensor([0.0]),
+        )
         with torch.no_grad():
             out, past = compiled.step(row, past, past_len=step)
         step += 1
@@ -562,7 +665,13 @@ def test_combined_renders_box_room():
     ref_frame = np.zeros((H, W, 3), dtype=np.float64)
     for col in range(W):
         ref_frame[:, col, :] = render_column(
-            col, px, py, int(player_angle), segs, config, textures=textures,
+            col,
+            px,
+            py,
+            int(player_angle),
+            segs,
+            config,
+            textures=textures,
         )
 
     # Verify frame isn't blank

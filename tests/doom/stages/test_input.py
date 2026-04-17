@@ -24,7 +24,6 @@ from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.doom.graph_constants import E8_INPUT, E8_WALL
 from torchwright.doom.stages.input import InputInputs, build_input
 
-
 # ---------------------------------------------------------------------------
 # Fixture
 # ---------------------------------------------------------------------------
@@ -69,11 +68,22 @@ def input_module():
         turn_speed=_TURN_SPEED,
         move_speed=_MOVE_SPEED,
     )
-    output = Concatenate([
-        out.new_angle, out.vel_dx, out.vel_dy, out.move_cos, out.move_sin,
-    ])
+    output = Concatenate(
+        [
+            out.new_angle,
+            out.vel_dx,
+            out.vel_dy,
+            out.move_cos,
+            out.move_sin,
+        ]
+    )
     return compile_headless(
-        output, pos, d=1024, d_head=16, max_layers=40, verbose=False,
+        output,
+        pos,
+        d=1024,
+        d_head=16,
+        max_layers=40,
+        verbose=False,
     )
 
 
@@ -84,8 +94,9 @@ def _pack(module, rows: list[dict]) -> torch.Tensor:
     t = torch.zeros(T, d_input, dtype=torch.float32)
     for i, row in enumerate(rows):
         for name, start, width in module._input_specs:
-            t[i, start:start + width] = torch.tensor(
-                row[name], dtype=torch.float32,
+            t[i, start : start + width] = torch.tensor(
+                row[name],
+                dtype=torch.float32,
             ).reshape(width)
     return t
 
@@ -124,13 +135,16 @@ def _reference_new_angle(old_angle: int, turn_left: bool, turn_right: bool) -> i
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("angle,controls,exp_angle_delta", [
-    (0, {"turn_right": True}, +_TURN_SPEED),
-    (10, {"turn_left": True}, -_TURN_SPEED),
-    (0, {}, 0),
-    (250, {"turn_right": True}, +_TURN_SPEED),   # wrap-around near 256
-    (3, {"turn_left": True}, -_TURN_SPEED),      # wrap-around near 0
-])
+@pytest.mark.parametrize(
+    "angle,controls,exp_angle_delta",
+    [
+        (0, {"turn_right": True}, +_TURN_SPEED),
+        (10, {"turn_left": True}, -_TURN_SPEED),
+        (0, {}, 0),
+        (250, {"turn_right": True}, +_TURN_SPEED),  # wrap-around near 256
+        (3, {"turn_left": True}, -_TURN_SPEED),  # wrap-around near 0
+    ],
+)
 def test_new_angle_matches_reference(input_module, angle, controls, exp_angle_delta):
     """new_angle = (old + turn_right*speed - turn_left*speed) mod 256."""
     row_input = {
@@ -161,15 +175,18 @@ def test_new_angle_matches_reference(input_module, angle, controls, exp_angle_de
     )
 
 
-@pytest.mark.parametrize("angle,controls", [
-    (0, {"forward": True}),      # east
-    (64, {"forward": True}),     # north
-    (128, {"forward": True}),    # west
-    (0, {"backward": True}),
-    (64, {"strafe_right": True}),
-    (0, {"strafe_left": True}),
-    (0, {"forward": True, "strafe_right": True}),   # diagonal
-])
+@pytest.mark.parametrize(
+    "angle,controls",
+    [
+        (0, {"forward": True}),  # east
+        (64, {"forward": True}),  # north
+        (128, {"forward": True}),  # west
+        (0, {"backward": True}),
+        (64, {"strafe_right": True}),
+        (0, {"strafe_left": True}),
+        (0, {"forward": True, "strafe_right": True}),  # diagonal
+    ],
+)
 def test_velocity_matches_reference(input_module, angle, controls):
     """vel_dx, vel_dy at broadcast-receiver must match reference trig-driven velocity."""
     row_input = {
@@ -190,9 +207,9 @@ def test_velocity_matches_reference(input_module, angle, controls):
     vel_dy = out[1, 2].item()
     ref_dx, ref_dy = _reference_velocity(angle, controls)
     # Allow a little slack for trig-table lookup + piecewise interp.
-    assert abs(vel_dx - ref_dx) < 0.05, (
-        f"angle={angle} controls={controls}: vel_dx={vel_dx:+.3f}, expected {ref_dx:+.3f}"
-    )
-    assert abs(vel_dy - ref_dy) < 0.05, (
-        f"angle={angle} controls={controls}: vel_dy={vel_dy:+.3f}, expected {ref_dy:+.3f}"
-    )
+    assert (
+        abs(vel_dx - ref_dx) < 0.05
+    ), f"angle={angle} controls={controls}: vel_dx={vel_dx:+.3f}, expected {ref_dx:+.3f}"
+    assert (
+        abs(vel_dy - ref_dy) < 0.05
+    ), f"angle={angle} controls={controls}: vel_dy={vel_dy:+.3f}, expected {ref_dy:+.3f}"

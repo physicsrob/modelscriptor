@@ -48,7 +48,6 @@ from torchwright.graph.attn import Attn, CAUSAL_MASK_SENTINEL
 from torchwright.graph.misc import Assert, InputNode, LiteralValue, Placeholder
 from torchwright.graph.pos_encoding import PosEncoding
 
-
 # ---------------------------------------------------------------------------
 # Oracle: memoised recursive evaluator
 # ---------------------------------------------------------------------------
@@ -186,7 +185,8 @@ class ProbeReport:
             return "\n".join(lines)
         lines.append(f"  first divergent: {self.first_divergent.summary()}")
         ranked = sorted(
-            self.per_node.values(), key=lambda r: -r.max_abs_error,
+            self.per_node.values(),
+            key=lambda r: -r.max_abs_error,
         )
         lines.append(f"  top-{show_top_k} by error magnitude:")
         for r in ranked[:show_top_k]:
@@ -228,9 +228,7 @@ def _run_with_states(
     compiled: "CompiledHeadless",
     prefill: torch.Tensor,
     past_len: int = 0,
-    past_kvs: Optional[
-        List[Optional[Tuple[torch.Tensor, torch.Tensor]]]
-    ] = None,
+    past_kvs: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
 ) -> Tuple[
     HeadlessTransformer,
     ResidualAssignment,
@@ -271,11 +269,13 @@ def _run_with_states(
             for i, layer in enumerate(net.layers):
                 res, _kv = layer.attn.forward_cached(res, past_kvs[i])
                 state_tensor[layer.attn.out_state] = (
-                    res, f"layer_{i}_attn_skip_out_state",
+                    res,
+                    f"layer_{i}_attn_skip_out_state",
                 )
                 res = layer.mlp.forward(res)
                 state_tensor[layer.mlp.out_state] = (
-                    res, f"layer_{i}_mlp_out_state",
+                    res,
+                    f"layer_{i}_mlp_out_state",
                 )
     return net, ra, state_tensor
 
@@ -309,9 +309,9 @@ def _extract_compiled_value(
     return res_tensor[:, cols]
 
 
-def _first_state_with(node: Node, ra: ResidualAssignment,
-                      ordered_states: List[ResidualStreamState]
-                      ) -> Optional[ResidualStreamState]:
+def _first_state_with(
+    node: Node, ra: ResidualAssignment, ordered_states: List[ResidualStreamState]
+) -> Optional[ResidualStreamState]:
     """Earliest sublayer state in which ``node`` is materialised."""
     if isinstance(node, Concatenate):
         # Concatenate is resolved transparently — pick the earliest
@@ -319,9 +319,7 @@ def _first_state_with(node: Node, ra: ResidualAssignment,
         children = [i for i in node.inputs]
         best: Optional[ResidualStreamState] = None
         for st in ordered_states:
-            if all(
-                _first_state_with(c, ra, [st]) is not None for c in children
-            ):
+            if all(_first_state_with(c, ra, [st]) is not None for c in children):
                 best = st
                 break
         return best
@@ -359,7 +357,9 @@ def probe_compiled(
     oracle = reference_eval(output_node, input_values, n_pos)
 
     net, ra, state_tensor = _run_with_states(
-        compiled, _inputs_from_dict(compiled, input_values, n_pos), past_len=0,
+        compiled,
+        _inputs_from_dict(compiled, input_values, n_pos),
+        past_len=0,
     )
     ordered_states = [s for _, _, s in _ordered_mlp_states(net, ra)]
 
@@ -472,7 +472,11 @@ def probe_graph(
         d_hidden=d_hidden,
     )
     return probe_compiled(
-        compiled, output_node, input_values, n_pos, atol=atol,
+        compiled,
+        output_node,
+        input_values,
+        n_pos,
+        atol=atol,
     )
 
 
@@ -534,12 +538,8 @@ class ResidualProbe:
         in on e.g. just the WALL rows of a long prefill.
         """
         pos = list(positions)
-        new_per_layer = {
-            layer: tensor[pos] for layer, tensor in self.per_layer.items()
-        }
-        new_shape = (
-            (len(pos), *self.shape[1:]) if self.shape else ()
-        )
+        new_per_layer = {layer: tensor[pos] for layer, tensor in self.per_layer.items()}
+        new_shape = (len(pos), *self.shape[1:]) if self.shape else ()
         return ResidualProbe(
             node=self.node,
             per_layer=new_per_layer,
@@ -555,9 +555,7 @@ def probe_residual(
     *,
     at_layer: Optional[int] = None,
     past_len: int = 0,
-    past_kvs: Optional[
-        List[Optional[Tuple[torch.Tensor, torch.Tensor]]]
-    ] = None,
+    past_kvs: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
 ) -> ResidualProbe:
     """Extract a node's residual value from each post-MLP layer snapshot.
 
@@ -593,7 +591,10 @@ def probe_residual(
         A :class:`ResidualProbe` with per-layer values.
     """
     _net, ra, state_tensor = _run_with_states(
-        compiled, prefill, past_len, past_kvs=past_kvs,
+        compiled,
+        prefill,
+        past_len,
+        past_kvs=past_kvs,
     )
 
     ordered = _ordered_mlp_states(_net, ra)
@@ -615,7 +616,10 @@ def probe_residual(
 
     layers = sorted(per_layer.keys())
     return ResidualProbe(
-        node=node, per_layer=per_layer, layers=layers, shape=shape,
+        node=node,
+        per_layer=per_layer,
+        layers=layers,
+        shape=shape,
     )
 
 
@@ -645,7 +649,8 @@ def attention_capture(
     ``(n_heads, n_queries, n_keys)``.
     """
     captured: Dict[str, Optional[torch.Tensor]] = {
-        "logits": None, "weights": None,
+        "logits": None,
+        "weights": None,
     }
     attn_module = net.layers[layer_index].attn.attn
     orig_fwd_cached = attn_module.forward_cached
@@ -672,7 +677,9 @@ def attention_capture(
         captured["weights"] = weights.detach().cpu()
         weighted = torch.bmm(weights, V)
         output = torch.einsum(
-            "hpk,hkd->pd", weighted, attn_module.output_matrix,
+            "hpk,hkd->pd",
+            weighted,
+            attn_module.output_matrix,
         )
         return output, (K, V)
 
@@ -701,7 +708,9 @@ class AttentionProbe:
     position_labels: List[str] = field(default_factory=list)
 
     def top(
-        self, k: int = 8, head: int = 0,
+        self,
+        k: int = 8,
+        head: int = 0,
     ) -> List[Tuple[int, float, str]]:
         """Return ``(key_pos, weight, label)`` for the ``k`` largest
         weights in head ``head``.  ``label`` is empty if
@@ -713,10 +722,7 @@ class AttentionProbe:
         topk = torch.topk(w, k=k_eff)
         out: List[Tuple[int, float, str]] = []
         for val, idx in zip(topk.values.tolist(), topk.indices.tolist()):
-            label = (
-                self.position_labels[idx]
-                if idx < len(self.position_labels) else ""
-            )
+            label = self.position_labels[idx] if idx < len(self.position_labels) else ""
             out.append((int(idx), float(val), label))
         return out
 
@@ -793,9 +799,9 @@ def probe_attention(
 
     weights = captured["weights"]
     logits = captured["logits"]
-    assert weights is not None and logits is not None, (
-        "attention_capture did not fire — hook installed on wrong layer?"
-    )
+    assert (
+        weights is not None and logits is not None
+    ), "attention_capture did not fire — hook installed on wrong layer?"
 
     return AttentionProbe(
         attn_node=attn_node,
@@ -813,8 +819,8 @@ class LayerDiffRecord:
 
     layer_index: int
     state_name: str
-    value: torch.Tensor            # (len(positions), node.d_output)
-    delta: torch.Tensor            # abs(value - reference)
+    value: torch.Tensor  # (len(positions), node.d_output)
+    delta: torch.Tensor  # abs(value - reference)
     max_abs_delta: float
 
 
@@ -850,9 +856,7 @@ def probe_layer_diff(
     sentinel: Optional[float] = None,
     sentinel_tol: float = 1e-4,
     past_len: int = 0,
-    past_kvs: Optional[
-        List[Optional[Tuple[torch.Tensor, torch.Tensor]]]
-    ] = None,
+    past_kvs: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
 ) -> LayerDiffReport:
     """Track a node's value + delta-vs-reference across consecutive layers.
 
@@ -899,7 +903,10 @@ def probe_layer_diff(
         A populated :class:`LayerDiffReport`.
     """
     _net, ra, state_tensor = _run_with_states(
-        compiled, prefill, past_len, past_kvs=past_kvs,
+        compiled,
+        prefill,
+        past_len,
+        past_kvs=past_kvs,
     )
     ordered = _ordered_mlp_states(_net, ra)
 
@@ -928,13 +935,15 @@ def probe_layer_diff(
             )
         delta = (value - ref_cpu).abs()
         max_abs = float(delta.max().item())
-        report.records.append(LayerDiffRecord(
-            layer_index=layer_i,
-            state_name=state_name,
-            value=value,
-            delta=delta,
-            max_abs_delta=max_abs,
-        ))
+        report.records.append(
+            LayerDiffRecord(
+                layer_index=layer_i,
+                state_name=state_name,
+                value=value,
+                delta=delta,
+                max_abs_delta=max_abs,
+            )
+        )
         if report.first_drift_layer is None and max_abs > drift_threshold:
             report.first_drift_layer = layer_i
         if (
@@ -981,7 +990,9 @@ def check_asserts_on_compiled(
         return
 
     _net, ra, state_tensor = _run_with_states(
-        compiled, _inputs_from_dict(compiled, input_values, n_pos), past_len=0,
+        compiled,
+        _inputs_from_dict(compiled, input_values, n_pos),
+        past_len=0,
     )
     ordered_states = [s for _, _, s in _ordered_mlp_states(_net, ra)]
 

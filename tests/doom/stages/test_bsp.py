@@ -18,7 +18,6 @@ from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
 from torchwright.doom.stages.bsp import BspInputs, build_bsp
 
-
 _MAX_COORD = 20.0
 _MAX_BSP_NODES = 4
 
@@ -38,14 +37,18 @@ def bsp_module():
     bsp_plane_ny = create_input("bsp_plane_ny", 1, value_range=(-1.0, 1.0))
     bsp_plane_d = create_input("bsp_plane_d", 1, value_range=(-_MAX_COORD, _MAX_COORD))
     bsp_node_id_onehot = create_input(
-        "bsp_node_id_onehot", _MAX_BSP_NODES, value_range=(0.0, 1.0),
+        "bsp_node_id_onehot",
+        _MAX_BSP_NODES,
+        value_range=(0.0, 1.0),
     )
     is_bsp_node = create_input("is_bsp_node", 1, value_range=(-1.0, 1.0))
 
     out = build_bsp(
         BspInputs(
-            player_x=player_x, player_y=player_y,
-            bsp_plane_nx=bsp_plane_nx, bsp_plane_ny=bsp_plane_ny,
+            player_x=player_x,
+            player_y=player_y,
+            bsp_plane_nx=bsp_plane_nx,
+            bsp_plane_ny=bsp_plane_ny,
             bsp_plane_d=bsp_plane_d,
             bsp_node_id_onehot=bsp_node_id_onehot,
             is_bsp_node=is_bsp_node,
@@ -55,8 +58,12 @@ def bsp_module():
         max_bsp_nodes=_MAX_BSP_NODES,
     )
     return compile_headless(
-        out.side_P_vec, pos,
-        d=1024, d_head=16, max_layers=40, verbose=False,
+        out.side_P_vec,
+        pos,
+        d=1024,
+        d_head=16,
+        max_layers=40,
+        verbose=False,
     )
 
 
@@ -66,8 +73,9 @@ def _pack(module, rows: list[dict]) -> torch.Tensor:
     t = torch.zeros(T, d_input, dtype=torch.float32)
     for i, row in enumerate(rows):
         for name, start, width in module._input_specs:
-            t[i, start:start + width] = torch.tensor(
-                row[name], dtype=torch.float32,
+            t[i, start : start + width] = torch.tensor(
+                row[name],
+                dtype=torch.float32,
             ).reshape(width)
     return t
 
@@ -82,9 +90,12 @@ def _bsp_row(i: int, nx: float, ny: float, d: float, px: float, py: float) -> di
     oh = [1.0 if k == i else 0.0 for k in range(_MAX_BSP_NODES)]
     return {
         "is_bsp_node": 1.0,  # +1 = valid at this BSP_NODE position
-        "bsp_plane_nx": nx, "bsp_plane_ny": ny, "bsp_plane_d": d,
+        "bsp_plane_nx": nx,
+        "bsp_plane_ny": ny,
+        "bsp_plane_d": d,
         "bsp_node_id_onehot": oh,
-        "player_x": px, "player_y": py,
+        "player_x": px,
+        "player_y": py,
     }
 
 
@@ -92,9 +103,12 @@ def _receiver_row(px: float, py: float) -> dict:
     """A non-BSP_NODE receiver position.  Not used for the broadcast math."""
     return {
         "is_bsp_node": -1.0,  # -1 = not a BSP_NODE (matches equals_vector convention)
-        "bsp_plane_nx": 0.0, "bsp_plane_ny": 0.0, "bsp_plane_d": 0.0,
+        "bsp_plane_nx": 0.0,
+        "bsp_plane_ny": 0.0,
+        "bsp_plane_d": 0.0,
         "bsp_node_id_onehot": [0.0] * _MAX_BSP_NODES,
-        "player_x": px, "player_y": py,
+        "player_x": px,
+        "player_y": py,
     }
 
 
@@ -103,29 +117,33 @@ def _receiver_row(px: float, py: float) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("px,py,planes,expected_sides", [
-    # One plane x=0 (nx=1, ny=0, d=0).  Player at (3, 0) → FRONT → side_P[0]=1.
-    (3.0, 0.0,
-     [(1.0, 0.0, 0.0)],
-     [1.0, 0.0, 0.0, 0.0]),
-    # Same plane, player at (-3, 0) → BACK → side_P[0]=0.
-    (-3.0, 0.0,
-     [(1.0, 0.0, 0.0)],
-     [0.0, 0.0, 0.0, 0.0]),
-    # Two planes: x=0 and y=0.  Player at (3, 2) → FRONT of both.
-    (3.0, 2.0,
-     [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
-     [1.0, 1.0, 0.0, 0.0]),
-    # Three planes, player on various sides.
-    # plane 0: x-5 → raw = 1*3 + 0*2 + (-5) = -2 → BACK → 0
-    # plane 1: y+5 → raw = 0 + 1*2 + 5 = 7 → FRONT → 1
-    # plane 2: x+y → raw = 3 + 2 + 0 = 5 → FRONT → 1
-    (3.0, 2.0,
-     [(1.0, 0.0, -5.0), (0.0, 1.0, 5.0), (1.0, 1.0, 0.0)],
-     [0.0, 1.0, 1.0, 0.0]),
-])
+@pytest.mark.parametrize(
+    "px,py,planes,expected_sides",
+    [
+        # One plane x=0 (nx=1, ny=0, d=0).  Player at (3, 0) → FRONT → side_P[0]=1.
+        (3.0, 0.0, [(1.0, 0.0, 0.0)], [1.0, 0.0, 0.0, 0.0]),
+        # Same plane, player at (-3, 0) → BACK → side_P[0]=0.
+        (-3.0, 0.0, [(1.0, 0.0, 0.0)], [0.0, 0.0, 0.0, 0.0]),
+        # Two planes: x=0 and y=0.  Player at (3, 2) → FRONT of both.
+        (3.0, 2.0, [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0)], [1.0, 1.0, 0.0, 0.0]),
+        # Three planes, player on various sides.
+        # plane 0: x-5 → raw = 1*3 + 0*2 + (-5) = -2 → BACK → 0
+        # plane 1: y+5 → raw = 0 + 1*2 + 5 = 7 → FRONT → 1
+        # plane 2: x+y → raw = 3 + 2 + 0 = 5 → FRONT → 1
+        (
+            3.0,
+            2.0,
+            [(1.0, 0.0, -5.0), (0.0, 1.0, 5.0), (1.0, 1.0, 0.0)],
+            [0.0, 1.0, 1.0, 0.0],
+        ),
+    ],
+)
 def test_side_P_vec_matches_plane_classification(
-    bsp_module, px, py, planes, expected_sides,
+    bsp_module,
+    px,
+    py,
+    planes,
+    expected_sides,
 ):
     """side_P_vec[i] must equal 1 iff nx_i*px + ny_i*py + d_i > 0.
 
@@ -137,8 +155,7 @@ def test_side_P_vec_matches_plane_classification(
     assert len(planes) <= _MAX_BSP_NODES, "test setup exceeds max_bsp_nodes"
 
     rows = [
-        _bsp_row(i, nx, ny, d, px=px, py=py)
-        for i, (nx, ny, d) in enumerate(planes)
+        _bsp_row(i, nx, ny, d, px=px, py=py) for i, (nx, ny, d) in enumerate(planes)
     ]
     # Pad remaining slots with planes that classify unambiguously as BACK
     # (nx=1, ny=0, d=-99 → raw = px - 99 ≤ -79 across the whole map).

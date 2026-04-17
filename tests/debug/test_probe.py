@@ -110,7 +110,10 @@ def test_probe_residual_reads_intermediate_node():
     y = multiply_const(x, 3.0)
     z = add_const(y, 1.0)
     module = compile_headless(
-        pos, io={"x": (x, z)}, d=64, verbose=False,
+        pos,
+        io={"x": (x, z)},
+        d=64,
+        verbose=False,
     )
 
     inp = torch.tensor([[2.0, 4.0]])
@@ -121,9 +124,9 @@ def test_probe_residual_reads_intermediate_node():
     for layer_i in report.layers:
         v = report.at(layer_i)
         assert v is not None
-        assert torch.allclose(v, expected_y, atol=0.1), (
-            f"layer {layer_i}: expected {expected_y.tolist()} got {v.tolist()}"
-        )
+        assert torch.allclose(
+            v, expected_y, atol=0.1
+        ), f"layer {layer_i}: expected {expected_y.tolist()} got {v.tolist()}"
     # at_layer filter: restrict to the last layer that holds y.
     one = probe_residual(module, inp, y, at_layer=report.layers[-1])
     assert one.layers == [report.layers[-1]]
@@ -140,14 +143,20 @@ def test_probe_attention_captures_softmax_weights():
     x = create_input("x", 4)
     torch.manual_seed(0)
     attn = Attn(
-        query_in=x, key_in=x, value_in=x,
+        query_in=x,
+        key_in=x,
+        value_in=x,
         query_matrix=torch.randn(4, 4),
         key_matrix=torch.randn(4, 4),
         value_matrix=torch.randn(4, 4),
         output_matrix=torch.randn(4, 4),
     )
     module = compile_headless(
-        pos, io={"x": (x, attn)}, d=256, d_head=16, verbose=False,
+        pos,
+        io={"x": (x, attn)},
+        d=256,
+        d_head=16,
+        verbose=False,
     )
 
     inp = torch.randn(3, 4)
@@ -156,16 +165,16 @@ def test_probe_attention_captures_softmax_weights():
     assert report.layer_index >= 0
     # Softmax sums to 1 per head (within fp tolerance).
     sums = report.weights.sum(dim=-1)
-    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-4), (
-        f"weights don't sum to 1 per head: {sums.tolist()}"
-    )
+    assert torch.allclose(
+        sums, torch.ones_like(sums), atol=1e-4
+    ), f"weights don't sum to 1 per head: {sums.tolist()}"
     # Causal mask: query row 2 can attend to positions 0, 1, 2 only.
     # Positions 3..n_keys-1 (if any) must have negligible weight.
     if report.weights.shape[1] > 3:
         future_mass = report.weights[:, 3:].sum().item()
-        assert future_mass < 1e-3, (
-            f"causal mask leak — future positions got {future_mass:.3g}"
-        )
+        assert (
+            future_mass < 1e-3
+        ), f"causal mask leak — future positions got {future_mass:.3g}"
     # top() returns a ranked list.
     top = report.top(k=3, head=0)
     assert len(top) == 3
@@ -189,7 +198,10 @@ def test_probe_layer_diff_drift_and_sentinel():
     x = create_input("x", 2)
     y = multiply_const(x, 3.0)
     module = compile_headless(
-        pos, io={"x": (x, y)}, d=64, verbose=False,
+        pos,
+        io={"x": (x, y)},
+        d=64,
+        verbose=False,
     )
 
     inp = torch.tensor([[2.0, 4.0], [1.0, 5.0]])
@@ -198,8 +210,12 @@ def test_probe_layer_diff_drift_and_sentinel():
 
     # Correct reference → no drift.
     ok = probe_layer_diff(
-        module, inp, y,
-        reference=true_ref, positions=positions, drift_threshold=0.5,
+        module,
+        inp,
+        y,
+        reference=true_ref,
+        positions=positions,
+        drift_threshold=0.5,
     )
     assert ok.records, "no layers traced"
     assert ok.first_drift_layer is None, (
@@ -210,8 +226,12 @@ def test_probe_layer_diff_drift_and_sentinel():
     # Wrong reference → drift flagged at the first layer.
     bad_ref = torch.zeros_like(true_ref)
     bad = probe_layer_diff(
-        module, inp, y,
-        reference=bad_ref, positions=positions, drift_threshold=0.5,
+        module,
+        inp,
+        y,
+        reference=bad_ref,
+        positions=positions,
+        drift_threshold=0.5,
     )
     assert bad.first_drift_layer is not None
     assert bad.first_drift_layer == bad.records[0].layer_index
@@ -220,17 +240,25 @@ def test_probe_layer_diff_drift_and_sentinel():
     # (the top-left element).  Using that as the sentinel must flag the
     # first layer; a value that never surfaces must not flag anything.
     s_hit = probe_layer_diff(
-        module, inp, y,
-        reference=true_ref, positions=positions,
-        sentinel=6.0, sentinel_tol=0.1,
+        module,
+        inp,
+        y,
+        reference=true_ref,
+        positions=positions,
+        sentinel=6.0,
+        sentinel_tol=0.1,
     )
     assert s_hit.first_sentinel_layer == s_hit.records[0].layer_index
     assert s_hit.sentinel_value == 6.0
 
     s_miss = probe_layer_diff(
-        module, inp, y,
-        reference=true_ref, positions=positions,
-        sentinel=-999.0, sentinel_tol=0.01,
+        module,
+        inp,
+        y,
+        reference=true_ref,
+        positions=positions,
+        sentinel=-999.0,
+        sentinel_tol=0.01,
     )
     assert s_miss.first_sentinel_layer is None
 
@@ -244,13 +272,18 @@ def test_probe_clean_on_v2_box_room(tiny_config):
     max_walls = 8
     max_bsp_nodes = 48
     graph_io, pos_encoding = build_game_graph(
-        tiny_config, textures, max_walls=max_walls,
-        max_coord=10.0, move_speed=0.3, turn_speed=4,
+        tiny_config,
+        textures,
+        max_walls=max_walls,
+        max_coord=10.0,
+        move_speed=0.3,
+        turn_speed=4,
         max_bsp_nodes=max_bsp_nodes,
     )
     output_node = graph_io.concat_output()
 
     from torchwright.doom.game_graph import E8_INPUT
+
     d_render_fb = 2 * max_walls + 11
     d_sort_out = 8 + 5 + 3 + max_walls
     tex_h = textures[0].shape[1]
@@ -291,13 +324,19 @@ def test_probe_clean_on_v2_box_room(tiny_config):
     # still catches real compilation bugs (missing layers, swapped
     # inputs) which show as errors of 1000+.
     report = probe_graph(
-        output_node, pos_encoding, input_values, n_pos=1,
-        d=2048, d_head=32, verbose=False, atol=500.0,
+        output_node,
+        pos_encoding,
+        input_values,
+        n_pos=1,
+        d=2048,
+        d_head=32,
+        verbose=False,
+        atol=500.0,
     )
 
-    assert report.nodes_checked, (
-        "probe checked zero nodes — residual snapshots likely not populated"
-    )
-    assert report.first_divergent is None, (
-        f"probe reported divergence on known-good graph:\n{report.format_short()}"
-    )
+    assert (
+        report.nodes_checked
+    ), "probe checked zero nodes — residual snapshots likely not populated"
+    assert (
+        report.first_divergent is None
+    ), f"probe reported divergence on known-good graph:\n{report.format_short()}"

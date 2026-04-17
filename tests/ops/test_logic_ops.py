@@ -44,7 +44,9 @@ def test_cond_add_vector():
 
 def test_cond_gate():
     x = create_input("x", 1)
-    x_bounded = assert_matches_value_type(x, NodeValueType(value_range=Range(-2.0, 2.0)))
+    x_bounded = assert_matches_value_type(
+        x, NodeValueType(value_range=Range(-2.0, 2.0))
+    )
     cond_input = create_input("cond", 1)
     out = cond_gate(cond_input, x_bounded)
     for cond_value in [-1.0, 1.0]:
@@ -66,7 +68,9 @@ def test_cond_gate():
 def test_cond_gate_exact_branch_passes_clean_cond():
     """Two-sublayer branch matches the single-sublayer branch under clean ±1 cond."""
     x = create_input("x", 1)
-    x_bounded = assert_matches_value_type(x, NodeValueType(value_range=Range(-2.0, 2.0)))
+    x_bounded = assert_matches_value_type(
+        x, NodeValueType(value_range=Range(-2.0, 2.0))
+    )
     cond_input = create_input("cond", 1)
     out = cond_gate(cond_input, x_bounded, approximate=False)
     for cond_value in [-1.0, 1.0]:
@@ -86,7 +90,9 @@ def test_cond_gate_exact_branch_preserves_small_inputs():
     """With a bounded inp range the cancellation-free branch is float-exact on pass-through."""
     x = create_input("x", 1)
     # Wrap in Assert to declare a bounded range; cond_gate reads this range to set M.
-    x_bounded = assert_matches_value_type(x, NodeValueType(value_range=Range(-1.0, 1.0)))
+    x_bounded = assert_matches_value_type(
+        x, NodeValueType(value_range=Range(-1.0, 1.0))
+    )
     cond_input = create_input("cond", 1)
     out = cond_gate(cond_input, x_bounded, approximate=False)
 
@@ -107,7 +113,9 @@ def test_cond_gate_adaptive_M_uses_value_range():
     """Single-sublayer (approximate=True) branch picks M from inp.value_type.value_range,
     so small inputs survive that would be lost under the old global big_offset=1000."""
     x = create_input("x", 1)
-    x_bounded = assert_matches_value_type(x, NodeValueType(value_range=Range(-1.0, 1.0)))
+    x_bounded = assert_matches_value_type(
+        x, NodeValueType(value_range=Range(-1.0, 1.0))
+    )
     cond_input = create_input("cond", 1)
     out = cond_gate(cond_input, x_bounded, approximate=True)
 

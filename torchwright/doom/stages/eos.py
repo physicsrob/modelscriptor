@@ -30,7 +30,6 @@ from torchwright.ops.map_select import select
 from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.stages.wall import CollisionFlags
 
-
 # ---------------------------------------------------------------------------
 # Contract
 # ---------------------------------------------------------------------------
@@ -39,8 +38,8 @@ from torchwright.doom.stages.wall import CollisionFlags
 @dataclass
 class EosInputs:
     # Token-type flags.
-    is_wall: Node          # 1.0 at WALL positions (for collision aggregation)
-    is_eos: Node           # 1.0 at the single EOS position (for state broadcast)
+    is_wall: Node  # 1.0 at WALL positions (for collision aggregation)
+    is_eos: Node  # 1.0 at the single EOS position (for state broadcast)
 
     # Per-wall collision flags from the WALL stage.
     collision: CollisionFlags
@@ -81,8 +80,11 @@ def build_eos(inputs: EosInputs) -> EosOutputs:
 
     with annotate("eos/attention"):
         px, py, angle = _broadcast_resolved_state(
-            inputs.pos_encoding, inputs.is_eos,
-            resolved_x, resolved_y, inputs.new_angle,
+            inputs.pos_encoding,
+            inputs.is_eos,
+            resolved_x,
+            resolved_y,
+            inputs.new_angle,
         )
 
     return EosOutputs(

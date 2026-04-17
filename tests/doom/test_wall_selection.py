@@ -18,7 +18,6 @@ from torchwright.reference_renderer.scenes import box_room_textured
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
-
 TRIG = generate_trig_table()
 
 
@@ -68,11 +67,13 @@ def _wall_band(column, ceiling_color, floor_color, tol=0.05):
     H = len(column)
     ceil_c = np.array(ceiling_color)
     floor_c = np.array(floor_color)
-    is_wall = np.array([
-        np.linalg.norm(column[r] - ceil_c) > tol
-        and np.linalg.norm(column[r] - floor_c) > tol
-        for r in range(H)
-    ])
+    is_wall = np.array(
+        [
+            np.linalg.norm(column[r] - ceil_c) > tol
+            and np.linalg.norm(column[r] - floor_c) > tol
+            for r in range(H)
+        ]
+    )
     if not is_wall.any():
         return None
     indices = np.where(is_wall)[0]
@@ -143,31 +144,45 @@ class TestColumnVisibility:
 
     def test_full_span(self):
         cfg = _config(32, 24, 8)
-        v = self._vis_cols(Segment(ax=5, ay=-5, bx=5, by=5, color=(1, 0, 0)),
-                           0, 0, 0, cfg)
+        v = self._vis_cols(
+            Segment(ax=5, ay=-5, bx=5, by=5, color=(1, 0, 0)), 0, 0, 0, cfg
+        )
         assert len(v) == 32
 
     def test_behind_invisible(self):
         cfg = _config(32, 24, 8)
-        v = self._vis_cols(Segment(ax=-5, ay=-5, bx=-5, by=5, color=(0, 1, 0)),
-                           0, 0, 0, cfg)
+        v = self._vis_cols(
+            Segment(ax=-5, ay=-5, bx=-5, by=5, color=(0, 1, 0)), 0, 0, 0, cfg
+        )
         assert len(v) == 0
 
     def test_contiguous(self):
-        cfg = RenderConfig(screen_width=64, screen_height=24, fov_columns=32,
-                           trig_table=TRIG, ceiling_color=(0, 0, 0),
-                           floor_color=(0.5, 0.5, 0.5))
-        v = self._vis_cols(Segment(ax=5, ay=-1, bx=5, by=1, color=(1, 0, 0)),
-                           0, 0, 0, cfg)
+        cfg = RenderConfig(
+            screen_width=64,
+            screen_height=24,
+            fov_columns=32,
+            trig_table=TRIG,
+            ceiling_color=(0, 0, 0),
+            floor_color=(0.5, 0.5, 0.5),
+        )
+        v = self._vis_cols(
+            Segment(ax=5, ay=-1, bx=5, by=1, color=(1, 0, 0)), 0, 0, 0, cfg
+        )
         if len(v) >= 2:
             assert v[-1] - v[0] + 1 == len(v)
 
     def test_partial_span(self):
-        cfg = RenderConfig(screen_width=64, screen_height=48, fov_columns=32,
-                           trig_table=TRIG, ceiling_color=(0, 0, 0),
-                           floor_color=(0.5, 0.5, 0.5))
-        v = self._vis_cols(Segment(ax=5, ay=-1, bx=5, by=1, color=(1, 0, 0)),
-                           0, 0, 0, cfg)
+        cfg = RenderConfig(
+            screen_width=64,
+            screen_height=48,
+            fov_columns=32,
+            trig_table=TRIG,
+            ceiling_color=(0, 0, 0),
+            floor_color=(0.5, 0.5, 0.5),
+        )
+        v = self._vis_cols(
+            Segment(ax=5, ay=-1, bx=5, by=1, color=(1, 0, 0)), 0, 0, 0, cfg
+        )
         assert 0 < len(v) < 64
 
 
@@ -195,7 +210,9 @@ class TestReferenceStructure:
         assert band is not None, "Should see a wall at center column"
         height = band[1] - band[0]
         expected = cfg.screen_height / 5.0
-        assert abs(height - expected) < 2, f"Wall height {height} != expected ~{expected:.1f}"
+        assert (
+            abs(height - expected) < 2
+        ), f"Wall height {height} != expected ~{expected:.1f}"
 
     def test_wall_height_near_wall(self, box_data):
         """Near east wall (dist 2): wall should be taller than at center."""
@@ -207,7 +224,9 @@ class TestReferenceStructure:
         assert band_far is not None and band_near is not None
         h_far = band_far[1] - band_far[0]
         h_near = band_near[1] - band_near[0]
-        assert h_near > h_far, f"Near wall ({h_near}px) should be taller than far ({h_far}px)"
+        assert (
+            h_near > h_far
+        ), f"Near wall ({h_near}px) should be taller than far ({h_far}px)"
 
     def test_different_walls_different_textures(self, box_data):
         """Facing east vs north: different walls have visually different pixels."""
@@ -218,13 +237,15 @@ class TestReferenceStructure:
         band_e = _wall_band(frame_e[:, 16, :], cfg.ceiling_color, cfg.floor_color)
         band_n = _wall_band(frame_n[:, 16, :], cfg.ceiling_color, cfg.floor_color)
         assert band_e is not None and band_n is not None
-        wall_e = frame_e[band_e[0]:band_e[1], 16, :]
-        wall_n = frame_n[band_n[0]:band_n[1], 16, :]
+        wall_e = frame_e[band_e[0] : band_e[1], 16, :]
+        wall_n = frame_n[band_n[0] : band_n[1], 16, :]
         # Average color should differ (different textures)
         mean_e = wall_e.mean(axis=0)
         mean_n = wall_n.mean(axis=0)
         diff = np.linalg.norm(mean_e - mean_n)
-        assert diff > 0.05, f"Different walls should have different textures, diff={diff:.4f}"
+        assert (
+            diff > 0.05
+        ), f"Different walls should have different textures, diff={diff:.4f}"
 
     def test_wall_coverage_fraction(self, box_data):
         """At center of box room, wall should cover roughly H/5 / H ≈ 20% of each column."""
@@ -259,19 +280,22 @@ class TestCompiledStructure:
     @pytest.fixture(scope="class")
     def module(self, box_data):
         from torchwright.doom.compile import compile_game
+
         segs, texs, cfg = box_data
-        return compile_game(cfg, texs, max_walls=8, max_coord=10.0, d=2048, verbose=False)
+        return compile_game(
+            cfg, texs, max_walls=8, max_coord=10.0, d=2048, verbose=False
+        )
 
     def _compiled_frame(self, module, box_data, px, py, angle):
         from torchwright.doom.compile import step_frame
         from torchwright.doom.game import GameState
         from torchwright.doom.input import PlayerInput
         from torchwright.doom.map_subset import build_scene_subset
+
         segs, texs, cfg = box_data
         subset = build_scene_subset(segs, texs)
         state = GameState(x=px, y=py, angle=angle)
-        frame, _ = step_frame(module, state, PlayerInput(), subset, cfg,
-                              textures=texs)
+        frame, _ = step_frame(module, state, PlayerInput(), subset, cfg, textures=texs)
         return frame
 
     def test_wall_height_center_column(self, module, box_data):
@@ -288,8 +312,9 @@ class TestCompiledStructure:
 
         ref_h = ref_band[1] - ref_band[0]
         comp_h = comp_band[1] - comp_band[0]
-        assert abs(ref_h - comp_h) <= 2, \
-            f"Wall height: compiled={comp_h} vs reference={ref_h}"
+        assert (
+            abs(ref_h - comp_h) <= 2
+        ), f"Wall height: compiled={comp_h} vs reference={ref_h}"
 
     def test_wall_top_bottom_match(self, module, box_data):
         """Wall top and bottom row must match reference within 2 rows."""
@@ -301,10 +326,12 @@ class TestCompiledStructure:
         comp_band = _wall_band(comp[:, 16, :], cfg.ceiling_color, cfg.floor_color)
 
         assert ref_band is not None and comp_band is not None
-        assert abs(ref_band[0] - comp_band[0]) <= 2, \
-            f"Wall top: compiled={comp_band[0]} vs reference={ref_band[0]}"
-        assert abs(ref_band[1] - comp_band[1]) <= 2, \
-            f"Wall bottom: compiled={comp_band[1]} vs reference={ref_band[1]}"
+        assert (
+            abs(ref_band[0] - comp_band[0]) <= 2
+        ), f"Wall top: compiled={comp_band[0]} vs reference={ref_band[0]}"
+        assert (
+            abs(ref_band[1] - comp_band[1]) <= 2
+        ), f"Wall bottom: compiled={comp_band[1]} vs reference={ref_band[1]}"
 
     def test_correct_texture_facing_east(self, module, box_data):
         """Center column wall color must match reference (correct texture)."""
@@ -317,13 +344,14 @@ class TestCompiledStructure:
         assert ref_band is not None and comp_band is not None
 
         # Compare average wall color (robust to slight height differences)
-        ref_wall = ref[ref_band[0]:ref_band[1], 16, :]
-        comp_wall = comp[comp_band[0]:comp_band[1], 16, :]
+        ref_wall = ref[ref_band[0] : ref_band[1], 16, :]
+        comp_wall = comp[comp_band[0] : comp_band[1], 16, :]
         ref_mean = ref_wall.mean(axis=0)
         comp_mean = comp_wall.mean(axis=0)
         diff = np.linalg.norm(ref_mean - comp_mean)
-        assert diff < 0.15, \
-            f"Wall texture color mismatch: ref={ref_mean} comp={comp_mean} diff={diff:.3f}"
+        assert (
+            diff < 0.15
+        ), f"Wall texture color mismatch: ref={ref_mean} comp={comp_mean} diff={diff:.3f}"
 
     def test_correct_texture_facing_north(self, module, box_data):
         """Facing north: texture should match reference (different from east)."""
@@ -335,13 +363,14 @@ class TestCompiledStructure:
         comp_band = _wall_band(comp[:, 16, :], cfg.ceiling_color, cfg.floor_color)
         assert ref_band is not None and comp_band is not None
 
-        ref_wall = ref[ref_band[0]:ref_band[1], 16, :]
-        comp_wall = comp[comp_band[0]:comp_band[1], 16, :]
+        ref_wall = ref[ref_band[0] : ref_band[1], 16, :]
+        comp_wall = comp[comp_band[0] : comp_band[1], 16, :]
         ref_mean = ref_wall.mean(axis=0)
         comp_mean = comp_wall.mean(axis=0)
         diff = np.linalg.norm(ref_mean - comp_mean)
-        assert diff < 0.15, \
-            f"Wall texture color mismatch: ref={ref_mean} comp={comp_mean} diff={diff:.3f}"
+        assert (
+            diff < 0.15
+        ), f"Wall texture color mismatch: ref={ref_mean} comp={comp_mean} diff={diff:.3f}"
 
     def test_different_walls_different_textures(self, module, box_data):
         """Compiled east vs north frames must produce different wall textures."""
@@ -353,11 +382,12 @@ class TestCompiledStructure:
         band_n = _wall_band(frame_n[:, 16, :], cfg.ceiling_color, cfg.floor_color)
         assert band_e is not None and band_n is not None
 
-        mean_e = frame_e[band_e[0]:band_e[1], 16, :].mean(axis=0)
-        mean_n = frame_n[band_n[0]:band_n[1], 16, :].mean(axis=0)
+        mean_e = frame_e[band_e[0] : band_e[1], 16, :].mean(axis=0)
+        mean_n = frame_n[band_n[0] : band_n[1], 16, :].mean(axis=0)
         diff = np.linalg.norm(mean_e - mean_n)
-        assert diff > 0.05, \
-            f"East and north walls should have different textures, diff={diff:.4f}"
+        assert (
+            diff > 0.05
+        ), f"East and north walls should have different textures, diff={diff:.4f}"
 
     def test_wall_coverage_matches_reference(self, module, box_data):
         """Total wall pixel fraction must match reference within 10%."""
@@ -375,8 +405,9 @@ class TestCompiledStructure:
 
         ref_cov = _coverage(ref)
         comp_cov = _coverage(comp)
-        assert abs(ref_cov - comp_cov) < 0.1, \
-            f"Wall coverage: compiled={comp_cov:.3f} vs reference={ref_cov:.3f}"
+        assert (
+            abs(ref_cov - comp_cov) < 0.1
+        ), f"Wall coverage: compiled={comp_cov:.3f} vs reference={ref_cov:.3f}"
 
     def test_per_column_wall_height(self, module, box_data):
         """Every column's wall height must match reference within 3 rows."""
@@ -398,8 +429,9 @@ class TestCompiledStructure:
             if abs(ref_h - comp_h) > 3:
                 mismatches.append((col, ref_h, comp_h))
 
-        assert len(mismatches) == 0, \
-            f"{len(mismatches)} columns with wall height mismatch: {mismatches[:5]}"
+        assert (
+            len(mismatches) == 0
+        ), f"{len(mismatches)} columns with wall height mismatch: {mismatches[:5]}"
 
     def test_near_wall_fills_screen(self, module, box_data):
         """Standing 2 units from east wall: wall should fill most of screen."""
@@ -408,20 +440,25 @@ class TestCompiledStructure:
         band = _wall_band(comp[:, 16, :], cfg.ceiling_color, cfg.floor_color)
         assert band is not None, "Should see a wall"
         height = band[1] - band[0]
-        assert height >= cfg.screen_height * 0.4, \
-            f"Near wall should fill >=40% of screen, got {height}/{cfg.screen_height}"
+        assert (
+            height >= cfg.screen_height * 0.4
+        ), f"Near wall should fill >=40% of screen, got {height}/{cfg.screen_height}"
 
-    @pytest.mark.parametrize("angle,wall_name", [
-        (0, "east"),
-        (64, "north"),
-        (128, "west"),
-        (192, "south"),
-    ])
+    @pytest.mark.parametrize(
+        "angle,wall_name",
+        [
+            (0, "east"),
+            (64, "north"),
+            (128, "west"),
+            (192, "south"),
+        ],
+    )
     def test_four_directions_wall_visible(self, module, box_data, angle, wall_name):
         """Each cardinal direction should show a wall at the center column."""
         segs, texs, cfg = box_data
         comp = self._compiled_frame(module, box_data, 0, 0, angle)
         band = _wall_band(comp[:, 16, :], cfg.ceiling_color, cfg.floor_color)
         assert band is not None, f"Should see {wall_name} wall when facing {wall_name}"
-        assert band[1] - band[0] >= 3, \
-            f"{wall_name} wall too short: {band[1] - band[0]} rows"
+        assert (
+            band[1] - band[0] >= 3
+        ), f"{wall_name} wall too short: {band[1] - band[0]} rows"

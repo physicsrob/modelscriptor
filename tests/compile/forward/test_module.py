@@ -51,9 +51,7 @@ def _empty_past_feeds(per_layer_n_heads: list, d_head: int) -> dict:
 def _discover_meta(session):
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
-    per_layer_n_heads = [
-        int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)
-    ]
+    per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
     return n_layers, per_layer_n_heads, d_head
 
@@ -91,14 +89,17 @@ def test_token_onnx_prefill_matches_compute():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder.onnx")
         compile_to_onnx(
-            output_node, pos_encoding, embedding, onnx_path,
-            d=D, d_head=D_HEAD, verbose=False,
+            output_node,
+            pos_encoding,
+            embedding,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            verbose=False,
         )
 
         tokens = ["<bos", "1", "+", "2", "\n"]
-        ref_logits = _reference_logits(
-            output_node, pos_encoding, embedding, tokens
-        )
+        ref_logits = _reference_logits(output_node, pos_encoding, embedding, tokens)
 
         session = onnxruntime.InferenceSession(onnx_path)
         n_layers, per_layer_n_heads, d_head = _discover_meta(session)
@@ -110,9 +111,9 @@ def test_token_onnx_prefill_matches_compute():
         feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
         onnx_logits = session.run(["logits"], feeds)[0]
 
-        assert np.allclose(ref_logits, onnx_logits, atol=1e-4), (
-            f"logits max diff: {np.abs(ref_logits - onnx_logits).max():.6f}"
-        )
+        assert np.allclose(
+            ref_logits, onnx_logits, atol=1e-4
+        ), f"logits max diff: {np.abs(ref_logits - onnx_logits).max():.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +127,13 @@ def test_token_onnx_decode_step_matches_full_prefill():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder.onnx")
         compile_to_onnx(
-            output_node, pos_encoding, embedding, onnx_path,
-            d=D, d_head=D_HEAD, verbose=False,
+            output_node,
+            pos_encoding,
+            embedding,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            verbose=False,
         )
 
         tokens = ["<bos", "1", "+", "2", "\n"]
@@ -180,17 +186,22 @@ def test_token_onnx_autoregressive_1digit():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder.onnx")
         compile_to_onnx(
-            output_node, pos_encoding, embedding, onnx_path,
-            d=D, d_head=D_HEAD, verbose=False,
+            output_node,
+            pos_encoding,
+            embedding,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            verbose=False,
         )
 
         model = _load(onnx_path)
         test_cases = [("1+1\n", "2"), ("2+3\n", "5"), ("4+5\n", "9")]
         for input_str, expected in test_cases:
             result = "".join(generate(model, input_str))
-            assert result == expected, (
-                f"{input_str}: expected {expected!r}, got {result!r}"
-            )
+            assert (
+                result == expected
+            ), f"{input_str}: expected {expected!r}, got {result!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -206,8 +217,13 @@ def test_token_onnx_autoregressive_3digit():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder3.onnx")
         compile_to_onnx(
-            output_node, pos_encoding, embedding, onnx_path,
-            d=D, d_head=D_HEAD, verbose=False,
+            output_node,
+            pos_encoding,
+            embedding,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            verbose=False,
         )
 
         model = _load(onnx_path)
@@ -220,9 +236,9 @@ def test_token_onnx_autoregressive_3digit():
         ]
         for input_str, expected in test_cases:
             result = "".join(generate(model, input_str))
-            assert result == expected, (
-                f"{input_str}: expected {expected!r}, got {result!r}"
-            )
+            assert (
+                result == expected
+            ), f"{input_str}: expected {expected!r}, got {result!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +254,13 @@ def test_token_onnx_sidecar_schema_and_metadata():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder.onnx")
         compile_to_onnx(
-            output_node, pos_encoding, embedding, onnx_path,
-            d=D, d_head=D_HEAD, verbose=False,
+            output_node,
+            pos_encoding,
+            embedding,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            verbose=False,
         )
 
         meta_path = meta_path_for(onnx_path)

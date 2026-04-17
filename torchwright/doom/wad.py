@@ -24,7 +24,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -35,10 +34,20 @@ import numpy as np
 SUBSECTOR_FLAG = 0x8000
 
 # Lump names that belong to a map (follow the map marker lump).
-_MAP_LUMP_NAMES = frozenset({
-    "THINGS", "LINEDEFS", "SIDEDEFS", "VERTEXES", "SEGS",
-    "SSECTORS", "NODES", "SECTORS", "REJECT", "BLOCKMAP",
-})
+_MAP_LUMP_NAMES = frozenset(
+    {
+        "THINGS",
+        "LINEDEFS",
+        "SIDEDEFS",
+        "VERTEXES",
+        "SEGS",
+        "SSECTORS",
+        "NODES",
+        "SECTORS",
+        "REJECT",
+        "BLOCKMAP",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +217,8 @@ class WADReader:
         # Palette (first of 14 palettes in PLAYPAL)
         pal_off, _ = self._lumps["PLAYPAL"]
         self.palette = np.frombuffer(
-            self._data[pal_off : pal_off + 768], dtype=np.uint8,
+            self._data[pal_off : pal_off + 768],
+            dtype=np.uint8,
         ).reshape(256, 3)
 
         # Patch names
@@ -230,8 +240,7 @@ class WADReader:
         off, _ = self._lumps[lump_name]
         num = struct.unpack_from("<I", self._data, off)[0]
         offsets = [
-            struct.unpack_from("<I", self._data, off + 4 + i * 4)[0]
-            for i in range(num)
+            struct.unpack_from("<I", self._data, off + 4 + i * 4)[0] for i in range(num)
         ]
         defs = {}
         for tex_off in offsets:
@@ -367,10 +376,17 @@ class WADReader:
         for v1, v2, flags, special, tag, fs, bs in struct.iter_unpack("<HHHHHHH", buf):
             front = -1 if fs == 0xFFFF else fs
             back = -1 if bs == 0xFFFF else bs
-            result.append(Linedef(
-                v1=v1, v2=v2, flags=flags, special=special, tag=tag,
-                front_sidedef=front, back_sidedef=back,
-            ))
+            result.append(
+                Linedef(
+                    v1=v1,
+                    v2=v2,
+                    flags=flags,
+                    special=special,
+                    tag=tag,
+                    front_sidedef=front,
+                    back_sidedef=back,
+                )
+            )
         return result
 
     @staticmethod
@@ -387,13 +403,16 @@ class WADReader:
         buf = self._data[off : off + size]
         result = []
         for xo, yo, u, lo, mi, sec in struct.iter_unpack("<hh8s8s8sH", buf):
-            result.append(Sidedef(
-                x_offset=xo, y_offset=yo,
-                upper=self._decode_name(u),
-                lower=self._decode_name(lo),
-                middle=self._decode_name(mi),
-                sector=sec,
-            ))
+            result.append(
+                Sidedef(
+                    x_offset=xo,
+                    y_offset=yo,
+                    upper=self._decode_name(u),
+                    lower=self._decode_name(lo),
+                    middle=self._decode_name(mi),
+                    sector=sec,
+                )
+            )
         return result
 
     def _parse_sectors(self, off: int, size: int) -> List[Sector]:
@@ -404,13 +423,20 @@ class WADReader:
         """
         buf = self._data[off : off + size]
         result = []
-        for fh, ch, ft, ct, light, special, tag in struct.iter_unpack("<hh8s8shhh", buf):
-            result.append(Sector(
-                floor_h=fh, ceiling_h=ch,
-                floor_tex=self._decode_name(ft),
-                ceiling_tex=self._decode_name(ct),
-                light=light, special=special, tag=tag,
-            ))
+        for fh, ch, ft, ct, light, special, tag in struct.iter_unpack(
+            "<hh8s8shhh", buf
+        ):
+            result.append(
+                Sector(
+                    floor_h=fh,
+                    ceiling_h=ch,
+                    floor_tex=self._decode_name(ft),
+                    ceiling_tex=self._decode_name(ct),
+                    light=light,
+                    special=special,
+                    tag=tag,
+                )
+            )
         return result
 
     def _parse_segs(self, off: int, size: int) -> List[Seg]:
@@ -421,10 +447,16 @@ class WADReader:
         buf = self._data[off : off + size]
         result = []
         for v1, v2, angle, ld, side, offset in struct.iter_unpack("<HHhHhh", buf):
-            result.append(Seg(
-                v1=v1, v2=v2, angle=angle,
-                linedef=ld, side=side, offset=offset,
-            ))
+            result.append(
+                Seg(
+                    v1=v1,
+                    v2=v2,
+                    angle=angle,
+                    linedef=ld,
+                    side=side,
+                    offset=offset,
+                )
+            )
         return result
 
     def _parse_subsectors(self, off: int, size: int) -> List[Subsector]:
@@ -449,17 +481,34 @@ class WADReader:
         result = []
         # 14 int16 fields + no extra padding (14*2 = 28 bytes).
         for fields in struct.iter_unpack("<hhhh" "hhhh" "hhhh" "HH", buf):
-            (px, py, dx, dy,
-             f_top, f_bot, f_left, f_right,
-             b_top, b_bot, b_left, b_right,
-             front_child, back_child) = fields
-            result.append(BspNode(
-                px=px, py=py, dx=dx, dy=dy,
-                front_bbox=(f_top, f_bot, f_left, f_right),
-                back_bbox=(b_top, b_bot, b_left, b_right),
-                front_child=front_child,
-                back_child=back_child,
-            ))
+            (
+                px,
+                py,
+                dx,
+                dy,
+                f_top,
+                f_bot,
+                f_left,
+                f_right,
+                b_top,
+                b_bot,
+                b_left,
+                b_right,
+                front_child,
+                back_child,
+            ) = fields
+            result.append(
+                BspNode(
+                    px=px,
+                    py=py,
+                    dx=dx,
+                    dy=dy,
+                    front_bbox=(f_top, f_bot, f_left, f_right),
+                    back_bbox=(b_top, b_bot, b_left, b_right),
+                    front_child=front_child,
+                    back_child=back_child,
+                )
+            )
         return result
 
     def get_map(self, map_name: str) -> MapData:
@@ -472,13 +521,18 @@ class WADReader:
         any required lump is missing.
         """
         lumps = self._find_map_lumps(map_name)
-        required = ("VERTEXES", "LINEDEFS", "SIDEDEFS", "SECTORS",
-                    "SEGS", "SSECTORS", "NODES")
+        required = (
+            "VERTEXES",
+            "LINEDEFS",
+            "SIDEDEFS",
+            "SECTORS",
+            "SEGS",
+            "SSECTORS",
+            "NODES",
+        )
         missing = [n for n in required if n not in lumps]
         if missing:
-            raise KeyError(
-                f"Map {map_name!r} missing required lumps: {missing}"
-            )
+            raise KeyError(f"Map {map_name!r} missing required lumps: {missing}")
         return MapData(
             name=map_name,
             vertices=self._parse_vertexes(*lumps["VERTEXES"]),
@@ -491,7 +545,9 @@ class WADReader:
         )
 
     def get_map_segments(
-        self, map_name: str, tex_size: int = 8,
+        self,
+        map_name: str,
+        tex_size: int = 8,
     ) -> Tuple[List["Segment"], List[np.ndarray], Dict[str, int]]:
         """Load renderable segments and their texture atlas from a map.
 
@@ -555,15 +611,27 @@ class WADReader:
                 if seg.texture_id < 0:
                     remapped.append(seg)
                 elif seg.texture_id in old_to_new:
-                    remapped.append(Segment(
-                        ax=seg.ax, ay=seg.ay, bx=seg.bx, by=seg.by,
-                        color=seg.color, texture_id=old_to_new[seg.texture_id],
-                    ))
+                    remapped.append(
+                        Segment(
+                            ax=seg.ax,
+                            ay=seg.ay,
+                            bx=seg.bx,
+                            by=seg.by,
+                            color=seg.color,
+                            texture_id=old_to_new[seg.texture_id],
+                        )
+                    )
                 else:
-                    remapped.append(Segment(
-                        ax=seg.ax, ay=seg.ay, bx=seg.bx, by=seg.by,
-                        color=seg.color, texture_id=-1,
-                    ))
+                    remapped.append(
+                        Segment(
+                            ax=seg.ax,
+                            ay=seg.ay,
+                            bx=seg.bx,
+                            by=seg.by,
+                            color=seg.color,
+                            texture_id=-1,
+                        )
+                    )
             segments = remapped
 
         return segments, textures, valid_name_to_id
@@ -586,7 +654,8 @@ def sector_color(sector_index: int) -> Tuple[float, float, float]:
 
 
 def _assign_tex_id(
-    name: str, name_to_id: Dict[str, int],
+    name: str,
+    name_to_id: Dict[str, int],
 ) -> int:
     """Return the texture id for *name*, assigning a new one if unseen.
 
@@ -656,9 +725,14 @@ def seg_list_to_segments(
         color = sector_color(sd.sector)
         v1 = md.vertices[seg.v1]
         v2 = md.vertices[seg.v2]
-        segments.append(Segment(
-            ax=float(v1.x), ay=float(v1.y),
-            bx=float(v2.x), by=float(v2.y),
-            color=color, texture_id=tex_id,
-        ))
+        segments.append(
+            Segment(
+                ax=float(v1.x),
+                ay=float(v1.y),
+                bx=float(v2.x),
+                by=float(v2.y),
+                color=color,
+                texture_id=tex_id,
+            )
+        )
     return segments, name_to_id

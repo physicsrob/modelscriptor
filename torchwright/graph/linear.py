@@ -73,7 +73,7 @@ class Linear(Node):
             for child in inp.flatten_inputs():
                 child_range = child.value_type.value_range
                 child_rows = len(child)
-                child_matrix = self.output_matrix[row:row + child_rows]
+                child_matrix = self.output_matrix[row : row + child_rows]
                 row += child_rows
                 if not child_range.is_finite():
                     # Bail to the scalar summary path — this child dominates.

@@ -26,7 +26,6 @@ from examples.range_printer import (
     out_feedback_slice,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -124,10 +123,10 @@ def _build_step_row(compiled, token_type_vec, max_items, **kwargs):
 # max_items must equal len(items), same as DOOM's max_walls == actual walls.
 # ---------------------------------------------------------------------------
 
-_THREE_ITEMS = [(2, 5), (7, 9), (0, 3)]          # 3 + 2 + 3 = 8 cols
-_SINGLE_ITEM = [(5, 8)]                           # 3 cols
-_SINGLE_COL = [(3, 4)]                            # 1 col
-_MIXED = [(0, 1), (5, 8)]                         # 1 + 3 = 4 cols
+_THREE_ITEMS = [(2, 5), (7, 9), (0, 3)]  # 3 + 2 + 3 = 8 cols
+_SINGLE_ITEM = [(5, 8)]  # 3 cols
+_SINGLE_COL = [(3, 4)]  # 1 col
+_MIXED = [(0, 1), (5, 8)]  # 1 + 3 = 4 cols
 
 _CASES = [
     pytest.param(_THREE_ITEMS, id="three_items"),
@@ -157,15 +156,15 @@ def test_oracle(items):
 
     for k, expected in enumerate(expected_cols):
         got = out[N + k, idx_col].item()
-        assert abs(got - expected) < 0.5, (
-            f"step {k}: active_col={got:.2f}, expected {expected}"
-        )
+        assert (
+            abs(got - expected) < 0.5
+        ), f"step {k}: active_col={got:.2f}, expected {expected}"
 
     # Last print position should have done_flag > 0
     last_pos = N + len(expected_cols) - 1
-    assert out[last_pos, idx_done].item() > 0.0, (
-        f"expected done_flag > 0 at last step, got {out[last_pos, idx_done].item():.2f}"
-    )
+    assert (
+        out[last_pos, idx_done].item() > 0.0
+    ), f"expected done_flag > 0 at last step, got {out[last_pos, idx_done].item():.2f}"
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +195,12 @@ def test_autoregressive(items):
     # Prefill: ITEM tokens
     for i, (lo, hi) in enumerate(items):
         row = _build_step_row(
-            compiled, E8_ITEM, max_items, item_idx=float(i), lo=float(lo), hi=float(hi),
+            compiled,
+            E8_ITEM,
+            max_items,
+            item_idx=float(i),
+            lo=float(lo),
+            hi=float(hi),
         )
         with torch.no_grad():
             out, past = compiled.step(row, past, past_len=step_idx)
@@ -232,7 +236,7 @@ def test_autoregressive(items):
 
         # Read feedback
         fb = out[0, fb_sl].detach().cpu().numpy()
-        mask = np.round(fb[: max_items]).clip(0, 1)
+        mask = np.round(fb[:max_items]).clip(0, 1)
         col_val = float(fb[max_items])
         is_new = float(fb[max_items + 1])
 
@@ -264,6 +268,6 @@ def test_probe_parity():
         verbose=False,
         atol=1.0,
     )
-    assert report.first_divergent is None, (
-        f"Probe diverged at node: {report.first_divergent}"
-    )
+    assert (
+        report.first_divergent is None
+    ), f"Probe diverged at node: {report.first_divergent}"

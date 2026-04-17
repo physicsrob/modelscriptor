@@ -56,7 +56,7 @@ def test_strip_chained_asserts_compose_claims():
     # After stripping both should have applied to the innermost node.
     inp = InputNode("x", 2)
     inner = assert_integer(inp)  # integer
-    outer = assert_01(inner)     # binary (which implies integer)
+    outer = assert_01(inner)  # binary (which implies integer)
     GraphAnalyzer(outer)
     vt = inp.value_type
     assert vt.is_binary and vt.is_integer

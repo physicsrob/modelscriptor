@@ -31,10 +31,13 @@ from torchwright.ops.arithmetic_ops import (
     subtract,
 )
 from torchwright.ops.attention_ops import attend_argmin_unmasked
-from torchwright.ops.inout_nodes import create_input, create_literal_value, create_pos_encoding
+from torchwright.ops.inout_nodes import (
+    create_input,
+    create_literal_value,
+    create_pos_encoding,
+)
 from torchwright.ops.logic_ops import bool_all_true, bool_not, equals_vector
 from torchwright.ops.map_select import in_range, select
-
 
 # ---------------------------------------------------------------------------
 # Token types
@@ -53,8 +56,13 @@ _SENTINEL_SCORE = 99.0
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _extract_from(
-    node: Node, d_total: int, start: int, width: int, name: str,
+    node: Node,
+    d_total: int,
+    start: int,
+    width: int,
+    name: str,
 ) -> Node:
     """Slice *width* columns starting at *start* from a *d_total*-wide node."""
     m = torch.zeros(d_total, width)
@@ -66,6 +74,7 @@ def _extract_from(
 # ---------------------------------------------------------------------------
 # Graph
 # ---------------------------------------------------------------------------
+
 
 def build_range_printer_graph(
     max_items: int = MAX_ITEMS,
@@ -90,7 +99,8 @@ def build_range_printer_graph(
 
     # --- Score (ITEM positions get item_index; others get sentinel) -----
     sentinel = create_literal_value(
-        torch.tensor([_SENTINEL_SCORE]), name="sentinel",
+        torch.tensor([_SENTINEL_SCORE]),
+        name="sentinel",
     )
     score = assert_integer(select(is_item, item_index, sentinel))
 
@@ -124,8 +134,8 @@ def build_range_printer_graph(
     # Inner-loop test: does active_col + 1 still fall within [lo, hi)?
     next_col_val = add_const(active_col, 1.0)
     remaining = subtract(sel_hi, next_col_val)
-    inner_continues = compare(remaining, 0.5)   # +1 if hi - next > 0.5
-    inner_done = bool_not(inner_continues)       # +1 when range exhausted
+    inner_continues = compare(remaining, 0.5)  # +1 if hi - next > 0.5
+    inner_done = bool_not(inner_continues)  # +1 when range exhausted
 
     # Mask update: OR in the selected item when inner loop finishes.
     mask_with_new = add(print_mask, sel_onehot)
@@ -146,17 +156,20 @@ def build_range_printer_graph(
     next_col_output = select(inner_continues, next_col_val, zero_col)
 
     # --- Output --------------------------------------------------------
-    output = Concatenate([
-        active_col,        # 0:   the column value emitted this step
-        done_flag,         # 1:   +1 when all items exhausted
-        next_mask,         # 2:   updated mask for next step
-        next_col_output,   # 2+N: next col value
-        next_is_new_item,  # 3+N: next is_new_item flag
-    ])
+    output = Concatenate(
+        [
+            active_col,  # 0:   the column value emitted this step
+            done_flag,  # 1:   +1 when all items exhausted
+            next_mask,  # 2:   updated mask for next step
+            next_col_output,  # 2+N: next col value
+            next_is_new_item,  # 3+N: next is_new_item flag
+        ]
+    )
     return output, pos_encoding
 
 
 # --- Output index helpers (for host-side parsing) ----------------------
+
 
 def out_active_col() -> int:
     return 0

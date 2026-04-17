@@ -9,7 +9,6 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
 # Built-in 8x8 textures
 # ---------------------------------------------------------------------------
@@ -29,16 +28,18 @@ def texture_brick() -> np.ndarray:
     R = (0.7, 0.2, 0.1)
     D = (0.5, 0.15, 0.08)
     M = (0.4, 0.4, 0.35)  # mortar
-    return _make_texture([
-        [R, R, R, M, D, D, D, M],
-        [R, R, R, M, D, D, D, M],
-        [R, R, R, M, D, D, D, M],
-        [M, M, M, M, M, M, M, M],
-        [D, D, M, R, R, R, M, D],
-        [D, D, M, R, R, R, M, D],
-        [D, D, M, R, R, R, M, D],
-        [M, M, M, M, M, M, M, M],
-    ])
+    return _make_texture(
+        [
+            [R, R, R, M, D, D, D, M],
+            [R, R, R, M, D, D, D, M],
+            [R, R, R, M, D, D, D, M],
+            [M, M, M, M, M, M, M, M],
+            [D, D, M, R, R, R, M, D],
+            [D, D, M, R, R, R, M, D],
+            [D, D, M, R, R, R, M, D],
+            [M, M, M, M, M, M, M, M],
+        ]
+    )
 
 
 def texture_stone() -> np.ndarray:
@@ -46,16 +47,18 @@ def texture_stone() -> np.ndarray:
     L = (0.6, 0.6, 0.55)
     G = (0.45, 0.45, 0.4)
     D = (0.3, 0.3, 0.28)
-    return _make_texture([
-        [L, L, L, D, G, G, G, G],
-        [L, L, L, D, G, G, G, G],
-        [L, L, L, D, G, G, G, G],
-        [D, D, D, D, D, D, D, D],
-        [G, G, D, L, L, L, L, D],
-        [G, G, D, L, L, L, L, D],
-        [G, G, D, L, L, L, L, D],
-        [D, D, D, D, D, D, D, D],
-    ])
+    return _make_texture(
+        [
+            [L, L, L, D, G, G, G, G],
+            [L, L, L, D, G, G, G, G],
+            [L, L, L, D, G, G, G, G],
+            [D, D, D, D, D, D, D, D],
+            [G, G, D, L, L, L, L, D],
+            [G, G, D, L, L, L, L, D],
+            [G, G, D, L, L, L, L, D],
+            [D, D, D, D, D, D, D, D],
+        ]
+    )
 
 
 def texture_stripe() -> np.ndarray:
@@ -70,16 +73,18 @@ def texture_checker() -> np.ndarray:
     """8x8 checkerboard — white and dark gray 2x2 blocks."""
     W = (0.8, 0.8, 0.8)
     D = (0.3, 0.3, 0.3)
-    return _make_texture([
-        [W, W, D, D, W, W, D, D],
-        [W, W, D, D, W, W, D, D],
-        [D, D, W, W, D, D, W, W],
-        [D, D, W, W, D, D, W, W],
-        [W, W, D, D, W, W, D, D],
-        [W, W, D, D, W, W, D, D],
-        [D, D, W, W, D, D, W, W],
-        [D, D, W, W, D, D, W, W],
-    ])
+    return _make_texture(
+        [
+            [W, W, D, D, W, W, D, D],
+            [W, W, D, D, W, W, D, D],
+            [D, D, W, W, D, D, W, W],
+            [D, D, W, W, D, D, W, W],
+            [W, W, D, D, W, W, D, D],
+            [W, W, D, D, W, W, D, D],
+            [D, D, W, W, D, D, W, W],
+            [D, D, W, W, D, D, W, W],
+        ]
+    )
 
 
 DEFAULT_TEXTURES = [texture_brick, texture_stone, texture_stripe, texture_checker]
@@ -106,7 +111,9 @@ def solid_color_texture(color: Tuple[float, float, float]) -> np.ndarray:
 
 
 def downscale_texture(
-    tex: np.ndarray, target_w: int, target_h: int,
+    tex: np.ndarray,
+    target_w: int,
+    target_h: int,
 ) -> np.ndarray:
     """Downscale a texture by averaging blocks of source pixels.
 

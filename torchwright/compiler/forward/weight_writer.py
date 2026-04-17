@@ -22,8 +22,12 @@ from torchwright.graph.relu import ReLU
 @dataclass
 class AttnHeadOp:
     op_type: Literal[
-        "compute_attn", "compute_linear", "compute_add", "cancel", "add_into",
-        "delta_transfer"
+        "compute_attn",
+        "compute_linear",
+        "compute_add",
+        "cancel",
+        "add_into",
+        "delta_transfer",
     ]
     node: Optional[Node]
     target_cols: List[int]
@@ -125,10 +129,18 @@ def _scatter_attn_head(
     # destination is always Float.  Original scalar-loop assignment
     # auto-cast; vectorized assignment does not.
     target_dtype = attn.query_matrix.dtype
-    attn.query_matrix[head, q_idx_t, :d_head] = q_mat[: len(q_idx), :d_head].to(target_dtype)
-    attn.key_matrix[head, k_idx_t, :d_head] = k_mat[: len(k_idx), :d_head].to(target_dtype)
-    attn.value_matrix[head, v_idx_t, :d_head] = v_mat[: len(v_idx), :d_head].to(target_dtype)
-    attn.output_matrix[head, :d_head, o_idx_t] = o_mat[:d_head, : len(o_idx)].to(target_dtype)
+    attn.query_matrix[head, q_idx_t, :d_head] = q_mat[: len(q_idx), :d_head].to(
+        target_dtype
+    )
+    attn.key_matrix[head, k_idx_t, :d_head] = k_mat[: len(k_idx), :d_head].to(
+        target_dtype
+    )
+    attn.value_matrix[head, v_idx_t, :d_head] = v_mat[: len(v_idx), :d_head].to(
+        target_dtype
+    )
+    attn.output_matrix[head, :d_head, o_idx_t] = o_mat[:d_head, : len(o_idx)].to(
+        target_dtype
+    )
 
 
 def _allocate_head(attn):
@@ -199,13 +211,26 @@ def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
         v_end = min(v_start + layer_d_head, node.d_v)
         chunk_size = v_end - v_start
 
-        v_chunk = F.pad(node.value_matrix[:, v_start:v_end], (0, layer_d_head - chunk_size))
-        o_chunk = F.pad(node.output_matrix[v_start:v_end, :], (0, 0, 0, layer_d_head - chunk_size))
+        v_chunk = F.pad(
+            node.value_matrix[:, v_start:v_end], (0, layer_d_head - chunk_size)
+        )
+        o_chunk = F.pad(
+            node.output_matrix[v_start:v_end, :], (0, 0, 0, layer_d_head - chunk_size)
+        )
 
         head = _allocate_head(attn)
         _scatter_attn_head(
-            attn, head, q_idx, k_idx, v_idx, o_idx,
-            q_mat, k_mat, v_chunk, o_chunk, layer_d_head,
+            attn,
+            head,
+            q_idx,
+            k_idx,
+            v_idx,
+            o_idx,
+            q_mat,
+            k_mat,
+            v_chunk,
+            o_chunk,
+            layer_d_head,
         )
 
 
@@ -315,11 +340,20 @@ def _write_compute_add(
             v_mat = torch.eye(2 * chunk_size, d_head)
             o_mat = torch.zeros(d_head, chunk_size)
             o_mat[:chunk_size, :chunk_size] = torch.eye(chunk_size)
-            o_mat[chunk_size:2 * chunk_size, :chunk_size] = torch.eye(chunk_size)
+            o_mat[chunk_size : 2 * chunk_size, :chunk_size] = torch.eye(chunk_size)
             head = _allocate_head(attn)
             _scatter_attn_head(
-                attn, head, pe_idx, pe_idx, combined_v_idx, o_chunk_idx,
-                q_mat, k_mat, v_mat, o_mat, d_head,
+                attn,
+                head,
+                pe_idx,
+                pe_idx,
+                combined_v_idx,
+                o_chunk_idx,
+                q_mat,
+                k_mat,
+                v_mat,
+                o_mat,
+                d_head,
             )
         else:
             # Too wide to combine — one head per input.
@@ -329,8 +363,17 @@ def _write_compute_add(
                 o_mat = torch.eye(d_head, chunk_size)
                 head = _allocate_head(attn)
                 _scatter_attn_head(
-                    attn, head, pe_idx, pe_idx, v_chunk_idx, o_chunk_idx,
-                    q_mat, k_mat, v_mat, o_mat, d_head,
+                    attn,
+                    head,
+                    pe_idx,
+                    pe_idx,
+                    v_chunk_idx,
+                    o_chunk_idx,
+                    q_mat,
+                    k_mat,
+                    v_mat,
+                    o_mat,
+                    d_head,
                 )
 
 
@@ -471,12 +514,23 @@ def _write_delta_transfer(
             combined_v_idx = op.source_cols[start:end] + op.subtract_cols[start:end]
             v_mat = torch.eye(2 * chunk_size, d_head)
             o_mat = torch.zeros(d_head, chunk_size)
-            o_mat[:chunk_size, :chunk_size] = torch.eye(chunk_size)         # +1
-            o_mat[chunk_size:2 * chunk_size, :chunk_size] = -torch.eye(chunk_size)  # -1
+            o_mat[:chunk_size, :chunk_size] = torch.eye(chunk_size)  # +1
+            o_mat[chunk_size : 2 * chunk_size, :chunk_size] = -torch.eye(
+                chunk_size
+            )  # -1
             head = _allocate_head(attn)
             _scatter_attn_head(
-                attn, head, pe_idx, pe_idx, combined_v_idx, o_chunk_idx,
-                q_mat, k_mat, v_mat, o_mat, d_head,
+                attn,
+                head,
+                pe_idx,
+                pe_idx,
+                combined_v_idx,
+                o_chunk_idx,
+                q_mat,
+                k_mat,
+                v_mat,
+                o_mat,
+                d_head,
             )
         else:
             # Too wide to combine — one head per group.
@@ -484,14 +538,32 @@ def _write_delta_transfer(
             o_mat = torch.eye(d_head, chunk_size)  # +1 coefficient
             head = _allocate_head(attn)
             _scatter_attn_head(
-                attn, head, pe_idx, pe_idx, op.source_cols[start:end], o_chunk_idx,
-                q_mat, k_mat, v_mat, o_mat, d_head,
+                attn,
+                head,
+                pe_idx,
+                pe_idx,
+                op.source_cols[start:end],
+                o_chunk_idx,
+                q_mat,
+                k_mat,
+                v_mat,
+                o_mat,
+                d_head,
             )
             o_mat = -torch.eye(d_head, chunk_size)  # -1 coefficient
             head = _allocate_head(attn)
             _scatter_attn_head(
-                attn, head, pe_idx, pe_idx, op.subtract_cols[start:end], o_chunk_idx,
-                q_mat, k_mat, v_mat, o_mat, d_head,
+                attn,
+                head,
+                pe_idx,
+                pe_idx,
+                op.subtract_cols[start:end],
+                o_chunk_idx,
+                q_mat,
+                k_mat,
+                v_mat,
+                o_mat,
+                d_head,
             )
 
 
@@ -550,7 +622,10 @@ def _write_compute_relu(
         for leaf in leaves:
             if leaf in biased_linears:
                 # contrib[j] = sum_i l1.W[offset+i, j] * leaf.bias[i]
-                contrib = leaf.output_bias @ l1_node.output_matrix[offset : offset + len(leaf), :]
+                contrib = (
+                    leaf.output_bias
+                    @ l1_node.output_matrix[offset : offset + len(leaf), :]
+                )
                 mlp.linear1.output_bias[slots_t] += contrib.to(target_dtype)
             offset += len(leaf)
 

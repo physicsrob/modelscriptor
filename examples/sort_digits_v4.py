@@ -70,7 +70,6 @@ from torchwright.ops.prefix_ops import prefix_sum
 from torchwright.ops.scalar_encoding import digit_to_scaled_scalar
 from torchwright.ops.sequence_ops import check_is_digit
 
-
 D_MODEL = 512
 MAX_INPUT = 10
 MAX_OUT = 10
@@ -117,9 +116,7 @@ def _emit_by_slot_index(
     # trigger itself, 1 at P+1, etc.). At positions before the trigger
     # this is garbage, but the ``has_triggered`` select below discards
     # the entire sum in that case.
-    steps_since = add_scaled_nodes(
-        1.0, pos_scalar, -1.0, trigger_pos_scalar
-    )
+    steps_since = add_scaled_nodes(1.0, pos_scalar, -1.0, trigger_pos_scalar)
 
     gated = []
     for k in range(max_out):
@@ -187,9 +184,7 @@ def create_network_parts(
         create_literal_value(torch.tensor([1.0])),
         create_literal_value(torch.tensor([0.0])),
     )
-    running_input_digit_count = prefix_sum(
-        pos_encoding, is_input_digit_01, n_stages
-    )
+    running_input_digit_count = prefix_sum(pos_encoding, is_input_digit_01, n_stages)
     digit_index = add_scaled_nodes(
         1.0,
         running_input_digit_count,
@@ -211,23 +206,27 @@ def create_network_parts(
         create_literal_value(torch.tensor([1.0])),
     )
     position_onehot_bool = in_range(digit_index, digit_index_plus_one, max_input)
-    position_onehot = assert_onehot(add_scaled_nodes(
-        0.5,
-        position_onehot_bool,
-        0.5,
-        create_literal_value(torch.ones(max_input)),
-    ))
+    position_onehot = assert_onehot(
+        add_scaled_nodes(
+            0.5,
+            position_onehot_bool,
+            0.5,
+            create_literal_value(torch.ones(max_input)),
+        )
+    )
 
     # score: 10 * digit + digit_index at *input* digit positions,
     # sentinel elsewhere. Valid range [0, 99]; sentinel 100 guarantees
     # every other position (including emitted output digits after the
     # trigger) is beaten by any real input-digit position in the argmin.
     score_if_digit = add_scaled_nodes(10.0, digit_scalar, 1.0, digit_index)
-    score = assert_integer(select(
-        is_input_digit,
-        score_if_digit,
-        create_literal_value(torch.tensor([_NON_DIGIT_SCORE])),
-    ))
+    score = assert_integer(
+        select(
+            is_input_digit,
+            score_if_digit,
+            create_literal_value(torch.tensor([_NON_DIGIT_SCORE])),
+        )
+    )
 
     # --- Unrolled selection sort ---
     # mask_k is a width-MAX_INPUT {0, 1} vector whose value at every

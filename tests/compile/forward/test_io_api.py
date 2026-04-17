@@ -9,9 +9,12 @@ import pytest
 import torch
 
 from torchwright.compiler.export import compile_headless
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding, create_literal_value
+from torchwright.ops.inout_nodes import (
+    create_input,
+    create_pos_encoding,
+    create_literal_value,
+)
 from torchwright.ops.arithmetic_ops import add_const, multiply_const, add
-
 
 # ---------------------------------------------------------------------------
 # Basic io API tests
@@ -173,7 +176,9 @@ def test_io_autoregressive():
     for i in range(5):
         current = module(current)  # Output IS next input
         expected = torch.full((1, 4), float(i + 1))
-        assert torch.allclose(current, expected, atol=0.1), f"Step {i}: expected {expected}, got {current}"
+        assert torch.allclose(
+            current, expected, atol=0.1
+        ), f"Step {i}: expected {expected}, got {current}"
 
 
 def test_io_uses_input_value():

@@ -88,7 +88,9 @@ def render_column(
 
     # Ray direction — map column to angle using fov_columns for angular span
     col_offset = col - config.screen_width // 2
-    ray_angle = (player_angle + col_offset * config.fov_columns // config.screen_width) % 256
+    ray_angle = (
+        player_angle + col_offset * config.fov_columns // config.screen_width
+    ) % 256
     ray_cos = config.trig_table[ray_angle, 0]
     ray_sin = config.trig_table[ray_angle, 1]
 
@@ -197,7 +199,12 @@ def render_frame(
 
     for col in range(config.screen_width):
         frame[:, col, :] = render_column(
-            col, player_x, player_y, player_angle, segments, config,
+            col,
+            player_x,
+            player_y,
+            player_angle,
+            segments,
+            config,
             textures=textures,
         )
 

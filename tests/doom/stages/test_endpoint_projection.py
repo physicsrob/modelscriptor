@@ -24,7 +24,6 @@ from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
 from torchwright.doom.stages.wall import _endpoint_to_column
 
-
 _MAX_COORD = 10.0
 _W = 16
 _FOV = 16
@@ -38,14 +37,27 @@ def endpoint_module():
     position 1 exists only so the sequence isn't degenerate.
     """
     pos = create_pos_encoding()
-    cross = create_input("cross", 1, value_range=(-_MAX_COORD * _MAX_COORD, _MAX_COORD * _MAX_COORD))
-    dot = create_input("dot", 1, value_range=(-_MAX_COORD * _MAX_COORD, _MAX_COORD * _MAX_COORD))
+    cross = create_input(
+        "cross", 1, value_range=(-_MAX_COORD * _MAX_COORD, _MAX_COORD * _MAX_COORD)
+    )
+    dot = create_input(
+        "dot", 1, value_range=(-_MAX_COORD * _MAX_COORD, _MAX_COORD * _MAX_COORD)
+    )
     col = _endpoint_to_column(
-        cross, dot, W=_W, fov=_FOV, max_coord=_MAX_COORD, suffix="probe",
+        cross,
+        dot,
+        W=_W,
+        fov=_FOV,
+        max_coord=_MAX_COORD,
+        suffix="probe",
     )
     return compile_headless(
-        Concatenate([col]), pos,
-        d=512, d_head=32, max_layers=20, verbose=False,
+        Concatenate([col]),
+        pos,
+        d=512,
+        d_head=32,
+        max_layers=20,
+        verbose=False,
     )
 
 
@@ -55,8 +67,9 @@ def _pack(module, rows: list[dict]) -> torch.Tensor:
     t = torch.zeros(T, d_input, dtype=torch.float32)
     for i, row in enumerate(rows):
         for name, start, width in module._input_specs:
-            t[i, start:start + width] = torch.tensor(
-                row[name], dtype=torch.float32,
+            t[i, start : start + width] = torch.tensor(
+                row[name],
+                dtype=torch.float32,
             ).reshape(width)
     return t
 

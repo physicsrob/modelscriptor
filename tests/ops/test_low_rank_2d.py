@@ -47,9 +47,7 @@ def test_low_rank_2d_product_rank1_exact():
     for x in bp:
         for y in bp:
             got = _eval_2d(node, x, y)
-            assert abs(got - x * y) < 0.1, (
-                f"{x}*{y}: got {got}, expected {x * y}"
-            )
+            assert abs(got - x * y) < 0.1, f"{x}*{y}: got {got}, expected {x * y}"
 
     # Exact (modulo inner multiply precision) at cell interiors too —
     # the decomposition is algebraically exact, only multiply_2d's own
@@ -57,9 +55,7 @@ def test_low_rank_2d_product_rank1_exact():
     # giving ~1% precision.
     for x, y in [(0.5, 0.5), (-1.5, 2.5), (2.7, -0.9)]:
         got = _eval_2d(node, x, y)
-        assert abs(got - x * y) < 0.25, (
-            f"{x}*{y}: got {got}, expected {x * y}"
-        )
+        assert abs(got - x * y) < 0.25, f"{x}*{y}: got {got}, expected {x * y}"
 
 
 def test_low_rank_2d_product_non_uniform_rank1_exact():
@@ -73,9 +69,7 @@ def test_low_rank_2d_product_non_uniform_rank1_exact():
             got = _eval_2d(node, x, y)
             # Absolute tolerance accommodates the inner multiply's grid
             # quantization; product magnitudes up to 100.
-            assert abs(got - x * y) < 1.0, (
-                f"{x}*{y}: got {got}, expected {x * y}"
-            )
+            assert abs(got - x * y) < 1.0, f"{x}*{y}: got {got}, expected {x * y}"
 
 
 def test_low_rank_2d_constant_function():
@@ -91,8 +85,23 @@ def test_low_rank_2d_constant_function():
 
 def test_low_rank_2d_atan_non_uniform_K3():
     """``atan(x/y)`` on the TODO pathological grid — K=3 gets σ_4 ≈ 0.008."""
-    bp_x = [-2.0, -1.5, -1.0, -0.75, -0.5, -0.25, -0.1, 0.0,
-            0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+    bp_x = [
+        -2.0,
+        -1.5,
+        -1.0,
+        -0.75,
+        -0.5,
+        -0.25,
+        -0.1,
+        0.0,
+        0.1,
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        1.5,
+        2.0,
+    ]
     bp_y = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
 
     node = _build(bp_x, bp_y, lambda x, y: math.atan(x / y), rank=3)
@@ -109,9 +118,9 @@ def test_low_rank_2d_atan_non_uniform_K3():
         for y in bp_y:
             got = _eval_2d(node, x, y)
             expected = math.atan(x / y)
-            assert abs(got - expected) < tol, (
-                f"atan({x}/{y}): got {got}, expected {expected}"
-            )
+            assert (
+                abs(got - expected) < tol
+            ), f"atan({x}/{y}): got {got}, expected {expected}"
 
     # The specific interior probe that was the TODO's failing case.
     got = _eval_2d(node, -1.25, 8.5)
@@ -120,8 +129,7 @@ def test_low_rank_2d_atan_non_uniform_K3():
     # be closer to true than to triangulated-PL, and certainly within
     # 0.1 of either.  Pre-fix buggy value was -1.04 — far outside this.
     assert abs(got - math.atan(-1.25 / 8.5)) < 0.1, (
-        f"interior probe (-1.25, 8.5): got {got}, "
-        f"oracle {math.atan(-1.25 / 8.5)}"
+        f"interior probe (-1.25, 8.5): got {got}, " f"oracle {math.atan(-1.25 / 8.5)}"
     )
 
 
@@ -142,9 +150,7 @@ def test_low_rank_2d_sum_is_rank_2():
     for x in bp:
         for y in bp:
             got = _eval_2d(node, x, y)
-            assert abs(got - (x + y)) < 0.3, (
-                f"{x}+{y}: got {got}, expected {x + y}"
-            )
+            assert abs(got - (x + y)) < 0.3, f"{x}+{y}: got {got}, expected {x + y}"
 
 
 def test_low_rank_2d_compiled_product():
@@ -165,12 +171,18 @@ def test_low_rank_2d_compiled_product():
     cache = reference_eval(node, inputs, n_pos)
     oracle = cache[node].flatten()
     expected = torch.tensor([a * b for a, b in zip(xs, ys)])
-    assert torch.allclose(oracle, expected, atol=0.3), (
-        f"oracle: {oracle.tolist()}\nexpected: {expected.tolist()}"
-    )
+    assert torch.allclose(
+        oracle, expected, atol=0.3
+    ), f"oracle: {oracle.tolist()}\nexpected: {expected.tolist()}"
 
     report = probe_graph(
-        node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
-        d=512, d_head=16, verbose=False, atol=0.5,
+        node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=n_pos,
+        d=512,
+        d_head=16,
+        verbose=False,
+        atol=0.5,
     )
     assert report.first_divergent is None, report.format_short()

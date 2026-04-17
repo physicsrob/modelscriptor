@@ -15,7 +15,6 @@ from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.graph import Embedding, Node
 
-
 D_HEAD = 32
 
 
@@ -40,7 +39,9 @@ def _run_autoregressive(
     tokens = list(input_tokens)
     emitted = []
     for _ in range(max_new_tokens):
-        result = net.compute(n_pos=len(tokens), input_values={"embedding_input": tokens})
+        result = net.compute(
+            n_pos=len(tokens), input_values={"embedding_input": tokens}
+        )
         next_token = _decode_token(embedding, result[output_node][-1])
         if next_token == "<eos>":
             break
@@ -116,9 +117,9 @@ def _check_case(net, output_node, embedding, input_str: str, expected: str):
     decoded = _run_autoregressive(
         net, output_node, embedding, tokens, max_new_tokens=len(input_str)
     )
-    assert decoded == expected, (
-        f"input={input_str!r} expected={expected!r} got={decoded!r}"
-    )
+    assert (
+        decoded == expected
+    ), f"input={input_str!r} expected={expected!r} got={decoded!r}"
 
 
 # ---------------------------------------------------------------------------

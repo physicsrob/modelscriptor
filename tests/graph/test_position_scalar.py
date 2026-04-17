@@ -21,7 +21,6 @@ from torchwright.graph import PosEncoding
 from torchwright.ops.arithmetic_ops import add, multiply_const
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
-
 # Cover sizes the DOOM code actually uses:
 #   32    — existing test_game_graph.small_config patch_equivalence scale
 #   48    — padding between baseline and 100
@@ -77,8 +76,12 @@ def test_position_scalar_compiled(seq_len):
     output = add(scalar, multiply_const(dummy, 0.0))
 
     module = compile_headless(
-        output, pos_encoding,
-        d=1024, d_head=16, max_layers=20, verbose=False,
+        output,
+        pos_encoding,
+        d=1024,
+        d_head=16,
+        max_layers=20,
+        verbose=False,
     )
 
     inputs = torch.zeros(seq_len, 1)
@@ -87,6 +90,5 @@ def test_position_scalar_compiled(seq_len):
     expected = torch.arange(seq_len, dtype=out.dtype)
     max_err = (out - expected).abs().max().item()
     assert max_err < 0.5, (
-        f"compiled position_scalar max error {max_err:.3f} at "
-        f"seq_len={seq_len}"
+        f"compiled position_scalar max error {max_err:.3f} at " f"seq_len={seq_len}"
     )

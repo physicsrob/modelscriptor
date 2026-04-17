@@ -54,7 +54,6 @@ from torchwright.ops.sequence_ops import (
     remove_leading_0s,
 )
 
-
 D_MODEL = 1024
 
 
@@ -153,9 +152,7 @@ def create_network_parts(
 
     # --- Phase 2c: Multiplication (scalar-space via polarization) ---
     # a*b = ((a+b)^2 - (a-b)^2) / 4, using thermometer squaring
-    mul_result = multiply_integers(
-        number_a, number_b, max_value=10**max_digits - 1
-    )
+    mul_result = multiply_integers(number_a, number_b, max_value=10**max_digits - 1)
     max_result_mul = (10**max_digits - 1) ** 2  # e.g. 999^2=998001
     num_mul_digits = 2 * max_digits
     mul_digit_scalars = number_to_digit_scalars(

@@ -34,7 +34,6 @@ from torchwright.doom.graph_utils import extract_from
 
 import torch
 
-
 # ---------------------------------------------------------------------------
 # Contract
 # ---------------------------------------------------------------------------
@@ -43,14 +42,14 @@ import torch
 @dataclass
 class ThinkingInputs:
     # SORTED-stage outputs (per-SORTED-position Nodes read via attention).
-    sel_bsp_rank: Node         # score; sentinel replaces at non-SORTED
-    sel_onehot: Node           # wall-index position key for argmin
-    gated_render_data: Node    # 6-wide wall render data gated to 0 off-SORTED
-    vis_lo: Node               # col_lo (float, zeroed when sort exhausted)
-    vis_hi: Node               # col_hi (float, zeroed when sort exhausted)
+    sel_bsp_rank: Node  # score; sentinel replaces at non-SORTED
+    sel_onehot: Node  # wall-index position key for argmin
+    gated_render_data: Node  # 6-wide wall render data gated to 0 off-SORTED
+    vis_lo: Node  # col_lo (float, zeroed when sort exhausted)
+    vis_hi: Node  # col_hi (float, zeroed when sort exhausted)
 
     # Host-fed running mask of walls already fully rendered.
-    render_mask: Node          # max_walls-wide
+    render_mask: Node  # max_walls-wide
 
     # Token-type flags.
     is_sorted: Node
@@ -75,7 +74,7 @@ class ThinkingOutputs:
     t_tex_id: Node
     t_col_lo: Node
     t_col_hi: Node
-    t_onehot: Node             # max_walls-wide
+    t_onehot: Node  # max_walls-wide
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +87,8 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
         # Score: sel_bsp_rank at SORTED positions, sentinel elsewhere so
         # the argmin only considers SORTED candidates.
         render_sentinel = create_literal_value(
-            torch.tensor([99.0]), name="render_sentinel",
+            torch.tensor([99.0]),
+            name="render_sentinel",
         )
         render_score = assert_integer(
             select(inputs.is_sorted, inputs.sel_bsp_rank, render_sentinel)
@@ -96,21 +96,28 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
 
         # Position key: sel_onehot (wall-index) at SORTED, zeros elsewhere.
         z_mw = create_literal_value(
-            torch.zeros(max_walls), name="z_mw_thinking",
+            torch.zeros(max_walls),
+            name="z_mw_thinking",
         )
-        render_position_onehot = assert_onehot(select(
-            inputs.is_sorted, inputs.sel_onehot, z_mw,
-        ))
+        render_position_onehot = assert_onehot(
+            select(
+                inputs.is_sorted,
+                inputs.sel_onehot,
+                z_mw,
+            )
+        )
 
         # Value: render data + col bounds + one-hot for downstream mask update.
         # gated_render_data and vis_lo/vis_hi are already gated by
         # sort_active in SORTED (zeroed at exhausted positions).
-        render_value = Concatenate([
-            inputs.gated_render_data,  # 6
-            inputs.vis_lo,             # 1
-            inputs.vis_hi,             # 1
-            inputs.sel_onehot,         # max_walls
-        ])
+        render_value = Concatenate(
+            [
+                inputs.gated_render_data,  # 6
+                inputs.vis_lo,  # 1
+                inputs.vis_hi,  # 1
+                inputs.sel_onehot,  # max_walls
+            ]
+        )
         render_value_gated = cond_gate(inputs.is_sorted, render_value)
 
         selected_render = attend_argmin_unmasked(
@@ -123,14 +130,14 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
 
         d_rv = 8 + max_walls
         t_sort_den = extract_from(selected_render, d_rv, 0, 1, "t_sort_den")
-        t_C        = extract_from(selected_render, d_rv, 1, 1, "t_C")
-        t_D        = extract_from(selected_render, d_rv, 2, 1, "t_D")
-        t_E        = extract_from(selected_render, d_rv, 3, 1, "t_E")
-        t_H_inv    = extract_from(selected_render, d_rv, 4, 1, "t_H_inv")
-        t_tex_id   = extract_from(selected_render, d_rv, 5, 1, "t_tex_id")
-        t_col_lo   = extract_from(selected_render, d_rv, 6, 1, "t_col_lo")
-        t_col_hi   = extract_from(selected_render, d_rv, 7, 1, "t_col_hi")
-        t_onehot   = extract_from(selected_render, d_rv, 8, max_walls, "t_onehot")
+        t_C = extract_from(selected_render, d_rv, 1, 1, "t_C")
+        t_D = extract_from(selected_render, d_rv, 2, 1, "t_D")
+        t_E = extract_from(selected_render, d_rv, 3, 1, "t_E")
+        t_H_inv = extract_from(selected_render, d_rv, 4, 1, "t_H_inv")
+        t_tex_id = extract_from(selected_render, d_rv, 5, 1, "t_tex_id")
+        t_col_lo = extract_from(selected_render, d_rv, 6, 1, "t_col_lo")
+        t_col_hi = extract_from(selected_render, d_rv, 7, 1, "t_col_hi")
+        t_onehot = extract_from(selected_render, d_rv, 8, max_walls, "t_onehot")
 
     return ThinkingOutputs(
         t_sort_den=t_sort_den,

@@ -162,9 +162,7 @@ class SiblingClusterAnalyzer:
     # Per-join cluster construction
     # ------------------------------------------------------------------
 
-    def _try_build_cluster(
-        self, join: Node, cluster_id: int
-    ) -> Optional[ClusterInfo]:
+    def _try_build_cluster(self, join: Node, cluster_id: int) -> Optional[ClusterInfo]:
         inputs = list(join.inputs)
 
         # Step 1: per-input backward-reachable set (Concatenate-transparent).
@@ -189,9 +187,7 @@ class SiblingClusterAnalyzer:
                 continue
 
             # Step 4: compute peak width, skipping MLP-chain-internal ReLUs.
-            widths = [
-                len(n) for n in exclusive if not self._is_chain_internal_relu(n)
-            ]
+            widths = [len(n) for n in exclusive if not self._is_chain_internal_relu(n)]
             if not widths:
                 continue
             peak = max(widths)
@@ -250,9 +246,7 @@ class SiblingClusterAnalyzer:
                 stack.append(inp)
         return result
 
-    def _union_others(
-        self, per_input_reachable: List[Set[Node]]
-    ) -> List[Set[Node]]:
+    def _union_others(self, per_input_reachable: List[Set[Node]]) -> List[Set[Node]]:
         """For each index i, return the union of all other reachable sets."""
         out: List[Set[Node]] = []
         for i, _ in enumerate(per_input_reachable):
@@ -263,9 +257,7 @@ class SiblingClusterAnalyzer:
             out.append(u)
         return out
 
-    def _prune_external_consumers(
-        self, exclusive: Set[Node], join: Node
-    ) -> Set[Node]:
+    def _prune_external_consumers(self, exclusive: Set[Node], join: Node) -> Set[Node]:
         """Iteratively drop nodes with consumers outside ``exclusive ∪ {join}``.
 
         Concatenates on the consumer side are walked through: a node n

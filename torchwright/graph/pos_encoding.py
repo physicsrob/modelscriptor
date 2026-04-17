@@ -65,12 +65,12 @@ class PosEncoding(Node):
         max_sin = math.sin(max_pos * freq) * 1.05  # slight margin
         n_bp = 18
         bps = [
-            max_sin * (1.0 - ((n_bp - 1 - k) / (n_bp - 1)) ** 2)
-            for k in range(n_bp)
+            max_sin * (1.0 - ((n_bp - 1 - k) / (n_bp - 1)) ** 2) for k in range(n_bp)
         ]
 
         return piecewise_linear(
-            sin_val, bps,
+            sin_val,
+            bps,
             lambda x: math.asin(max(-1.0, min(1.0, x))) / freq,
             name="position_scalar",
         )

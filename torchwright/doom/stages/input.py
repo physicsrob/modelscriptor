@@ -34,7 +34,6 @@ from torchwright.ops.map_select import select
 from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.renderer import trig_lookup
 
-
 # ---------------------------------------------------------------------------
 # Contract
 # ---------------------------------------------------------------------------
@@ -51,8 +50,8 @@ class InputInputs:
     input_backward: Node
     input_strafe_left: Node
     input_strafe_right: Node
-    is_input: Node                 # per-position flag (1.0 at INPUT positions)
-    pos_encoding: PosEncoding      # shared across all stages
+    is_input: Node  # per-position flag (1.0 at INPUT positions)
+    pos_encoding: PosEncoding  # shared across all stages
 
 
 @dataclass
@@ -99,7 +98,11 @@ def build_input(
             return _broadcast_to_all_positions(
                 inputs.pos_encoding,
                 inputs.is_input,
-                vel_dx, vel_dy, move_cos, move_sin, new_angle,
+                vel_dx,
+                vel_dy,
+                move_cos,
+                move_sin,
+                new_angle,
             )
 
 

@@ -62,7 +62,6 @@ from torchwright.doom.graph_constants import DIFF_BP, TRIG_BP, VEL_BP
 from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.wall_payload import pack_wall_payload
 
-
 # ---------------------------------------------------------------------------
 # Contract
 # ---------------------------------------------------------------------------
@@ -76,9 +75,9 @@ class CollisionFlags:
     only sees real hit/miss decisions.
     """
 
-    hit_full: Node     # full (vel_dx, vel_dy) ray
-    hit_x: Node        # x-only (vel_dx, 0) ray
-    hit_y: Node        # y-only (0, vel_dy) ray
+    hit_full: Node  # full (vel_dx, vel_dy) ray
+    hit_x: Node  # x-only (vel_dx, 0) ray
+    hit_y: Node  # y-only (0, vel_dy) ray
 
 
 @dataclass
@@ -107,21 +106,21 @@ class WallInputs:
     # BSP rank precomputation: ``rank = dot(coeffs, side_P_vec) + const``.
     # Host precomputes coefficients from the BSP tree structure; side_P_vec
     # comes from the BSP stage's broadcast.
-    wall_bsp_coeffs: Node   # max_bsp_nodes-wide (meaningful at WALL positions)
-    wall_bsp_const: Node    # 1-wide (meaningful at WALL positions)
-    side_P_vec: Node        # max_bsp_nodes-wide (broadcast from BSP stage)
+    wall_bsp_coeffs: Node  # max_bsp_nodes-wide (meaningful at WALL positions)
+    wall_bsp_const: Node  # 1-wide (meaningful at WALL positions)
+    side_P_vec: Node  # max_bsp_nodes-wide (broadcast from BSP stage)
 
 
 @dataclass
 class WallOutputs:
     collision: CollisionFlags
-    sort_score: Node        # per-position, fed as ``score`` to SORTED's argmin
-    sort_value: Node        # packed payload, fed as ``value`` to SORTED's argmin
-    position_onehot: Node   # per-wall one-hot + 0.5 bias, fed to SORTED argmin
-    is_renderable: Node     # ±1 validity signal fed to SORTED's argmin
+    sort_score: Node  # per-position, fed as ``score`` to SORTED's argmin
+    sort_value: Node  # packed payload, fed as ``value`` to SORTED's argmin
+    position_onehot: Node  # per-wall one-hot + 0.5 bias, fed to SORTED argmin
+    is_renderable: Node  # ±1 validity signal fed to SORTED's argmin
     indicators_above: Node  # max_walls-wide thermometer I(bsp_rank >= c AND
-                            # is_renderable) — fed as key_in to SORTED's
-                            # attend_argmin_above_integer
+    # is_renderable) — fed as key_in to SORTED's
+    # attend_argmin_above_integer
 
 
 # ---------------------------------------------------------------------------
@@ -145,22 +144,31 @@ def build_wall(
         sort_den, sort_num_t = _compute_central_ray_intersection(inputs)
 
     with annotate("wall/precompute"):
-        precomp_C, precomp_D, precomp_E, precomp_H_inv = (
-            _compute_render_precomputation(inputs, sort_num_t, H, max_coord)
+        precomp_C, precomp_D, precomp_E, precomp_H_inv = _compute_render_precomputation(
+            inputs, sort_num_t, H, max_coord
         )
 
     with annotate("bsp/rank"):
         bsp_rank, is_renderable = _compute_bsp_rank(
-            inputs, sort_den, sort_num_t, max_bsp_nodes,
+            inputs,
+            sort_den,
+            sort_num_t,
+            max_bsp_nodes,
         )
 
     with annotate("wall/visibility"):
         vis_lo, vis_hi = _compute_visibility_columns(
-            inputs.wall_ax, inputs.wall_ay, inputs.wall_bx, inputs.wall_by,
-            inputs.player_x, inputs.player_y,
-            inputs.move_cos, inputs.move_sin,
+            inputs.wall_ax,
+            inputs.wall_ay,
+            inputs.wall_bx,
+            inputs.wall_by,
+            inputs.player_x,
+            inputs.player_y,
+            inputs.move_cos,
+            inputs.move_sin,
             is_renderable,
-            config=config, max_coord=max_coord,
+            config=config,
+            max_coord=max_coord,
         )
 
     with annotate("wall/onehot"):
@@ -168,15 +176,25 @@ def build_wall(
 
     with annotate("wall/indicators_above"):
         indicators_above = _compute_indicators_above(
-            bsp_rank, is_renderable, max_walls,
+            bsp_rank,
+            is_renderable,
+            max_walls,
         )
 
     sort_value = pack_wall_payload(
-        inputs.wall_ax, inputs.wall_ay, inputs.wall_bx, inputs.wall_by,
+        inputs.wall_ax,
+        inputs.wall_ay,
+        inputs.wall_bx,
+        inputs.wall_by,
         inputs.wall_tex_id,
-        sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv,
+        sort_den,
+        precomp_C,
+        precomp_D,
+        precomp_E,
+        precomp_H_inv,
         bsp_rank,
-        vis_lo, vis_hi,
+        vis_lo,
+        vis_hi,
         position_onehot,
     )
 
@@ -214,9 +232,7 @@ def _collision_validity(den: Node, num_t: Node, num_u: Node) -> Node:
     u_margin = subtract(abs_den, adj_num_u)
     is_u_le_den = compare(u_margin, -epsilon)
 
-    return bool_all_true(
-        [is_den_ok, is_t_pos, is_t_le_den, is_u_ge_0, is_u_le_den]
-    )
+    return bool_all_true([is_den_ok, is_t_pos, is_t_le_den, is_u_ge_0, is_u_le_den])
 
 
 def _compute_collision_flags(inputs: WallInputs) -> CollisionFlags:
@@ -232,18 +248,24 @@ def _compute_collision_flags(inputs: WallInputs) -> CollisionFlags:
     day = subtract(inputs.wall_ay, inputs.player_y)
 
     # Shared products (6 MLP sublayers).
-    p_dx_ey = piecewise_linear_2d(inputs.vel_dx, ey, VEL_BP, DIFF_BP,
-                                   lambda a, b: a * b, name="c_dx_ey")
-    p_dy_ex = piecewise_linear_2d(inputs.vel_dy, ex, VEL_BP, DIFF_BP,
-                                   lambda a, b: a * b, name="c_dy_ex")
-    p_dax_ey = piecewise_linear_2d(dax, ey, DIFF_BP, DIFF_BP,
-                                    lambda a, b: a * b, name="c_dax_ey")
-    p_day_ex = piecewise_linear_2d(day, ex, DIFF_BP, DIFF_BP,
-                                    lambda a, b: a * b, name="c_day_ex")
-    p_dax_dy = piecewise_linear_2d(dax, inputs.vel_dy, DIFF_BP, VEL_BP,
-                                    lambda a, b: a * b, name="c_dax_dy")
-    p_day_dx = piecewise_linear_2d(day, inputs.vel_dx, DIFF_BP, VEL_BP,
-                                    lambda a, b: a * b, name="c_day_dx")
+    p_dx_ey = piecewise_linear_2d(
+        inputs.vel_dx, ey, VEL_BP, DIFF_BP, lambda a, b: a * b, name="c_dx_ey"
+    )
+    p_dy_ex = piecewise_linear_2d(
+        inputs.vel_dy, ex, VEL_BP, DIFF_BP, lambda a, b: a * b, name="c_dy_ex"
+    )
+    p_dax_ey = piecewise_linear_2d(
+        dax, ey, DIFF_BP, DIFF_BP, lambda a, b: a * b, name="c_dax_ey"
+    )
+    p_day_ex = piecewise_linear_2d(
+        day, ex, DIFF_BP, DIFF_BP, lambda a, b: a * b, name="c_day_ex"
+    )
+    p_dax_dy = piecewise_linear_2d(
+        dax, inputs.vel_dy, DIFF_BP, VEL_BP, lambda a, b: a * b, name="c_dax_dy"
+    )
+    p_day_dx = piecewise_linear_2d(
+        day, inputs.vel_dx, DIFF_BP, VEL_BP, lambda a, b: a * b, name="c_day_dx"
+    )
 
     # Shared num_t (same for all three rays).
     num_t = subtract(p_dax_ey, p_day_ex)
@@ -291,22 +313,38 @@ def _compute_central_ray_intersection(inputs: WallInputs):
     w_gy = subtract(inputs.player_y, inputs.wall_ay)
 
     sort_ey_cos = piecewise_linear_2d(
-        w_ey, inputs.move_cos, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="sort_ey_cos",
+        w_ey,
+        inputs.move_cos,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="sort_ey_cos",
     )
     sort_ex_sin = piecewise_linear_2d(
-        w_ex, inputs.move_sin, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="sort_ex_sin",
+        w_ex,
+        inputs.move_sin,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="sort_ex_sin",
     )
     sort_den = subtract(sort_ey_cos, sort_ex_sin)
 
     sort_ey_fx = piecewise_linear_2d(
-        w_ey, w_fx, DIFF_BP, DIFF_BP,
-        lambda a, b: a * b, name="sort_ey_fx",
+        w_ey,
+        w_fx,
+        DIFF_BP,
+        DIFF_BP,
+        lambda a, b: a * b,
+        name="sort_ey_fx",
     )
     sort_ex_gy = piecewise_linear_2d(
-        w_ex, w_gy, DIFF_BP, DIFF_BP,
-        lambda a, b: a * b, name="sort_ex_gy",
+        w_ex,
+        w_gy,
+        DIFF_BP,
+        DIFF_BP,
+        lambda a, b: a * b,
+        name="sort_ex_gy",
     )
     sort_num_t = add(sort_ey_fx, sort_ex_gy)
 
@@ -336,39 +374,65 @@ def _compute_render_precomputation(
     w_gy = subtract(inputs.player_y, inputs.wall_ay)
 
     sort_ey_sin = piecewise_linear_2d(
-        w_ey, inputs.move_sin, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="sort_ey_sin",
+        w_ey,
+        inputs.move_sin,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="sort_ey_sin",
     )
     sort_ex_cos = piecewise_linear_2d(
-        w_ex, inputs.move_cos, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="sort_ex_cos",
+        w_ex,
+        inputs.move_cos,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="sort_ex_cos",
     )
     precomp_C = add(sort_ey_sin, sort_ex_cos)
 
     sort_fx_sin = piecewise_linear_2d(
-        w_fx, inputs.move_sin, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="sort_fx_sin",
+        w_fx,
+        inputs.move_sin,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="sort_fx_sin",
     )
     sort_gy_cos = piecewise_linear_2d(
-        w_gy, inputs.move_cos, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="sort_gy_cos",
+        w_gy,
+        inputs.move_cos,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="sort_gy_cos",
     )
     precomp_D = add(sort_fx_sin, sort_gy_cos)
 
     sort_fx_cos = piecewise_linear_2d(
-        w_fx, inputs.move_cos, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="sort_fx_cos",
+        w_fx,
+        inputs.move_cos,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="sort_fx_cos",
     )
     sort_gy_sin = piecewise_linear_2d(
-        w_gy, inputs.move_sin, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="sort_gy_sin",
+        w_gy,
+        inputs.move_sin,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="sort_gy_sin",
     )
     precomp_E = subtract(sort_fx_cos, sort_gy_sin)
 
     abs_num_t = abs(sort_num_t)
     inv_abs_num_t = reciprocal(
-        abs_num_t, min_value=0.3,
-        max_value=2.0 * max_coord * max_coord, step=1.0,
+        abs_num_t,
+        min_value=0.3,
+        max_value=2.0 * max_coord * max_coord,
+        step=1.0,
     )
     precomp_H_inv = multiply_const(inv_abs_num_t, float(H))
 
@@ -406,10 +470,18 @@ def _compute_bsp_rank(
     bsp_products = []
     for i in range(max_bsp_nodes):
         c_i = extract_from(
-            inputs.wall_bsp_coeffs, max_bsp_nodes, i, 1, f"bsp_c_{i}",
+            inputs.wall_bsp_coeffs,
+            max_bsp_nodes,
+            i,
+            1,
+            f"bsp_c_{i}",
         )
         s_i = extract_from(
-            inputs.side_P_vec, max_bsp_nodes, i, 1, f"bsp_s_{i}",
+            inputs.side_P_vec,
+            max_bsp_nodes,
+            i,
+            1,
+            f"bsp_s_{i}",
         )
         # Compare against 0.5 yields a stable ±1 bool even against small
         # interpolation noise in side_P_vec's 0/1 values.
@@ -438,7 +510,9 @@ def _compute_position_onehot(wall_index: Node, max_walls: int) -> Node:
 
 
 def _compute_indicators_above(
-    bsp_rank: Node, is_renderable: Node, max_walls: int,
+    bsp_rank: Node,
+    is_renderable: Node,
+    max_walls: int,
 ) -> Node:
     """Width-``max_walls`` thermometer encoding of the BSP rank.
 
@@ -455,7 +529,8 @@ def _compute_indicators_above(
     Mirrors ``examples.sort_digits_v1._build_indicators_above``.
     """
     zero_lit = create_literal_value(
-        torch.tensor([0.0]), name="indicators_zero",
+        torch.tensor([0.0]),
+        name="indicators_zero",
     )
     cols = []
     for c in range(max_walls):
@@ -465,7 +540,10 @@ def _compute_indicators_above(
         # the ramp cleanly between adjacent integers.  Non-renderable
         # walls have the step zeroed out by the outer select.
         step_01 = compare(
-            bsp_rank, (c - 1) + 0.5, true_level=1.0, false_level=0.0,
+            bsp_rank,
+            (c - 1) + 0.5,
+            true_level=1.0,
+            false_level=0.0,
         )
         col = select(is_renderable, step_01, zero_lit)
         cols.append(col)
@@ -486,9 +564,21 @@ def _compute_indicators_above(
 # positive-only; the behind-flip is a single select on ``sign(dot)``
 # after the lookup.
 _COL_FOLD_BP_CROSS = [
-    -2.0, -1.5, -1.0, -0.75, -0.5, -0.25, -0.1,
+    -2.0,
+    -1.5,
+    -1.0,
+    -0.75,
+    -0.5,
+    -0.25,
+    -0.1,
     0.0,
-    0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1.0,
+    1.5,
+    2.0,
 ]
 _COL_FOLD_BP_DOT_ABS = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
 
@@ -502,9 +592,14 @@ _T_COMPARE_SCALE = 100.0
 
 
 def _compute_visibility_columns(
-    wall_ax: Node, wall_ay: Node, wall_bx: Node, wall_by: Node,
-    player_x: Node, player_y: Node,
-    move_cos: Node, move_sin: Node,
+    wall_ax: Node,
+    wall_ay: Node,
+    wall_bx: Node,
+    wall_by: Node,
+    player_x: Node,
+    player_y: Node,
+    move_cos: Node,
+    move_sin: Node,
     is_renderable: Node,
     *,
     config: RenderConfig,
@@ -550,10 +645,18 @@ def _compute_visibility_columns(
     # entangle residual-stream columns and amplify cross-coupling
     # through the compiled softmax.
     cross_a, dot_a = _rotate_into_player_frame(
-        move_cos, move_sin, dax, day, "va",
+        move_cos,
+        move_sin,
+        dax,
+        day,
+        "va",
     )
     cross_b, dot_b = _rotate_into_player_frame(
-        move_cos, move_sin, dbx, dby, "vb",
+        move_cos,
+        move_sin,
+        dbx,
+        dby,
+        "vb",
     )
 
     fov_rad = float(fov) * math.pi / 128.0
@@ -564,32 +667,41 @@ def _compute_visibility_columns(
     # FOV-boundary evaluations at the two endpoints.
     f_L_a = add_scaled_nodes(sin_hf, dot_a, -cos_hf, cross_a)
     f_L_b = add_scaled_nodes(sin_hf, dot_b, -cos_hf, cross_b)
-    f_R_a = add_scaled_nodes(sin_hf, dot_a,  cos_hf, cross_a)
-    f_R_b = add_scaled_nodes(sin_hf, dot_b,  cos_hf, cross_b)
+    f_R_a = add_scaled_nodes(sin_hf, dot_a, cos_hf, cross_a)
+    f_R_b = add_scaled_nodes(sin_hf, dot_b, cos_hf, cross_b)
 
-    max_f_mag = (sin_hf + cos_hf) * max_coord    # bound on |f_*|
-    max_denom = 2.0 * max_f_mag                  # bound on |f_A − f_B|
+    max_f_mag = (sin_hf + cos_hf) * max_coord  # bound on |f_*|
+    max_denom = 2.0 * max_f_mag  # bound on |f_A − f_B|
 
     t_lo_L, t_hi_L = _plane_clip_contribs(
-        f_L_a, f_L_b, max_denom=max_denom, max_f_mag=max_f_mag, suffix="L",
+        f_L_a,
+        f_L_b,
+        max_denom=max_denom,
+        max_f_mag=max_f_mag,
+        suffix="L",
     )
     t_lo_R, t_hi_R = _plane_clip_contribs(
-        f_R_a, f_R_b, max_denom=max_denom, max_f_mag=max_f_mag, suffix="R",
+        f_R_a,
+        f_R_b,
+        max_denom=max_denom,
+        max_f_mag=max_f_mag,
+        suffix="R",
     )
 
     zero_lit = create_literal_value(torch.tensor([0.0]), name="t_zero")
-    one_lit  = create_literal_value(torch.tensor([1.0]), name="t_one")
+    one_lit = create_literal_value(torch.tensor([1.0]), name="t_one")
 
     # t_lo = max(0, t_lo_L, t_lo_R), t_hi = min(1, t_hi_L, t_hi_R).
     # Use the ``(a±b ± |a-b|)/2`` max/min so we don't compound
     # compare+select transition-width errors across nested ops.
     t_lo = max_node(max_node(zero_lit, t_lo_L), t_lo_R)
-    t_hi = min_node(min_node(one_lit,  t_hi_L), t_hi_R)
+    t_hi = min_node(min_node(one_lit, t_hi_L), t_hi_R)
 
     # Segment fully outside FOV iff t_lo > t_hi.  Scale so the compare
     # saturates even when the range is "just barely" empty/non-empty.
     is_empty = compare(
-        multiply_const(subtract(t_lo, t_hi), _T_COMPARE_SCALE), 0.0,
+        multiply_const(subtract(t_lo, t_hi), _T_COMPARE_SCALE),
+        0.0,
     )
 
     # ---- Project the clipped endpoints to screen cols ------------------
@@ -603,10 +715,20 @@ def _compute_visibility_columns(
     W_lit = create_literal_value(torch.tensor([float(W)]), name="col_W")
 
     col_A_interior = _endpoint_to_column(
-        cross_a, dot_a, W=W, fov=fov, max_coord=max_coord, suffix="a_int",
+        cross_a,
+        dot_a,
+        W=W,
+        fov=fov,
+        max_coord=max_coord,
+        suffix="a_int",
     )
     col_B_interior = _endpoint_to_column(
-        cross_b, dot_b, W=W, fov=fov, max_coord=max_coord, suffix="b_int",
+        cross_b,
+        dot_b,
+        W=W,
+        fov=fov,
+        max_coord=max_coord,
+        suffix="b_int",
     )
 
     # Which side of the cone clipped A?  L contribution won → col=W (left
@@ -614,7 +736,8 @@ def _compute_visibility_columns(
     a_inside_L = compare(f_L_a, 0.0)
     a_inside_R = compare(f_R_a, 0.0)
     a_clipped_on_L = compare(
-        multiply_const(subtract(t_lo_L, t_lo_R), _T_COMPARE_SCALE), 0.0,
+        multiply_const(subtract(t_lo_L, t_lo_R), _T_COMPARE_SCALE),
+        0.0,
     )
     col_A_boundary = select(a_clipped_on_L, W_lit, zero_lit)
     col_A = select(
@@ -627,7 +750,8 @@ def _compute_visibility_columns(
     b_inside_L = compare(f_L_b, 0.0)
     b_inside_R = compare(f_R_b, 0.0)
     b_clipped_on_L = compare(
-        multiply_const(subtract(t_hi_R, t_hi_L), _T_COMPARE_SCALE), 0.0,
+        multiply_const(subtract(t_hi_R, t_hi_L), _T_COMPARE_SCALE),
+        0.0,
     )
     col_B_boundary = select(b_clipped_on_L, W_lit, zero_lit)
     col_B = select(
@@ -642,7 +766,8 @@ def _compute_visibility_columns(
     # On empty segment, collapse to the right-edge sentinel so the
     # render stage reads zero-width cover and skips the wall.
     sentinel = create_literal_value(
-        torch.tensor([float(W + 2)]), name="vis_empty_sentinel",
+        torch.tensor([float(W + 2)]),
+        name="vis_empty_sentinel",
     )
     vis_lo_raw = select(is_empty, sentinel, vis_lo_visible)
     vis_hi_raw = select(is_empty, sentinel, vis_hi_visible)
@@ -656,7 +781,12 @@ def _compute_visibility_columns(
 
 
 def _plane_clip_contribs(
-    f_a: Node, f_b: Node, *, max_denom: float, max_f_mag: float, suffix: str,
+    f_a: Node,
+    f_b: Node,
+    *,
+    max_denom: float,
+    max_f_mag: float,
+    suffix: str,
 ) -> tuple[Node, Node]:
     """Per-plane contributions ``(t_lo_contrib, t_hi_contrib)`` for clipping
     a segment against a half-plane ``f(p) ≥ 0``.
@@ -681,33 +811,44 @@ def _plane_clip_contribs(
     denom_pos = compare(denom, 0.0)
     denom_abs = clamp(abs(denom), 0.1, max_denom)
     inv_denom_abs = reciprocal(
-        denom_abs, min_value=0.1, max_value=max_denom, step=0.1,
+        denom_abs,
+        min_value=0.1,
+        max_value=max_denom,
+        step=0.1,
     )
     max_inv = 1.0 / 0.1  # upper bound on |inv_denom_abs|
 
     # t_star (signed) = f_a / denom.
     # Compute |t_star| via multiply_2d and flip sign based on denom.
     t_star_pos = multiply_2d(
-        f_a, inv_denom_abs,
-        max_abs1=max_f_mag, max_abs2=max_inv,
-        step1=0.5, step2=0.5, min2=0.0,
+        f_a,
+        inv_denom_abs,
+        max_abs1=max_f_mag,
+        max_abs2=max_inv,
+        step1=0.5,
+        step2=0.5,
+        min2=0.0,
         name=f"t_star_pos_{suffix}",
     )
     t_star_neg = multiply_const(t_star_pos, -1.0)
     t_star = select(denom_pos, t_star_pos, t_star_neg)
 
     zero_lit = create_literal_value(torch.tensor([0.0]), name=f"t_zero_{suffix}")
-    one_lit  = create_literal_value(torch.tensor([1.0]), name=f"t_one_{suffix}")
+    one_lit = create_literal_value(torch.tensor([1.0]), name=f"t_one_{suffix}")
     a_inside = compare(f_a, 0.0)
     b_inside = compare(f_b, 0.0)
 
     t_lo_contrib = select(a_inside, zero_lit, t_star)
-    t_hi_contrib = select(b_inside, one_lit,  t_star)
+    t_hi_contrib = select(b_inside, one_lit, t_star)
     return t_lo_contrib, t_hi_contrib
 
 
 def _rotate_into_player_frame(
-    cos_p: Node, sin_p: Node, dx: Node, dy: Node, suffix: str,
+    cos_p: Node,
+    sin_p: Node,
+    dx: Node,
+    dy: Node,
+    suffix: str,
 ):
     """Return ``(cross, dot)`` of a 2D offset with the player's facing vector.
 
@@ -715,22 +856,32 @@ def _rotate_into_player_frame(
     ``dot   = cos*dx + sin*dy``  (forward projection)
     """
     cross = subtract(
-        piecewise_linear_2d(cos_p, dy, TRIG_BP, DIFF_BP,
-                            lambda a, b: a * b, name=f"cos_dy_{suffix}"),
-        piecewise_linear_2d(sin_p, dx, TRIG_BP, DIFF_BP,
-                            lambda a, b: a * b, name=f"sin_dx_{suffix}"),
+        piecewise_linear_2d(
+            cos_p, dy, TRIG_BP, DIFF_BP, lambda a, b: a * b, name=f"cos_dy_{suffix}"
+        ),
+        piecewise_linear_2d(
+            sin_p, dx, TRIG_BP, DIFF_BP, lambda a, b: a * b, name=f"sin_dx_{suffix}"
+        ),
     )
     dot = add(
-        piecewise_linear_2d(cos_p, dx, TRIG_BP, DIFF_BP,
-                            lambda a, b: a * b, name=f"cos_dx_{suffix}"),
-        piecewise_linear_2d(sin_p, dy, TRIG_BP, DIFF_BP,
-                            lambda a, b: a * b, name=f"sin_dy_{suffix}"),
+        piecewise_linear_2d(
+            cos_p, dx, TRIG_BP, DIFF_BP, lambda a, b: a * b, name=f"cos_dx_{suffix}"
+        ),
+        piecewise_linear_2d(
+            sin_p, dy, TRIG_BP, DIFF_BP, lambda a, b: a * b, name=f"sin_dy_{suffix}"
+        ),
     )
     return cross, dot
 
 
 def _endpoint_to_column(
-    cross: Node, dot: Node, *, W: int, fov: int, max_coord: float, suffix: str,
+    cross: Node,
+    dot: Node,
+    *,
+    W: int,
+    fov: int,
+    max_coord: float,
+    suffix: str,
 ) -> Node:
     """Convert ``(cross, dot)`` to a signed screen column.
 
@@ -776,22 +927,28 @@ def _endpoint_to_column(
     dot_pos = clamp(abs_dot, bp_dot_lo, bp_dot_hi)
 
     atan_val = low_rank_2d(
-        cross_clamped, dot_pos,
-        _COL_FOLD_BP_CROSS, _COL_FOLD_BP_DOT_ABS,
+        cross_clamped,
+        dot_pos,
+        _COL_FOLD_BP_CROSS,
+        _COL_FOLD_BP_DOT_ABS,
         _atan_of,
         rank=3,
         name=f"atan_front_{suffix}",
     )
     col_front = Linear(
-        atan_val, torch.tensor([[col_scale]]),
-        torch.tensor([half_W]), name=f"col_front_{suffix}",
+        atan_val,
+        torch.tensor([[col_scale]]),
+        torch.tensor([half_W]),
+        name=f"col_front_{suffix}",
     )
 
     # Behind-flip: ``col_back = W − col_front`` (reflection across
     # centre), matching the prior implementation.
     col_back = Linear(
-        col_front, torch.tensor([[-1.0]]),
-        torch.tensor([float(W)]), name=f"col_{suffix}_back",
+        col_front,
+        torch.tensor([[-1.0]]),
+        torch.tensor([float(W)]),
+        name=f"col_{suffix}_back",
     )
     col_final = select(dot_sign, col_front, col_back)
 

@@ -34,7 +34,6 @@ from torchwright.reference_renderer.types import RenderConfig
 
 from torchwright.doom.stages.wall import _compute_visibility_columns
 
-
 _MAX_COORD = 20.0
 _W = 16
 _H = 20
@@ -43,7 +42,9 @@ _FOV = 16
 
 def _config() -> RenderConfig:
     return RenderConfig(
-        screen_width=_W, screen_height=_H, fov_columns=_FOV,
+        screen_width=_W,
+        screen_height=_H,
+        fov_columns=_FOV,
         trig_table=generate_trig_table(),
         ceiling_color=(0.2, 0.2, 0.2),
         floor_color=(0.4, 0.4, 0.4),
@@ -71,15 +72,26 @@ def vis_module():
     is_renderable = create_input("is_renderable", 1, value_range=(-1.0, 1.0))
 
     vis_lo, vis_hi = _compute_visibility_columns(
-        wall_ax, wall_ay, wall_bx, wall_by,
-        player_x, player_y,
-        move_cos, move_sin,
+        wall_ax,
+        wall_ay,
+        wall_bx,
+        wall_by,
+        player_x,
+        player_y,
+        move_cos,
+        move_sin,
         is_renderable,
-        config=_config(), max_coord=_MAX_COORD,
+        config=_config(),
+        max_coord=_MAX_COORD,
     )
     output = Concatenate([vis_lo, vis_hi])
     return compile_headless(
-        output, pos, d=1024, d_head=32, max_layers=60, verbose=False,
+        output,
+        pos,
+        d=1024,
+        d_head=32,
+        max_layers=60,
+        verbose=False,
     )
 
 
@@ -89,15 +101,21 @@ def _pack(module, rows: list[dict]) -> torch.Tensor:
     t = torch.zeros(T, d_input, dtype=torch.float32)
     for i, row in enumerate(rows):
         for name, start, width in module._input_specs:
-            t[i, start:start + width] = torch.tensor(
-                row[name], dtype=torch.float32,
+            t[i, start : start + width] = torch.tensor(
+                row[name],
+                dtype=torch.float32,
             ).reshape(width)
     return t
 
 
 def _oracle_vis_columns(
-    ax: float, ay: float, bx: float, by: float,
-    px: float, py: float, angle_idx: int,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+    px: float,
+    py: float,
+    angle_idx: int,
 ) -> tuple[float, float]:
     """Exact Python implementation of ``_compute_visibility_columns``.
 
@@ -233,9 +251,14 @@ def test_visibility_columns_match_oracle(vis_module, name, px, py, angle, wall):
     cos_p = float(trig[angle % 256, 0])
     sin_p = float(trig[angle % 256, 1])
     row = {
-        "wall_ax": ax, "wall_ay": ay, "wall_bx": bx, "wall_by": by,
-        "player_x": px, "player_y": py,
-        "move_cos": cos_p, "move_sin": sin_p,
+        "wall_ax": ax,
+        "wall_ay": ay,
+        "wall_bx": bx,
+        "wall_by": by,
+        "player_x": px,
+        "player_y": py,
+        "move_cos": cos_p,
+        "move_sin": sin_p,
         "is_renderable": 1.0,
     }
     # compile_headless wants at least 2 positions for the sequence to be
@@ -248,7 +271,13 @@ def test_visibility_columns_match_oracle(vis_module, name, px, py, angle, wall):
     vis_hi_got = out[0, 1].item()
 
     vis_lo_ref, vis_hi_ref = _oracle_vis_columns(
-        ax, ay, bx, by, px, py, angle,
+        ax,
+        ay,
+        bx,
+        by,
+        px,
+        py,
+        angle,
     )
 
     lo_err = abs(vis_lo_got - vis_lo_ref)

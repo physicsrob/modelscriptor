@@ -14,7 +14,6 @@ from torchwright.ops.const import (
     embedding_step_sharpness,
 )
 
-
 _GATE_OFFSET_SAFETY_FACTOR = 2.0
 """Headroom over the declared ``max|value|`` so that activation noise
 from the compiled transformer's ReLU approximations doesn't leak
@@ -139,7 +138,9 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     )
     from torchwright.graph.value_type import Guarantee
 
-    return assert_matches_value_type(result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE))
+    return assert_matches_value_type(
+        result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE)
+    )
 
 
 def cond_add_vector(

@@ -68,7 +68,6 @@ def test_1digit_adder():
         verbose=True,
     )
 
-
     test_cases = [
         ("1+1\n", "2"),
         ("2+3\n", "5"),
@@ -122,7 +121,6 @@ def test_3digit_adder():
         verbose=True,
     )
 
-
     test_cases = [
         ("1+1\n", "2"),
         ("12+34\n", "46"),
@@ -149,7 +147,6 @@ def test_3digit_autoregressive():
         pos_encoding=pos_encoding,
         verbose=False,
     )
-
 
     test_cases = [
         ("1+2\n", "3"),

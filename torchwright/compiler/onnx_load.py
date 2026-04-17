@@ -29,7 +29,6 @@ import torch
 
 from torchwright.compiler.export import HEADLESS_META_FORMAT, meta_path_for
 
-
 # Past state is a pair (past_K_tuple, past_V_tuple) where each inner
 # tuple has one torch.Tensor of shape (n_heads, n_past, d_head) per
 # layer.  Both CompiledHeadless and OnnxHeadlessModule use this exact
@@ -104,12 +103,10 @@ class OnnxHeadlessModule:
         # past_K_i inputs have shape (n_heads_i, n_past, d_head); after
         # head trimming each layer may have a different head count.
         inputs = {inp.name: inp for inp in self._session.get_inputs()}
-        self._n_layers = sum(
-            1 for name in inputs if name.startswith("past_K_")
-        )
-        assert self._n_layers > 0, (
-            f"{onnx_path}: no past_K_* inputs — is this a cached-protocol model?"
-        )
+        self._n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
+        assert (
+            self._n_layers > 0
+        ), f"{onnx_path}: no past_K_* inputs — is this a cached-protocol model?"
         self._per_layer_n_heads = [
             int(inputs[f"past_K_{i}"].shape[0]) for i in range(self._n_layers)
         ]
@@ -124,12 +121,10 @@ class OnnxHeadlessModule:
     def empty_past(self) -> PastKV:
         """Zero-length past tensors suitable for a first prefill call."""
         past_K = tuple(
-            torch.zeros(nh, 0, self._d_head)
-            for nh in self._per_layer_n_heads
+            torch.zeros(nh, 0, self._d_head) for nh in self._per_layer_n_heads
         )
         past_V = tuple(
-            torch.zeros(nh, 0, self._d_head)
-            for nh in self._per_layer_n_heads
+            torch.zeros(nh, 0, self._d_head) for nh in self._per_layer_n_heads
         )
         return (past_K, past_V)
 
@@ -187,8 +182,7 @@ class OnnxHeadlessModule:
             torch.from_numpy(results[1 + 2 * i]) for i in range(self._n_layers)
         )
         new_V = tuple(
-            torch.from_numpy(results[1 + 2 * i + 1])
-            for i in range(self._n_layers)
+            torch.from_numpy(results[1 + 2 * i + 1]) for i in range(self._n_layers)
         )
 
         return outputs, (new_K, new_V)

@@ -28,9 +28,7 @@ def test_count_to_target():
     )
     assert result.tolist() == [[3.0]]
 
-    done_result = done.compute(
-        n_pos=1, input_values={"counter": torch.tensor([[0.0]])}
-    )
+    done_result = done.compute(n_pos=1, input_values={"counter": torch.tensor([[0.0]])})
     assert done_result.tolist() == [[1.0]]
 
 
@@ -51,14 +49,10 @@ def test_already_done():
         done_fn=done_fn,
     )
 
-    result = state["x"].compute(
-        n_pos=1, input_values={"x": torch.tensor([[50.0]])}
-    )
+    result = state["x"].compute(n_pos=1, input_values={"x": torch.tensor([[50.0]])})
     assert result.tolist() == [[50.0]]
 
-    done_result = done.compute(
-        n_pos=1, input_values={"x": torch.tensor([[50.0]])}
-    )
+    done_result = done.compute(n_pos=1, input_values={"x": torch.tensor([[50.0]])})
     assert done_result.tolist() == [[1.0]]
 
 
@@ -79,14 +73,10 @@ def test_zero_iterations():
         done_fn=done_fn,
     )
 
-    result = state["x"].compute(
-        n_pos=1, input_values={"x": torch.tensor([[5.0]])}
-    )
+    result = state["x"].compute(n_pos=1, input_values={"x": torch.tensor([[5.0]])})
     assert result.tolist() == [[5.0]]
 
-    done_result = done.compute(
-        n_pos=1, input_values={"x": torch.tensor([[5.0]])}
-    )
+    done_result = done.compute(n_pos=1, input_values={"x": torch.tensor([[5.0]])})
     assert done_result.tolist() == [[-1.0]]
 
 
@@ -112,9 +102,7 @@ def test_never_done():
     )
     assert result.tolist() == [[3.0]]
 
-    done_result = done.compute(
-        n_pos=1, input_values={"counter": torch.tensor([[0.0]])}
-    )
+    done_result = done.compute(n_pos=1, input_values={"counter": torch.tensor([[0.0]])})
     assert done_result.tolist() == [[-1.0]]
 
 

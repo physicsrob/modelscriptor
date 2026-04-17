@@ -13,7 +13,6 @@ from torchwright.debug.probe import probe_graph, reference_eval
 from torchwright.ops.arithmetic_ops import multiply_2d, signed_multiply
 from torchwright.ops.inout_nodes import create_input
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -50,9 +49,7 @@ def test_multiply_2d_grid_points():
         for b in range(-5, 6):
             expected = float(a * b)
             result = _eval_mul(node, float(a), float(b))
-            assert abs(result - expected) < 0.01, (
-                f"{a}*{b} = {expected}, got {result}"
-            )
+            assert abs(result - expected) < 0.01, f"{a}*{b} = {expected}, got {result}"
 
 
 def test_multiply_2d_fine_step():
@@ -63,9 +60,7 @@ def test_multiply_2d_fine_step():
         for b in [-3.0, -1.5, 0.0, 1.5, 3.0]:
             expected = a * b
             result = _eval_mul(node, a, b)
-            assert abs(result - expected) < 0.01, (
-                f"{a}*{b} = {expected}, got {result}"
-            )
+            assert abs(result - expected) < 0.01, f"{a}*{b} = {expected}, got {result}"
 
 
 # ---------------------------------------------------------------------------
@@ -88,9 +83,7 @@ def test_multiply_2d_sign_combinations():
     ]
     for a, b, expected in cases:
         result = _eval_mul(node, a, b)
-        assert abs(result - expected) < 0.5, (
-            f"{a}*{b} = {expected}, got {result}"
-        )
+        assert abs(result - expected) < 0.5, f"{a}*{b} = {expected}, got {result}"
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +118,10 @@ def test_multiply_2d_custom_breakpoints():
     diff_bp = [-10.0, -5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0, 10.0]
     trig_bp = [-1.0, -0.5, 0.0, 0.5, 1.0]
     node = _build_multiply_2d(
-        max_abs1=10.0, max_abs2=1.0,
-        breakpoints1=diff_bp, breakpoints2=trig_bp,
+        max_abs1=10.0,
+        max_abs2=1.0,
+        breakpoints1=diff_bp,
+        breakpoints2=trig_bp,
     )
 
     # Exact at grid points
@@ -134,9 +129,7 @@ def test_multiply_2d_custom_breakpoints():
         for b in trig_bp:
             expected = a * b
             result = _eval_mul(node, a, b)
-            assert abs(result - expected) < 0.01, (
-                f"{a}*{b} = {expected}, got {result}"
-            )
+            assert abs(result - expected) < 0.01, f"{a}*{b} = {expected}, got {result}"
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +140,10 @@ def test_multiply_2d_custom_breakpoints():
 def test_multiply_2d_unsigned():
     """min2=0 for positive-only second input (e.g., inv_range)."""
     node = _build_multiply_2d(
-        max_abs1=10.0, max_abs2=2.0,
-        step1=1.0, step2=0.25,
+        max_abs1=10.0,
+        max_abs2=2.0,
+        step1=1.0,
+        step2=0.25,
         min2=0.0,
     )
 
@@ -157,26 +152,25 @@ def test_multiply_2d_unsigned():
         for b in [0.0, 0.5, 1.0, 2.0]:
             expected = a * b
             result = _eval_mul(node, a, b)
-            assert abs(result - expected) < 0.3, (
-                f"{a}*{b} = {expected}, got {result}"
-            )
+            assert abs(result - expected) < 0.3, f"{a}*{b} = {expected}, got {result}"
 
 
 def test_multiply_2d_both_unsigned():
     """Both inputs non-negative."""
     node = _build_multiply_2d(
-        max_abs1=5.0, max_abs2=5.0,
-        step1=1.0, step2=1.0,
-        min1=0.0, min2=0.0,
+        max_abs1=5.0,
+        max_abs2=5.0,
+        step1=1.0,
+        step2=1.0,
+        min1=0.0,
+        min2=0.0,
     )
 
     for a in [0.0, 1.0, 3.0, 5.0]:
         for b in [0.0, 1.0, 3.0, 5.0]:
             expected = a * b
             result = _eval_mul(node, a, b)
-            assert abs(result - expected) < 0.01, (
-                f"{a}*{b} = {expected}, got {result}"
-            )
+            assert abs(result - expected) < 0.01, f"{a}*{b} = {expected}, got {result}"
 
 
 # ---------------------------------------------------------------------------
@@ -187,8 +181,10 @@ def test_multiply_2d_both_unsigned():
 def test_multiply_2d_output_clamp():
     """max_abs_output caps the product."""
     node = _build_multiply_2d(
-        max_abs1=10.0, max_abs2=10.0,
-        step1=1.0, step2=1.0,
+        max_abs1=10.0,
+        max_abs2=10.0,
+        step1=1.0,
+        step2=1.0,
         max_abs_output=20.0,
     )
 
@@ -217,10 +213,10 @@ def test_multiply_2d_vs_signed_multiply():
     a_inp = create_input("a", 1)
     b_inp = create_input("b", 1)
 
-    node_2d = multiply_2d(a_inp, b_inp, max_abs1=10.0, max_abs2=10.0,
-                          step1=1.0, step2=1.0)
-    node_sm = signed_multiply(a_inp, b_inp, max_abs1=10.0, max_abs2=10.0,
-                              step=1.0)
+    node_2d = multiply_2d(
+        a_inp, b_inp, max_abs1=10.0, max_abs2=10.0, step1=1.0, step2=1.0
+    )
+    node_sm = signed_multiply(a_inp, b_inp, max_abs1=10.0, max_abs2=10.0, step=1.0)
 
     for a in [-7.0, -3.0, 0.0, 4.0, 8.0]:
         for b in [-6.0, -1.0, 0.0, 2.0, 9.0]:
@@ -232,12 +228,12 @@ def test_multiply_2d_vs_signed_multiply():
             r_sm = node_sm.compute(n_pos=1, input_values=inputs).item()
             expected = a * b
             # Both should be close to the true product
-            assert abs(r_2d - expected) < 0.5, (
-                f"multiply_2d({a}, {b}) = {r_2d}, expected {expected}"
-            )
-            assert abs(r_sm - expected) < 0.5, (
-                f"signed_multiply({a}, {b}) = {r_sm}, expected {expected}"
-            )
+            assert (
+                abs(r_2d - expected) < 0.5
+            ), f"multiply_2d({a}, {b}) = {r_2d}, expected {expected}"
+            assert (
+                abs(r_sm - expected) < 0.5
+            ), f"signed_multiply({a}, {b}) = {r_sm}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -258,15 +254,22 @@ def test_multiply_2d_probe():
     # Oracle check
     cache = reference_eval(node, inputs, n_pos)
     oracle = cache[node].flatten()
-    expected = torch.tensor([a_vals[i, 0].item() * b_vals[i, 0].item()
-                             for i in range(n_pos)])
-    assert torch.allclose(oracle, expected, atol=0.01), (
-        f"oracle: {oracle.tolist()}\nexpected: {expected.tolist()}"
+    expected = torch.tensor(
+        [a_vals[i, 0].item() * b_vals[i, 0].item() for i in range(n_pos)]
     )
+    assert torch.allclose(
+        oracle, expected, atol=0.01
+    ), f"oracle: {oracle.tolist()}\nexpected: {expected.tolist()}"
 
     # Compiled check
     report = probe_graph(
-        node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
-        d=512, d_head=16, verbose=False, atol=0.5,
+        node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=n_pos,
+        d=512,
+        d_head=16,
+        verbose=False,
+        atol=0.5,
     )
     assert report.first_divergent is None, report.format_short()

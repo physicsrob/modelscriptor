@@ -48,9 +48,7 @@ def _assert_no_dead_children(
 
         row = 0
         for child in input_node.flatten_inputs():
-            live = any(
-                bool((m[row : row + len(child)] != 0).any()) for _r, m in shared
-            )
+            live = any(bool((m[row : row + len(child)] != 0).any()) for _r, m in shared)
             if not live:
                 raise AssertionError(
                     f"Attn input shared across {shared_roles} has a dead "
@@ -104,8 +102,12 @@ class Attn(Node):
         assert output_matrix.shape[0] == self.d_v
 
         _assert_no_dead_children(
-            query_in, key_in, value_in,
-            query_matrix, key_matrix, value_matrix,
+            query_in,
+            key_in,
+            value_in,
+            query_matrix,
+            key_matrix,
+            value_matrix,
         )
 
         self.query_matrix = query_matrix

@@ -133,9 +133,7 @@ def _load(onnx_path: str) -> _Model:
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
     assert n_layers > 0, "ONNX model has no past_K_* inputs — expected cached export"
-    per_layer_n_heads = [
-        int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)
-    ]
+    per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
 
     return _Model(

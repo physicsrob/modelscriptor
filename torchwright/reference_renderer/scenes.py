@@ -22,10 +22,10 @@ def box_room(size: float = 10.0) -> List[Segment]:
     """
     h = size / 2.0
     return [
-        Segment(ax=h, ay=-h, bx=h, by=h, color=(1.0, 0.0, 0.0)),      # east (red)
-        Segment(ax=-h, ay=h, bx=-h, by=-h, color=(0.0, 1.0, 0.0)),    # west (green)
-        Segment(ax=-h, ay=h, bx=h, by=h, color=(0.0, 0.0, 1.0)),      # north (blue)
-        Segment(ax=h, ay=-h, bx=-h, by=-h, color=(1.0, 1.0, 0.0)),    # south (yellow)
+        Segment(ax=h, ay=-h, bx=h, by=h, color=(1.0, 0.0, 0.0)),  # east (red)
+        Segment(ax=-h, ay=h, bx=-h, by=-h, color=(0.0, 1.0, 0.0)),  # west (green)
+        Segment(ax=-h, ay=h, bx=h, by=h, color=(0.0, 0.0, 1.0)),  # north (blue)
+        Segment(ax=h, ay=-h, bx=-h, by=-h, color=(1.0, 1.0, 0.0)),  # south (yellow)
     ]
 
 
@@ -63,38 +63,33 @@ def multi_room() -> List[Segment]:
 
     return [
         # Room A walls
-        Segment(ax=-12, ay=-6, bx=-4, by=-6, color=RED),        # south
-        Segment(ax=-12, ay=6, bx=-12, by=-6, color=GREEN),      # west
-        Segment(ax=-4, ay=6, bx=-12, by=6, color=BLUE),         # north
-        Segment(ax=-4, ay=-6, bx=-4, by=-2, color=YELLOW),      # east-south (doorway)
-        Segment(ax=-4, ay=2, bx=-4, by=6, color=YELLOW),        # east-north (doorway)
-
+        Segment(ax=-12, ay=-6, bx=-4, by=-6, color=RED),  # south
+        Segment(ax=-12, ay=6, bx=-12, by=-6, color=GREEN),  # west
+        Segment(ax=-4, ay=6, bx=-12, by=6, color=BLUE),  # north
+        Segment(ax=-4, ay=-6, bx=-4, by=-2, color=YELLOW),  # east-south (doorway)
+        Segment(ax=-4, ay=2, bx=-4, by=6, color=YELLOW),  # east-north (doorway)
         # Corridor south wall
-        Segment(ax=-4, ay=-2, bx=-2, by=-2, color=GRAY),        # entry south
-        Segment(ax=-2, ay=-2, bx=2, by=-2, color=GRAY),         # middle south
-        Segment(ax=2, ay=-2, bx=4, by=-4, color=GRAY),          # exit south (diagonal!)
-
+        Segment(ax=-4, ay=-2, bx=-2, by=-2, color=GRAY),  # entry south
+        Segment(ax=-2, ay=-2, bx=2, by=-2, color=GRAY),  # middle south
+        Segment(ax=2, ay=-2, bx=4, by=-4, color=GRAY),  # exit south (diagonal!)
         # Corridor north wall
-        Segment(ax=-4, ay=2, bx=-2, by=2, color=GRAY),          # entry north
-        Segment(ax=-2, ay=2, bx=2, by=2, color=GRAY),           # middle north
-        Segment(ax=2, ay=2, bx=4, by=4, color=GRAY),            # exit north (diagonal!)
-
+        Segment(ax=-4, ay=2, bx=-2, by=2, color=GRAY),  # entry north
+        Segment(ax=-2, ay=2, bx=2, by=2, color=GRAY),  # middle north
+        Segment(ax=2, ay=2, bx=4, by=4, color=GRAY),  # exit north (diagonal!)
         # Room B walls
-        Segment(ax=4, ay=-4, bx=12, by=-4, color=CYAN),         # south
-        Segment(ax=12, ay=-4, bx=12, by=4, color=MAGENTA),      # east
-        Segment(ax=12, ay=4, bx=4, by=4, color=ORANGE),         # north
-        Segment(ax=4, ay=4, bx=4, by=2, color=BLUE),            # west-north (doorway)
-        Segment(ax=4, ay=-2, bx=4, by=-4, color=BLUE),          # west-south (doorway)
-
+        Segment(ax=4, ay=-4, bx=12, by=-4, color=CYAN),  # south
+        Segment(ax=12, ay=-4, bx=12, by=4, color=MAGENTA),  # east
+        Segment(ax=12, ay=4, bx=4, by=4, color=ORANGE),  # north
+        Segment(ax=4, ay=4, bx=4, by=2, color=BLUE),  # west-north (doorway)
+        Segment(ax=4, ay=-2, bx=4, by=-4, color=BLUE),  # west-south (doorway)
         # Extra interior walls for complexity
-        Segment(ax=-10, ay=0, bx=-8, by=0, color=RED),          # shelf in room A
-        Segment(ax=8, ay=-2, bx=10, by=0, color=CYAN),          # diagonal wall in room B!
-        Segment(ax=8, ay=2, bx=10, by=0, color=ORANGE),         # diagonal wall in room B!
-
+        Segment(ax=-10, ay=0, bx=-8, by=0, color=RED),  # shelf in room A
+        Segment(ax=8, ay=-2, bx=10, by=0, color=CYAN),  # diagonal wall in room B!
+        Segment(ax=8, ay=2, bx=10, by=0, color=ORANGE),  # diagonal wall in room B!
         # Pillars (short segments)
         Segment(ax=0, ay=-1.5, bx=0, by=-0.5, color=MAGENTA),  # corridor pillar south
-        Segment(ax=0, ay=0.5, bx=0, by=1.5, color=MAGENTA),    # corridor pillar north
-        Segment(ax=-7, ay=-3, bx=-7, by=-2, color=GREEN),       # pillar in room A
+        Segment(ax=0, ay=0.5, bx=0, by=1.5, color=MAGENTA),  # corridor pillar north
+        Segment(ax=-7, ay=-3, bx=-7, by=-2, color=GREEN),  # pillar in room A
     ]
 
 
@@ -119,11 +114,11 @@ def multi_room_textured(
         wad = WADReader(wad_path)
         names = ["STARTAN3", "STARG3", "BROWN1", "BROWNGRN"]
         textures = [
-            downscale_texture(wad.get_texture(n), tex_size, tex_size)
-            for n in names
+            downscale_texture(wad.get_texture(n), tex_size, tex_size) for n in names
         ]
     else:
         from torchwright.reference_renderer.textures import default_texture_atlas
+
         textures = default_texture_atlas()
 
     T_A, T_DOOR, T_CORR, T_B = 0, 1, 2, 3
@@ -144,29 +139,24 @@ def multi_room_textured(
         Segment(ax=-4, ay=6, bx=-12, by=6, color=BLUE, texture_id=T_A),
         Segment(ax=-4, ay=-6, bx=-4, by=-2, color=YELLOW, texture_id=T_DOOR),
         Segment(ax=-4, ay=2, bx=-4, by=6, color=YELLOW, texture_id=T_DOOR),
-
         # Corridor south wall
         Segment(ax=-4, ay=-2, bx=-2, by=-2, color=GRAY, texture_id=T_CORR),
         Segment(ax=-2, ay=-2, bx=2, by=-2, color=GRAY, texture_id=T_CORR),
         Segment(ax=2, ay=-2, bx=4, by=-4, color=GRAY, texture_id=T_CORR),
-
         # Corridor north wall
         Segment(ax=-4, ay=2, bx=-2, by=2, color=GRAY, texture_id=T_CORR),
         Segment(ax=-2, ay=2, bx=2, by=2, color=GRAY, texture_id=T_CORR),
         Segment(ax=2, ay=2, bx=4, by=4, color=GRAY, texture_id=T_CORR),
-
         # Room B walls
         Segment(ax=4, ay=-4, bx=12, by=-4, color=CYAN, texture_id=T_B),
         Segment(ax=12, ay=-4, bx=12, by=4, color=MAGENTA, texture_id=T_B),
         Segment(ax=12, ay=4, bx=4, by=4, color=ORANGE, texture_id=T_B),
         Segment(ax=4, ay=4, bx=4, by=2, color=BLUE, texture_id=T_DOOR),
         Segment(ax=4, ay=-2, bx=4, by=-4, color=BLUE, texture_id=T_DOOR),
-
         # Extra interior walls
         Segment(ax=-10, ay=0, bx=-8, by=0, color=RED, texture_id=T_A),
         Segment(ax=8, ay=-2, bx=10, by=0, color=CYAN, texture_id=T_A),
         Segment(ax=8, ay=2, bx=10, by=0, color=ORANGE, texture_id=T_A),
-
         # Pillars
         Segment(ax=0, ay=-1.5, bx=0, by=-0.5, color=MAGENTA, texture_id=T_CORR),
         Segment(ax=0, ay=0.5, bx=0, by=1.5, color=MAGENTA, texture_id=T_CORR),
@@ -199,11 +189,11 @@ def box_room_textured(
         wad = WADReader(wad_path)
         names = ["STARTAN3", "STARG3", "BROWN1", "BROWNGRN"]
         textures = [
-            downscale_texture(wad.get_texture(n), tex_size, tex_size)
-            for n in names
+            downscale_texture(wad.get_texture(n), tex_size, tex_size) for n in names
         ]
     else:
         from torchwright.reference_renderer.textures import default_texture_atlas
+
         textures = default_texture_atlas()
 
     segments = [

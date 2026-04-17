@@ -42,7 +42,6 @@ from torchwright.ops.scalar_encoding import (
 )
 from torchwright.ops.sequence_ops import output_sequence
 
-
 D_MODEL = 512
 
 # Fixed digit width per Fibonacci number. W=2 handles values up to 99.
@@ -118,7 +117,9 @@ def create_network_parts(
     for _ in range(n_terms - 2):
         recurrence_tokens.extend(recurrence_digits)
 
-    all_tokens = seed_tokens + recurrence_tokens + [create_literal_value(embed("<eos>"))]
+    all_tokens = (
+        seed_tokens + recurrence_tokens + [create_literal_value(embed("<eos>"))]
+    )
 
     output_node = output_sequence(
         pos_encoding,

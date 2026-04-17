@@ -15,7 +15,6 @@ import pytest
 
 from tests._utils.image_compare import compare_images
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -64,11 +63,10 @@ def _shift_edge_pad(img: np.ndarray, *, dr: int = 0, dc: int = 0) -> np.ndarray:
     boundaries stay self-consistent.
     """
     h, w = img.shape[:2]
-    ref_pad = np.pad(img, ((abs(dr), abs(dr)), (abs(dc), abs(dc)), (0, 0)),
-                     mode="edge")
+    ref_pad = np.pad(img, ((abs(dr), abs(dr)), (abs(dc), abs(dc)), (0, 0)), mode="edge")
     r0 = abs(dr) - dr
     c0 = abs(dc) - dc
-    return ref_pad[r0:r0 + h, c0:c0 + w].copy()
+    return ref_pad[r0 : r0 + h, c0 : c0 + w].copy()
 
 
 def test_one_pixel_horizontal_shift_tolerated():

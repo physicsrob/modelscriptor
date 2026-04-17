@@ -85,8 +85,8 @@ class LayerScheduler:
         self._admission_deferred = False
         self._admission_bypass = False
 
-        attn_ops, mlp_ops, biased_linears, had_schedulable = (
-            self._schedule_layer_inner(residual_map, computed_nodes)
+        attn_ops, mlp_ops, biased_linears, had_schedulable = self._schedule_layer_inner(
+            residual_map, computed_nodes
         )
 
         # Deadlock guard: if admission deferred every compute candidate and
@@ -94,11 +94,7 @@ class LayerScheduler:
         # is only safe when no state was mutated (no free_adds, no cancels,
         # no placements) — all of those append to attn_ops, so the
         # emptiness check is sufficient.
-        if (
-            not attn_ops
-            and not mlp_ops
-            and self._admission_deferred
-        ):
+        if not attn_ops and not mlp_ops and self._admission_deferred:
             self._admission_bypass = True
             attn_ops, mlp_ops, biased_linears, had_schedulable = (
                 self._schedule_layer_inner(residual_map, computed_nodes)
@@ -165,10 +161,19 @@ class LayerScheduler:
 
         # --- 2. Attention sublayer ---
         (
-            attn_ops, biased_linears, heads_used,
-            cancel_cols, cancel_cols_set, cancel_heads,
+            attn_ops,
+            biased_linears,
+            heads_used,
+            cancel_cols,
+            cancel_cols_set,
+            cancel_heads,
         ) = self._schedule_attn_sublayer(
-            ready, dead, free_adds, deferred_adds, residual_map, computed_nodes,
+            ready,
+            dead,
+            free_adds,
+            deferred_adds,
+            residual_map,
+            computed_nodes,
             chain_protected,
         )
 
@@ -200,8 +205,15 @@ class LayerScheduler:
         # thread the shared batch state through.
         mlp_ops, cancel_cols, cancel_cols_set, cancel_heads, heads_used = (
             self._schedule_mlp_sublayer(
-                ready, chains, biased_linears, residual_map, computed_nodes,
-                cancel_cols, cancel_cols_set, cancel_heads, heads_used,
+                ready,
+                chains,
+                biased_linears,
+                residual_map,
+                computed_nodes,
+                cancel_cols,
+                cancel_cols_set,
+                cancel_heads,
+                heads_used,
             )
         )
 
@@ -221,7 +233,13 @@ class LayerScheduler:
     # ------------------------------------------------------------------
 
     def _schedule_attn_sublayer(
-        self, ready, dead, free_adds, deferred_adds, residual_map, computed_nodes,
+        self,
+        ready,
+        dead,
+        free_adds,
+        deferred_adds,
+        residual_map,
+        computed_nodes,
         chain_protected=frozenset(),
     ):
         attn_ops = []
@@ -285,19 +303,25 @@ class LayerScheduler:
             if heads_used + n_heads > self.n_heads:
                 continue
             self._require_live(
-                dead_addend, residual_map,
+                dead_addend,
+                residual_map,
                 f"add_into dead-addend for {add_node!r}",
             )
             self._require_live(
-                live_addend, residual_map,
+                live_addend,
+                residual_map,
                 f"add_into live-addend for {add_node!r}",
             )
             target_cols = residual_map.get_indices(dead_addend)
             live_source_cols = residual_map.resolve_indices(live_addend)
-            attn_ops.append(AttnHeadOp(
-                "add_into", add_node, target_cols,
-                source_cols=live_source_cols,
-            ))
+            attn_ops.append(
+                AttnHeadOp(
+                    "add_into",
+                    add_node,
+                    target_cols,
+                    source_cols=live_source_cols,
+                )
+            )
             residual_map.reassign(dead_addend, add_node)
             computed_nodes.add(add_node)
             add_into_live_addends.add(live_addend)
@@ -406,7 +430,8 @@ class LayerScheduler:
             op = AttnHeadOp(op_type, node, target_cols)
             if op_type == "compute_linear":
                 self._require_live(
-                    node.inputs[0], residual_map,
+                    node.inputs[0],
+                    residual_map,
                     f"compute_linear input for {node!r}",
                 )
                 op.source_cols = residual_map.resolve_indices(node.inputs[0])
@@ -476,8 +501,12 @@ class LayerScheduler:
         # Expose the batched cancel state to the MLP sublayer so it can
         # extend the same batch with dirty MLP target cols.
         return (
-            attn_ops, biased_linears, heads_used,
-            cancel_cols, cancel_cols_set, cancel_heads,
+            attn_ops,
+            biased_linears,
+            heads_used,
+            cancel_cols,
+            cancel_cols_set,
+            cancel_heads,
         )
 
     # ------------------------------------------------------------------
@@ -485,8 +514,16 @@ class LayerScheduler:
     # ------------------------------------------------------------------
 
     def _schedule_mlp_sublayer(
-        self, ready, chains, biased_linears, residual_map, computed_nodes,
-        cancel_cols, cancel_cols_set, cancel_heads, heads_used,
+        self,
+        ready,
+        chains,
+        biased_linears,
+        residual_map,
+        computed_nodes,
+        cancel_cols,
+        cancel_cols_set,
+        cancel_heads,
+        heads_used,
     ):
         mlp_ops = []
         next_slot = 0
@@ -554,14 +591,20 @@ class LayerScheduler:
             mlp_slots = list(range(next_slot, next_slot + d_hidden))
             next_slot += d_hidden
             self._require_live(
-                l1.inputs[0], residual_map,
+                l1.inputs[0],
+                residual_map,
                 f"compute_relu (L1 input) for {l2!r}",
             )
             input_cols = residual_map.resolve_indices(l1.inputs[0])
-            mlp_ops.append(MLPOp(
-                "compute_relu", l2, target_cols, mlp_slots,
-                source_cols=input_cols,
-            ))
+            mlp_ops.append(
+                MLPOp(
+                    "compute_relu",
+                    l2,
+                    target_cols,
+                    mlp_slots,
+                    source_cols=input_cols,
+                )
+            )
             commit_cancel(additions, delta)
             dirty = residual_map.dirty_subset(target_cols)
             if dirty:
@@ -611,14 +654,20 @@ class LayerScheduler:
             mlp_slots = list(range(next_slot, next_slot + d_relu))
             next_slot += d_relu
             self._require_live(
-                node.inputs[0], residual_map,
+                node.inputs[0],
+                residual_map,
                 f"compute_standalone_relu input for {node!r}",
             )
             input_cols = residual_map.resolve_indices(node.inputs[0])
-            mlp_ops.append(MLPOp(
-                "compute_standalone_relu", node, target_cols, mlp_slots,
-                source_cols=input_cols,
-            ))
+            mlp_ops.append(
+                MLPOp(
+                    "compute_standalone_relu",
+                    node,
+                    target_cols,
+                    mlp_slots,
+                    source_cols=input_cols,
+                )
+            )
             commit_cancel(additions, delta)
             dirty = residual_map.dirty_subset(target_cols)
             if dirty:

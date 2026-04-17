@@ -49,7 +49,6 @@ from torchwright.reference_renderer.textures import default_texture_atlas
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
-
 # ---------------------------------------------------------------------------
 # Shared synthetic map: 4 walls forming an axis-aligned 10x10 box
 # with a tight 3-node BSP (root splits on x=0, each half splits on y=0).
@@ -59,28 +58,39 @@ from torchwright.reference_renderer.types import RenderConfig, Segment
 def _synthetic_box_md() -> MapData:
     """A 4-wall box + 3-node BSP (identical to the one in test_map_subset)."""
     vertices = [
-        Vertex(5, -5), Vertex(5, 5),    # east endpoints
-        Vertex(-5, 5), Vertex(-5, -5),  # west endpoints
+        Vertex(5, -5),
+        Vertex(5, 5),  # east endpoints
+        Vertex(-5, 5),
+        Vertex(-5, -5),  # west endpoints
     ]
-    sectors = [Sector(
-        floor_h=0, ceiling_h=128,
-        floor_tex="F", ceiling_tex="C",
-        light=255, special=0, tag=0,
-    )]
+    sectors = [
+        Sector(
+            floor_h=0,
+            ceiling_h=128,
+            floor_tex="F",
+            ceiling_tex="C",
+            light=255,
+            special=0,
+            tag=0,
+        )
+    ]
     sidedefs = [
-        Sidedef(x_offset=0, y_offset=0, upper="-", lower="-",
-                middle=name, sector=0)
+        Sidedef(x_offset=0, y_offset=0, upper="-", lower="-", middle=name, sector=0)
         for name in ("BRICK", "STONE", "STRIPE", "CHECKER")
     ]
     linedefs = [
-        Linedef(v1=0, v2=1, flags=0, special=0, tag=0,
-                front_sidedef=0, back_sidedef=-1),  # east
-        Linedef(v1=1, v2=2, flags=0, special=0, tag=0,
-                front_sidedef=1, back_sidedef=-1),  # north
-        Linedef(v1=2, v2=3, flags=0, special=0, tag=0,
-                front_sidedef=2, back_sidedef=-1),  # west
-        Linedef(v1=3, v2=0, flags=0, special=0, tag=0,
-                front_sidedef=3, back_sidedef=-1),  # south
+        Linedef(
+            v1=0, v2=1, flags=0, special=0, tag=0, front_sidedef=0, back_sidedef=-1
+        ),  # east
+        Linedef(
+            v1=1, v2=2, flags=0, special=0, tag=0, front_sidedef=1, back_sidedef=-1
+        ),  # north
+        Linedef(
+            v1=2, v2=3, flags=0, special=0, tag=0, front_sidedef=2, back_sidedef=-1
+        ),  # west
+        Linedef(
+            v1=3, v2=0, flags=0, special=0, tag=0, front_sidedef=3, back_sidedef=-1
+        ),  # south
     ]
     segs = [
         Seg(v1=0, v2=1, angle=0, linedef=0, side=0, offset=0),  # east
@@ -99,26 +109,43 @@ def _synthetic_box_md() -> MapData:
     #   node ne_sw (idx 0): y=0 split in x>0 half
     #   node nw_se (idx 1): y=0 split in x<0 half
     ne_sw = BspNode(
-        px=0, py=0, dx=1, dy=0,
-        front_bbox=(0, -5, 0, 5), back_bbox=(5, 0, 0, 5),
-        front_child=SUBSECTOR_FLAG | 3,   # south (y<0, x>0)
-        back_child=SUBSECTOR_FLAG | 0,    # east (y>0, x>0)
+        px=0,
+        py=0,
+        dx=1,
+        dy=0,
+        front_bbox=(0, -5, 0, 5),
+        back_bbox=(5, 0, 0, 5),
+        front_child=SUBSECTOR_FLAG | 3,  # south (y<0, x>0)
+        back_child=SUBSECTOR_FLAG | 0,  # east (y>0, x>0)
     )
     nw_se = BspNode(
-        px=0, py=0, dx=1, dy=0,
-        front_bbox=(0, -5, -5, 0), back_bbox=(5, 0, -5, 0),
-        front_child=SUBSECTOR_FLAG | 2,   # west (y<0, x<0)
-        back_child=SUBSECTOR_FLAG | 1,    # north (y>0, x<0)
+        px=0,
+        py=0,
+        dx=1,
+        dy=0,
+        front_bbox=(0, -5, -5, 0),
+        back_bbox=(5, 0, -5, 0),
+        front_child=SUBSECTOR_FLAG | 2,  # west (y<0, x<0)
+        back_child=SUBSECTOR_FLAG | 1,  # north (y>0, x<0)
     )
     root = BspNode(
-        px=0, py=0, dx=0, dy=1,
-        front_bbox=(5, -5, 0, 5), back_bbox=(5, -5, -5, 0),
-        front_child=0, back_child=1,
+        px=0,
+        py=0,
+        dx=0,
+        dy=1,
+        front_bbox=(5, -5, 0, 5),
+        back_bbox=(5, -5, -5, 0),
+        front_child=0,
+        back_child=1,
     )
     return MapData(
         name="TEST",
-        vertices=vertices, linedefs=linedefs, sidedefs=sidedefs,
-        sectors=sectors, segs=segs, subsectors=subsectors,
+        vertices=vertices,
+        linedefs=linedefs,
+        sidedefs=sidedefs,
+        sectors=sectors,
+        segs=segs,
+        subsectors=subsectors,
         nodes=[ne_sw, nw_se, root],
     )
 
@@ -132,17 +159,25 @@ def _build_synthetic_subset(max_bsp_nodes: int = 16) -> MapSubset:
     paths = _walk_paths(md, root_idx)
     subset_node_ids = set()
     for ss in {seg_to_ss[s] for s in selected_orig}:
-        for (n, _) in paths[ss]:
+        for n, _ in paths[ss]:
             subset_node_ids.add(n)
     sorted_old = sorted(subset_node_ids)
     old_to_new = {old: new for new, old in enumerate(sorted_old)}
     bsp_nodes = [_make_plane(md.nodes[o]) for o in sorted_old]
     _ss, fc, bc = _count_selected_in_subtree(
-        md, set(selected_orig), root_idx,
+        md,
+        set(selected_orig),
+        root_idx,
     )
     coeffs, consts = _compute_coefficients(
-        md, selected_orig, seg_to_ss, paths, fc, bc,
-        old_to_new, max_bsp_nodes=max_bsp_nodes,
+        md,
+        selected_orig,
+        seg_to_ss,
+        paths,
+        fc,
+        bc,
+        old_to_new,
+        max_bsp_nodes=max_bsp_nodes,
     )
 
     # 4 simple solid-color textures (seg-0..3 → textures 0..3)
@@ -152,12 +187,16 @@ def _build_synthetic_subset(max_bsp_nodes: int = 16) -> MapSubset:
         seg = md.segs[W_idx]
         v1 = md.vertices[seg.v1]
         v2 = md.vertices[seg.v2]
-        segments.append(Segment(
-            ax=float(v1.x), ay=float(v1.y),
-            bx=float(v2.x), by=float(v2.y),
-            color=(0.5, 0.5, 0.5),
-            texture_id=W_idx,
-        ))
+        segments.append(
+            Segment(
+                ax=float(v1.x),
+                ay=float(v1.y),
+                bx=float(v2.x),
+                by=float(v2.y),
+                color=(0.5, 0.5, 0.5),
+                texture_id=W_idx,
+            )
+        )
 
     return MapSubset(
         segments=segments,
@@ -172,7 +211,9 @@ def _build_synthetic_subset(max_bsp_nodes: int = 16) -> MapSubset:
 
 def _small_config() -> RenderConfig:
     return RenderConfig(
-        screen_width=16, screen_height=20, fov_columns=16,
+        screen_width=16,
+        screen_height=20,
+        fov_columns=16,
         trig_table=generate_trig_table(),
         ceiling_color=(0.2, 0.2, 0.2),
         floor_color=(0.4, 0.4, 0.4),
@@ -195,9 +236,13 @@ class TestBspIntegration:
     def module(self, subset):
         config = _small_config()
         return compile_game(
-            config, subset.textures,
-            max_walls=8, max_bsp_nodes=16,
-            d=2048, d_head=32, verbose=False,
+            config,
+            subset.textures,
+            max_walls=8,
+            max_bsp_nodes=16,
+            d=2048,
+            d_head=32,
+            verbose=False,
         )
 
     def test_module_metadata_includes_max_bsp_nodes(self, module) -> None:
@@ -206,9 +251,12 @@ class TestBspIntegration:
     def test_module_has_bsp_inputs(self, module) -> None:
         input_names = {name for name, _, _ in module._input_specs}
         for required in (
-            "bsp_plane_nx", "bsp_plane_ny", "bsp_plane_d",
+            "bsp_plane_nx",
+            "bsp_plane_ny",
+            "bsp_plane_d",
             "bsp_node_id_onehot",
-            "wall_bsp_coeffs", "wall_bsp_const",
+            "wall_bsp_coeffs",
+            "wall_bsp_const",
         ):
             assert required in input_names, f"missing input: {required}"
 
@@ -227,12 +275,12 @@ class TestBspIntegration:
         from torchwright.graph.misc import Assert
 
         asserts = module.metadata.get("asserts", [])
-        assert isinstance(asserts, list), (
-            f"expected 'asserts' metadata entry to be a list, got {type(asserts)}"
-        )
-        assert all(isinstance(a, Assert) for a in asserts), (
-            "'asserts' metadata must contain Assert nodes"
-        )
+        assert isinstance(
+            asserts, list
+        ), f"expected 'asserts' metadata entry to be a list, got {type(asserts)}"
+        assert all(
+            isinstance(a, Assert) for a in asserts
+        ), "'asserts' metadata must contain Assert nodes"
         assert len(asserts) >= 3, (
             f"expected ≥3 annotated invariants after compile_game; "
             f"got {len(asserts)}.  Check that the SORTED stage's "
@@ -277,7 +325,11 @@ class TestBspIntegration:
         frame, _ = step_frame(module, state, PlayerInput(), subset, config)
 
         ref = render_frame(
-            state.x, state.y, angle, subset.segments, config,
+            state.x,
+            state.y,
+            angle,
+            subset.segments,
+            config,
             textures=subset.textures,
         )
         result = compare_images(frame, ref)
@@ -291,10 +343,12 @@ class TestBspIntegration:
         """
         config = _small_config()
         state1 = GameState(x=0.0, y=0.0, angle=0, move_speed=0.3, turn_speed=4)
-        frame1, state2 = step_frame(module, state1, PlayerInput(forward=True),
-                                    subset, config)
-        frame2, _ = step_frame(module, state2, PlayerInput(forward=True),
-                               subset, config)
+        frame1, state2 = step_frame(
+            module, state1, PlayerInput(forward=True), subset, config
+        )
+        frame2, _ = step_frame(
+            module, state2, PlayerInput(forward=True), subset, config
+        )
 
         ceil = np.array(config.ceiling_color)
         floor = np.array(config.floor_color)
@@ -329,8 +383,14 @@ class TestBspIntegration:
         ref = np.zeros_like(frame)
         for col in range(config.screen_width):
             from torchwright.reference_renderer.render import render_column
+
             ref[:, col, :] = render_column(
-                col, 0.0, 0.0, 0, subset.segments, config,
+                col,
+                0.0,
+                0.0,
+                0,
+                subset.segments,
+                config,
                 textures=subset.textures,
             )
         compare_images(frame, ref).assert_matches()

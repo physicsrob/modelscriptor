@@ -68,7 +68,6 @@ from torchwright.graph.asserts import (
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.value_type import NodeValueType
 
-
 # Default tolerance for hard-selection output assertions.  At
 # ``_QUERY_GAIN = 8`` the runner-up softmax weight is ``exp(-8) ≈ 3.4e-4``,
 # so contamination of the winning value is at most
@@ -79,7 +78,9 @@ from torchwright.graph.value_type import NodeValueType
 _HARD_SELECTION_ATOL = 5e-3
 
 
-def _wrap_hard_selection_output(attn: Attn, value: Node, atol: float = _HARD_SELECTION_ATOL) -> Node:
+def _wrap_hard_selection_output(
+    attn: Attn, value: Node, atol: float = _HARD_SELECTION_ATOL
+) -> Node:
     """Bake a value-type guarantee onto a hard-selection primitive's output.
 
     Hard-selection primitives construct Q/K so that softmax concentrates
@@ -322,7 +323,7 @@ def attend_argmin(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
     key_in = Concatenate([pos_encoding, score])
     key_matrix = torch.zeros((len(key_in), d_head))
     key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq  # latest-position tiebreak
-    key_matrix[d_pos, 0] = -1.0                         # smaller score → larger logit
+    key_matrix[d_pos, 0] = -1.0  # smaller score → larger logit
 
     attn = _build_selection_attn(pos_encoding, key_in, key_matrix, value)
     return _wrap_hard_selection_output(attn, value)
@@ -352,7 +353,7 @@ def attend_argmax(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
     key_in = Concatenate([pos_encoding, score])
     key_matrix = torch.zeros((len(key_in), d_head))
     key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq  # latest-position tiebreak
-    key_matrix[d_pos, 0] = 1.0                          # larger score → larger logit
+    key_matrix[d_pos, 0] = 1.0  # larger score → larger logit
 
     attn = _build_selection_attn(pos_encoding, key_in, key_matrix, value)
     return _wrap_hard_selection_output(attn, value)
@@ -408,7 +409,11 @@ def attend_argmin_where(
     require_integer(score, "attend_argmin_where")
     assert len(validity) == 1, "attend_argmin_where expects a 1D boolean validity"
     attn = _build_where_attn(
-        pos_encoding, score, validity, value, score_sign=-1.0,
+        pos_encoding,
+        score,
+        validity,
+        value,
+        score_sign=-1.0,
     )
     return _wrap_hard_selection_output(attn, value)
 
@@ -437,7 +442,11 @@ def attend_argmax_where(
     require_integer(score, "attend_argmax_where")
     assert len(validity) == 1, "attend_argmax_where expects a 1D boolean validity"
     attn = _build_where_attn(
-        pos_encoding, score, validity, value, score_sign=+1.0,
+        pos_encoding,
+        score,
+        validity,
+        value,
+        score_sign=+1.0,
     )
     return _wrap_hard_selection_output(attn, value)
 
@@ -769,9 +778,9 @@ def attend_argmin_valid_unmasked(
     """
     assert len(score) == 1, "attend_argmin_valid_unmasked expects a 1D scalar score"
     require_integer(score, "attend_argmin_valid_unmasked")
-    assert len(validity) == 1, (
-        "attend_argmin_valid_unmasked expects a 1D boolean validity"
-    )
+    assert (
+        len(validity) == 1
+    ), "attend_argmin_valid_unmasked expects a 1D boolean validity"
     require_binary(mask_vector, "attend_argmin_valid_unmasked")
     require_one_hot(position_onehot, "attend_argmin_valid_unmasked")
     assert len(mask_vector) == len(position_onehot), (
@@ -803,9 +812,11 @@ def attend_argmin_valid_unmasked(
     score_row = d_pos
     validity_row = d_pos + 1
     onehot_start_row = d_pos + 2
-    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq    # latest-position tiebreak
-    key_matrix[score_row, 0] = -1.0                       # smaller score → larger logit
-    key_matrix[validity_row, 0] = _VALIDITY_KEY_COEFF     # gained validity dominates mask accumulation
+    key_matrix[d_pos - 2, 0] = _TIEBREAK_COEFF / freq  # latest-position tiebreak
+    key_matrix[score_row, 0] = -1.0  # smaller score → larger logit
+    key_matrix[validity_row, 0] = (
+        _VALIDITY_KEY_COEFF  # gained validity dominates mask accumulation
+    )
     for c in range(n_slots):
         key_matrix[onehot_start_row + c, 1 + c] = 1.0
 

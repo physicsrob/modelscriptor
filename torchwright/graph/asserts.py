@@ -36,7 +36,6 @@ from torchwright.graph import Node, Concatenate
 from torchwright.graph.misc import Assert, Predicate
 from torchwright.graph.value_type import NodeValueType
 
-
 # ---------------------------------------------------------------------
 # Static contract helpers — the dual of assert_*.
 #
@@ -115,7 +114,11 @@ def _format_bad(x: torch.Tensor, mask: torch.Tensor, *, max_show: int = 3) -> st
     if not bad_indices:
         return "no bad entries"
     head = bad_indices[:max_show]
-    more = "" if len(bad_indices) <= max_show else f" (+{len(bad_indices) - max_show} more)"
+    more = (
+        ""
+        if len(bad_indices) <= max_show
+        else f" (+{len(bad_indices) - max_show} more)"
+    )
     # Show the actual offending values at those indices.
     flat = x.flatten()
     shown = ", ".join(f"[{i}]={flat[i].item():.4f}" for i in head)
@@ -123,7 +126,11 @@ def _format_bad(x: torch.Tensor, mask: torch.Tensor, *, max_show: int = 3) -> st
 
 
 def assert_in_range(
-    node: Node, lo: float, hi: float, *, atol: float = 1e-3,
+    node: Node,
+    lo: float,
+    hi: float,
+    *,
+    atol: float = 1e-3,
 ) -> Node:
     """Assert every element of ``node`` lies in ``[lo - atol, hi + atol]``.
 
@@ -131,6 +138,7 @@ def assert_in_range(
     typical post-PL2D noise.  Used for bounds like ``|score| ≤ 100``
     on ``attend_argmin_unmasked`` scores.
     """
+
     def predicate(x: torch.Tensor) -> tuple:
         bad = (x < lo - atol) | (x > hi + atol)
         if not bad.any():
@@ -138,7 +146,8 @@ def assert_in_range(
         return False, f"expected [{lo}, {hi}] (atol={atol}); {_format_bad(x, bad)}"
 
     return Assert(
-        node, predicate,
+        node,
+        predicate,
         message=f"values in [{lo}, {hi}]",
         claimed_type=NodeValueType.bounded(lo, hi),
     )
@@ -155,6 +164,7 @@ def assert_integer(node: Node, *, atol: float = 1e-3) -> Node:
     score-construction sites upstream of ``attend_argmin_*`` primitives
     whose ``require_integer(score)`` contract demands this claim.
     """
+
     def predicate(x: torch.Tensor) -> tuple:
         bad = (x - x.round()).abs() > atol
         if not bad.any():
@@ -165,6 +175,7 @@ def assert_integer(node: Node, *, atol: float = 1e-3) -> Node:
     # if finite; otherwise leave unbounded.
     r = node.value_type.value_range
     import math
+
     if math.isfinite(r.lo) and math.isfinite(r.hi):
         claimed = NodeValueType.integer(lo=math.floor(r.lo), hi=math.ceil(r.hi))
     else:
@@ -179,6 +190,7 @@ def assert_bool(node: Node, *, atol: float = 1e-3) -> Node:
     ``bool_any_true``, ``bool_all_true``, ``bool_not``, ``cond_gate``,
     and any ±1-valued node *before* it's averaged by attention.
     """
+
     def predicate(x: torch.Tensor) -> tuple:
         near_pos = (x - 1.0).abs() <= atol
         near_neg = (x + 1.0).abs() <= atol
@@ -188,7 +200,10 @@ def assert_bool(node: Node, *, atol: float = 1e-3) -> Node:
         return False, f"expected ±1 (atol={atol}); {_format_bad(x, bad)}"
 
     return Assert(
-        node, predicate, message="bool (±1)", claimed_type=NodeValueType.sign(),
+        node,
+        predicate,
+        message="bool (±1)",
+        claimed_type=NodeValueType.sign(),
     )
 
 
@@ -201,6 +216,7 @@ def assert_01(node: Node, *, atol: float = 1e-3) -> Node:
     ``atol`` than ``assert_bool`` because broadcast values accumulate
     more interpolation fuzz than raw ``compare`` outputs.
     """
+
     def predicate(x: torch.Tensor) -> tuple:
         near_zero = x.abs() <= atol
         near_one = (x - 1.0).abs() <= atol
@@ -210,7 +226,10 @@ def assert_01(node: Node, *, atol: float = 1e-3) -> Node:
         return False, f"expected {{0,1}} (atol={atol}); {_format_bad(x, bad)}"
 
     return Assert(
-        node, predicate, message="binary (0/1)", claimed_type=NodeValueType.binary(),
+        node,
+        predicate,
+        message="binary (0/1)",
+        claimed_type=NodeValueType.binary(),
     )
 
 
@@ -224,6 +243,7 @@ def assert_onehot(node: Node, *, atol: float = 1e-3) -> Node:
     WALL positions, ``sort_rank_onehot`` at SORTED positions, *before*
     either is routed through an attention value.
     """
+
     def predicate(x: torch.Tensor) -> tuple:
         if x.ndim != 2:
             return False, f"expected 2D (n_pos, d); got shape {tuple(x.shape)}"
@@ -239,14 +259,14 @@ def assert_onehot(node: Node, *, atol: float = 1e-3) -> Node:
         bad_rows = (~rows_ok).nonzero(as_tuple=False).flatten().tolist()
         head = bad_rows[:3]
         more = "" if len(bad_rows) <= 3 else f" (+{len(bad_rows) - 3} more)"
-        summary = ", ".join(
-            f"row {i} sum={row_sums[i].item():.3f}"
-            for i in head
-        )
+        summary = ", ".join(f"row {i} sum={row_sums[i].item():.3f}" for i in head)
         return False, f"not one-hot (atol={atol}); {summary}{more}"
 
     return Assert(
-        node, predicate, message="one-hot", claimed_type=NodeValueType.one_hot(),
+        node,
+        predicate,
+        message="one-hot",
+        claimed_type=NodeValueType.one_hot(),
     )
 
 
@@ -266,7 +286,10 @@ def _warn_approximate(prop: str, site: str, detail: str) -> None:
 
 
 def assert_matches_value_type(
-    node: Node, vt: NodeValueType, *, atol: float = 1e-3,
+    node: Node,
+    vt: NodeValueType,
+    *,
+    atol: float = 1e-3,
 ) -> Node:
     """Assert the tensor satisfies every property of ``vt`` within ``atol``.
 
@@ -354,12 +377,18 @@ def assert_matches_value_type(
         return True, ""
 
     return Assert(
-        node, predicate, message=f"matches {vt}", claimed_type=vt,
+        node,
+        predicate,
+        message=f"matches {vt}",
+        claimed_type=vt,
     )
 
 
 def assert_strictly_less(
-    a: Node, b: Node, *, margin: float = 0.0,
+    a: Node,
+    b: Node,
+    *,
+    margin: float = 0.0,
 ) -> Node:
     """Assert every element of ``a`` is strictly less than the matching element of ``b``.
 
@@ -397,7 +426,8 @@ def assert_strictly_less(
         )
 
     wrapped = Assert(
-        Concatenate([a, b]), predicate,
+        Concatenate([a, b]),
+        predicate,
         message=f"strictly_less (margin={margin})",
     )
     # The wrapped node is the concat of both; callers want ``b`` back so
@@ -406,6 +436,7 @@ def assert_strictly_less(
     # returned node has ``b``'s width and value.  The projection is
     # value-preserving, so the output inherits ``b``'s static type.
     from torchwright.graph import Linear
+
     proj = torch.zeros(len(a) + len(b), len(b))
     for i in range(len(b)):
         proj[len(a) + i, i] = 1.0
@@ -416,7 +447,9 @@ def assert_strictly_less(
 
 
 def assert_unique_values(
-    node: Node, *, margin: float = 0.5,
+    node: Node,
+    *,
+    margin: float = 0.5,
 ) -> Node:
     """Assert every pair of distinct components in a row differs by at least ``margin``.
 
@@ -429,6 +462,7 @@ def assert_unique_values(
     **Safe placement**: **pre-attention only.**  The whole point is to
     catch ties *before* they can blend.
     """
+
     def predicate(x: torch.Tensor) -> tuple:
         if x.ndim != 2:
             return False, f"expected 2D (n_pos, d); got shape {tuple(x.shape)}"
@@ -454,7 +488,10 @@ def assert_unique_values(
 
 
 def assert_distinct_across(
-    value: Node, where: Node, *, margin: float = 0.5,
+    value: Node,
+    where: Node,
+    *,
+    margin: float = 0.5,
 ) -> Node:
     """Assert per-position ``value`` is pairwise-distinct across rows where ``where ≈ 1``.
 
@@ -488,7 +525,7 @@ def assert_distinct_across(
 
     def predicate(x: torch.Tensor) -> tuple:
         val = x[:, :d_value]
-        valid = x[:, d_value:d_value + d_where]
+        valid = x[:, d_value : d_value + d_where]
         if d_where == 1:
             mask = valid.squeeze(-1) > 0.5
         else:
@@ -510,10 +547,12 @@ def assert_distinct_across(
 
     composite = Concatenate([value, where])
     wrapped = Assert(
-        composite, predicate,
+        composite,
+        predicate,
         message=f"distinct_across (margin={margin})",
     )
     from torchwright.graph import Linear
+
     proj = torch.zeros(d_value + d_where, d_value)
     for i in range(d_value):
         proj[i, i] = 1.0
@@ -524,7 +563,10 @@ def assert_distinct_across(
 
 
 def assert_score_gap_at_least(
-    score: Node, where: Node, *, margin: float = 1.0,
+    score: Node,
+    where: Node,
+    *,
+    margin: float = 1.0,
 ) -> Node:
     """Assert the two smallest valid ``score`` values differ by at least ``margin``.
 
@@ -553,7 +595,7 @@ def assert_score_gap_at_least(
 
     def predicate(x: torch.Tensor) -> tuple:
         val = x[:, :d_value]
-        valid = x[:, d_value:d_value + d_where]
+        valid = x[:, d_value : d_value + d_where]
         if d_where == 1:
             mask = valid.squeeze(-1) > 0.5
         else:
@@ -575,10 +617,12 @@ def assert_score_gap_at_least(
 
     composite = Concatenate([score, where])
     wrapped = Assert(
-        composite, predicate,
+        composite,
+        predicate,
         message=f"score_gap_at_least (margin={margin})",
     )
     from torchwright.graph import Linear
+
     proj = torch.zeros(d_value + d_where, d_value)
     for i in range(d_value):
         proj[i, i] = 1.0
@@ -589,7 +633,11 @@ def assert_score_gap_at_least(
 
 
 def assert_picked_from(
-    result: Node, values: Node, keys: Node, *, atol: float = 1e-2,
+    result: Node,
+    values: Node,
+    keys: Node,
+    *,
+    atol: float = 1e-2,
 ) -> Node:
     """Assert an attention output matches exactly one valid per-position value row.
 
@@ -630,8 +678,8 @@ def assert_picked_from(
 
     def predicate(x: torch.Tensor) -> tuple:
         res = x[:, :d_r]
-        vals = x[:, d_r:d_r + d_v]
-        keys_t = x[:, d_r + d_v:d_r + d_v + d_k]
+        vals = x[:, d_r : d_r + d_v]
+        keys_t = x[:, d_r + d_v : d_r + d_v + d_k]
         if d_k == 1:
             mask = keys_t.squeeze(-1) > 0.5
         else:
@@ -654,10 +702,12 @@ def assert_picked_from(
 
     composite = Concatenate([result, values, keys])
     wrapped = Assert(
-        composite, predicate,
+        composite,
+        predicate,
         message=f"attention picked one (atol={atol})",
     )
     from torchwright.graph import Linear
+
     proj = torch.zeros(d_r + d_v + d_k, d_r)
     for i in range(d_r):
         proj[i, i] = 1.0

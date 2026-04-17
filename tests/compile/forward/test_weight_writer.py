@@ -81,8 +81,9 @@ def _make_op(rmap: ResidualStreamMap, op_type: str, node, target_cols, **kwargs)
     return AttnHeadOp(op_type=op_type, node=node, target_cols=target_cols, **kwargs)
 
 
-def _make_mlp_op(rmap: ResidualStreamMap, op_type: str, node, target_cols,
-                 mlp_slots=None, **kwargs):
+def _make_mlp_op(
+    rmap: ResidualStreamMap, op_type: str, node, target_cols, mlp_slots=None, **kwargs
+):
     """Construct an MLPOp with source_cols captured from ``rmap``."""
     if mlp_slots is None:
         mlp_slots = []
@@ -93,8 +94,13 @@ def _make_mlp_op(rmap: ResidualStreamMap, op_type: str, node, target_cols,
         kwargs.setdefault("source_cols", rmap.resolve_indices(l1.inputs[0]))
     elif op_type == "compute_standalone_relu":
         kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
-    return MLPOp(op_type=op_type, node=node, target_cols=target_cols,
-                 mlp_slots=mlp_slots, **kwargs)
+    return MLPOp(
+        op_type=op_type,
+        node=node,
+        target_cols=target_cols,
+        mlp_slots=mlp_slots,
+        **kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -650,10 +656,10 @@ def test_mlp_relu_chain_multiple():
 
     layer = TransformerLayer(D, D_HEAD)
     ops = [
-        _make_mlp_op(rmap, "compute_relu", l1b, out1_cols,
-                     mlp_slots=list(range(0, 6))),
-        _make_mlp_op(rmap, "compute_relu", l2b, out2_cols,
-                     mlp_slots=list(range(6, 11))),
+        _make_mlp_op(rmap, "compute_relu", l1b, out1_cols, mlp_slots=list(range(0, 6))),
+        _make_mlp_op(
+            rmap, "compute_relu", l2b, out2_cols, mlp_slots=list(range(6, 11))
+        ),
     ]
     write_mlp_sublayer(layer, ops, rmap)
     layer.to(device_mod.get_device(verbose=False))
@@ -687,8 +693,9 @@ def test_mlp_standalone_relu():
     mlp_slots = list(range(0, 4))  # 4 slots for 4-dim ReLU
 
     layer = TransformerLayer(D, D_HEAD)
-    op = _make_mlp_op(rmap, "compute_standalone_relu", relu_node, out_cols,
-                      mlp_slots=mlp_slots)
+    op = _make_mlp_op(
+        rmap, "compute_standalone_relu", relu_node, out_cols, mlp_slots=mlp_slots
+    )
     write_mlp_sublayer(layer, [op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -722,8 +729,9 @@ def test_mlp_standalone_relu_preserves_input():
     mlp_slots = list(range(0, 4))
 
     layer = TransformerLayer(D, D_HEAD)
-    op = _make_mlp_op(rmap, "compute_standalone_relu", relu_node, out_cols,
-                      mlp_slots=mlp_slots)
+    op = _make_mlp_op(
+        rmap, "compute_standalone_relu", relu_node, out_cols, mlp_slots=mlp_slots
+    )
     write_mlp_sublayer(layer, [op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 

@@ -43,7 +43,6 @@ from torchwright.reference_renderer.scenes import (
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig
 
-
 # Matches the per-layer verbose line from forward_compile.
 #
 # Example with dense layer (density >10%):
@@ -139,7 +138,7 @@ def _cost_model(
     params_per_layer = 6 * d * d + 2 * d
     dense_params_total = L * params_per_layer
     dense_bytes_fp16 = dense_params_total * 2
-    dense_gb = dense_bytes_fp16 / (1024 ** 3)
+    dense_gb = dense_bytes_fp16 / (1024**3)
 
     # --- Compute: matmul + attention ---
     matmul_flops = L * 12 * d * d * P
@@ -182,14 +181,16 @@ def _parse_layer_stats(stdout_text: str) -> List[Tuple[int, int, int, int, int, 
     for line in stdout_text.splitlines():
         m = _LAYER_LINE_RE.match(line)
         if m:
-            rows.append((
-                int(m.group(1)),
-                int(m.group(2)),
-                int(m.group(3).replace(",", "")),
-                int(m.group(4)),
-                int(m.group(5)),
-                float(m.group(6)),
-            ))
+            rows.append(
+                (
+                    int(m.group(1)),
+                    int(m.group(2)),
+                    int(m.group(3).replace(",", "")),
+                    int(m.group(4)),
+                    int(m.group(5)),
+                    float(m.group(6)),
+                )
+            )
     return rows
 
 
@@ -223,10 +224,12 @@ def _profile_one(
     d_head: int,
 ) -> dict:
     graph_io, pos_encoding = build_game_graph(
-        config, textures,
+        config,
+        textures,
         max_walls=max(8, len(segments)),
         max_coord=max_coord,
-        move_speed=0.3, turn_speed=4,
+        move_speed=0.3,
+        turn_speed=4,
         chunk_size=chunk_size,
     )
     output_node = graph_io.concat_output()
@@ -358,14 +361,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         nargs="+",
         default=None,
         help="Chunk sizes to profile. "
-             "Default: all divisors of --height (descending).",
+        "Default: all divisors of --height (descending).",
     )
     parser.add_argument(
-        "--d", type=int, default=1024,
+        "--d",
+        type=int,
+        default=1024,
         help="Provisioned d_model for the compile call. Must be large "
-             "enough that no config runs out of stream width; raise if "
-             "you see a compile error at a tight rp. The reported "
-             "peak_d is the real minimum.",
+        "enough that no config runs out of stream width; raise if "
+        "you see a compile error at a tight rp. The reported "
+        "peak_d is the real minimum.",
     )
     parser.add_argument("--d-head", type=int, default=16)
     args = parser.parse_args(argv)
@@ -389,12 +394,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     wad_path = args.wad if args.tex_size > 8 else None
     if args.scene == "box":
         segments, textures = box_room_textured(
-            wad_path=wad_path, tex_size=args.tex_size,
+            wad_path=wad_path,
+            tex_size=args.tex_size,
         )
         max_coord = 10.0
     else:
         segments, textures = multi_room_textured(
-            wad_path=wad_path, tex_size=args.tex_size,
+            wad_path=wad_path,
+            tex_size=args.tex_size,
         )
         max_coord = 15.0
 
@@ -409,7 +416,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"  compiling rp={rp} ...", flush=True)
         try:
             row = _profile_one(
-                segments, textures, config, max_coord,
+                segments,
+                textures,
+                config,
+                max_coord,
                 chunk_size=rp,
                 d=args.d,
                 d_head=args.d_head,
@@ -418,17 +428,21 @@ def main(argv: Optional[List[str]] = None) -> None:
             # Capture failures per-config: we want to see how far down
             # the sweep succeeds, which is the whole point of finding
             # the minimum-viable rp.
-            results.append({
-                "cs": rp,
-                "chunks_per_col": (H + rp - 1) // rp,
-                "positions": max(8, len(segments)) * args.width * ((H + rp - 1) // rp),
-                "layers": None,
-                "peak_d": None,
-                "layer_params": None,
-                "time": None,
-                "wall_time": None,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
+            results.append(
+                {
+                    "cs": rp,
+                    "chunks_per_col": (H + rp - 1) // rp,
+                    "positions": max(8, len(segments))
+                    * args.width
+                    * ((H + rp - 1) // rp),
+                    "layers": None,
+                    "peak_d": None,
+                    "layer_params": None,
+                    "time": None,
+                    "wall_time": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
             print(f"    FAILED: {type(exc).__name__}: {exc}", flush=True)
             continue
         results.append(row)

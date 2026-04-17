@@ -23,7 +23,10 @@ from dataclasses import dataclass
 from torchwright.graph import Node, annotate
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import (
-    add, compare, multiply_2d, multiply_const,
+    add,
+    compare,
+    multiply_2d,
+    multiply_const,
 )
 from torchwright.ops.attention_ops import attend_mean_where
 from torchwright.ops.logic_ops import cond_gate
@@ -73,15 +76,21 @@ def build_bsp(
     """
     with annotate("bsp/side_p"):
         bsp_nx_px = multiply_2d(
-            inputs.bsp_plane_nx, inputs.player_x,
-            max_abs1=1.0, max_abs2=max_coord,
-            step1=0.1, step2=1.0,
+            inputs.bsp_plane_nx,
+            inputs.player_x,
+            max_abs1=1.0,
+            max_abs2=max_coord,
+            step1=0.1,
+            step2=1.0,
             name="bsp_nx_px",
         )
         bsp_ny_py = multiply_2d(
-            inputs.bsp_plane_ny, inputs.player_y,
-            max_abs1=1.0, max_abs2=max_coord,
-            step1=0.1, step2=1.0,
+            inputs.bsp_plane_ny,
+            inputs.player_y,
+            max_abs1=1.0,
+            max_abs2=max_coord,
+            step1=0.1,
+            step2=1.0,
             name="bsp_ny_py",
         )
         bsp_raw = add(add(bsp_nx_px, bsp_ny_py), inputs.bsp_plane_d)

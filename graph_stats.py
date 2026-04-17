@@ -56,7 +56,6 @@ from torchwright.reference_renderer.scenes import (
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig
 
-
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
@@ -112,10 +111,16 @@ def _collect_stats(all_nodes, d, d_head, node_to_layer=None):
                 if isinstance(consumer, Linear):
                     lrl_linears.add(consumer.node_id)
 
-    stats = defaultdict(lambda: {
-        "nodes": 0, "graph_params": 0, "alloc_params": 0,
-        "neurons": 0, "heads": 0, "layers": set(),
-    })
+    stats = defaultdict(
+        lambda: {
+            "nodes": 0,
+            "graph_params": 0,
+            "alloc_params": 0,
+            "neurons": 0,
+            "heads": 0,
+            "layers": set(),
+        }
+    )
     for node in all_nodes:
         key = node.annotation or "(none)"
         stats[key]["nodes"] += 1
@@ -162,10 +167,14 @@ def _print_table(stats, has_layers=False):
 
     layer_hdr = f"{'Layers':>14s} " if has_layers else ""
     layer_sep = f"{'─' * 14} " if has_layers else ""
-    print(f"\n  {'Annotation':<35s} {'Nodes':>7s} "
-          f"{'Neurons':>9s} {'Heads':>7s} {layer_hdr}"
-          f"{'Graph params':>14s} {'Alloc params':>14s}")
-    print(f"  {'─' * 35} {'─' * 7} {'─' * 9} {'─' * 7} {layer_sep}{'─' * 14} {'─' * 14}")
+    print(
+        f"\n  {'Annotation':<35s} {'Nodes':>7s} "
+        f"{'Neurons':>9s} {'Heads':>7s} {layer_hdr}"
+        f"{'Graph params':>14s} {'Alloc params':>14s}"
+    )
+    print(
+        f"  {'─' * 35} {'─' * 7} {'─' * 9} {'─' * 7} {layer_sep}{'─' * 14} {'─' * 14}"
+    )
 
     def top_level(item):
         return item[0].split("/")[0]
@@ -174,9 +183,11 @@ def _print_table(stats, has_layers=False):
         group_list = list(group_items)
         for key, s in group_list:
             layer_col = f"{_fmt_layers(s['layers']):>14s} " if has_layers else ""
-            print(f"  {key:<35s} {s['nodes']:>7,} "
-                  f"{s['neurons']:>9,} {s['heads']:>7,} {layer_col}"
-                  f"{s['graph_params']:>14,} {s['alloc_params']:>14,}")
+            print(
+                f"  {key:<35s} {s['nodes']:>7,} "
+                f"{s['neurons']:>9,} {s['heads']:>7,} {layer_col}"
+                f"{s['graph_params']:>14,} {s['alloc_params']:>14,}"
+            )
         if len(group_list) > 1:
             gn = sum(s["nodes"] for _, s in group_list)
             gneu = sum(s["neurons"] for _, s in group_list)
@@ -185,16 +196,20 @@ def _print_table(stats, has_layers=False):
             ga = sum(s["alloc_params"] for _, s in group_list)
             gl = set().union(*(s["layers"] for _, s in group_list))
             layer_col = f"{_fmt_layers(gl):>14s} " if has_layers else ""
-            print(f"  {'  ' + group_key + ' (total)':<35s} {gn:>7,} "
-                  f"{gneu:>9,} {gh:>7,} {layer_col}"
-                  f"{gg:>14,} {ga:>14,}")
+            print(
+                f"  {'  ' + group_key + ' (total)':<35s} {gn:>7,} "
+                f"{gneu:>9,} {gh:>7,} {layer_col}"
+                f"{gg:>14,} {ga:>14,}"
+            )
         print()
 
     all_layers = set().union(*(s["layers"] for s in stats.values()))
     layer_col = f"{_fmt_layers(all_layers):>14s} " if has_layers else ""
-    print(f"  {'TOTAL':<35s} {total_nodes:>7,} "
-          f"{total_neurons:>9,} {total_heads:>7,} {layer_col}"
-          f"{total_graph:>14,} {total_alloc:>14,}")
+    print(
+        f"  {'TOTAL':<35s} {total_nodes:>7,} "
+        f"{total_neurons:>9,} {total_heads:>7,} {layer_col}"
+        f"{total_graph:>14,} {total_alloc:>14,}"
+    )
 
     return total_nodes, total_graph, total_alloc
 
@@ -211,12 +226,18 @@ def _print_summary(total_graph, total_alloc, n_layers, layer_capacity):
     print(f"    Allocated params (head/slot cost):   {total_alloc:>14,}")
     print(f"    Total transformer capacity:          {total_capacity:>14,}")
     print()
-    print(f"    Density (graph / allocated):         {density:>13.2f}%"
-          f"   ← how sparse each allocated head/slot is")
-    print(f"    Utilization (allocated / capacity):  {utilization:>13.2f}%"
-          f"   ← how full each layer is")
-    print(f"    Overall (graph / capacity):          {overall:>13.2f}%"
-          f"   ← fraction of transformer that is non-zero")
+    print(
+        f"    Density (graph / allocated):         {density:>13.2f}%"
+        f"   ← how sparse each allocated head/slot is"
+    )
+    print(
+        f"    Utilization (allocated / capacity):  {utilization:>13.2f}%"
+        f"   ← how full each layer is"
+    )
+    print(
+        f"    Overall (graph / capacity):          {overall:>13.2f}%"
+        f"   ← fraction of transformer that is non-zero"
+    )
     print()
 
 
@@ -246,7 +267,9 @@ class CriticalPathAnalyzer:
         self._compute_distances()
 
         # The maximum distance = critical path length
-        self._max_depth = max(self._dist_to_output.values()) if self._dist_to_output else 0
+        self._max_depth = (
+            max(self._dist_to_output.values()) if self._dist_to_output else 0
+        )
 
     def _compute_distances(self):
         """BFS from outputs backward to compute distance to output for each node."""
@@ -332,7 +355,8 @@ class CriticalPathAnalyzer:
                 break
             # Find a consumer with dist - 1 (prefer staying on annotation)
             candidates = [
-                c for c in self._consumers.get(node, set())
+                c
+                for c in self._consumers.get(node, set())
                 if self._dist_to_output.get(c, -1) == dist - 1
             ]
             if not candidates:
@@ -353,7 +377,9 @@ class CriticalPathAnalyzer:
             counts[ann] += 1
         return dict(counts)
 
-    def find_contiguous_chains(self, path: List[Node]) -> List[Tuple[str, int, int, List[Node]]]:
+    def find_contiguous_chains(
+        self, path: List[Node]
+    ) -> List[Tuple[str, int, int, List[Node]]]:
         """Find contiguous runs of the same annotation in a path.
 
         Returns list of (annotation, start_idx, length, nodes).
@@ -424,7 +450,10 @@ def _print_critical_path_analysis(all_nodes: Set[Node], output_nodes: Set[Node])
         bars = []
         for d in range(0, max(depths) + 1, max(1, len(depths) // 20)):
             # Average count in this bucket
-            bucket = [hist.get(i, 0) for i in range(d, min(d + max(1, len(depths) // 20), max(depths) + 1))]
+            bucket = [
+                hist.get(i, 0)
+                for i in range(d, min(d + max(1, len(depths) // 20), max(depths) + 1))
+            ]
             avg = sum(bucket) / len(bucket) if bucket else 0
             level = int(8 * avg / max_count) if max_count > 0 else 0
             bars.append("▁▂▃▄▅▆▇█"[min(level, 7)])
@@ -441,7 +470,9 @@ def _print_critical_path_analysis(all_nodes: Set[Node], output_nodes: Set[Node])
         print(f"\n  {'Annotation':<35s} {'Ops':>8s} {'%':>8s}")
         print(f"  {'─' * 35} {'─' * 8} {'─' * 8}")
 
-        for ann, start, length, nodes in sorted(chains, key=lambda x: -_count_real_ops(x[3])):
+        for ann, start, length, nodes in sorted(
+            chains, key=lambda x: -_count_real_ops(x[3])
+        ):
             real_count = _count_real_ops(nodes)
             if real_count > 0:
                 pct = 100.0 * real_count / real_ops if real_ops else 0
@@ -510,22 +541,33 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=20)
     parser.add_argument("--tex-size", type=int, default=64)
     parser.add_argument("--max-walls", type=int, default=None)
-    parser.add_argument("--d", type=int, default=2048,
-                        help="Model dimension (for allocated param estimates)")
-    parser.add_argument("--d-head", type=int, default=None,
-                        help="Head dimension (default: auto from width/tex_size)")
-    parser.add_argument("--d-hidden", type=int, default=None,
-                        help="MLP hidden dimension (default: 4*d)")
+    parser.add_argument(
+        "--d",
+        type=int,
+        default=2048,
+        help="Model dimension (for allocated param estimates)",
+    )
+    parser.add_argument(
+        "--d-head",
+        type=int,
+        default=None,
+        help="Head dimension (default: auto from width/tex_size)",
+    )
+    parser.add_argument(
+        "--d-hidden", type=int, default=None, help="MLP hidden dimension (default: 4*d)"
+    )
     args = parser.parse_args()
 
     if args.scene == "box":
         segments, textures = box_room_textured(
-            wad_path="doom1.wad", tex_size=args.tex_size,
+            wad_path="doom1.wad",
+            tex_size=args.tex_size,
         )
         max_coord = 10.0
     else:
         segments, textures = multi_room_textured(
-            wad_path="doom1.wad", tex_size=args.tex_size,
+            wad_path="doom1.wad",
+            tex_size=args.tex_size,
         )
         max_coord = 15.0
 
@@ -553,14 +595,21 @@ def main():
         floor_color=(0.4, 0.4, 0.4),
     )
 
-    print(f"Building graph: {args.scene} scene, {args.width}x{args.height}, "
-          f"chunk_size={args.chunk_size}, {len(textures)} textures, "
-          f"max_walls={max_walls}")
-    print(f"Transformer config: d={d}, d_head={d_head}, d_hidden={d_hidden}, "
-          f"n_heads={d // d_head}")
+    print(
+        f"Building graph: {args.scene} scene, {args.width}x{args.height}, "
+        f"chunk_size={args.chunk_size}, {len(textures)} textures, "
+        f"max_walls={max_walls}"
+    )
+    print(
+        f"Transformer config: d={d}, d_head={d_head}, d_hidden={d_hidden}, "
+        f"n_heads={d // d_head}"
+    )
 
     graph_io, pos = build_game_graph(
-        config, textures, max_walls=max_walls, max_coord=max_coord,
+        config,
+        textures,
+        max_walls=max_walls,
+        max_coord=max_coord,
         chunk_size=args.chunk_size,
     )
     output = graph_io.concat_output()
@@ -570,12 +619,17 @@ def main():
     # Compile to get actual layer assignments
     print("Compiling...")
     node_to_layer: dict = {}
+
     def _track(node, layer_idx):
         node_to_layer[node.node_id] = layer_idx
 
     forward_compile(
-        d, d_head, output, pos,
-        verbose=False, max_layers=400,
+        d,
+        d_head,
+        output,
+        pos,
+        verbose=False,
+        max_layers=400,
         d_hidden=d_hidden if d_hidden != 4 * d else None,
         device=None,
         on_node_scheduled=_track,

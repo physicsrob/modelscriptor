@@ -43,7 +43,6 @@ from torchwright.graph import Concatenate, Embedding, LiteralValue, Node, PosEnc
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.misc import InputNode
 
-
 HEADLESS_META_FORMAT = "torchwright.headless.v1"
 TOKEN_META_FORMAT = "torchwright.token.v1"
 
@@ -166,7 +165,9 @@ def _tensor_to_proto(name: str, arr: np.ndarray):
         raw=True,
     )
     sparse_tp = helper.make_sparse_tensor(
-        values=values_tp, indices=indices_tp, dims=dims,
+        values=values_tp,
+        indices=indices_tp,
+        dims=dims,
     )
     return None, sparse_tp
 
@@ -279,7 +280,11 @@ def _make_stream_layer_weights_cb(
         # (nh, d, d_head) → (d, nh, d_head) → (d, hd)
         emit(
             f"l{i}_WQ",
-            attn.query_matrix.permute(1, 0, 2).reshape(d, hd).contiguous().cpu().numpy(),
+            attn.query_matrix.permute(1, 0, 2)
+            .reshape(d, hd)
+            .contiguous()
+            .cpu()
+            .numpy(),
         )
         attn.query_matrix = None
         emit(
@@ -289,7 +294,11 @@ def _make_stream_layer_weights_cb(
         attn.key_matrix = None
         emit(
             f"l{i}_WV",
-            attn.value_matrix.permute(1, 0, 2).reshape(d, hd).contiguous().cpu().numpy(),
+            attn.value_matrix.permute(1, 0, 2)
+            .reshape(d, hd)
+            .contiguous()
+            .cpu()
+            .numpy(),
         )
         attn.value_matrix = None
         # (nh, d_head, d) → (hd, d): canonical W_O layout that feeds
@@ -388,8 +397,12 @@ def _emit_cached_preamble(nodes: list, seq_input_name: str) -> None:
     add("Add", ["_rows", "_past_cache_len_s"], ["_abs_rows"])  # (n_new,)
     add("Unsqueeze", ["_abs_rows", "_axes1_1d"], ["_abs_rows_col"])  # (n_new, 1)
     add("Unsqueeze", ["_cols", "_axes0_1d"], ["_cols_row"])  # (1, n_total_mask)
-    add("Greater", ["_cols_row", "_abs_rows_col"], ["_mask_bool"])  # (n_new, n_total_mask)
-    add("Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"])  # (1, n_new, n_total_mask)
+    add(
+        "Greater", ["_cols_row", "_abs_rows_col"], ["_mask_bool"]
+    )  # (n_new, n_total_mask)
+    add(
+        "Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"]
+    )  # (1, n_new, n_total_mask)
 
     # Positional encoding slice uses past_len directly — this is the one
     # place past_len still matters, so the host can set the "absolute
@@ -491,9 +504,7 @@ def _emit_cached_layer_nodes(
     return f"{p}_res_next"
 
 
-def _kv_io_value_info(
-    per_layer_n_heads: List[int], d_head: int
-) -> tuple[list, list]:
+def _kv_io_value_info(per_layer_n_heads: List[int], d_head: int) -> tuple[list, list]:
     """Build ValueInfoProto entries for the KV-cache inputs and outputs.
 
     ``per_layer_n_heads`` gives the (possibly trimmed) head count for
@@ -573,7 +584,11 @@ def compile_headless_to_onnx(
     per_layer_n_heads: list = []
 
     on_layer_compiled = _make_stream_layer_weights_cb(
-        d, d_head, dense_inits, sparse_inits, per_layer_n_heads,
+        d,
+        d_head,
+        dense_inits,
+        sparse_inits,
+        per_layer_n_heads,
     )
 
     # --- Phase 1: streaming compile ---------------------------------------
@@ -649,9 +664,7 @@ def compile_headless_to_onnx(
     _add_float_init("pos_proj", pos_proj, dense_inits, sparse_inits)
     _add_float_init("constant_values", constant_values, dense_inits, sparse_inits)
     _add_float_init("pos_encoding_full", pos_encoding_buf, dense_inits, sparse_inits)
-    _add_int64_init(
-        "output_gather_indices_init", output_gather_indices, dense_inits
-    )
+    _add_int64_init("output_gather_indices_init", output_gather_indices, dense_inits)
     # Per-layer reshape constants (l{i}_qkv_view_shape, l{i}_ctx_flat_shape)
     # are emitted by the streaming weight callback.
     _add_scalar_inits(dense_inits)
@@ -763,7 +776,11 @@ def compile_to_onnx(
     per_layer_n_heads: list = []
 
     on_layer_compiled = _make_stream_layer_weights_cb(
-        d, d_head, dense_inits, sparse_inits, per_layer_n_heads,
+        d,
+        d_head,
+        dense_inits,
+        sparse_inits,
+        per_layer_n_heads,
     )
 
     # --- Phase 1: streaming compile ---------------------------------------
@@ -841,9 +858,7 @@ def compile_to_onnx(
     _add_float_init("constant_values", constant_values, dense_inits, sparse_inits)
     _add_float_init("pos_encoding_full", pos_encoding_buf, dense_inits, sparse_inits)
     _add_float_init("embed_table", embed_table_np, dense_inits, sparse_inits)
-    _add_int64_init(
-        "output_gather_indices_init", output_gather_indices, dense_inits
-    )
+    _add_int64_init("output_gather_indices_init", output_gather_indices, dense_inits)
     # Per-layer reshape constants (l{i}_qkv_view_shape, l{i}_ctx_flat_shape)
     # are emitted by the streaming weight callback.
     _add_scalar_inits(dense_inits)
@@ -939,7 +954,7 @@ def compile_to_onnx(
 
 
 def _compute_io_layout(
-    io: Dict[str, Tuple[Optional[Node], Optional[Node]]]
+    io: Dict[str, Tuple[Optional[Node], Optional[Node]]],
 ) -> Tuple[List[tuple], List[tuple], Dict[Node, Tuple[Optional[Node], List[int]]], int]:
     """Compute column assignments from io spec.
 
@@ -1004,9 +1019,7 @@ def _compute_io_layout(
     return input_specs, output_specs, overlays, d_input
 
 
-def _validate_io_spec(
-    io: Dict[str, Tuple[Optional[Node], Optional[Node]]]
-) -> None:
+def _validate_io_spec(io: Dict[str, Tuple[Optional[Node], Optional[Node]]]) -> None:
     """Validate the io spec.
 
     Raises ValueError if:
@@ -1022,16 +1035,12 @@ def _validate_io_spec(
     for name, (in_node, out_node) in io.items():
         # Check for empty tuple
         if in_node is None and out_node is None:
-            raise ValueError(
-                f"io entry '{name}' has both input and output as None"
-            )
+            raise ValueError(f"io entry '{name}' has both input and output as None")
 
         # Check for duplicate input nodes across entries
         if in_node is not None:
             if in_node in seen_input_nodes:
-                raise ValueError(
-                    f"Input node {in_node} appears in multiple io entries"
-                )
+                raise ValueError(f"Input node {in_node} appears in multiple io entries")
             seen_input_nodes.add(in_node)
 
         # Check for duplicate output nodes across entries
@@ -1089,15 +1098,11 @@ class CompiledHeadless:
         # KV cache shape metadata — discovered from the compiled transformer
         # so empty_past() can build zero-length tensors of the right shape.
         # After head trimming each layer may have a different n_heads.
-        self._per_layer_n_heads = [
-            layer.attn.attn.n_heads for layer in net.layers
-        ]
+        self._per_layer_n_heads = [layer.attn.attn.n_heads for layer in net.layers]
         self._d_head = net.layers[0].attn.attn.d_head
         self._n_layers = len(net.layers)
 
-    def _build_res_stream(
-        self, inputs: torch.Tensor, past_len: int
-    ) -> torch.Tensor:
+    def _build_res_stream(self, inputs: torch.Tensor, past_len: int) -> torch.Tensor:
         n_new = inputs.shape[0]
         input_values = {
             name: inputs[:, start : start + width]
@@ -1178,14 +1183,14 @@ class CompiledHeadless:
         """Return the slice of ``inputs`` for the named input field."""
         for n, s, w in self._input_specs:
             if n == name:
-                return inputs[..., s:s + w]
+                return inputs[..., s : s + w]
         raise KeyError(f"input field {name!r} not found")
 
     def output_slice(self, name: str, outputs: torch.Tensor) -> torch.Tensor:
         """Return the slice of ``outputs`` (post-gather) for the named output field."""
         for n, s, w in self._output_specs:
             if n == name:
-                return outputs[..., s:s + w]
+                return outputs[..., s : s + w]
         raise KeyError(f"output field {name!r} not found")
 
 
@@ -1246,7 +1251,9 @@ def compile_headless(
     else:
         # Legacy API: first_arg is output_node, second_arg is pos_encoding
         if output_node is not None:
-            raise ValueError("Cannot specify output_node both positionally and as keyword")
+            raise ValueError(
+                "Cannot specify output_node both positionally and as keyword"
+            )
         output_node = first_arg
         pos_encoding = second_arg
 
@@ -1329,8 +1336,11 @@ def compile_headless(
     output_indices_tensor = torch.tensor(output_indices, dtype=torch.long)
 
     return CompiledHeadless(
-        net, ch_input_specs, output_indices_tensor,
-        metadata=extra_metadata, output_specs=ch_output_specs,
+        net,
+        ch_input_specs,
+        output_indices_tensor,
+        metadata=extra_metadata,
+        output_specs=ch_output_specs,
     )
 
 
@@ -1353,6 +1363,7 @@ def _compile_headless_legacy(
     # (residual-stream indices, etc.) must match the compiled graph's
     # effective terminal node.
     from torchwright.graph.misc import Assert
+
     while isinstance(output_node, Assert):
         output_node = output_node.inputs[0]
 
@@ -1393,5 +1404,8 @@ def _compile_headless_legacy(
     )
 
     return CompiledHeadless(
-        net, input_specs, output_indices, metadata=extra_metadata,
+        net,
+        input_specs,
+        output_indices,
+        metadata=extra_metadata,
     )

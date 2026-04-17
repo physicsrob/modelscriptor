@@ -79,12 +79,16 @@ def map_to_table(
     # declares APPROXIMATE).
     from torchwright.graph.value_type import Guarantee
     from torchwright.graph.value_type import is_integer_tensor
+
     all_values = list(key_to_value.values()) + [default]
     is_int = (
-        Guarantee.APPROXIMATE if all(is_integer_tensor(v) for v in all_values) else False
+        Guarantee.APPROXIMATE
+        if all(is_integer_tensor(v) for v in all_values)
+        else False
     )
     return assert_matches_value_type(
-        result, NodeValueType(value_range=Range(lo, hi), is_integer=is_int),
+        result,
+        NodeValueType(value_range=Range(lo, hi), is_integer=is_int),
     )
 
 
@@ -105,7 +109,9 @@ def switch(conditions: List[Node], values: List[Node]) -> Node:
 
 
 def _select_output_type(
-    cond: Node, true_node: Node, false_node: Node,
+    cond: Node,
+    true_node: Node,
+    false_node: Node,
 ) -> NodeValueType:
     from torchwright.graph.value_type import _min_guarantee
 
@@ -120,7 +126,10 @@ def _select_output_type(
     is_onehot = _min_guarantee(cond_g, _min_guarantee(tv.is_one_hot, fv.is_one_hot))
     if is_onehot:
         return NodeValueType(
-            value_range=r, is_integer=is_int, is_binary=is_bin, is_one_hot=is_onehot,
+            value_range=r,
+            is_integer=is_int,
+            is_binary=is_bin,
+            is_one_hot=is_onehot,
         )
     if is_bin:
         return NodeValueType(value_range=r, is_integer=is_int, is_binary=is_bin)
@@ -130,7 +139,9 @@ def _select_output_type(
 
 
 def _select_offset(true_node: Node, false_node: Node, caller: str) -> float:
-    union_range = true_node.value_type.value_range.union(false_node.value_type.value_range)
+    union_range = true_node.value_type.value_range.union(
+        false_node.value_type.value_range
+    )
     union_vt = NodeValueType(value_range=union_range)
     return _max_abs_or_raise(union_vt, caller)
 
@@ -328,7 +339,9 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     )
     from torchwright.graph.value_type import Guarantee
 
-    return assert_matches_value_type(result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE))
+    return assert_matches_value_type(
+        result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE)
+    )
 
 
 def dynamic_extract(
@@ -411,7 +424,8 @@ def dynamic_extract(
     # is width n_entries * d_fill with zeros at every slot the mask
     # marks as -1.
     zero_d_fill = LiteralValue(
-        torch.zeros(d_fill), name="dynamic_extract_zero",
+        torch.zeros(d_fill),
+        name="dynamic_extract_zero",
     )
     masked = broadcast_select(
         masks=one_hot,
@@ -560,9 +574,9 @@ def broadcast_select(
 
     # Sublayer 2 reads [c_off (n_slots), c_on (n_slots), true_value, false_value].
     # Column layout:
-    c_off_col = 0                              # c_off[i] at col i
-    c_on_col = n_slots                         # c_on[i]  at col n_slots + i
-    true_col = 2 * n_slots                     # true_value slice
+    c_off_col = 0  # c_off[i] at col i
+    c_on_col = n_slots  # c_on[i]  at col n_slots + i
+    true_col = 2 * n_slots  # true_value slice
     false_col = 2 * n_slots + len(true_value)  # false_value slice
 
     d_hidden = 4 * n_slots * d_fill

@@ -73,8 +73,7 @@ class ImageCompareResult:
             f"image comparison failed (radius={R}, tolerance={self.pixel_tolerance})",
             f"  matched_fraction = {self.matched_fraction:.4f} "
             f"(threshold {min_matched_fraction:.4f})",
-            f"  max_err          = {self.max_err:.4f} "
-            f"(threshold {max_err:.4f})",
+            f"  max_err          = {self.max_err:.4f} " f"(threshold {max_err:.4f})",
             f"  unmatched pixels = {int(self.unmatched_mask.sum())} / "
             f"{self.unmatched_mask.size}",
             f"  worst pixel      = (row={r}, col={c})",
@@ -148,7 +147,7 @@ def compare_images(
     best = np.full((H, W), np.inf, dtype=np.float64)
     for dr in range(-R, R + 1):
         for dc in range(-R, R + 1):
-            shifted = ref_pad[R + dr:R + dr + H, R + dc:R + dc + W, :]
+            shifted = ref_pad[R + dr : R + dr + H, R + dc : R + dc + W, :]
             # L∞ across channels: all channels of this neighbor must be
             # within `dist` of the output pixel for them to "match".
             dist = np.abs(output - shifted).max(axis=-1)

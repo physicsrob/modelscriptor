@@ -10,7 +10,6 @@ from torchwright.graph.value_type import (
 
 import torch
 
-
 # A predicate maps a value tensor to ``(ok, detail)`` where ``detail`` is a
 # short human-readable hint included in the assertion message when ``ok``
 # is False.  Predicates receive the full ``(n_pos, d_output)`` tensor;
@@ -148,9 +147,15 @@ class LiteralValue(Node):
         hi = float(v.max().item())
         is_int = Guarantee.ALWAYS if is_integer_tensor(v) else False
         is_bin = Guarantee.ALWAYS if (is_int and lo >= 0.0 and hi <= 1.0) else False
-        is_sgn = Guarantee.ALWAYS if (is_int and lo >= -1.0 and hi <= 1.0 and not is_bin) else False
+        is_sgn = (
+            Guarantee.ALWAYS
+            if (is_int and lo >= -1.0 and hi <= 1.0 and not is_bin)
+            else False
+        )
         # one-hot: exactly one element is 1, rest are 0 (binary vector with sum == 1)
-        is_one_hot = Guarantee.ALWAYS if (is_bin and bool(v.sum().eq(1).item())) else False
+        is_one_hot = (
+            Guarantee.ALWAYS if (is_bin and bool(v.sum().eq(1).item())) else False
+        )
         return NodeValueType(
             value_range=Range(lo, hi),
             is_integer=is_int,

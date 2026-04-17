@@ -32,7 +32,6 @@ from torchwright.ops.arithmetic_ops import (
 )
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
-
 # (W, H, rp) — parametrized over the configs the DOOM code uses.
 # ``shards_per_col = H // rp`` drives the delta's wrap divisor; the
 # per-step cost of the compiled delta logic no longer depends on
@@ -73,15 +72,21 @@ def _build_sharding_graph(W: int, H: int, rp: int):
     pos_encoding = create_pos_encoding()
     cur_col_idx = create_input("cur_col_idx", 1, value_range=(0.0, float(W)))
     cur_patch_idx_in_col = create_input(
-        "cur_patch_idx_in_col", 1, value_range=(0.0, float(shards_per_col)),
+        "cur_patch_idx_in_col",
+        1,
+        value_range=(0.0, float(shards_per_col)),
     )
 
     patch_plus_one = add_const(cur_patch_idx_in_col, 1.0)
     next_patch_idx_in_col = mod_const(
-        patch_plus_one, shards_per_col, max_value=shards_per_col,
+        patch_plus_one,
+        shards_per_col,
+        max_value=shards_per_col,
     )
     wrap = thermometer_floor_div(
-        patch_plus_one, shards_per_col, max_value=shards_per_col,
+        patch_plus_one,
+        shards_per_col,
+        max_value=shards_per_col,
     )
     next_col_idx = add(cur_col_idx, wrap)
 
@@ -96,8 +101,8 @@ def _build_input_tensor(W: int, H: int, rp: int) -> torch.Tensor:
 
     t = torch.arange(total, dtype=torch.float32)
     inputs = torch.empty(total, 2)
-    inputs[:, 0] = (t // shards_per_col)   # cur_col_idx
-    inputs[:, 1] = (t %  shards_per_col)   # cur_patch_idx_in_col
+    inputs[:, 0] = t // shards_per_col  # cur_col_idx
+    inputs[:, 1] = t % shards_per_col  # cur_patch_idx_in_col
     return inputs
 
 
@@ -117,8 +122,12 @@ def test_delta_matches_ground_truth(W, H, rp):
     shards_per_col = H // rp
 
     module = compile_headless(
-        output, pos_encoding,
-        d=1024, d_head=16, max_layers=50, verbose=False,
+        output,
+        pos_encoding,
+        d=1024,
+        d_head=16,
+        max_layers=50,
+        verbose=False,
     )
 
     inputs = _build_input_tensor(W, H, rp)
@@ -131,7 +140,9 @@ def test_delta_matches_ground_truth(W, H, rp):
     cur_col = inputs[:, 0]
     cur_patch = inputs[:, 1]
     expected_next_col, expected_next_patch = _expected_next(
-        cur_col, cur_patch, shards_per_col,
+        cur_col,
+        cur_patch,
+        shards_per_col,
     )
 
     col_err = (next_col_out - expected_next_col).abs()
@@ -169,8 +180,12 @@ def test_delta_iterated_covers_full_grid(W, H, rp):
     shards_per_col = H // rp
 
     module = compile_headless(
-        output, pos_encoding,
-        d=1024, d_head=16, max_layers=50, verbose=False,
+        output,
+        pos_encoding,
+        d=1024,
+        d_head=16,
+        max_layers=50,
+        verbose=False,
     )
 
     inputs = _build_input_tensor(W, H, rp)

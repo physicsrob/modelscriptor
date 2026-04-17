@@ -137,9 +137,7 @@ def add_scaled_nodes(scale1: float, inp1: Node, scale2: float, inp2: Node) -> No
     return Linear(concat, M)
 
 
-def sum_nodes(
-    inp_list: List[Node], *, max_fanout: Optional[int] = None
-) -> Node:
+def sum_nodes(inp_list: List[Node], *, max_fanout: Optional[int] = None) -> Node:
     """Compute the sum of all input nodes.
 
     Args:
@@ -545,8 +543,12 @@ def piecewise_linear(
     # on the breakpoints (per-channel). Declare that range so downstream
     # gating ops can derive a tight offset.
     if clamp:
-        per_channel_los = [builtins.min(values[i][j] for i in range(n)) for j in range(d_out)]
-        per_channel_his = [builtins.max(values[i][j] for i in range(n)) for j in range(d_out)]
+        per_channel_los = [
+            builtins.min(values[i][j] for i in range(n)) for j in range(d_out)
+        ]
+        per_channel_his = [
+            builtins.max(values[i][j] for i in range(n)) for j in range(d_out)
+        ]
         lo = float(builtins.min(per_channel_los))
         hi = float(builtins.max(per_channel_his))
         result = assert_matches_value_type(
@@ -796,12 +798,8 @@ def piecewise_linear_2d(
                 input_proj[k, 1] = b
                 input_bias[k] = c
                 output_proj[k, 0] = w
-            ob = (
-                torch.tensor([bias_val]) if chunk_start == 0 else torch.zeros(1)
-            )
-            chunk_name = (
-                f"{name}_{chunk_start}_{chunk_start + d}" if multi else name
-            )
+            ob = torch.tensor([bias_val]) if chunk_start == 0 else torch.zeros(1)
+            chunk_name = f"{name}_{chunk_start}_{chunk_start + d}" if multi else name
             chunks.append(
                 linear_relu_linear(
                     input_node=inp,
@@ -927,9 +925,13 @@ def multiply_2d(
 
     if range1 < 1e-12 or range2 < 1e-12:
         result = piecewise_linear_2d(
-            inp1, inp2, breakpoints1, breakpoints2,
+            inp1,
+            inp2,
+            breakpoints1,
+            breakpoints2,
             lambda a, b: a * b,
-            d_max=d_max, name=name,
+            d_max=d_max,
+            name=name,
         )
     else:
         n = builtins.max(len(breakpoints1), len(breakpoints2))
@@ -953,9 +955,13 @@ def multiply_2d(
             return (lo1_f + range1 * u) * (lo2_f + range2 * v)
 
         result = piecewise_linear_2d(
-            inp1_norm, inp2_norm, bp_unit, bp_unit,
+            inp1_norm,
+            inp2_norm,
+            bp_unit,
+            bp_unit,
             _product_normalized,
-            d_max=d_max, name=name,
+            d_max=d_max,
+            name=name,
         )
 
     if max_abs_output is not None:
@@ -1074,19 +1080,27 @@ def low_rank_2d(
     v_by_bp = {breakpoints2[j]: [V_scaled[k][j] for k in range(K)] for j in range(n2)}
 
     u_vec = piecewise_linear(
-        inp1, breakpoints1, lambda x: u_by_bp[x],
-        d_max=d_max, name=f"{name}_u_vec",
+        inp1,
+        breakpoints1,
+        lambda x: u_by_bp[x],
+        d_max=d_max,
+        name=f"{name}_u_vec",
     )
     v_vec = piecewise_linear(
-        inp2, breakpoints2, lambda y: v_by_bp[y],
-        d_max=d_max, name=f"{name}_v_vec",
+        inp2,
+        breakpoints2,
+        lambda y: v_by_bp[y],
+        d_max=d_max,
+        name=f"{name}_v_vec",
     )
 
     # Per-component amplitude bounds (used to size the multiply grid).
-    u_abs_max = [builtins.max(_builtin_abs(U_scaled[i][k]) for i in range(n1))
-                 for k in range(K)]
-    v_abs_max = [builtins.max(_builtin_abs(V_scaled[k][j]) for j in range(n2))
-                 for k in range(K)]
+    u_abs_max = [
+        builtins.max(_builtin_abs(U_scaled[i][k]) for i in range(n1)) for k in range(K)
+    ]
+    v_abs_max = [
+        builtins.max(_builtin_abs(V_scaled[k][j]) for j in range(n2)) for k in range(K)
+    ]
 
     products: list = []
     for k in range(K):
@@ -1108,10 +1122,14 @@ def low_rank_2d(
 
         products.append(
             multiply_2d(
-                u_k, v_k,
-                max_abs1=u_bound, max_abs2=v_bound,
-                step1=step_u, step2=step_v,
-                d_max=d_max, name=f"{name}_prod{k}",
+                u_k,
+                v_k,
+                max_abs1=u_bound,
+                max_abs2=v_bound,
+                step1=step_u,
+                step2=step_v,
+                d_max=d_max,
+                name=f"{name}_prod{k}",
             )
         )
 
@@ -1271,7 +1289,8 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     from torchwright.graph.value_type import Guarantee
 
     return assert_matches_value_type(
-        result, NodeValueType.integer(lo=0, hi=n, guarantee=Guarantee.APPROXIMATE),
+        result,
+        NodeValueType.integer(lo=0, hi=n, guarantee=Guarantee.APPROXIMATE),
     )
 
 
@@ -1413,17 +1432,17 @@ def linear_bin_index(
     assert len(x_min) == 1, "x_min must be a 1D scalar node"
     assert len(x_max) == 1, "x_max must be a 1D scalar node"
     assert n_bins >= 1, "n_bins must be at least 1"
-    assert 0 < min_range < max_range, (
-        "need 0 < min_range < max_range for the reciprocal lookup"
-    )
+    assert (
+        0 < min_range < max_range
+    ), "need 0 < min_range < max_range for the reciprocal lookup"
 
     if inv_range is not None:
         # Caller pre-computed 1/clamped_range — skip steps 1-3.
         assert len(inv_range) == 1, "inv_range must be a 1D scalar node"
     else:
-        assert n_reciprocal_breakpoints >= 2, (
-            "need at least 2 breakpoints for the geometric reciprocal lookup"
-        )
+        assert (
+            n_reciprocal_breakpoints >= 2
+        ), "need at least 2 breakpoints for the geometric reciprocal lookup"
 
         # 1. range and its clamp.
         range_ = subtract(x_max, x_min)
@@ -1434,16 +1453,18 @@ def linear_bin_index(
         #    where r is the per-step ratio.  For 32 breakpoints over a
         #    400× range, r ≈ 1.22 and error_rel ≈ 1.2%.
         ratio = (max_range / min_range) ** (1.0 / (n_reciprocal_breakpoints - 1))
-        bps: List[float] = [min_range * (ratio ** k) for k in range(n_reciprocal_breakpoints)]
+        bps: List[float] = [
+            min_range * (ratio**k) for k in range(n_reciprocal_breakpoints)
+        ]
         # Pin the endpoints so float rounding can't drift them.
         bps[0] = min_range
         bps[-1] = max_range
         # The breakpoints must be strictly ascending — trivially true for
         # geometric spacing but assert in case min_range == max_range sneaks
         # through numerically.
-        assert all(bps[i] < bps[i + 1] for i in range(len(bps) - 1)), (
-            "geometric breakpoints collapsed — check min_range/max_range"
-        )
+        assert all(
+            bps[i] < bps[i + 1] for i in range(len(bps) - 1)
+        ), "geometric breakpoints collapsed — check min_range/max_range"
         inv_range = piecewise_linear(
             clamped_range,
             bps,
@@ -1556,7 +1577,7 @@ def reciprocal(
 
     n_breakpoints = builtins.max(int((max_value - min_value) / step) + 1, 32)
     ratio = (max_value / min_value) ** (1.0 / (n_breakpoints - 1))
-    breakpoints = [min_value * (ratio ** k) for k in range(n_breakpoints)]
+    breakpoints = [min_value * (ratio**k) for k in range(n_breakpoints)]
     breakpoints[0] = min_value
     breakpoints[-1] = max_value
 
@@ -1641,7 +1662,10 @@ def floor_int(
         name="floor_int",
     )
     return assert_matches_value_type(
-        result, NodeValueType.integer(lo=min_value, hi=max_value, guarantee=Guarantee.APPROXIMATE),
+        result,
+        NodeValueType.integer(
+            lo=min_value, hi=max_value, guarantee=Guarantee.APPROXIMATE
+        ),
     )
 
 
@@ -1671,7 +1695,10 @@ def ceil_int(inp: Node, min_value: int, max_value: int) -> Node:
 
 
 def multiply_integers(
-    inp1: Node, inp2: Node, max_value: int, strategy: str = "deep",
+    inp1: Node,
+    inp2: Node,
+    max_value: int,
+    strategy: str = "deep",
 ) -> Node:
     """Multiply two non-negative integer scalars using the polarization identity.
 
@@ -1813,8 +1840,8 @@ def signed_multiply(
         sq_sum = square_signed(s, max_abs=max_sum, step=step, d_max=d_max)
         sq_diff = square_signed(d, max_abs=max_sum, step=step, d_max=d_max)
     else:  # "deep"
-        abs_s = abs(s)               # |a+b|
-        abs_d = abs(d)               # |a-b|
+        abs_s = abs(s)  # |a+b|
+        abs_d = abs(d)  # |a-b|
         sq_sum = square(abs_s, max_value=max_sum, step=step, d_max=d_max)
         sq_diff = square(abs_d, max_value=max_sum, step=step, d_max=d_max)
 

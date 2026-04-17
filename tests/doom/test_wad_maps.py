@@ -39,7 +39,6 @@ from torchwright.reference_renderer.render import render_frame
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -63,11 +62,16 @@ def e1m1(wad: WADReader) -> MapData:
 def test_find_map_lumps_e1m1(wad: WADReader) -> None:
     """All seven geometry lumps are found for E1M1."""
     lumps = wad._find_map_lumps("E1M1")
-    expected = {"VERTEXES", "LINEDEFS", "SIDEDEFS", "SECTORS",
-                "SEGS", "SSECTORS", "NODES"}
-    assert expected.issubset(lumps.keys()), (
-        f"Missing lumps: {expected - lumps.keys()}"
-    )
+    expected = {
+        "VERTEXES",
+        "LINEDEFS",
+        "SIDEDEFS",
+        "SECTORS",
+        "SEGS",
+        "SSECTORS",
+        "NODES",
+    }
+    assert expected.issubset(lumps.keys()), f"Missing lumps: {expected - lumps.keys()}"
     # All lump sizes are positive
     for name in expected:
         _, size = lumps[name]
@@ -146,12 +150,12 @@ def test_linedef_sidedef_refs(e1m1: MapData) -> None:
     n_sd = len(e1m1.sidedefs)
     two_sided_count = 0
     for i, ld in enumerate(e1m1.linedefs):
-        assert 0 <= ld.front_sidedef < n_sd, (
-            f"linedef {i} has bad front_sidedef {ld.front_sidedef}"
-        )
-        assert ld.back_sidedef == -1 or 0 <= ld.back_sidedef < n_sd, (
-            f"linedef {i} has bad back_sidedef {ld.back_sidedef}"
-        )
+        assert (
+            0 <= ld.front_sidedef < n_sd
+        ), f"linedef {i} has bad front_sidedef {ld.front_sidedef}"
+        assert (
+            ld.back_sidedef == -1 or 0 <= ld.back_sidedef < n_sd
+        ), f"linedef {i} has bad back_sidedef {ld.back_sidedef}"
         if ld.back_sidedef != -1:
             two_sided_count += 1
     assert two_sided_count > 0, "expected at least one two-sided linedef"
@@ -171,8 +175,7 @@ def test_sidedef_texture_dash_preserved(e1m1: MapData) -> None:
     literally rather than stripping it to the empty string.
     """
     has_dash = any(
-        sd.upper == "-" or sd.middle == "-" or sd.lower == "-"
-        for sd in e1m1.sidedefs
+        sd.upper == "-" or sd.middle == "-" or sd.lower == "-" for sd in e1m1.sidedefs
     )
     assert has_dash, "expected at least one sidedef with '-' texture"
 
@@ -180,18 +183,16 @@ def test_sidedef_texture_dash_preserved(e1m1: MapData) -> None:
 def test_sector_floor_ceiling_order(e1m1: MapData) -> None:
     """Every sector's ceiling is at or above its floor."""
     for i, s in enumerate(e1m1.sectors):
-        assert s.ceiling_h >= s.floor_h, (
-            f"sector {i}: ceiling {s.ceiling_h} < floor {s.floor_h}"
-        )
+        assert (
+            s.ceiling_h >= s.floor_h
+        ), f"sector {i}: ceiling {s.ceiling_h} < floor {s.floor_h}"
 
 
 def test_seg_linedef_refs_valid(e1m1: MapData) -> None:
     """Every seg references a valid linedef."""
     n = len(e1m1.linedefs)
     for i, seg in enumerate(e1m1.segs):
-        assert 0 <= seg.linedef < n, (
-            f"seg {i} has invalid linedef {seg.linedef}"
-        )
+        assert 0 <= seg.linedef < n, f"seg {i} has invalid linedef {seg.linedef}"
 
 
 def test_seg_vertex_refs_valid(e1m1: MapData) -> None:
@@ -224,17 +225,14 @@ def test_bsp_node_children_valid(e1m1: MapData) -> None:
     n_nodes = len(e1m1.nodes)
     n_ss = len(e1m1.subsectors)
     for i, node in enumerate(e1m1.nodes):
-        for side, child in [("front", node.front_child),
-                            ("back", node.back_child)]:
+        for side, child in [("front", node.front_child), ("back", node.back_child)]:
             if child & SUBSECTOR_FLAG:
                 idx = child & ~SUBSECTOR_FLAG
-                assert 0 <= idx < n_ss, (
-                    f"node {i} {side} subsector {idx} out of range"
-                )
+                assert 0 <= idx < n_ss, f"node {i} {side} subsector {idx} out of range"
             else:
-                assert 0 <= child < n_nodes, (
-                    f"node {i} {side} node {child} out of range"
-                )
+                assert (
+                    0 <= child < n_nodes
+                ), f"node {i} {side} node {child} out of range"
 
 
 def test_bsp_tree_reaches_all_subsectors(e1m1: MapData) -> None:
@@ -248,14 +246,10 @@ def test_bsp_tree_reaches_all_subsectors(e1m1: MapData) -> None:
     def walk(child_ref: int) -> None:
         if child_ref & SUBSECTOR_FLAG:
             idx = child_ref & ~SUBSECTOR_FLAG
-            assert idx not in visited_ss, (
-                f"subsector {idx} reached twice"
-            )
+            assert idx not in visited_ss, f"subsector {idx} reached twice"
             visited_ss.add(idx)
             return
-        assert child_ref not in visited_nodes, (
-            f"node {child_ref} reached twice"
-        )
+        assert child_ref not in visited_nodes, f"node {child_ref} reached twice"
         visited_nodes.add(child_ref)
         node = e1m1.nodes[child_ref]
         walk(node.front_child)
@@ -264,8 +258,7 @@ def test_bsp_tree_reaches_all_subsectors(e1m1: MapData) -> None:
     root = len(e1m1.nodes) - 1
     walk(root)
     assert visited_ss == set(range(len(e1m1.subsectors))), (
-        f"unvisited subsectors: "
-        f"{set(range(len(e1m1.subsectors))) - visited_ss}"
+        f"unvisited subsectors: " f"{set(range(len(e1m1.subsectors))) - visited_ss}"
     )
     assert visited_nodes == set(range(len(e1m1.nodes)))
 
@@ -273,9 +266,7 @@ def test_bsp_tree_reaches_all_subsectors(e1m1: MapData) -> None:
 def test_bsp_splitting_line_nonzero(e1m1: MapData) -> None:
     """Every BSP node has a nonzero splitting direction vector."""
     for i, node in enumerate(e1m1.nodes):
-        assert node.dx != 0 or node.dy != 0, (
-            f"node {i} has zero splitting direction"
-        )
+        assert node.dx != 0 or node.dy != 0, f"node {i} has zero splitting direction"
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +289,7 @@ def test_get_map_segments_count_close_to_segs(wad: WADReader, e1m1: MapData) -> 
     segments, _, _ = wad.get_map_segments("E1M1", tex_size=8)
     ratio = len(segments) / len(e1m1.segs)
     assert ratio >= 0.95, (
-        f"only {len(segments)}/{len(e1m1.segs)} segs converted "
-        f"({ratio:.1%})"
+        f"only {len(segments)}/{len(e1m1.segs)} segs converted " f"({ratio:.1%})"
     )
 
 
@@ -321,9 +311,12 @@ def test_segment_coords_match_vertices(wad: WADReader, e1m1: MapData) -> None:
 
     # Find the corresponding Segment by matching endpoints
     match = [
-        s for s in segments
-        if s.ax == float(v1.x) and s.ay == float(v1.y)
-        and s.bx == float(v2.x) and s.by == float(v2.y)
+        s
+        for s in segments
+        if s.ax == float(v1.x)
+        and s.ay == float(v1.y)
+        and s.bx == float(v2.x)
+        and s.by == float(v2.y)
     ]
     assert len(match) >= 1, "converted segment has different coordinates"
 
@@ -336,13 +329,8 @@ def test_segment_coords_are_doom_native(wad: WADReader, e1m1: MapData) -> None:
     """
     segments, _, _ = wad.get_map_segments("E1M1", tex_size=8)
     # E1M1 spans roughly ±4000 in each axis, not ±1 or ±100.
-    max_abs = max(
-        max(abs(s.ax), abs(s.ay), abs(s.bx), abs(s.by))
-        for s in segments
-    )
-    assert max_abs > 100, (
-        f"max |coord| is {max_abs} — expected DOOM-native (>100)"
-    )
+    max_abs = max(max(abs(s.ax), abs(s.ay), abs(s.bx), abs(s.by)) for s in segments)
+    assert max_abs > 100, f"max |coord| is {max_abs} — expected DOOM-native (>100)"
 
 
 def test_segment_back_side_reversed_vs_front(e1m1: MapData) -> None:
@@ -363,7 +351,7 @@ def test_segment_back_side_reversed_vs_front(e1m1: MapData) -> None:
             v2f = e1m1.vertices[front.v2]
             v1b = e1m1.vertices[back.v1]
             v2b = e1m1.vertices[back.v2]
-            assert (v1f == v2b and v2f == v1b), (
+            assert v1f == v2b and v2f == v1b, (
                 f"linedef {ld_idx} front/back endpoints not reversed: "
                 f"front=({v1f}, {v2f}), back=({v1b}, {v2b})"
             )
@@ -387,12 +375,10 @@ def test_texture_atlas_shape(wad: WADReader) -> None:
     _, textures, _ = wad.get_map_segments("E1M1", tex_size=tex_size)
     assert len(textures) > 0
     for i, t in enumerate(textures):
-        assert t.shape == (tex_size, tex_size, 3), (
-            f"texture {i} has shape {t.shape}"
-        )
-        assert t.min() >= 0.0 and t.max() <= 1.0, (
-            f"texture {i} has out-of-range values ({t.min()}, {t.max()})"
-        )
+        assert t.shape == (tex_size, tex_size, 3), f"texture {i} has shape {t.shape}"
+        assert (
+            t.min() >= 0.0 and t.max() <= 1.0
+        ), f"texture {i} has out-of-range values ({t.min()}, {t.max()})"
 
 
 def test_texture_atlas_count_matches_ids(wad: WADReader) -> None:
@@ -434,32 +420,48 @@ def test_assign_tex_id_assigns_incrementally() -> None:
 
 def test_pick_seg_texture_prefers_middle() -> None:
     sd = Sidedef(
-        x_offset=0, y_offset=0,
-        upper="UP", lower="LO", middle="MID", sector=0,
+        x_offset=0,
+        y_offset=0,
+        upper="UP",
+        lower="LO",
+        middle="MID",
+        sector=0,
     )
     assert _pick_seg_texture(sd) == "MID"
 
 
 def test_pick_seg_texture_falls_back_to_lower() -> None:
     sd = Sidedef(
-        x_offset=0, y_offset=0,
-        upper="UP", lower="LO", middle="-", sector=0,
+        x_offset=0,
+        y_offset=0,
+        upper="UP",
+        lower="LO",
+        middle="-",
+        sector=0,
     )
     assert _pick_seg_texture(sd) == "LO"
 
 
 def test_pick_seg_texture_falls_back_to_upper() -> None:
     sd = Sidedef(
-        x_offset=0, y_offset=0,
-        upper="UP", lower="-", middle="-", sector=0,
+        x_offset=0,
+        y_offset=0,
+        upper="UP",
+        lower="-",
+        middle="-",
+        sector=0,
     )
     assert _pick_seg_texture(sd) == "UP"
 
 
 def test_pick_seg_texture_none_returns_dash() -> None:
     sd = Sidedef(
-        x_offset=0, y_offset=0,
-        upper="-", lower="-", middle="-", sector=0,
+        x_offset=0,
+        y_offset=0,
+        upper="-",
+        lower="-",
+        middle="-",
+        sector=0,
     )
     assert _pick_seg_texture(sd) == "-"
 
@@ -481,30 +483,42 @@ def _synthetic_map_data() -> MapData:
         name="TEST",
         vertices=[Vertex(0, 0), Vertex(10, 0), Vertex(10, 10), Vertex(0, 10)],
         linedefs=[
-            Linedef(v1=0, v2=1, flags=0, special=0, tag=0,
-                    front_sidedef=0, back_sidedef=-1),
-            Linedef(v1=1, v2=2, flags=0, special=0, tag=0,
-                    front_sidedef=1, back_sidedef=-1),
-            Linedef(v1=2, v2=3, flags=0, special=0, tag=0,
-                    front_sidedef=2, back_sidedef=-1),
-            Linedef(v1=3, v2=0, flags=0, special=0, tag=0,
-                    front_sidedef=3, back_sidedef=-1),
+            Linedef(
+                v1=0, v2=1, flags=0, special=0, tag=0, front_sidedef=0, back_sidedef=-1
+            ),
+            Linedef(
+                v1=1, v2=2, flags=0, special=0, tag=0, front_sidedef=1, back_sidedef=-1
+            ),
+            Linedef(
+                v1=2, v2=3, flags=0, special=0, tag=0, front_sidedef=2, back_sidedef=-1
+            ),
+            Linedef(
+                v1=3, v2=0, flags=0, special=0, tag=0, front_sidedef=3, back_sidedef=-1
+            ),
         ],
         sidedefs=[
-            Sidedef(x_offset=0, y_offset=0, upper="-", lower="-",
-                    middle="BRICK", sector=0),
-            Sidedef(x_offset=0, y_offset=0, upper="-", lower="-",
-                    middle="STONE", sector=0),
-            Sidedef(x_offset=0, y_offset=0, upper="-", lower="-",
-                    middle="BRICK", sector=0),
-            Sidedef(x_offset=0, y_offset=0, upper="-", lower="-",
-                    middle="-", sector=0),
+            Sidedef(
+                x_offset=0, y_offset=0, upper="-", lower="-", middle="BRICK", sector=0
+            ),
+            Sidedef(
+                x_offset=0, y_offset=0, upper="-", lower="-", middle="STONE", sector=0
+            ),
+            Sidedef(
+                x_offset=0, y_offset=0, upper="-", lower="-", middle="BRICK", sector=0
+            ),
+            Sidedef(x_offset=0, y_offset=0, upper="-", lower="-", middle="-", sector=0),
         ],
-        sectors=[Sector(
-            floor_h=0, ceiling_h=128,
-            floor_tex="FLOOR", ceiling_tex="CEIL",
-            light=255, special=0, tag=0,
-        )],
+        sectors=[
+            Sector(
+                floor_h=0,
+                ceiling_h=128,
+                floor_tex="FLOOR",
+                ceiling_tex="CEIL",
+                light=255,
+                special=0,
+                tag=0,
+            )
+        ],
         segs=[
             Seg(v1=0, v2=1, angle=0, linedef=0, side=0, offset=0),
             Seg(v1=1, v2=2, angle=0, linedef=1, side=0, offset=0),
@@ -579,11 +593,15 @@ def _rescale_segments(segments, factor: float):
     apply the scaling themselves.
     """
     from torchwright.reference_renderer.types import Segment
+
     return [
         Segment(
-            ax=s.ax * factor, ay=s.ay * factor,
-            bx=s.bx * factor, by=s.by * factor,
-            color=s.color, texture_id=s.texture_id,
+            ax=s.ax * factor,
+            ay=s.ay * factor,
+            bx=s.bx * factor,
+            by=s.by * factor,
+            color=s.color,
+            texture_id=s.texture_id,
         )
         for s in segments
     ]
@@ -601,7 +619,9 @@ def test_render_smoke_e1m1(wad: WADReader, e1m1: MapData) -> None:
     raw_segments, textures, _ = wad.get_map_segments("E1M1", tex_size=8)
     segments = _rescale_segments(raw_segments, factor)
     config = RenderConfig(
-        screen_width=32, screen_height=24, fov_columns=32,
+        screen_width=32,
+        screen_height=24,
+        fov_columns=32,
         trig_table=generate_trig_table(),
         ceiling_color=(0.2, 0.2, 0.2),
         floor_color=(0.4, 0.4, 0.4),
@@ -611,7 +631,7 @@ def test_render_smoke_e1m1(wad: WADReader, e1m1: MapData) -> None:
     # vertex (which the renderer may treat as inside a wall).
     offsets = [(0.3, 0.3), (-0.3, 0.3), (0.3, -0.3), (-0.3, -0.3)]
     # Take every Nth vertex for broad coverage.
-    sample = e1m1.vertices[::max(1, len(e1m1.vertices) // 16)]
+    sample = e1m1.vertices[:: max(1, len(e1m1.vertices) // 16)]
 
     saw_wall = False
     for v in sample:
@@ -620,7 +640,11 @@ def test_render_smoke_e1m1(wad: WADReader, e1m1: MapData) -> None:
             py = v.y * factor + dy
             for angle in (0, 64, 128, 192):
                 frame = render_frame(
-                    float(px), float(py), int(angle), segments, config,
+                    float(px),
+                    float(py),
+                    int(angle),
+                    segments,
+                    config,
                     textures=textures,
                 )
                 assert frame.shape == (24, 32, 3)
@@ -639,8 +663,7 @@ def test_render_smoke_e1m1(wad: WADReader, e1m1: MapData) -> None:
         if saw_wall:
             break
     assert saw_wall, (
-        "rendering E1M1 from any candidate position/angle failed to "
-        "show walls"
+        "rendering E1M1 from any candidate position/angle failed to " "show walls"
     )
 
 
@@ -650,7 +673,9 @@ def test_render_deterministic(wad: WADReader, e1m1: MapData) -> None:
     raw_segments, textures, _ = wad.get_map_segments("E1M1", tex_size=8)
     segments = _rescale_segments(raw_segments, factor)
     config = RenderConfig(
-        screen_width=16, screen_height=16, fov_columns=16,
+        screen_width=16,
+        screen_height=16,
+        fov_columns=16,
         trig_table=generate_trig_table(),
         ceiling_color=(0.2, 0.2, 0.2),
         floor_color=(0.4, 0.4, 0.4),

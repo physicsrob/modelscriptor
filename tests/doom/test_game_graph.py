@@ -22,7 +22,9 @@ from torchwright.reference_renderer.types import RenderConfig, Segment
 def _box_room_config():
     trig = generate_trig_table()
     config = RenderConfig(
-        screen_width=16, screen_height=20, fov_columns=16,
+        screen_width=16,
+        screen_height=20,
+        fov_columns=16,
         trig_table=trig,
         ceiling_color=(0.2, 0.2, 0.2),
         floor_color=(0.4, 0.4, 0.4),
@@ -32,14 +34,18 @@ def _box_room_config():
 
 def _box_room_segments(half=5.0):
     return [
-        Segment(ax=half, ay=-half, bx=half, by=half,
-                color=(0.8, 0.2, 0.1), texture_id=0),
-        Segment(ax=-half, ay=-half, bx=-half, by=half,
-                color=(0.8, 0.2, 0.1), texture_id=1),
-        Segment(ax=-half, ay=half, bx=half, by=half,
-                color=(0.8, 0.2, 0.1), texture_id=2),
-        Segment(ax=-half, ay=-half, bx=half, by=-half,
-                color=(0.8, 0.2, 0.1), texture_id=3),
+        Segment(
+            ax=half, ay=-half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=0
+        ),
+        Segment(
+            ax=-half, ay=-half, bx=-half, by=half, color=(0.8, 0.2, 0.1), texture_id=1
+        ),
+        Segment(
+            ax=-half, ay=half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=2
+        ),
+        Segment(
+            ax=-half, ay=-half, bx=half, by=-half, color=(0.8, 0.2, 0.1), texture_id=3
+        ),
     ]
 
 
@@ -49,7 +55,13 @@ def _ref_frame(px, py, angle, segs, config, textures):
     frame = np.zeros((H, W, 3), dtype=np.float64)
     for col in range(W):
         frame[:, col, :] = render_column(
-            col, px, py, int(angle), segs, config, textures=textures,
+            col,
+            px,
+            py,
+            int(angle),
+            segs,
+            config,
+            textures=textures,
         )
     return frame
 
@@ -70,7 +82,12 @@ class TestGameGraph:
     def module(self, box_room):
         config, textures, subset, segs, trig = box_room
         return compile_game(
-            config, textures, max_walls=8, d=2048, d_head=32, verbose=False,
+            config,
+            textures,
+            max_walls=8,
+            d=2048,
+            d_head=32,
+            verbose=False,
         )
 
     def test_renders_box_room(self, module, box_room):
@@ -80,7 +97,9 @@ class TestGameGraph:
         state = GameState(x=0.0, y=0.0, angle=0, move_speed=0.3, turn_speed=4)
         inputs = PlayerInput()
 
-        frame, new_state = step_frame(module, state, inputs, subset, config, textures=textures)
+        frame, new_state = step_frame(
+            module, state, inputs, subset, config, textures=textures
+        )
         ref = _ref_frame(0.0, 0.0, 0, segs, config, textures)
 
         assert frame.max() > 0.1, "frame appears blank"
@@ -97,17 +116,21 @@ class TestGameGraph:
 
         # Turn right: angle should increase by turn_speed
         inputs = PlayerInput(turn_right=True)
-        frame1, state1 = step_frame(module, state, inputs, subset, config, textures=textures)
-        assert abs(state1.angle - 4) < 1, (
-            f"angle after turn_right: {state1.angle}, expected ~4"
+        frame1, state1 = step_frame(
+            module, state, inputs, subset, config, textures=textures
         )
+        assert (
+            abs(state1.angle - 4) < 1
+        ), f"angle after turn_right: {state1.angle}, expected ~4"
 
         # Turn left from angle 0: should wrap to 252
         inputs = PlayerInput(turn_left=True)
-        frame2, state2 = step_frame(module, state, inputs, subset, config, textures=textures)
-        assert abs(state2.angle - 252) < 1, (
-            f"angle after turn_left: {state2.angle}, expected ~252"
+        frame2, state2 = step_frame(
+            module, state, inputs, subset, config, textures=textures
         )
+        assert (
+            abs(state2.angle - 252) < 1
+        ), f"angle after turn_left: {state2.angle}, expected ~252"
 
     @pytest.mark.parametrize("angle", [0, 64, 128, 192])
     def test_renders_from_angle(self, module, box_room, angle):
@@ -137,38 +160,44 @@ class TestGameGraph:
         ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
 
         compare_images(frame, ref).assert_matches(
-            min_matched_fraction=0.95, max_err=0.35,
+            min_matched_fraction=0.95,
+            max_err=0.35,
         )
 
-    @pytest.mark.parametrize("px,py,angle", [
-        pytest.param(
-            3.0, 2.0, 20,
-            marks=pytest.mark.xfail(
-                reason=(
-                    "Phase E regression, root cause partially characterized. "
-                    "At sort[0] the SORTED attend_argmin_above_integer softmax "
-                    "concentrates on SORTED[0] itself (weight=1.0, logit=+800) "
-                    "rather than any WALL position (logits +555..+637, expected "
-                    "+1000).  Raw sel_bsp_rank reads -1171.875 instead of a "
-                    "clean integer in [0, max_walls-1]; sort_done correctly "
-                    "fires and the 99-sentinel replaces the bogus value, but "
-                    "downstream THINKING/RENDER produce incorrect pixels.  The "
-                    "magnitude of the error (score contamination on the order "
-                    "of 100) is outside any documented per-op noise budget and "
-                    "is most naturally explained by residual-column aliasing in "
-                    "the compiled SORTED attention layer — the specific "
-                    "aliasing pair has NOT yet been identified.  See "
-                    "docs/postmortems/phase_e_xfail.md for the full evidence, "
-                    "the calculation that rules out per-op noise, and what "
-                    "would fix it.  Fixing requires compiler-internals work "
-                    "beyond the plan-6 investigation scope; tracked there."
+    @pytest.mark.parametrize(
+        "px,py,angle",
+        [
+            pytest.param(
+                3.0,
+                2.0,
+                20,
+                marks=pytest.mark.xfail(
+                    reason=(
+                        "Phase E regression, root cause partially characterized. "
+                        "At sort[0] the SORTED attend_argmin_above_integer softmax "
+                        "concentrates on SORTED[0] itself (weight=1.0, logit=+800) "
+                        "rather than any WALL position (logits +555..+637, expected "
+                        "+1000).  Raw sel_bsp_rank reads -1171.875 instead of a "
+                        "clean integer in [0, max_walls-1]; sort_done correctly "
+                        "fires and the 99-sentinel replaces the bogus value, but "
+                        "downstream THINKING/RENDER produce incorrect pixels.  The "
+                        "magnitude of the error (score contamination on the order "
+                        "of 100) is outside any documented per-op noise budget and "
+                        "is most naturally explained by residual-column aliasing in "
+                        "the compiled SORTED attention layer — the specific "
+                        "aliasing pair has NOT yet been identified.  See "
+                        "docs/postmortems/phase_e_xfail.md for the full evidence, "
+                        "the calculation that rules out per-op noise, and what "
+                        "would fix it.  Fixing requires compiler-internals work "
+                        "beyond the plan-6 investigation scope; tracked there."
+                    ),
+                    strict=True,
                 ),
-                strict=True,
             ),
-        ),
-        (-2.0, 3.0, 240),  # off-center, looking at wall at steep angle
-        (1.0, -3.0, 50),   # off-center, oblique to two walls
-    ])
+            (-2.0, 3.0, 240),  # off-center, looking at wall at steep angle
+            (1.0, -3.0, 50),  # off-center, oblique to two walls
+        ],
+    )
     def test_renders_off_center_oblique(self, module, box_room, px, py, angle):
         """Render from off-center positions at oblique angles.
 
@@ -184,7 +213,8 @@ class TestGameGraph:
         ref = _ref_frame(px, py, angle, segs, config, textures)
 
         compare_images(frame, ref).assert_matches(
-            min_matched_fraction=0.95, max_err=0.35,
+            min_matched_fraction=0.95,
+            max_err=0.35,
         )
 
     # ── Collision detection tests ──────────────────────────────────
@@ -199,7 +229,9 @@ class TestGameGraph:
         state = GameState(x=4.0, y=0.0, angle=0, move_speed=0.3, turn_speed=4)
         inputs = PlayerInput(forward=True)
 
-        _, new_state = step_frame(module, state, inputs, subset, config, textures=textures)
+        _, new_state = step_frame(
+            module, state, inputs, subset, config, textures=textures
+        )
         ref_state = update_state(state, inputs, segs, trig)
 
         assert new_state.x == pytest.approx(ref_state.x, abs=0.15)
@@ -213,7 +245,9 @@ class TestGameGraph:
         state = GameState(x=4.5, y=0.0, angle=32, move_speed=0.3, turn_speed=4)
         inputs = PlayerInput(forward=True)
 
-        _, new_state = step_frame(module, state, inputs, subset, config, textures=textures)
+        _, new_state = step_frame(
+            module, state, inputs, subset, config, textures=textures
+        )
         ref_state = update_state(state, inputs, segs, trig)
 
         # X should be blocked (near wall), Y should advance

@@ -16,7 +16,6 @@ from torchwright.debug.probe import probe_graph, reference_eval
 from torchwright.ops.arithmetic_ops import piecewise_linear_2d
 from torchwright.ops.inout_nodes import create_input
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -53,9 +52,9 @@ def test_piecewise_linear_2d_sum():
     # Exact at grid points
     for x in bp:
         for y in bp:
-            assert abs(_eval_2d(node, x, y) - (x + y)) < 0.01, (
-                f"f({x}, {y}) should be {x + y}"
-            )
+            assert (
+                abs(_eval_2d(node, x, y) - (x + y)) < 0.01
+            ), f"f({x}, {y}) should be {x + y}"
 
     # Between grid points — small interpolation noise from the ReLU basis
     assert abs(_eval_2d(node, 0.5, 0.5) - 1.0) < 0.1
@@ -72,17 +71,17 @@ def test_piecewise_linear_2d_product():
         for y in bp:
             expected = x * y
             result = _eval_2d(node, x, y)
-            assert abs(result - expected) < 0.01, (
-                f"f({x}, {y}) = {result}, expected {expected}"
-            )
+            assert (
+                abs(result - expected) < 0.01
+            ), f"f({x}, {y}) = {result}, expected {expected}"
 
     # Between grid points: error bounded by h1*h2/4 = 1*1/4 = 0.25
     for x, y in [(0.5, 0.5), (-1.5, 2.5), (0.3, -0.7)]:
         expected = x * y
         result = _eval_2d(node, x, y)
-        assert abs(result - expected) < 0.3, (
-            f"f({x}, {y}) = {result}, expected {expected}"
-        )
+        assert (
+            abs(result - expected) < 0.3
+        ), f"f({x}, {y}) = {result}, expected {expected}"
 
 
 def test_piecewise_linear_2d_abs_sum():
@@ -99,15 +98,13 @@ def test_piecewise_linear_2d_abs_sum():
     ]
     for x, y, expected in grid_cases:
         result = _eval_2d(node, x, y)
-        assert abs(result - expected) < 0.01, (
-            f"|{x}| + |{y}| = {expected}, got {result}"
-        )
+        assert (
+            abs(result - expected) < 0.01
+        ), f"|{x}| + |{y}| = {expected}, got {result}"
 
     # Between grid points — interpolation noise from the ReLU basis
     result = _eval_2d(node, 0.5, -0.5)
-    assert abs(result - 1.0) < 0.15, (
-        f"|0.5| + |-0.5| = 1.0, got {result}"
-    )
+    assert abs(result - 1.0) < 0.15, f"|0.5| + |-0.5| = 1.0, got {result}"
 
 
 def test_piecewise_linear_2d_constant():
@@ -119,17 +116,13 @@ def test_piecewise_linear_2d_constant():
     for x in bp:
         for y in bp:
             result = _eval_2d(node, x, y)
-            assert abs(result - 5.0) < 0.01, (
-                f"f({x}, {y}) = {result}, expected 5.0"
-            )
+            assert abs(result - 5.0) < 0.01, f"f({x}, {y}) = {result}, expected 5.0"
 
     # Between grid points — small noise from the least-squares solve
     for x in [0.5, 1.5]:
         for y in [0.5, 1.5]:
             result = _eval_2d(node, x, y)
-            assert abs(result - 5.0) < 0.15, (
-                f"f({x}, {y}) = {result}, expected 5.0"
-            )
+            assert abs(result - 5.0) < 0.15, f"f({x}, {y}) = {result}, expected 5.0"
 
 
 def test_piecewise_linear_2d_clamping():
@@ -170,9 +163,9 @@ def test_piecewise_linear_2d_non_uniform():
         for y in bp:
             expected = x * y
             result = _eval_2d(node, x, y)
-            assert abs(result - expected) < 0.01, (
-                f"f({x}, {y}) = {result}, expected {expected}"
-            )
+            assert (
+                abs(result - expected) < 0.01
+            ), f"f({x}, {y}) = {result}, expected {expected}"
 
     # At mid-cell points near zero (fine grid), error should be small
     assert abs(_eval_2d(node, 0.5, 0.5) - 0.25) < 0.1
@@ -193,15 +186,13 @@ def test_piecewise_linear_2d_asymmetric():
     ]
     for x, y, expected in grid_cases:
         result = _eval_2d(node, x, y)
-        assert abs(result - expected) < 0.01, (
-            f"f({x}, {y}) = {result}, expected {expected}"
-        )
+        assert (
+            abs(result - expected) < 0.01
+        ), f"f({x}, {y}) = {result}, expected {expected}"
 
     # Between grid points
     result = _eval_2d(node, 1.5, 0.5)
-    assert abs(result - 4.5) < 0.1, (
-        f"f(1.5, 0.5) = {result}, expected 4.5"
-    )
+    assert abs(result - 4.5) < 0.1, f"f(1.5, 0.5) = {result}, expected 4.5"
 
 
 # ---------------------------------------------------------------------------
@@ -227,13 +218,19 @@ def test_piecewise_linear_2d_probe():
     cache = reference_eval(node, inputs, n_pos)
     oracle = cache[node].flatten()
     expected = torch.tensor([x * y for x, y in zip(xs, ys)])
-    assert torch.allclose(oracle, expected, atol=0.01), (
-        f"oracle: {oracle.tolist()}\nexpected: {expected.tolist()}"
-    )
+    assert torch.allclose(
+        oracle, expected, atol=0.01
+    ), f"oracle: {oracle.tolist()}\nexpected: {expected.tolist()}"
 
     # Compiled check
     report = probe_graph(
-        node, pos_encoding=None, input_values=inputs, n_pos=n_pos,
-        d=512, d_head=16, verbose=False, atol=0.5,
+        node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=n_pos,
+        d=512,
+        d_head=16,
+        verbose=False,
+        atol=0.5,
     )
     assert report.first_divergent is None, report.format_short()

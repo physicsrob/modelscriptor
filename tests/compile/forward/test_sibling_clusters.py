@@ -17,7 +17,10 @@ from torchwright.graph.misc import InputNode
 
 def _linear(inp, d_out, name=""):
     return Linear(
-        inp, torch.zeros(len(inp), d_out), torch.zeros(d_out), name=name,
+        inp,
+        torch.zeros(len(inp), d_out),
+        torch.zeros(d_out),
+        name=name,
     )
 
 
