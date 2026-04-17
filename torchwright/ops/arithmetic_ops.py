@@ -816,7 +816,45 @@ def piecewise_linear_2d(
     if _builtin_abs(base_sx) > 1e-10 or _builtin_abs(base_sy) > 1e-10:
         base_weight = torch.tensor([[base_sx], [base_sy]])
         base_linear = Linear(inp, base_weight, name=f"{name}_base")
-        return Add(base_linear, result)
+        result = Add(base_linear, result)
+
+    # Declare the tight output range.  The piecewise-ReLU chain is
+    # interpolated inside the grid and clamped to nearest edge/corner
+    # outside (per docstring: constant extrapolation), so its
+    # contribution is always bounded by the function's min/max over the
+    # grid vertices.  When a non-zero base linear term (base_sx*x +
+    # base_sy*y) is present, it extrapolates linearly with the inputs —
+    # add its contribution over the inputs' declared ranges.  Without
+    # this tightening, downstream consumers see the Linear's worst-case
+    # ``linear_output_range`` bound, which for a typical 300-unit hidden
+    # layer overestimates the true bound by 4–7 orders of magnitude.
+    grid_vals = [v for row in values for v in row]
+    grid_lo = builtins.min(grid_vals)
+    grid_hi = builtins.max(grid_vals)
+    base_lo = 0.0
+    base_hi = 0.0
+    can_tighten = True
+    if _builtin_abs(base_sx) > 1e-10:
+        r1 = inp1.value_type.value_range
+        if not r1.is_finite():
+            can_tighten = False
+        else:
+            cand = (base_sx * r1.lo, base_sx * r1.hi)
+            base_lo += builtins.min(cand)
+            base_hi += builtins.max(cand)
+    if can_tighten and _builtin_abs(base_sy) > 1e-10:
+        r2 = inp2.value_type.value_range
+        if not r2.is_finite():
+            can_tighten = False
+        else:
+            cand = (base_sy * r2.lo, base_sy * r2.hi)
+            base_lo += builtins.min(cand)
+            base_hi += builtins.max(cand)
+    if can_tighten:
+        result = assert_matches_value_type(
+            result,
+            NodeValueType(value_range=Range(grid_lo + base_lo, grid_hi + base_hi)),
+        )
     return result
 
 
