@@ -152,7 +152,7 @@ def test_identity_layer():
 def test_attn_compute():
     """Compile a basic Attn node into one attention head."""
     pos = _make_pos_encoding()
-    value_in = InputNode("v", 4)
+    value_in = InputNode("v", 4, value_range=(-100.0, 100.0))
     # Build an Attn node that does current-position attention and passes through value
     d_head = D_HEAD
     attn_node = Attn(
@@ -191,7 +191,7 @@ def test_attn_compute():
 def test_attn_compute_small_d_head():
     """Attn node with d_head smaller than layer d_head — needs padding."""
     pos = _make_pos_encoding()
-    value_in = InputNode("v", 4)
+    value_in = InputNode("v", 4, value_range=(-100.0, 100.0))
     small_d_head = 8  # smaller than D_HEAD=16
 
     attn_node = Attn(
@@ -228,7 +228,7 @@ def test_attn_compute_small_d_head():
 def test_attn_compute_shared_inputs():
     """Attn node where query_in == key_in (like attend_to_offset)."""
     pos = _make_pos_encoding()
-    value_in = InputNode("v", 4)
+    value_in = InputNode("v", 4, value_range=(-100.0, 100.0))
 
     # attend_to_offset pattern: query and key both use pos_encoding
     attn_node = pos.attend_to_offset(value_in, delta_pos=-1)
@@ -257,8 +257,8 @@ def test_attn_compute_shared_inputs():
 def test_attn_compute_multiposition():
     """Attn node with cross-position attention (get_prev_value pattern)."""
     pos = _make_pos_encoding()
-    value_in = InputNode("v", 4)
-    cond_in = InputNode("c", 1)
+    value_in = InputNode("v", 4, value_range=(-100.0, 100.0))
+    cond_in = InputNode("c", 1, value_range=(-100.0, 100.0))
 
     attn_node = pos.get_prev_value(value_in, cond_in)
 
@@ -311,7 +311,7 @@ def test_attn_compute_multiposition():
 def test_linear_zero_bias():
     """Zero-bias Linear compiled via current-position attention."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     W = torch.randn(4, 3)
     linear_node = Linear(x, W, torch.zeros(3), name="lin")
 
@@ -344,7 +344,7 @@ def test_linear_large_input():
     """
     pos = _make_pos_encoding()
     # 4 inputs of 8 dims each, concatenated → 32-dim input
-    inputs = [InputNode(f"x{i}", 8) for i in range(4)]
+    inputs = [InputNode(f"x{i}", 8, value_range=(-100.0, 100.0)) for i in range(4)]
     cat = Concatenate(inputs)
     # Summing matrix: each output dim accumulates from all 4 inputs
     d_out = 8
@@ -381,7 +381,7 @@ def test_linear_large_input():
 def test_linear_different_dims():
     """Zero-bias Linear where input dim != output dim."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 8)
+    x = InputNode("x", 8, value_range=(-100.0, 100.0))
     W = torch.randn(8, 3)
     linear_node = Linear(x, W, torch.zeros(3), name="lin")
 
@@ -414,7 +414,7 @@ def test_linear_different_dims():
 def test_cancel():
     """Cancel a node: columns should become zero after attn sublayer."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
 
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
@@ -439,8 +439,8 @@ def test_cancel():
 def test_cancel_multiple():
     """Cancel two nodes in the same layer using different heads."""
     pos = _make_pos_encoding()
-    a = InputNode("a", 3)
-    b = InputNode("b", 5)
+    a = InputNode("a", 3, value_range=(-100.0, 100.0))
+    b = InputNode("b", 5, value_range=(-100.0, 100.0))
 
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
@@ -473,8 +473,8 @@ def test_cancel_multiple():
 def test_add_into():
     """Add(A, B) where A is dead — write B into A's columns via skip."""
     pos = _make_pos_encoding()
-    a = InputNode("a", 4)
-    b = InputNode("b", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
     # inputs[0]=a is dead (at target_cols), inputs[1]=b is live (copied via attention)
     add_node = Add(a, b)
 
@@ -514,8 +514,8 @@ def test_add_into_dead_at_inputs1():
     where chain_output is dead but lives at inputs[1].
     """
     pos = _make_pos_encoding()
-    live = InputNode("live", 4)
-    dead = InputNode("dead", 4)
+    live = InputNode("live", 4, value_range=(-100.0, 100.0))
+    dead = InputNode("dead", 4, value_range=(-100.0, 100.0))
     # Dead addend is inputs[1], not inputs[0]
     add_node = Add(live, dead)
 
@@ -555,8 +555,8 @@ def test_add_into_dead_at_inputs1():
 def test_compute_add():
     """Add(a, b) with neither input dead — copies both via separate heads."""
     pos = _make_pos_encoding()
-    a = InputNode("a", 4)
-    b = InputNode("b", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
 
     rmap = ResidualStreamMap(D)
@@ -586,8 +586,8 @@ def test_compute_add_wide():
     """compute_add with vectors wider than d_head — requires multiple head groups."""
     pos = _make_pos_encoding()
     # 20 > D_HEAD=16, so needs 2 heads per input (4 heads total)
-    a = InputNode("a", 20)
-    b = InputNode("b", 20)
+    a = InputNode("a", 20, value_range=(-100.0, 100.0))
+    b = InputNode("b", 20, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
 
     d_wide = 128  # Need room for pos(16) + a(20) + b(20) + out(20)
@@ -627,7 +627,7 @@ def test_compute_add_wide():
 
 def test_mlp_relu_chain():
     """Linear -> ReLU -> Linear chain compiled via MLP."""
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     W1 = torch.randn(4, 8)
     b1 = torch.randn(8)
     W2 = torch.randn(8, 3)
@@ -660,8 +660,8 @@ def test_mlp_relu_chain():
 
 def test_mlp_relu_chain_multiple():
     """Two L->R->L chains in same MLP, using different slot ranges."""
-    x = InputNode("x", 4)
-    y = InputNode("y", 3)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    y = InputNode("y", 3, value_range=(-100.0, 100.0))
 
     # Chain 1: x -> l1a -> relu -> l1b
     l1a = Linear(x, torch.randn(4, 6), torch.randn(6), name="l1a")
@@ -708,7 +708,7 @@ def test_mlp_relu_chain_multiple():
 
 def test_mlp_standalone_relu():
     """Standalone ReLU compiled via MLP with identity linear1/linear2."""
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     relu_node = ReLU(x, name="standalone_relu")
 
     rmap = ResidualStreamMap(D)
@@ -744,7 +744,7 @@ def test_mlp_standalone_relu():
 
 def test_mlp_standalone_relu_preserves_input():
     """Standalone ReLU doesn't corrupt the input node's columns."""
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     relu_node = ReLU(x, name="standalone_relu")
 
     rmap = ResidualStreamMap(D)
@@ -814,7 +814,7 @@ def test_mlp_constant():
 def test_biased_linear_split():
     """Linear with non-zero bias: attention computes Wx, MLP adds b."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     W = torch.randn(4, 3)
     b = torch.randn(3)
     linear_node = Linear(x, W, b, name="biased")
@@ -858,7 +858,7 @@ def test_biased_linear_split():
 def test_non_contiguous_columns():
     """Operations work with scattered (non-contiguous) column indices."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     W = torch.randn(4, 3)
     linear_node = Linear(x, W, torch.zeros(3), name="lin")
 
@@ -866,7 +866,7 @@ def test_non_contiguous_columns():
     # by allocating and freeing intermediate nodes
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)  # takes first 16 cols
-    dummy1 = InputNode("d1", 2)
+    dummy1 = InputNode("d1", 2, value_range=(-100.0, 100.0))
     rmap.allocate(x)  # takes next 4
     d1_cols = rmap.allocate(dummy1)  # takes next 2
     out_cols = rmap.allocate(linear_node)  # takes next 3
@@ -900,7 +900,7 @@ def test_non_contiguous_columns():
 def test_mixed_layer():
     """One layer with both attention ops and MLP ops, verifying composition."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
 
     # Attention: zero-bias linear
     W_attn = torch.randn(4, 3)

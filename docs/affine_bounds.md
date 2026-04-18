@@ -1143,3 +1143,130 @@ needs to pin these down:
   that compares compiled behavior on a reference example
   (walkthrough, adder, calculator) before and after migration is
   a good guardrail.
+
+---
+
+## Appendix F: Revised direction — eager bounds, no finalize
+
+The placeholder/finalize architecture described in the main document
+was implemented and found to be **actively harmful**. This appendix
+describes the replacement direction.
+
+### What went wrong
+
+The finalize-based design required every `cond_gate` and `select` to
+return a `ConsumerPlaceholder` during construction, deferring the
+real subgraph to a later `finalize(root)` pass. This introduced:
+
+1. **`_rebind_downstream`** — after materializing a placeholder,
+   walk every node in the graph and rewrite `inputs` lists that
+   referenced the placeholder to point at the materialized output.
+2. **`_compute_all_ready`** — after each materialization, re-walk
+   the graph to compute affine bounds for nodes that are now ready.
+3. **Auto-finalize in `Node.__init_subclass__`** — wrap every
+   `Node.compute()` to call `finalize(self)` if affine bounds are
+   missing, so reference evaluation works transparently.
+4. **Stale eager types** — placeholder nodes' `compute_value_type()`
+   returned value types that were sometimes more pessimistic than
+   what the real subgraph would produce (e.g. `unknown()` when the
+   cond wasn't `is_sign`). Downstream nodes built during
+   construction used these pessimistic types for their own
+   `_value_type_eager`. After finalize replaced the placeholder
+   with the real subgraph, the downstream nodes' eager types were
+   NOT recomputed — they stayed stale. The affine bound's
+   `_value_type_affine` is the intersection of eager and affine
+   ranges, so a stale `(-inf, inf)` eager range meant the affine
+   range (however wide) passed through unclamped.
+
+This produced silent M-value explosions (M = 3.3e21 observed in
+`balanced_parens`) that caused the compiled transformer to output
+garbage. The failure was silent — no assertion, no error, just
+wrong output. An M sanity bound was added as a guardrail, but the
+root cause was architectural: the placeholder indirection made
+value-type propagation unsound.
+
+### The replacement: eager bounds at init time
+
+Affine bounds are computed in `Node.__init__`, immediately after
+`compute_value_type()`. Each node's bound is derived from its
+inputs' bounds, which are already available (inputs are constructed
+before the node that consumes them).
+
+`cond_gate` and `select` build their subgraphs eagerly, as they
+did before the placeholder experiment. No placeholders, no
+finalize, no `_rebind_downstream`, no auto-finalize wrapper.
+
+### Self-keyed basis
+
+The main document assumes a single shared `Basis` object built from
+ALL `InputNode`s in the graph — a fact only known after
+construction is complete. This was the original motivation for the
+finalize pass.
+
+The replacement uses a **self-keyed basis**: each `AffineBound`
+carries a column map `Dict[int, int]` that maps `InputNode.node_id`
+to column index. The `A` matrices are dense tensors whose columns
+correspond to the entries in that map.
+
+- **`InputNode`** creates a 1-column bound keyed to itself.
+- **`LiteralValue`, `Embedding`, `PosEncoding`** create 0-column
+  (degenerate) bounds with an empty column map.
+- **Binary ops** (`Add`, `Concatenate`, `Attn` value path) merge
+  their inputs' column maps into a union, reindexing the `A`
+  matrices so columns align. Merging is a scatter into a
+  wider tensor — the cost is proportional to `n_input_nodes`,
+  which is small (1 for simple examples, ~20 for DOOM).
+- **Unary ops** (`Linear`, `ReLU`, `Assert`) inherit the input's
+  column map unchanged. No reindexing needed.
+
+This eliminates the global basis entirely. Each `AffineBound` is
+self-contained. No construction-order constraints. No basis
+invalidation when a new `InputNode` is created. Two bounds from
+unrelated subgraphs can be combined without prior coordination.
+
+### Column map merging
+
+When combining two `AffineBound`s with column maps
+`{A: 0, B: 1}` and `{B: 0, C: 1}`:
+
+1. Build the union map: `{A: 0, B: 1, C: 2}`.
+2. Create new `A` matrices with 3 columns, initialized to zero.
+3. Scatter the first bound's columns: column 0 → position 0
+   (A), column 1 → position 1 (B).
+4. Scatter the second bound's columns: column 0 → position 1
+   (B), column 1 → position 2 (C).
+5. Apply the rule (e.g. element-wise addition for `Add`).
+
+The scatter is O(d_output × n_columns) per operand — negligible
+for the matrix sizes involved.
+
+### Basis range information
+
+The shared `Basis` object in the main document stores `x_lo` /
+`x_hi` per variable. With self-keyed bounds, this information lives
+on the `InputNode` objects themselves (their `value_range`). When
+`to_interval()` needs the basis box, it reads ranges from the
+`InputNode`s referenced by the column map.
+
+This is equivalent and avoids a separate object. `InputNode`s
+already store their declared ranges; `to_interval()` just looks
+them up by node_id.
+
+### What stays the same
+
+The per-op propagation rules (Linear, Add, ReLU, Concatenate,
+Attn, Assert, etc.) are unchanged in their math. Only the basis
+bookkeeping differs. The structural flag composition rules are
+unchanged. The `to_interval()` sign-split formula is unchanged.
+The degenerate-bound escape hatch for ops that can't compute
+affine bounds is unchanged.
+
+### What is deleted
+
+- `ConsumerPlaceholder`, `CondGatePlaceholder`, `SelectPlaceholder`
+- `finalize()` and all its helpers (`_rebind_downstream`,
+  `_compute_all_ready`, `_tighten_basis_from_input_asserts`)
+- Auto-finalize wrapper in `Node.__init_subclass__`
+- The `Basis` class (replaced by per-bound column maps)
+- `ValueTypeNotFinalized` exception
+- The *Graph lifecycle* section's two-phase model

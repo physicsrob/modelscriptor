@@ -26,7 +26,7 @@ def _linear(inp, d_out, name=""):
 
 def test_detects_wide_sibling_cluster():
     """6 parallel width-64 branches feeding one Concatenate → 1 cluster."""
-    shared_in = InputNode(1, name="shared")
+    shared_in = InputNode(1, name="shared", value_range=(-100.0, 100.0))
     terminals = []
     for i in range(6):
         # Each branch: shared_in -> Linear(→64) -> Linear(→3)
@@ -46,7 +46,7 @@ def test_detects_wide_sibling_cluster():
 
 def test_no_cluster_when_branches_narrow():
     """6 branches but each max width=1 → rejected by min_peak_width."""
-    shared_in = InputNode(1, name="shared")
+    shared_in = InputNode(1, name="shared", value_range=(-100.0, 100.0))
     terminals = []
     for i in range(6):
         n = _linear(shared_in, 1, name=f"scalar_{i}")
@@ -60,7 +60,7 @@ def test_no_cluster_when_branches_narrow():
 
 def test_no_cluster_when_few_branches():
     """3 wide branches — below default min_chains=4, rejected."""
-    shared_in = InputNode(1, name="shared")
+    shared_in = InputNode(1, name="shared", value_range=(-100.0, 100.0))
     terminals = []
     for i in range(3):
         wide = _linear(shared_in, 64, name=f"wide_{i}")
@@ -74,7 +74,7 @@ def test_no_cluster_when_few_branches():
 
 def test_custom_thresholds():
     """With min_chains=3, the 3-branch case should be detected."""
-    shared_in = InputNode(1, name="shared")
+    shared_in = InputNode(1, name="shared", value_range=(-100.0, 100.0))
     terminals = []
     for i in range(3):
         wide = _linear(shared_in, 64, name=f"wide_{i}")
@@ -88,7 +88,7 @@ def test_custom_thresholds():
 
 def test_node_to_chain_mapping():
     """Each branch-exclusive node should map back to its (cluster, chain)."""
-    shared_in = InputNode(1, name="shared")
+    shared_in = InputNode(1, name="shared", value_range=(-100.0, 100.0))
     branches = []
     for i in range(4):
         wide = _linear(shared_in, 64, name=f"wide_{i}")
@@ -118,7 +118,7 @@ def test_node_to_chain_mapping():
 
 def test_terminal_mapping():
     """The branch terminal (direct input to join) is registered separately."""
-    shared_in = InputNode(1, name="shared")
+    shared_in = InputNode(1, name="shared", value_range=(-100.0, 100.0))
     terminals = []
     for i in range(4):
         wide = _linear(shared_in, 64, name=f"wide_{i}")
@@ -136,7 +136,7 @@ def test_terminal_mapping():
 
 def test_diamond_dependency_excluded():
     """A node shared across two branches is excluded from both."""
-    shared_in = InputNode(1, name="shared")
+    shared_in = InputNode(1, name="shared", value_range=(-100.0, 100.0))
     # Create a shared intermediate used by two different branches.
     shared_mid = _linear(shared_in, 64, name="shared_mid")
     # Four branches, two of which use shared_mid (diamond), two independent.
@@ -162,7 +162,7 @@ def test_diamond_dependency_excluded():
 
 def test_concatenate_feeding_linear_still_detected():
     """A Concatenate feeding a Linear is still a join — peak width matters."""
-    shared_in = InputNode(1, name="shared")
+    shared_in = InputNode(1, name="shared", value_range=(-100.0, 100.0))
     branches = [_linear(shared_in, 64, name=f"br_{i}") for i in range(4)]
     concat = Concatenate(branches)
     final = _linear(concat, 4, name="final")

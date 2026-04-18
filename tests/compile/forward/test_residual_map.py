@@ -10,7 +10,7 @@ from torchwright.graph.misc import InputNode, LiteralValue
 def test_allocate_and_free():
     """Allocate a node, verify indices, free it, verify columns recovered."""
     rmap = ResidualStreamMap(64)
-    node = InputNode("x", 8)
+    node = InputNode("x", 8, value_range=(-100.0, 100.0))
 
     indices = rmap.allocate(node)
     assert len(indices) == 8
@@ -28,9 +28,9 @@ def test_allocate_and_free():
 def test_multiple_allocations():
     """Three nodes get non-overlapping index sets."""
     rmap = ResidualStreamMap(64)
-    a = InputNode("a", 8)
-    b = InputNode("b", 16)
-    c = InputNode("c", 4)
+    a = InputNode("a", 8, value_range=(-100.0, 100.0))
+    b = InputNode("b", 16, value_range=(-100.0, 100.0))
+    c = InputNode("c", 4, value_range=(-100.0, 100.0))
 
     idx_a = rmap.allocate(a)
     idx_b = rmap.allocate(b)
@@ -46,9 +46,9 @@ def test_multiple_allocations():
 def test_full_stream():
     """Fill the stream exactly, then verify next allocation raises."""
     rmap = ResidualStreamMap(16)
-    a = InputNode("a", 8)
-    b = InputNode("b", 8)
-    c = InputNode("c", 1)
+    a = InputNode("a", 8, value_range=(-100.0, 100.0))
+    b = InputNode("b", 8, value_range=(-100.0, 100.0))
+    c = InputNode("c", 1, value_range=(-100.0, 100.0))
 
     rmap.allocate(a)
     rmap.allocate(b)
@@ -61,8 +61,8 @@ def test_full_stream():
 def test_reassign():
     """Reassign columns from one node to another."""
     rmap = ResidualStreamMap(64)
-    old = InputNode("old", 8)
-    new = InputNode("new", 8)
+    old = InputNode("old", 8, value_range=(-100.0, 100.0))
+    new = InputNode("new", 8, value_range=(-100.0, 100.0))
 
     indices = rmap.allocate(old)
     rmap.reassign(old, new)
@@ -76,9 +76,9 @@ def test_reassign():
 def test_build_residual_assignment():
     """Build a ResidualAssignment and verify get_node_indices works."""
     rmap = ResidualStreamMap(64)
-    inp = InputNode("x", 8)
+    inp = InputNode("x", 8, value_range=(-100.0, 100.0))
     const = LiteralValue(torch.ones(4))
-    out = InputNode("out", 3)
+    out = InputNode("out", 3, value_range=(-100.0, 100.0))
 
     idx_inp = rmap.allocate(inp)
     idx_const = rmap.allocate(const)
@@ -102,9 +102,9 @@ def test_build_residual_assignment():
 def test_no_fragmentation():
     """Non-contiguous free space is usable because contiguity is not required."""
     rmap = ResidualStreamMap(32)
-    a = InputNode("a", 8)
-    b = InputNode("b", 8)
-    c = InputNode("c", 8)
+    a = InputNode("a", 8, value_range=(-100.0, 100.0))
+    b = InputNode("b", 8, value_range=(-100.0, 100.0))
+    c = InputNode("c", 8, value_range=(-100.0, 100.0))
 
     rmap.allocate(a)
     rmap.allocate(b)
@@ -117,7 +117,7 @@ def test_no_fragmentation():
 
     # Allocate a node larger than the gap — succeeds because columns
     # don't need to be contiguous
-    d = InputNode("d", 16)
+    d = InputNode("d", 16, value_range=(-100.0, 100.0))
     indices = rmap.allocate(d)
     assert len(indices) == 16
     assert len(set(indices)) == 16
@@ -130,8 +130,8 @@ def test_no_fragmentation():
 def test_resolve_indices_concatenate():
     """resolve_indices resolves Concatenate to its children's indices in order."""
     rmap = ResidualStreamMap(64)
-    a = InputNode("a", 4)
-    b = InputNode("b", 3)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 3, value_range=(-100.0, 100.0))
 
     idx_a = rmap.allocate(a)
     idx_b = rmap.allocate(b)

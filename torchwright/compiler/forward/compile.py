@@ -185,13 +185,6 @@ def forward_compile(
         A HeadlessTransformer whose compute() method reproduces
         output_node.compute() for the same inputs.
     """
-    # 0. Finalize affine bounds (must run before Assert stripping)
-    from torchwright.graph.finalize import finalize
-    from torchwright.graph.placeholders import ConsumerPlaceholder
-
-    original_output = output_node
-    output_node = finalize(output_node)
-
     # 1. Analyze graph
     graph = GraphAnalyzer(output_node)
     # GraphAnalyzer may have stripped the output if it was an Assert; use
@@ -200,17 +193,12 @@ def forward_compile(
     output_node = graph.get_output_node()
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
 
-    # Unwrap any Assert or placeholder keys in the overlays dict.
+    # Unwrap any Assert keys in the overlays dict.
     if overlays:
         from torchwright.graph.misc import Assert
 
         unwrapped: dict = {}
         for k, v in overlays.items():
-            if (
-                isinstance(k, ConsumerPlaceholder)
-                and k._materialized_output is not None
-            ):
-                k = k._materialized_output
             while isinstance(k, Assert):
                 k = k.inputs[0]
             unwrapped[k] = v
@@ -456,12 +444,6 @@ def forward_compile(
         ra.assign(out_state, output_node, residual_map.get_indices(output_node))
     net.residual_assignment = ra
     net.assert_aliases = graph.get_assert_aliases()
-
-    if (
-        isinstance(original_output, ConsumerPlaceholder)
-        and original_output is not output_node
-    ):
-        ra.add_alias(original_output, output_node)
 
     if trim_heads:
         for layer in net.layers:

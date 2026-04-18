@@ -108,13 +108,16 @@ def _select_output_type(
     true_node: Node,
     false_node: Node,
 ) -> NodeValueType:
-    if not cond.value_type.is_sign:
-        return NodeValueType.unknown()
     tv = true_node.value_type
     fv = false_node.value_type
     r = tv.value_range.union(fv.value_range)
+    if not r.is_finite():
+        return NodeValueType.unknown()
+    if not cond.value_type.is_sign:
+        return NodeValueType(value_range=r)
     is_int = tv.is_integer and fv.is_integer
     is_bin = tv.is_binary and fv.is_binary
+    is_sgn = tv.is_sign and fv.is_sign
     is_onehot = tv.is_one_hot and fv.is_one_hot
     if is_onehot:
         return NodeValueType(
@@ -125,6 +128,8 @@ def _select_output_type(
         )
     if is_bin:
         return NodeValueType(value_range=r, is_integer=is_int, is_binary=is_bin)
+    if is_sgn:
+        return NodeValueType(value_range=r, is_integer=is_int, is_sign=is_sgn)
     if is_int:
         return NodeValueType(value_range=r, is_integer=is_int)
     return NodeValueType(value_range=r)
@@ -257,15 +262,6 @@ def select(
     """
     assert len(cond) == 1
     assert len(true_node) == len(false_node)
-
-    union_range = true_node.value_type.value_range.union(
-        false_node.value_type.value_range
-    )
-    if not union_range.is_finite():
-        from torchwright.graph.placeholders import SelectPlaceholder
-
-        return SelectPlaceholder(cond, true_node, false_node, approximate=approximate)
-
     return _build_select(cond, true_node, false_node, approximate=approximate)
 
 

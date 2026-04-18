@@ -35,18 +35,6 @@ class GraphAnalyzer:
         self._output_node = output_node
         self._all_nodes = get_ancestor_nodes({output_node})
 
-        from torchwright.graph.placeholders import ConsumerPlaceholder
-
-        placeholders = [
-            n for n in self._all_nodes if isinstance(n, ConsumerPlaceholder)
-        ]
-        if placeholders:
-            names = [f"{type(p).__name__}(id={p.node_id})" for p in placeholders]
-            raise RuntimeError(
-                f"ConsumerPlaceholder nodes remain after finalize: {names}. "
-                f"Call finalize(root) before constructing GraphAnalyzer."
-            )
-
         # Build reverse dependency map: node -> set of nodes that consume it
         self._consumers: Dict[Node, Set[Node]] = defaultdict(set)
         for node in self._all_nodes:

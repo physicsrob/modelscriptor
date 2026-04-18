@@ -26,7 +26,7 @@ class InputNode(Node):
         d_output_or_nothing=None,
         name: str = "",
         *,
-        value_range: Optional[Tuple[float, float]] = None,
+        value_range: Tuple[float, float],
     ):
         # Support both old and new constructor patterns:
         # - InputNode(d_output) - new anonymous pattern
@@ -50,8 +50,6 @@ class InputNode(Node):
         current_session().register_input(self)
 
     def compute_value_type(self) -> NodeValueType:
-        if self._declared_value_range is None:
-            return NodeValueType.unknown()
         lo, hi = self._declared_value_range
         return NodeValueType(value_range=Range(float(lo), float(hi)))
 

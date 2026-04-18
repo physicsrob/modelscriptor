@@ -28,7 +28,7 @@ def test_tightened_with_forces_range_under_binary():
 
 
 def test_strip_transfers_integer_claim_to_wrapped_node():
-    inp = InputNode("x", 3)  # unknown value_type
+    inp = InputNode("x", 3, value_range=(-100.0, 100.0))  # unknown value_type
     wrapped = assert_integer(inp)
     analyzer = GraphAnalyzer(wrapped)
     out = analyzer.get_output_node()
@@ -37,7 +37,7 @@ def test_strip_transfers_integer_claim_to_wrapped_node():
 
 
 def test_strip_transfers_binary_claim():
-    inp = InputNode("x", 4)
+    inp = InputNode("x", 4, value_range=(-100.0, 100.0))
     wrapped = assert_01(inp)
     GraphAnalyzer(wrapped)
     assert inp.value_type.is_binary
@@ -45,7 +45,7 @@ def test_strip_transfers_binary_claim():
 
 
 def test_strip_transfers_one_hot_claim():
-    inp = InputNode("x", 5)
+    inp = InputNode("x", 5, value_range=(-100.0, 100.0))
     wrapped = assert_onehot(inp)
     GraphAnalyzer(wrapped)
     assert inp.value_type.is_one_hot
@@ -54,7 +54,7 @@ def test_strip_transfers_one_hot_claim():
 def test_strip_chained_asserts_compose_claims():
     # Two Asserts stacked — integer range [0, 9] plus binary (0/1).
     # After stripping both should have applied to the innermost node.
-    inp = InputNode("x", 2)
+    inp = InputNode("x", 2, value_range=(-100.0, 100.0))
     inner = assert_integer(inp)  # integer
     outer = assert_01(inner)  # binary (which implies integer)
     GraphAnalyzer(outer)

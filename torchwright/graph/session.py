@@ -1,9 +1,9 @@
-"""Graph session management for affine bound propagation.
+"""Graph session management.
 
-A *graph session* scopes the set of ``InputNode`` instances that form
-the basis for affine bounds.  Call ``fresh_graph_session()`` as a
-context manager to create a new session; ``InputNode.__init__`` auto-
-registers into the current session.
+A *graph session* scopes the set of ``InputNode`` instances.
+Call ``fresh_graph_session()`` as a context manager to create a
+new session; ``InputNode.__init__`` auto-registers into the current
+session.
 
 Construction outside any explicit session uses an implicit module-level
 session (back-compat for REPL / simple test use).  Nested ``with`` is
@@ -20,31 +20,14 @@ if TYPE_CHECKING:
     from torchwright.graph.misc import InputNode
 
 
-class ValueTypeNotFinalized(RuntimeError):
-    """Raised when accessing affine bounds before ``finalize()``."""
-
-
-class GraphFrozen(RuntimeError):
-    """Raised when mutating a session after ``finalize()``."""
-
-
 class GraphSession:
     """Holds state for one graph-construction session."""
 
     def __init__(self) -> None:
         self.input_nodes: List["InputNode"] = []
-        self.frozen: bool = False
 
     def register_input(self, node: "InputNode") -> None:
-        if self.frozen:
-            raise GraphFrozen(
-                "Cannot create new InputNode after finalize(). "
-                "Start a fresh_graph_session() for a new graph."
-            )
         self.input_nodes.append(node)
-
-    def freeze(self) -> None:
-        self.frozen = True
 
 
 _implicit_session = GraphSession()

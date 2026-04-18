@@ -16,5 +16,4 @@ from .misc import (
 from .pos_encoding import PosEncoding
 from .relu import ReLU
 from .asserts import require_integer, require_binary, require_sign, require_one_hot
-from .session import fresh_graph_session, ValueTypeNotFinalized, GraphFrozen
-from .finalize import finalize
+from .session import fresh_graph_session

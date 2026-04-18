@@ -131,14 +131,13 @@ def test_cond_gate_adaptive_M_uses_value_range():
     assert abs(output.item() - small) < 1.0e-6
 
 
-def test_cond_gate_defers_unbounded_inp():
-    """Unbounded inp range returns a placeholder instead of raising."""
-    from torchwright.graph.placeholders import CondGatePlaceholder
-
+def test_cond_gate_builds_eagerly():
+    """cond_gate with bounded inputs builds eagerly (no placeholder)."""
     x = create_input("x", 1)
     cond_input = create_input("cond", 1)
     result = cond_gate(cond_input, x)
-    assert isinstance(result, CondGatePlaceholder)
+    assert result._affine_bound is not None
+    assert result.value_type.value_range.is_finite()
 
 
 def test_bool_any_true():

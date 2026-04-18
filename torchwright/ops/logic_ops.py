@@ -22,6 +22,8 @@ through the gate's off-path. The old global ``big_offset = 1000`` gave
 win (M ≈ 2·max_abs rather than 1000) while tolerating modest drift."""
 
 
+_MAX_REASONABLE_OFFSET = 1e6
+
 def _max_abs_or_raise(vt: NodeValueType, caller: str) -> float:
     r = vt.value_range
     m = max(abs(r.lo), abs(r.hi))
@@ -31,7 +33,13 @@ def _max_abs_or_raise(vt: NodeValueType, caller: str) -> float:
             f"got {vt}. Wrap the upstream node with "
             f"`assert_matches_value_type(node, NodeValueType(value_range=Range(lo, hi)))`."
         )
-    return _GATE_OFFSET_SAFETY_FACTOR * m
+    M = _GATE_OFFSET_SAFETY_FACTOR * m
+    assert M <= _MAX_REASONABLE_OFFSET, (
+        f"{caller}: M offset {M:.2e} exceeds sanity bound {_MAX_REASONABLE_OFFSET:.0e}. "
+        f"Input value_range={r} is likely a stale or un-clamped range — "
+        f"check that upstream value_type propagation returns bounded ranges."
+    )
+    return M
 
 
 def bool_any_true(inp_list: List[Node]) -> Node:
@@ -188,11 +196,13 @@ def cond_add_vector(
 
 
 def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
-    if not cond.value_type.is_sign:
-        return NodeValueType.unknown()
     vt = inp.value_type
     r = vt.value_range
+    if not r.is_finite():
+        return NodeValueType.unknown()
     out_range = Range(min(0.0, r.lo), max(0.0, r.hi))
+    if not cond.value_type.is_sign:
+        return NodeValueType(value_range=out_range)
     if vt.is_binary:
         return NodeValueType(
             value_range=out_range,
@@ -306,10 +316,4 @@ def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
        measured at commit a979f69. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
-
-    if not inp.value_type.value_range.is_finite():
-        from torchwright.graph.placeholders import CondGatePlaceholder
-
-        return CondGatePlaceholder(cond, inp, approximate=approximate)
-
     return _build_cond_gate(cond, inp, approximate=approximate)

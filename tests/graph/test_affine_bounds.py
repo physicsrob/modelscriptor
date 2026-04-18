@@ -1,5 +1,5 @@
-"""Unit tests for affine bound propagation: Basis, AffineBound factories,
-and to_interval() concretization.
+"""Unit tests for eager affine bound propagation: AffineBound factories,
+alignment, to_interval() concretization, and per-op rules.
 """
 
 import math
@@ -7,45 +7,9 @@ import math
 import pytest
 import torch
 
-from torchwright.graph import InputNode, LiteralValue, finalize
+from torchwright.graph import InputNode, LiteralValue
 from torchwright.graph.affine_bound import AffineBound
-from torchwright.graph.basis import Basis
-from torchwright.graph.session import (
-    ValueTypeNotFinalized,
-    fresh_graph_session,
-)
-
-# --- Basis ---------------------------------------------------------------
-
-
-class TestBasis:
-    def test_from_single_input(self):
-        with fresh_graph_session():
-            x = InputNode(3, name="x")
-            basis = Basis.from_input_nodes([x])
-            assert basis.n == 3
-            assert basis.index_of(x) == (0, 3)
-
-    def test_from_multiple_inputs(self):
-        with fresh_graph_session():
-            x = InputNode(3, name="x")
-            y = InputNode(2, name="y")
-            basis = Basis.from_input_nodes([x, y])
-            assert basis.n == 5
-            assert basis.index_of(x) == (0, 3)
-            assert basis.index_of(y) == (3, 2)
-
-    def test_index_of_missing_raises(self):
-        with fresh_graph_session():
-            x = InputNode(3, name="x")
-            y = InputNode(2, name="y")
-            basis = Basis.from_input_nodes([x])
-            with pytest.raises(KeyError):
-                basis.index_of(y)
-
-    def test_empty_basis(self):
-        basis = Basis.from_input_nodes([])
-        assert basis.n == 0
+from torchwright.graph.session import fresh_graph_session
 
 
 # --- AffineBound factories -----------------------------------------------
@@ -55,60 +19,33 @@ class TestAffineBoundFactories:
     def test_identity(self):
         with fresh_graph_session():
             x = InputNode(3, name="x", value_range=(-1.0, 1.0))
-            basis = Basis.from_input_nodes([x])
-            ab = AffineBound.identity(basis, x)
+            ab = AffineBound.identity(x)
             assert ab.d_output == 3
-            assert ab.basis is basis
+            assert ab.n_cols == 3
+            assert ab.columns == {x.node_id: (0, 3)}
             assert torch.equal(ab.A_lo, torch.eye(3, dtype=torch.float64))
             assert torch.equal(ab.A_hi, torch.eye(3, dtype=torch.float64))
             assert torch.equal(ab.b_lo, torch.zeros(3, dtype=torch.float64))
             assert torch.equal(ab.b_hi, torch.zeros(3, dtype=torch.float64))
 
-    def test_identity_two_inputs(self):
-        with fresh_graph_session():
-            x = InputNode(2, name="x", value_range=(-1.0, 1.0))
-            y = InputNode(3, name="y", value_range=(0.0, 5.0))
-            basis = Basis.from_input_nodes([x, y])
-
-            ab_x = AffineBound.identity(basis, x)
-            assert ab_x.d_output == 2
-            expected_A = torch.zeros(2, 5, dtype=torch.float64)
-            expected_A[0, 0] = 1.0
-            expected_A[1, 1] = 1.0
-            assert torch.equal(ab_x.A_lo, expected_A)
-
-            ab_y = AffineBound.identity(basis, y)
-            assert ab_y.d_output == 3
-            expected_A_y = torch.zeros(3, 5, dtype=torch.float64)
-            expected_A_y[0, 2] = 1.0
-            expected_A_y[1, 3] = 1.0
-            expected_A_y[2, 4] = 1.0
-            assert torch.equal(ab_y.A_lo, expected_A_y)
-
     def test_constant(self):
-        with fresh_graph_session():
-            x = InputNode(2, name="x")
-            basis = Basis.from_input_nodes([x])
-            vals = torch.tensor([3.0, 7.0])
-            ab = AffineBound.constant(basis, vals)
-            assert ab.d_output == 2
-            assert torch.equal(ab.A_lo, torch.zeros(2, 2, dtype=torch.float64))
-            assert torch.allclose(ab.b_lo, vals.double())
-            assert torch.allclose(ab.b_hi, vals.double())
+        vals = torch.tensor([3.0, 7.0])
+        ab = AffineBound.constant(vals)
+        assert ab.d_output == 2
+        assert ab.n_cols == 0
+        assert ab.columns == {}
+        assert torch.allclose(ab.b_lo, vals.double())
+        assert torch.allclose(ab.b_hi, vals.double())
 
     def test_degenerate(self):
-        with fresh_graph_session():
-            x = InputNode(2, name="x")
-            basis = Basis.from_input_nodes([x])
-            ab = AffineBound.degenerate(basis, 4, lo=-5.0, hi=10.0)
-            assert ab.d_output == 4
-            assert torch.equal(ab.A_lo, torch.zeros(4, 2, dtype=torch.float64))
-            assert torch.allclose(ab.b_lo, torch.full((4,), -5.0, dtype=torch.float64))
-            assert torch.allclose(ab.b_hi, torch.full((4,), 10.0, dtype=torch.float64))
+        ab = AffineBound.degenerate(4, lo=-5.0, hi=10.0)
+        assert ab.d_output == 4
+        assert ab.n_cols == 0
+        assert torch.allclose(ab.b_lo, torch.full((4,), -5.0, dtype=torch.float64))
+        assert torch.allclose(ab.b_hi, torch.full((4,), 10.0, dtype=torch.float64))
 
     def test_degenerate_defaults_to_inf(self):
-        basis = Basis.from_input_nodes([])
-        ab = AffineBound.degenerate(basis, 2)
+        ab = AffineBound.degenerate(2)
         assert ab.b_lo[0].item() == float("-inf")
         assert ab.b_hi[0].item() == float("inf")
 
@@ -120,8 +57,7 @@ class TestToInterval:
     def test_identity_interval_matches_input_range(self):
         with fresh_graph_session():
             x = InputNode(2, name="x", value_range=(-3.0, 5.0))
-            basis = Basis.from_input_nodes([x])
-            ab = AffineBound.identity(basis, x)
+            ab = AffineBound.identity(x)
             intervals = ab.to_interval()
             assert len(intervals) == 2
             assert intervals[0].lo == pytest.approx(-3.0)
@@ -130,47 +66,80 @@ class TestToInterval:
             assert intervals[1].hi == pytest.approx(5.0)
 
     def test_constant_interval(self):
-        with fresh_graph_session():
-            x = InputNode(2, name="x", value_range=(-1.0, 1.0))
-            basis = Basis.from_input_nodes([x])
-            ab = AffineBound.constant(basis, torch.tensor([3.0, 7.0]))
-            intervals = ab.to_interval()
-            assert intervals[0].lo == pytest.approx(3.0)
-            assert intervals[0].hi == pytest.approx(3.0)
-            assert intervals[1].lo == pytest.approx(7.0)
-            assert intervals[1].hi == pytest.approx(7.0)
+        ab = AffineBound.constant(torch.tensor([3.0, 7.0]))
+        intervals = ab.to_interval()
+        assert intervals[0].lo == pytest.approx(3.0)
+        assert intervals[0].hi == pytest.approx(3.0)
+        assert intervals[1].lo == pytest.approx(7.0)
+        assert intervals[1].hi == pytest.approx(7.0)
 
     def test_degenerate_interval(self):
-        with fresh_graph_session():
-            x = InputNode(2, name="x")
-            basis = Basis.from_input_nodes([x])
-            ab = AffineBound.degenerate(basis, 1, lo=-5.0, hi=10.0)
-            intervals = ab.to_interval()
-            assert intervals[0].lo == pytest.approx(-5.0)
-            assert intervals[0].hi == pytest.approx(10.0)
+        ab = AffineBound.degenerate(1, lo=-5.0, hi=10.0)
+        intervals = ab.to_interval()
+        assert intervals[0].lo == pytest.approx(-5.0)
+        assert intervals[0].hi == pytest.approx(10.0)
 
     def test_scalar_range_union(self):
+        ab = AffineBound.constant(torch.tensor([3.0, 7.0]))
+        r = ab.to_scalar_range()
+        assert r.lo == pytest.approx(3.0)
+        assert r.hi == pytest.approx(7.0)
+
+
+# --- Alignment -----------------------------------------------------------
+
+
+class TestAlign:
+    def test_identical_columns_fast_path(self):
         with fresh_graph_session():
             x = InputNode(2, name="x", value_range=(-1.0, 1.0))
-            basis = Basis.from_input_nodes([x])
-            ab = AffineBound.constant(basis, torch.tensor([3.0, 7.0]))
-            r = ab.to_scalar_range()
-            assert r.lo == pytest.approx(3.0)
-            assert r.hi == pytest.approx(7.0)
+            a = AffineBound.identity(x)
+            b = AffineBound.identity(x)
+            a2, b2 = AffineBound.align(a, b)
+            assert a2.columns == a.columns
+            assert torch.equal(a2.A_lo, a.A_lo)
 
-    def test_affine_sum_tight(self):
-        """x + (-x) should give interval [0, 0], not [-2, 2]."""
+    def test_disjoint_inputs_merge(self):
         with fresh_graph_session():
-            x = InputNode(1, name="x", value_range=(-1.0, 1.0))
-            basis = Basis.from_input_nodes([x])
-            A_lo = torch.tensor([[0.0]], dtype=torch.float64)
-            A_hi = torch.tensor([[0.0]], dtype=torch.float64)
-            b_lo = torch.tensor([0.0], dtype=torch.float64)
-            b_hi = torch.tensor([0.0], dtype=torch.float64)
-            ab = AffineBound(A_lo=A_lo, A_hi=A_hi, b_lo=b_lo, b_hi=b_hi, basis=basis)
-            intervals = ab.to_interval()
-            assert intervals[0].lo == pytest.approx(0.0)
-            assert intervals[0].hi == pytest.approx(0.0)
+            x = InputNode(2, name="x", value_range=(-1.0, 1.0))
+            y = InputNode(3, name="y", value_range=(0.0, 5.0))
+            ax = AffineBound.identity(x)
+            ay = AffineBound.identity(y)
+            ax2, ay2 = AffineBound.align(ax, ay)
+            assert ax2.n_cols == 5
+            assert ay2.n_cols == 5
+            assert ax2.columns == ay2.columns
+            # x's identity is in first 2 cols, zeros in last 3
+            assert ax2.A_lo[0, 0].item() == 1.0
+            assert ax2.A_lo[0, 2].item() == 0.0
+            # y's identity is in last 3 cols, zeros in first 2
+            assert ay2.A_lo[0, 0].item() == 0.0
+            x_id, y_id = x.node_id, y.node_id
+            y_start = ay2.columns[y_id][0]
+            assert ay2.A_lo[0, y_start].item() == 1.0
+
+    def test_ranges_intersected(self):
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-5.0, 5.0))
+            a = AffineBound(
+                A_lo=torch.ones(1, 1, dtype=torch.float64),
+                A_hi=torch.ones(1, 1, dtype=torch.float64),
+                b_lo=torch.zeros(1, dtype=torch.float64),
+                b_hi=torch.zeros(1, dtype=torch.float64),
+                columns={x.node_id: (0, 1)},
+                input_ranges={x.node_id: (-5.0, 5.0)},
+            )
+            b = AffineBound(
+                A_lo=torch.ones(1, 1, dtype=torch.float64),
+                A_hi=torch.ones(1, 1, dtype=torch.float64),
+                b_lo=torch.zeros(1, dtype=torch.float64),
+                b_hi=torch.zeros(1, dtype=torch.float64),
+                columns={x.node_id: (0, 1)},
+                input_ranges={x.node_id: (-2.0, 3.0)},
+            )
+            a2, b2 = AffineBound.align(a, b)
+            assert a2.input_ranges[x.node_id] == (-2.0, 3.0)
+            assert b2.input_ranges[x.node_id] == (-2.0, 3.0)
 
 
 # --- Session management --------------------------------------------------
@@ -179,10 +148,10 @@ class TestToInterval:
 class TestSession:
     def test_fresh_session_isolates_inputs(self):
         with fresh_graph_session() as s1:
-            x = InputNode(2, name="x")
+            x = InputNode(2, name="x", value_range=(-100.0, 100.0))
             assert len(s1.input_nodes) == 1
         with fresh_graph_session() as s2:
-            y = InputNode(3, name="y")
+            y = InputNode(3, name="y", value_range=(-100.0, 100.0))
             assert len(s2.input_nodes) == 1
             assert s2.input_nodes[0] is y
 
@@ -192,41 +161,31 @@ class TestSession:
                 with fresh_graph_session():
                     pass
 
-    def test_affine_bound_before_finalize_raises(self):
+
+# --- Eager bounds (computed in __init__) -----------------------------------
+
+
+class TestEagerBounds:
+    def test_input_has_affine_bound(self):
         with fresh_graph_session():
-            x = InputNode(2, name="x")
-            with pytest.raises(ValueTypeNotFinalized):
-                _ = x.affine_bound
+            x = InputNode(2, name="x", value_range=(-1.0, 1.0))
+            assert x._affine_bound is not None
+            assert x.affine_bound.d_output == 2
 
-
-# --- finalize() -----------------------------------------------------------
-
-
-class TestFinalize:
-    def test_finalize_sets_affine_bounds(self):
+    def test_add_has_affine_bound(self):
         with fresh_graph_session():
             x = InputNode(2, name="x", value_range=(-1.0, 1.0))
             lit = LiteralValue(torch.tensor([3.0, 5.0]))
             from torchwright.graph import Add
 
             s = Add(x, lit)
-            finalize(s)
             assert s._affine_bound is not None
             assert x._affine_bound is not None
             assert lit._affine_bound is not None
 
-    def test_finalize_idempotent(self):
+    def test_input_identity_interval(self):
         with fresh_graph_session():
             x = InputNode(2, name="x", value_range=(-1.0, 1.0))
-            finalize(x)
-            first = x._affine_bound
-            finalize(x)
-            assert x._affine_bound is first
-
-    def test_finalize_input_identity(self):
-        with fresh_graph_session():
-            x = InputNode(2, name="x", value_range=(-1.0, 1.0))
-            finalize(x)
             ab = x.affine_bound
             intervals = ab.to_interval()
             assert intervals[0].lo == pytest.approx(-1.0)
@@ -235,12 +194,23 @@ class TestFinalize:
     def test_repr_works(self):
         with fresh_graph_session():
             x = InputNode(2, name="x", value_range=(-1.0, 1.0))
-            finalize(x)
             r = repr(x.affine_bound)
             assert "AffineBound" in r
 
+    def test_column_map_two_inputs_add(self):
+        """Add of two InputNodes merges their column maps."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(0.0, 1.0))
+            y = InputNode(1, name="y", value_range=(2.0, 3.0))
+            from torchwright.graph import Add
 
-# --- Exact affine rules (Phase C) ----------------------------------------
+            s = Add(x, y)
+            assert x.node_id in s.affine_bound.columns
+            assert y.node_id in s.affine_bound.columns
+            assert s.affine_bound.n_cols == 2
+
+
+# --- Exact affine rules ---------------------------------------------------
 
 
 class TestLinearRule:
@@ -250,7 +220,6 @@ class TestLinearRule:
             lin = __import__("torchwright.graph", fromlist=["Linear"]).Linear(
                 x, torch.eye(2), name="id"
             )
-            finalize(lin)
             intervals = lin.affine_bound.to_interval()
             assert intervals[0].lo == pytest.approx(-3.0)
             assert intervals[0].hi == pytest.approx(5.0)
@@ -262,7 +231,6 @@ class TestLinearRule:
             from torchwright.graph import Linear
 
             lin = Linear(x, W, name="scale")
-            finalize(lin)
             intervals = lin.affine_bound.to_interval()
             assert intervals[0].lo == pytest.approx(0.0)
             assert intervals[0].hi == pytest.approx(6.0)
@@ -274,7 +242,6 @@ class TestLinearRule:
             from torchwright.graph import Linear
 
             lin = Linear(x, W, name="neg")
-            finalize(lin)
             intervals = lin.affine_bound.to_interval()
             assert intervals[0].lo == pytest.approx(-6.0)
             assert intervals[0].hi == pytest.approx(-2.0)
@@ -287,7 +254,6 @@ class TestLinearRule:
             from torchwright.graph import Linear
 
             lin = Linear(x, W, b, name="bias")
-            finalize(lin)
             intervals = lin.affine_bound.to_interval()
             assert intervals[0].lo == pytest.approx(5.0)
             assert intervals[0].hi == pytest.approx(6.0)
@@ -302,7 +268,6 @@ class TestAddRule:
 
             neg_x = Linear(x, torch.tensor([[-1.0]]), name="neg")
             s = Add(x, neg_x, name="cancel")
-            finalize(s)
             intervals = s.affine_bound.to_interval()
             assert intervals[0].lo == pytest.approx(0.0)
             assert intervals[0].hi == pytest.approx(0.0)
@@ -314,7 +279,6 @@ class TestAddRule:
             from torchwright.graph import Add
 
             s = Add(x, y, name="sum")
-            finalize(s)
             intervals = s.affine_bound.to_interval()
             assert intervals[0].lo == pytest.approx(2.0)
             assert intervals[0].hi == pytest.approx(4.0)
@@ -328,7 +292,6 @@ class TestConcatRule:
             from torchwright.graph import Concatenate
 
             c = Concatenate([x, y])
-            finalize(c)
             intervals = c.affine_bound.to_interval()
             assert len(intervals) == 3
             assert intervals[0].lo == pytest.approx(-1.0)
@@ -340,9 +303,7 @@ class TestConcatRule:
 class TestLiteralRule:
     def test_literal_constant_bound(self):
         with fresh_graph_session():
-            x = InputNode(1, name="x")
             lit = LiteralValue(torch.tensor([3.0, 7.0]))
-            finalize(lit)
             intervals = lit.affine_bound.to_interval()
             assert intervals[0].lo == pytest.approx(3.0)
             assert intervals[0].hi == pytest.approx(3.0)
@@ -351,27 +312,21 @@ class TestLiteralRule:
 
 
 class TestDualRail:
-    def test_value_type_affine_tightens_range(self):
-        """Affine bounds should tighten value_type range after finalize."""
+    def test_value_type_tightens_from_affine(self):
+        """Affine bounds should tighten value_type range eagerly."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-1.0, 1.0))
             from torchwright.graph import Linear, Add
 
             neg_x = Linear(x, torch.tensor([[-1.0]]), name="neg")
             s = Add(x, neg_x, name="cancel")
-            # Before finalize, eager range is [-2, 2]
-            eager_range = s._value_type_eager.value_range
-            assert eager_range.lo == pytest.approx(-2.0)
-            assert eager_range.hi == pytest.approx(2.0)
-            finalize(s)
-            # After finalize, affine-derived range is [0, 0]
+            # Eager range would be [-2, 2] but affine tightens to [0, 0]
             assert s.value_type.value_range.lo == pytest.approx(0.0)
             assert s.value_type.value_range.hi == pytest.approx(0.0)
 
     def test_value_type_preserves_structural_flags(self):
         with fresh_graph_session():
             lit = LiteralValue(torch.tensor([0.0, 1.0]))
-            finalize(lit)
             assert lit.value_type.is_binary is True
             assert lit.value_type.is_integer is True
 
@@ -390,7 +345,6 @@ class TestSoundness:
             from torchwright.graph import Linear
 
             lin = Linear(x, W, b, name="test")
-            finalize(lin)
             intervals = lin.affine_bound.to_interval()
             for _ in range(100):
                 xv = torch.FloatTensor(1, 2).uniform_(-3.0, 3.0)
@@ -406,13 +360,12 @@ class TestSoundness:
 
             neg = Linear(x, torch.tensor([[-1.0]]))
             s = Add(x, neg)
-            finalize(s)
             r = s.affine_bound.to_interval()[0]
             assert r.lo == pytest.approx(0.0)
             assert r.hi == pytest.approx(0.0)
 
 
-# --- ReLU envelope (Phase D) ---------------------------------------------
+# --- ReLU envelope --------------------------------------------------------
 
 
 class TestReluRule:
@@ -423,7 +376,6 @@ class TestReluRule:
             from torchwright.graph import ReLU
 
             r = ReLU(x)
-            finalize(r)
             intervals = r.affine_bound.to_interval()
             assert intervals[0].lo == pytest.approx(1.0)
             assert intervals[0].hi == pytest.approx(3.0)
@@ -435,7 +387,6 @@ class TestReluRule:
             from torchwright.graph import ReLU
 
             r = ReLU(x)
-            finalize(r)
             intervals = r.affine_bound.to_interval()
             assert intervals[0].lo == pytest.approx(0.0)
             assert intervals[0].hi == pytest.approx(0.0)
@@ -447,17 +398,9 @@ class TestReluRule:
             from torchwright.graph import ReLU
 
             r = ReLU(x)
-            finalize(r)
             intervals = r.affine_bound.to_interval()
-            # Lower bound: alpha=1.0 (h=4 >= -l=2), so lower = max(0, x) >= x
-            # Lower bound at x=-2: max(0, -2) = 0; but affine lower bound = alpha * x = -2
-            # So the affine lower is clamped: actually lo = alpha * lo = -2. But relu floor = 0.
-            # The affine bound computes lo = alpha*lo = 1.0*(-2.0) = -2.0
-            # Upper bound: slope = h/(h-l) = 4/6 = 2/3
-            # Upper at x=-2: 2/3 * (-2 - (-2)) = 0; at x=4: 2/3 * (4 - (-2)) = 4.0
             assert intervals[0].lo >= -2.0 - 1e-5
             assert intervals[0].hi == pytest.approx(4.0)
-            # ReLU output must be in [0, 4], affine captures [lo, 4]
             assert intervals[0].hi <= 4.0 + 1e-5
 
     def test_relu_soundness(self):
@@ -467,7 +410,6 @@ class TestReluRule:
             from torchwright.graph import ReLU
 
             r = ReLU(x)
-            finalize(r)
             intervals = r.affine_bound.to_interval()
             for _ in range(200):
                 xv = torch.FloatTensor(1).uniform_(-3.0, 5.0)
@@ -476,7 +418,7 @@ class TestReluRule:
                 assert yv <= intervals[0].hi + 1e-5
 
 
-# --- Assert pass-through (Phase D) ----------------------------------------
+# --- Assert pass-through --------------------------------------------------
 
 
 class TestAssertRule:
@@ -486,16 +428,83 @@ class TestAssertRule:
             from torchwright.graph.asserts import assert_in_range
 
             a = assert_in_range(x, -3.0, 3.0)
-            finalize(a)
-            # Assert should pass through the input's affine bound
             assert torch.equal(a.affine_bound.A_lo, x.affine_bound.A_lo)
             assert torch.equal(a.affine_bound.A_hi, x.affine_bound.A_hi)
-            # But value_type should reflect tightened range
             assert a.value_type.value_range.lo == pytest.approx(-3.0)
             assert a.value_type.value_range.hi == pytest.approx(3.0)
 
+    def test_assert_tightens_downstream(self):
+        """Tightened input_ranges propagate through downstream Linear."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-10.0, 10.0))
+            from torchwright.graph import Linear
+            from torchwright.graph.asserts import assert_in_range
 
-# --- Attn degenerate (Phase E) -------------------------------------------
+            a = assert_in_range(x, -2.0, 3.0)
+            scaled = Linear(a, torch.tensor([[2.0]]), name="scale")
+            intervals = scaled.affine_bound.to_interval()
+            assert intervals[0].lo == pytest.approx(-4.0)
+            assert intervals[0].hi == pytest.approx(6.0)
+
+    def test_assert_chain_tightens(self):
+        """Chained Asserts (assert_01(assert_integer(x))) tighten downstream."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-10.0, 10.0))
+            from torchwright.graph.asserts import assert_01, assert_integer
+
+            a1 = assert_integer(x)
+            a2 = assert_01(a1)
+            intervals = a2.affine_bound.to_interval()
+            assert intervals[0].lo == pytest.approx(0.0)
+            assert intervals[0].hi == pytest.approx(1.0)
+
+    def test_assert_does_not_tighten_input_node(self):
+        """Assert does NOT mutate the InputNode's own affine bound."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-10.0, 10.0))
+            from torchwright.graph.asserts import assert_in_range
+
+            assert_in_range(x, -2.0, 3.0)
+            x_intervals = x.affine_bound.to_interval()
+            assert x_intervals[0].lo == pytest.approx(-10.0)
+            assert x_intervals[0].hi == pytest.approx(10.0)
+
+    def test_parallel_paths_independent(self):
+        """Parallel paths from the same input don't interfere."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-10.0, 10.0))
+            from torchwright.graph import Linear
+            from torchwright.graph.asserts import assert_in_range
+
+            a1 = assert_in_range(x, -2.0, 3.0)
+            a2 = assert_in_range(x, -5.0, 5.0)
+            lin1 = Linear(a1, torch.tensor([[1.0]]))
+            lin2 = Linear(a2, torch.tensor([[1.0]]))
+            # lin1 sees tighter range from a1
+            assert lin1.affine_bound.to_interval()[0].lo == pytest.approx(-2.0)
+            assert lin1.affine_bound.to_interval()[0].hi == pytest.approx(3.0)
+            # lin2 sees wider range from a2
+            assert lin2.affine_bound.to_interval()[0].lo == pytest.approx(-5.0)
+            assert lin2.affine_bound.to_interval()[0].hi == pytest.approx(5.0)
+
+    def test_multiple_asserts_intersect_in_add(self):
+        """Multiple Asserts on the same InputNode intersect when added."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-100.0, 100.0))
+            from torchwright.graph import Add
+            from torchwright.graph.asserts import assert_in_range
+
+            a1 = assert_in_range(x, -5.0, 10.0)
+            a2 = assert_in_range(x, -3.0, 20.0)
+            s = Add(a1, a2)
+            # align intersects input_ranges: max(-5,-3)=-3, min(10,20)=10
+            # s = 2*x with x in [-3, 10] -> [-6, 20]
+            intervals = s.affine_bound.to_interval()
+            assert intervals[0].lo == pytest.approx(-6.0)
+            assert intervals[0].hi == pytest.approx(20.0)
+
+
+# --- Attn degenerate ------------------------------------------------------
 
 
 class TestAttnRule:
@@ -514,7 +523,6 @@ class TestAttnRule:
                 value_matrix=torch.eye(2),
                 output_matrix=torch.eye(2),
             )
-            finalize(attn)
             r = attn.affine_bound.to_scalar_range()
             assert r.lo <= 2.0 + 1e-5
             assert r.hi >= 3.0 - 1e-5

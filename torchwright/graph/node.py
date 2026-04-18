@@ -135,15 +135,23 @@ class Node:
         # node isn't scheduled until every listed predecessor is in
         # ``computed_nodes``.  Empty by default.
         self.scheduling_predecessors: Set["Node"] = set()
-        self._affine_bound: object = None
         global_node_id += 1
         self._value_type_eager = self.compute_value_type()
-        self._value_type_affine: Optional[NodeValueType] = None
+        from torchwright.graph.affine_rules import compute_affine_bound
+
+        self._affine_bound = compute_affine_bound(self)
+        affine_range = self._affine_bound.to_scalar_range()
+        eager_range = self._value_type_eager.value_range
+        tightened = eager_range.intersect(affine_range)
+        if tightened != eager_range:
+            from dataclasses import replace
+
+            self._value_type_eager = replace(
+                self._value_type_eager, value_range=tightened
+            )
 
     @property
     def value_type(self) -> NodeValueType:
-        if self._value_type_affine is not None:
-            return self._value_type_affine
         return self._value_type_eager
 
     @property
@@ -156,12 +164,6 @@ class Node:
 
     @property
     def affine_bound(self):
-        from torchwright.graph.session import ValueTypeNotFinalized
-
-        if self._affine_bound is None:
-            raise ValueTypeNotFinalized(
-                "Affine bounds not yet computed. Call finalize(root) first."
-            )
         return self._affine_bound
 
     def compute_value_type(self) -> NodeValueType:

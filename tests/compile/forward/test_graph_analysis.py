@@ -15,7 +15,7 @@ def _make_linear(inp, d_out, name=""):
 
 def test_simple_chain():
     """Input -> Linear -> ReLU -> Linear: verify topo order, critical path, consumers."""
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = _make_linear(x, 4, "l1")
     r = ReLU(l1, name="relu")
     l2 = _make_linear(r, 2, "l2")
@@ -42,7 +42,7 @@ def test_simple_chain():
 
 def test_diamond_graph():
     """Input -> A, Input -> B, Add(A, B): verify readiness progression."""
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     a = _make_linear(x, 4, "a")
     b = _make_linear(x, 4, "b")
     out = Add(a, b, name="sum")
@@ -70,8 +70,8 @@ def test_diamond_graph():
 
 def test_concatenate_transparency():
     """Concat([A, B]) -> Linear: readiness depends on A, B not the Concat node."""
-    a = InputNode("a", 4)
-    b = InputNode("b", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
     cat = Concatenate([a, b])
     l = _make_linear(cat, 2, "l")
 
@@ -124,7 +124,7 @@ def test_adder_graph():
 
 def test_ready_nodes_progression():
     """Iteratively add ready nodes to available set — all nodes eventually computed."""
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = _make_linear(x, 4, "l1")
     r = ReLU(l1, name="relu")
     a = _make_linear(r, 4, "a")
