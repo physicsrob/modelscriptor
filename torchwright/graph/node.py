@@ -14,27 +14,13 @@ def _verify_tensor_against_value_type(node: "Node", tensor: torch.Tensor) -> Non
     """Assert the actual tensor conforms to the node's declared value_type.
 
     Used by the optional runtime verifier (``TW_VERIFY_VALUE_TYPES``).
-    For ``Guarantee.ALWAYS`` properties, violations raise.
-    For ``Guarantee.APPROXIMATE`` properties, violations warn to stderr.
+    All violations raise ``AssertionError``.
     """
-    import sys
-
-    from torchwright.graph.value_type import Guarantee
-
     vt = node.value_type
     if tensor.numel() == 0:
         return
     t = tensor.detach()
     name = f"{node.node_type()}(id={node.node_id}, name='{node.name}')"
-
-    def _report(prop: str, msg: str, level: "Guarantee | bool") -> None:
-        if level is Guarantee.APPROXIMATE:
-            print(
-                f"WARNING: approximate {prop} transition-zone hit: {msg}",
-                file=sys.stderr,
-            )
-        else:
-            raise AssertionError(msg)
 
     r = vt.value_range
     actual_lo = float(t.min().item())
@@ -48,32 +34,24 @@ def _verify_tensor_against_value_type(node: "Node", tensor: torch.Tensor) -> Non
     if vt.is_integer:
         diff = (t - t.round()).abs().max().item()
         if diff > tol:
-            _report(
-                "integer",
-                f"{name}: declared is_integer but observed max deviation {diff}",
-                vt.is_integer,
+            raise AssertionError(
+                f"{name}: declared is_integer but observed max deviation {diff}"
             )
     if vt.is_binary:
         if not torch.all((t.round() == 0) | (t.round() == 1)).item():
-            _report(
-                "binary",
-                f"{name}: declared is_binary but values outside {{0,1}}",
-                vt.is_binary,
+            raise AssertionError(
+                f"{name}: declared is_binary but values outside {{0,1}}"
             )
     if vt.is_sign:
         if not torch.all((t.round() == -1) | (t.round() == 1)).item():
-            _report(
-                "sign",
-                f"{name}: declared is_sign but values outside {{-1,+1}}",
-                vt.is_sign,
+            raise AssertionError(
+                f"{name}: declared is_sign but values outside {{-1,+1}}"
             )
     if vt.is_one_hot:
         sums = t.round().sum(dim=-1)
         if not torch.all(sums == 1).item():
-            _report(
-                "one-hot",
-                f"{name}: declared is_one_hot but per-row sum not equal to 1",
-                vt.is_one_hot,
+            raise AssertionError(
+                f"{name}: declared is_one_hot but per-row sum not equal to 1"
             )
 
 
@@ -157,12 +135,34 @@ class Node:
         # node isn't scheduled until every listed predecessor is in
         # ``computed_nodes``.  Empty by default.
         self.scheduling_predecessors: Set["Node"] = set()
+        self._affine_bound: object = None
         global_node_id += 1
-        self._value_type = self.compute_value_type()
+        self._value_type_eager = self.compute_value_type()
+        self._value_type_affine: Optional[NodeValueType] = None
 
     @property
     def value_type(self) -> NodeValueType:
-        return self._value_type
+        if self._value_type_affine is not None:
+            return self._value_type_affine
+        return self._value_type_eager
+
+    @property
+    def _value_type(self) -> NodeValueType:
+        return self._value_type_eager
+
+    @_value_type.setter
+    def _value_type(self, val: NodeValueType) -> None:
+        self._value_type_eager = val
+
+    @property
+    def affine_bound(self):
+        from torchwright.graph.session import ValueTypeNotFinalized
+
+        if self._affine_bound is None:
+            raise ValueTypeNotFinalized(
+                "Affine bounds not yet computed. Call finalize(root) first."
+            )
+        return self._affine_bound
 
     def compute_value_type(self) -> NodeValueType:
         """Return the static value-type of this node's output.

@@ -75,13 +75,15 @@ def test_select_exact_branch_preserves_small_inputs():
     assert torch.equal(output, f_val)
 
 
-def test_select_rejects_unbounded_branches():
-    """Unbounded true/false branches fail at build time with a TypeError."""
+def test_select_defers_unbounded_branches():
+    """Unbounded true/false branches return a placeholder instead of raising."""
+    from torchwright.graph.placeholders import SelectPlaceholder
+
     cond_input = create_input("cond", 1)
     t = create_input("t", 1)  # unbounded
     f = create_literal_value(torch.tensor([1.0]))  # bounded
-    with pytest.raises(TypeError, match="value_range"):
-        select(cond_input, t, f)
+    result = select(cond_input, t, f)
+    assert isinstance(result, SelectPlaceholder)
 
 
 def test_broadcast_select_exact_branch():

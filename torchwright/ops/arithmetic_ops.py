@@ -276,20 +276,17 @@ def abs(inp: Node) -> Node:
 
 
 def _compare_output_type(true_level: float, false_level: float) -> NodeValueType:
-    from torchwright.graph.value_type import Guarantee
-
     lo = builtins.min(true_level, false_level)
     hi = builtins.max(true_level, false_level)
     is_int = (true_level == round(true_level)) and (false_level == round(false_level))
     is_bin = is_int and lo == 0.0 and hi == 1.0
     is_sgn = is_int and lo == -1.0 and hi == 1.0
-    g = Guarantee.APPROXIMATE
     if is_bin:
-        return NodeValueType.binary(guarantee=g)
+        return NodeValueType.binary()
     if is_sgn:
-        return NodeValueType.sign(guarantee=g)
+        return NodeValueType.sign()
     if is_int:
-        return NodeValueType.integer(lo=lo, hi=hi, guarantee=g)
+        return NodeValueType.integer(lo=lo, hi=hi)
     return NodeValueType.unknown()
 
 
@@ -1324,11 +1321,9 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
         input_scale=step_sharpness,
         name="thermometer_floor_div",
     )
-    from torchwright.graph.value_type import Guarantee
-
     return assert_matches_value_type(
         result,
-        NodeValueType.integer(lo=0, hi=n, guarantee=Guarantee.APPROXIMATE),
+        NodeValueType.integer(lo=0, hi=n),
     )
 
 
@@ -1668,8 +1663,6 @@ def floor_int(
        Max error: 0.9993 abs, 0.953 rel over 8192 samples;
        measured at commit a979f69. See docs/numerical_noise.md.
     """
-    from torchwright.graph.value_type import Guarantee
-
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
 
@@ -1701,9 +1694,7 @@ def floor_int(
     )
     return assert_matches_value_type(
         result,
-        NodeValueType.integer(
-            lo=min_value, hi=max_value, guarantee=Guarantee.APPROXIMATE
-        ),
+        NodeValueType.integer(lo=min_value, hi=max_value),
     )
 
 

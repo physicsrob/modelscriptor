@@ -79,6 +79,10 @@ def reference_eval(
         itself) to its oracle value as an ``(n_pos, node.d_output)``
         tensor.
     """
+    from torchwright.graph.finalize import finalize
+
+    output_node = finalize(output_node)
+
     cache: Dict[Node, torch.Tensor] = {}
 
     # Collect all node subclasses reachable from the output graph so we

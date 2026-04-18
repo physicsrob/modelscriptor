@@ -595,49 +595,19 @@ def test_picked_from_returns_result_width():
 # exercised by torchwright/doom/stages/sorted.py + tests/doom/.
 
 
-# --- Guarantee level: APPROXIMATE warns, ALWAYS raises ------------------
+# --- All violations are hard errors now -----------------------------------
 
 
-def test_approximate_integer_warns_instead_of_raising():
-    """APPROXIMATE integer violation should warn, not raise."""
-    from torchwright.graph.value_type import Guarantee
-
-    inp = LiteralValue(torch.tensor([6.5]))  # non-integer
-    node = assert_matches_value_type(
-        inp, NodeValueType.integer(0, 9, guarantee=Guarantee.APPROXIMATE)
-    )
-    # Should not raise — just warn
-    node.compute(1, {})
-
-
-def test_always_integer_raises():
-    """ALWAYS integer violation should still raise."""
+def test_integer_violation_raises():
     inp = LiteralValue(torch.tensor([6.5]))  # non-integer
     node = assert_matches_value_type(inp, NodeValueType.integer(0, 9))
     with pytest.raises(AssertionError, match="not integer"):
         node.compute(1, {})
 
 
-def test_approximate_sign_warns_instead_of_raising():
-    """APPROXIMATE sign violation should warn, not raise."""
-    from torchwright.graph.value_type import Guarantee
-
-    inp = LiteralValue(torch.tensor([0.5]))  # not ±1
-    node = assert_matches_value_type(
-        inp, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE)
-    )
-    # Should not raise
-    node.compute(1, {})
-
-
-def test_require_integer_accepts_approximate():
-    """require_integer should accept both ALWAYS and APPROXIMATE."""
-    from torchwright.graph.value_type import Guarantee
+def test_require_integer_accepts_true():
     from torchwright.graph.asserts import require_integer
 
     inp = LiteralValue(torch.tensor([3.0]))
-    node = assert_matches_value_type(
-        inp, NodeValueType.integer(0, 9, guarantee=Guarantee.APPROXIMATE)
-    )
-    # Should not raise TypeError
+    node = assert_matches_value_type(inp, NodeValueType.integer(0, 9))
     require_integer(node, "test")

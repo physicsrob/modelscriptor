@@ -131,14 +131,14 @@ def test_cond_gate_adaptive_M_uses_value_range():
     assert abs(output.item() - small) < 1.0e-6
 
 
-def test_cond_gate_rejects_unbounded_inp():
-    """Unbounded inp range fails at build time with a TypeError pointing at value_range."""
-    import pytest
+def test_cond_gate_defers_unbounded_inp():
+    """Unbounded inp range returns a placeholder instead of raising."""
+    from torchwright.graph.placeholders import CondGatePlaceholder
 
     x = create_input("x", 1)
     cond_input = create_input("cond", 1)
-    with pytest.raises(TypeError, match="value_range"):
-        cond_gate(cond_input, x)
+    result = cond_gate(cond_input, x)
+    assert isinstance(result, CondGatePlaceholder)
 
 
 def test_bool_any_true():

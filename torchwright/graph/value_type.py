@@ -12,70 +12,11 @@ their inputs via the helpers in ``torchwright.graph.asserts``.
 
 from __future__ import annotations
 
-import enum
 import math
 from dataclasses import dataclass, field, replace
-from typing import Optional, Union
+from typing import Optional
 
 _INF = math.inf
-
-
-class Guarantee(enum.Enum):
-    """Strength of a structural claim about a node's output.
-
-    ALWAYS
-        Structurally exact — the mathematical construction guarantees
-        this property holds for every element.  Examples: LiteralValue
-        with integer data, Linear with integer weights on integer input.
-
-    APPROXIMATE
-        Holds outside narrow piecewise-linear transition zones.  The
-        ReLU-based step-function approximation has an eps-wide ramp
-        where intermediate values appear.  Examples: floor_int, compare,
-        in_range, thermometer_floor_div, equals_vector.
-    """
-
-    ALWAYS = "always"
-    APPROXIMATE = "approximate"
-
-    def __bool__(self) -> bool:
-        """Both levels are truthy, enabling ``if vt.is_integer:`` compat."""
-        return True
-
-
-# Type alias for the property fields: Guarantee.ALWAYS, Guarantee.APPROXIMATE,
-# or False (no claim).
-GuaranteeLevel = Union[Guarantee, bool]  # bool is only ever False at runtime
-
-
-def _min_guarantee(a: GuaranteeLevel, b: GuaranteeLevel) -> GuaranteeLevel:
-    """AND semantics: both must claim; result is the weaker level.
-
-    Used by ``intersect_element_props`` and propagation rules where an
-    output property holds only if *all* relevant inputs have it.
-    """
-    if a is False or b is False:
-        return False
-    if a is Guarantee.APPROXIMATE or b is Guarantee.APPROXIMATE:
-        return Guarantee.APPROXIMATE
-    return Guarantee.ALWAYS
-
-
-def _max_guarantee(a: GuaranteeLevel, b: GuaranteeLevel) -> GuaranteeLevel:
-    """OR semantics: either can claim; result is the weaker of the claimants.
-
-    Used by ``tightened_with`` where if *either* side makes a claim the
-    claim survives, but at the weaker of the two guarantee levels.
-    """
-    if a is False and b is False:
-        return False
-    if a is False:
-        return b
-    if b is False:
-        return a
-    if a is Guarantee.APPROXIMATE or b is Guarantee.APPROXIMATE:
-        return Guarantee.APPROXIMATE
-    return Guarantee.ALWAYS
 
 
 @dataclass(frozen=True)
@@ -141,29 +82,20 @@ class NodeValueType:
     Element properties hold for every scalar in the output; vector
     properties describe the width-dim vector at each position.
 
-    Each boolean property is either ``False`` (no claim),
-    ``Guarantee.ALWAYS`` (structurally exact), or
-    ``Guarantee.APPROXIMATE`` (holds outside piecewise-linear
-    transition zones).  Both enum values are truthy so existing
-    ``if vt.is_integer:`` checks work unchanged.
+    Each structural property is a plain ``bool``: ``True`` means the
+    property is claimed, ``False`` means no claim.
     """
 
     # --- Element properties ---
     value_range: Range = field(default_factory=Range.unbounded)
-    is_integer: GuaranteeLevel = False
-    is_binary: GuaranteeLevel = False
-    is_sign: GuaranteeLevel = False
+    is_integer: bool = False
+    is_binary: bool = False
+    is_sign: bool = False
 
     # --- Vector properties ---
-    is_one_hot: GuaranteeLevel = False
+    is_one_hot: bool = False
 
     def __post_init__(self):
-        # Auto-upgrade bare True → Guarantee.ALWAYS for migration safety.
-        for field_name in ("is_integer", "is_binary", "is_sign", "is_one_hot"):
-            val = getattr(self, field_name)
-            if val is True:
-                object.__setattr__(self, field_name, Guarantee.ALWAYS)
-
         if self.is_binary:
             if not self.is_integer:
                 raise ValueError("is_binary implies is_integer")
@@ -191,31 +123,29 @@ class NodeValueType:
     def integer(
         lo: Optional[float] = None,
         hi: Optional[float] = None,
-        *,
-        guarantee: Guarantee = Guarantee.ALWAYS,
     ) -> "NodeValueType":
         r = Range(-_INF if lo is None else float(lo), _INF if hi is None else float(hi))
-        return NodeValueType(value_range=r, is_integer=guarantee)
+        return NodeValueType(value_range=r, is_integer=True)
 
     @staticmethod
-    def binary(*, guarantee: Guarantee = Guarantee.ALWAYS) -> "NodeValueType":
+    def binary() -> "NodeValueType":
         return NodeValueType(
-            value_range=Range(0.0, 1.0), is_integer=guarantee, is_binary=guarantee
+            value_range=Range(0.0, 1.0), is_integer=True, is_binary=True
         )
 
     @staticmethod
-    def sign(*, guarantee: Guarantee = Guarantee.ALWAYS) -> "NodeValueType":
+    def sign() -> "NodeValueType":
         return NodeValueType(
-            value_range=Range(-1.0, 1.0), is_integer=guarantee, is_sign=guarantee
+            value_range=Range(-1.0, 1.0), is_integer=True, is_sign=True
         )
 
     @staticmethod
-    def one_hot(*, guarantee: Guarantee = Guarantee.ALWAYS) -> "NodeValueType":
+    def one_hot() -> "NodeValueType":
         return NodeValueType(
             value_range=Range(0.0, 1.0),
-            is_integer=guarantee,
-            is_binary=guarantee,
-            is_one_hot=guarantee,
+            is_integer=True,
+            is_binary=True,
+            is_one_hot=True,
         )
 
     @staticmethod
@@ -278,19 +208,19 @@ def tightened_with(a: NodeValueType, b: NodeValueType) -> NodeValueType:
     """Combine two claims into the strictest type both admit.
 
     Ranges are intersected; structural claims are OR-ed (either side's
-    claim survives, at the weaker of the two guarantee levels).  Range
-    is further tightened to the invariant constraints implied by the
-    OR-ed claims (e.g. ``is_binary`` forces range ⊆ [0, 1]).
+    claim survives).  Range is further tightened to the invariant
+    constraints implied by the OR-ed claims (e.g. ``is_binary`` forces
+    range ⊆ [0, 1]).
 
     Used by the compiler's Assert-strip pass to transfer an Assert's
     ``claimed_type`` onto the node it wrapped, so downstream analysis
     that runs after stripping still sees the strengthened type.
     """
     r = a.value_range.intersect(b.value_range)
-    is_int = _max_guarantee(a.is_integer, b.is_integer)
-    is_bin = _max_guarantee(a.is_binary, b.is_binary)
-    is_sgn = _max_guarantee(a.is_sign, b.is_sign)
-    is_onehot = _max_guarantee(a.is_one_hot, b.is_one_hot)
+    is_int = a.is_integer or b.is_integer
+    is_bin = a.is_binary or b.is_binary
+    is_sgn = a.is_sign or b.is_sign
+    is_onehot = a.is_one_hot or b.is_one_hot
     if is_bin:
         r = r.intersect(Range(0.0, 1.0))
     if is_sgn:
@@ -318,8 +248,8 @@ def intersect_element_props(a: NodeValueType, b: NodeValueType) -> NodeValueType
     )
     return NodeValueType(
         value_range=r,
-        is_integer=_min_guarantee(a.is_integer, b.is_integer),
-        is_binary=_min_guarantee(a.is_binary, b.is_binary),
-        is_sign=_min_guarantee(a.is_sign, b.is_sign),
+        is_integer=a.is_integer and b.is_integer,
+        is_binary=a.is_binary and b.is_binary,
+        is_sign=a.is_sign and b.is_sign,
         is_one_hot=False,
     )

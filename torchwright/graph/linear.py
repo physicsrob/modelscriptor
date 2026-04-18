@@ -1,4 +1,5 @@
-from typing import List, Dict, Optional
+from typing import Optional
+
 from torchwright.graph import Node
 from torchwright.graph.value_type import (
     NodeValueType,
@@ -58,14 +59,8 @@ class Linear(Node):
         inp_t = inp.value_type
         weights_int = is_integer_tensor(self.output_matrix)
         bias_int = is_integer_tensor(self.output_bias)
-        # Preserve the input's guarantee level when weights and bias are integer.
         is_int = inp_t.is_integer if (weights_int and bias_int) else False
 
-        # If the input is a Concatenate, each child slab has its own range;
-        # using the Concatenate's scalar summary (union across all children)
-        # hugely over-estimates the output range when the children have very
-        # different ranges (e.g. ``[cond (-1,1), inp (-30,30)]``).
-        # Do interval arithmetic slab-by-slab for a much tighter bound.
         if isinstance(inp, Concatenate) and inp.inputs:
             row = 0
             per_col_mins = None
@@ -76,7 +71,6 @@ class Linear(Node):
                 child_matrix = self.output_matrix[row : row + child_rows]
                 row += child_rows
                 if not child_range.is_finite():
-                    # Bail to the scalar summary path — this child dominates.
                     per_col_mins = None
                     break
                 lo_prod = child_range.lo * child_matrix
@@ -87,11 +81,11 @@ class Linear(Node):
                     per_col_mins = child_mins
                     per_col_maxs = child_maxs
                 else:
+                    assert per_col_maxs is not None
                     per_col_mins = per_col_mins + child_mins
-                    assert per_col_maxs is not None  # set alongside per_col_mins
                     per_col_maxs = per_col_maxs + child_maxs
             if per_col_mins is not None:
-                assert per_col_maxs is not None  # set alongside per_col_mins
+                assert per_col_maxs is not None
                 per_col_mins = per_col_mins + self.output_bias
                 per_col_maxs = per_col_maxs + self.output_bias
                 out_range = Range(

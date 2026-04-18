@@ -270,21 +270,6 @@ def assert_onehot(node: Node, *, atol: float = 1e-3) -> Node:
     )
 
 
-def _warn_approximate(prop: str, site: str, detail: str) -> None:
-    """Print a warning for an APPROXIMATE property violation.
-
-    These are expected transition-zone artifacts, not bugs.  The message
-    is written to stderr so it's visible during test runs but doesn't
-    cause assertion failures.
-    """
-    import sys
-
-    print(
-        f"WARNING: approximate {prop} transition-zone hit at {site}: {detail}",
-        file=sys.stderr,
-    )
-
-
 def assert_matches_value_type(
     node: Node,
     vt: NodeValueType,
@@ -301,10 +286,7 @@ def assert_matches_value_type(
     cases where the construction doesn't actually deliver what the
     primitive promised.
 
-    For ``Guarantee.ALWAYS`` properties, violations are hard errors.
-    For ``Guarantee.APPROXIMATE`` properties, violations are warnings
-    (transition-zone hits are expected for piecewise-linear step
-    function approximations).
+    All violations are hard errors.
 
     Checks, each with tolerance ``atol``:
       * ``value_range`` — no element outside [lo - atol, hi + atol]
@@ -318,13 +300,9 @@ def assert_matches_value_type(
     """
     import math
 
-    from torchwright.graph.value_type import Guarantee
-
     r = vt.value_range
 
     def predicate(x: torch.Tensor) -> tuple:
-        site = ""  # filled by Assert._check from annotation
-
         if math.isfinite(r.lo) or math.isfinite(r.hi):
             bad = torch.zeros_like(x, dtype=torch.bool)
             if math.isfinite(r.lo):
@@ -336,29 +314,17 @@ def assert_matches_value_type(
         if vt.is_integer:
             bad = (x - x.round()).abs() > atol
             if bad.any():
-                detail = f"not integer (atol={atol}); {_format_bad(x, bad)}"
-                if vt.is_integer is Guarantee.APPROXIMATE:
-                    _warn_approximate("integer", f"node", detail)
-                else:
-                    return False, detail
+                return False, f"not integer (atol={atol}); {_format_bad(x, bad)}"
         if vt.is_binary:
             rounded = x.round()
             bad = ~((rounded == 0) | (rounded == 1))
             if bad.any():
-                detail = f"not in {{0,1}} (atol={atol}); {_format_bad(x, bad)}"
-                if vt.is_binary is Guarantee.APPROXIMATE:
-                    _warn_approximate("binary", f"node", detail)
-                else:
-                    return False, detail
+                return False, f"not in {{0,1}} (atol={atol}); {_format_bad(x, bad)}"
         if vt.is_sign:
             rounded = x.round()
             bad = ~((rounded == -1) | (rounded == 1))
             if bad.any():
-                detail = f"not in {{-1,+1}} (atol={atol}); {_format_bad(x, bad)}"
-                if vt.is_sign is Guarantee.APPROXIMATE:
-                    _warn_approximate("sign", f"node", detail)
-                else:
-                    return False, detail
+                return False, f"not in {{-1,+1}} (atol={atol}); {_format_bad(x, bad)}"
         if vt.is_one_hot:
             if x.ndim != 2:
                 return False, f"one-hot: expected 2D, got shape {tuple(x.shape)}"
@@ -369,11 +335,7 @@ def assert_matches_value_type(
             bad_rows = ~(row_elem_ok & row_sum_ok)
             if bad_rows.any():
                 idx = bad_rows.nonzero(as_tuple=False).flatten().tolist()[:3]
-                detail = f"not one-hot (atol={atol}); rows {idx}"
-                if vt.is_one_hot is Guarantee.APPROXIMATE:
-                    _warn_approximate("one-hot", f"node", detail)
-                else:
-                    return False, detail
+                return False, f"not one-hot (atol={atol}); rows {idx}"
         return True, ""
 
     return Assert(
