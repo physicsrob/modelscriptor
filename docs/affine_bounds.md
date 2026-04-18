@@ -994,3 +994,152 @@ Every bit of bound tightness comes from exact affine algebra on
 `Linear` / `Add` / `Concatenate`. Every bit of looseness comes
 from one of two places: straddling-`ReLU` envelopes, or `Attn`
 emitting a zero-coefficient `AffineBound`.
+
+---
+
+## Appendix: context for plan-mode and future maintainers
+
+This appendix holds context that shaped the design but does not
+belong in the design proper — rejected alternatives, validation
+steps that were discussed but deferred, claims that should be
+verified during implementation, and open questions that plan mode
+needs to resolve. None of it changes the design; all of it is
+useful when deciding *how* to implement or *whether* to revisit a
+choice.
+
+### A. Design alternatives considered and rejected
+
+- **Forward-mode vs backward-mode LiRPA / CROWN.** Backward-mode is
+  tighter per query (relaxations picked per output), but requires
+  re-walking ancestors per bound-consumer site; this design has
+  many such sites across the graph. Forward-mode was chosen for fit
+  with the per-node `compute_value_type()` contract. If forward
+  bounds prove too loose in practice, backward-mode is the
+  documented upgrade path.
+- **Basis construction timing.** Earlier options: (a) convention —
+  require all `InputNode`s to be declared first and auto-freeze the
+  basis on the first non-`InputNode` construction; (c) dynamic
+  basis that widens as new `InputNode`s arrive. Both were rejected
+  in favor of (b) — explicit `finalize(root)` with compile / compute
+  auto-trigger — because it cleanly separates graph construction
+  from bound computation without imposing construction order and
+  without the complexity of growing-basis bookkeeping.
+- **`Guarantee` removal as a gradual migration.** A shim where
+  `Guarantee.ALWAYS` aliases `True` and `APPROXIMATE` silently
+  promotes (or warns) was rejected in favor of all-at-once
+  deletion. The scope is small and the shim would leave two
+  spellings of the same concept alive in the code indefinitely.
+- **auto_LiRPA as a runtime / compile-time dependency.** Rejected.
+  auto_LiRPA wraps `nn.Module`s, expects a query-driven workflow,
+  and carries its own softmax / bilinear relaxations that this
+  design does not use. Adopting it would mean writing an IR-to-
+  Module adapter per primitive and running the library in a mode
+  it is not designed for. A from-scratch implementation of
+  forward-mode LiRPA inside `compute_value_type()` is both smaller
+  and a better fit.
+- **Affine-preserving attention.** Published softmax and bilinear
+  `Q·K^T` relaxations (see *Related prior work* in the `Attn`
+  section) could tighten attention bounds but introduce
+  cross-position coupling that the single-position basis cannot
+  represent. Rejected for v1; not for reasons of mathematical
+  impossibility.
+- **α-CROWN for the `ReLU` lower bound.** Rejected for v1 because
+  it is not a local rule change — it requires autograd through
+  bounds and a per-query optimization pass. Treated in the doc as
+  a future upgrade with non-trivial architectural cost.
+
+### B. Validation step discussed but not performed
+
+Before committing to implementation, a diagnostic measurement was
+proposed: wrap the compiled `HeadlessTransformer` (walkthrough or
+similar real graph) in `auto_LiRPA`'s `BoundedModule`, run CROWN,
+and compare the resulting interval widths at the four bound-
+consumer sites (`cond_gate._max_abs_or_raise`,
+`floor_int`'s breakpoint span, `assert_in_range`'s inferred claim,
+`attend_mean`'s `atol`) against the current scalar-IBP widths.
+The expected ratios are what justify the implementation cost.
+
+This step was not performed. The decision to proceed rested on
+qualitative reasoning: the codebase already has hand-rolled
+workarounds for correlation-blindness (`linear_output_range`'s
+per-component arithmetic, the cond_gate offset pattern), which
+suggests the gap is meaningful. Plan mode should decide whether to
+run the measurement as a first milestone to set an empirical
+expectation, or proceed directly.
+
+### C. Claims to verify during implementation
+
+The design makes several empirical claims that are plausible but
+uncorroborated. Each should be checked when the relevant code is
+touched:
+
+- **"The scheduler does not build graphs that rely on
+  cancellation through a straddling `ReLU`."** Stated in the `Add`
+  caveat. Before trusting it, grep for patterns like
+  `ReLU(x) - ReLU(x)` or structural equivalents and confirm no
+  compiled op depends on exact cancellation downstream of a
+  straddling ReLU.
+- **"Typical `n` is on the order of tens to low hundreds."**
+  Stated in the sizing subsection. Verify by computing
+  `sum_of_input_widths` on the actual compiled DOOM graph and any
+  other non-trivial example.
+- **"`float64` is sufficient under bounded weight norms."**
+  Stated in the sizing subsection. Verify by running a test
+  pipeline that compares `to_interval()` output between
+  `float32` and `float64` coefficient storage on a 50-70 layer
+  graph. If divergence is larger than bound-consumer tolerance,
+  the claim fails.
+- **Structural flag composition rules match existing compiled
+  behavior.** The tables in *Structural flag composition*
+  were derived from first principles. Compare against the
+  current `_min_guarantee`-based composition on a representative
+  set of real nodes to confirm no semantic drift.
+
+### D. Open implementation questions
+
+The design says *what* happens but not always *how*. Plan mode
+needs to pin these down:
+
+- **Placeholder Python class.** Is there a single
+  `ConsumerPlaceholder(Node)` class parameterized by op type and
+  config, or one subclass per consumer op? What attributes does
+  it carry for materialize? How are downstream references to it
+  rebound when materialization replaces it with a subgraph —
+  mutation of `inputs` lists on descendants, or a separate indirection?
+- **`fresh_graph_session` scope and semantics.** Context manager
+  vs explicit reset? What state is per-session vs global? What
+  happens if nested?
+- **`AffineBound` factory signatures.** The appendix in the doc
+  sketches `identity`, `constant`, `degenerate`. Exact signatures
+  (keyword args, dtype handling, what accepts `None`) are
+  undecided.
+- **Migration ordering.** Which primitive ports first? Option (b)
+  in *Ops with custom `compute_value_type` overrides* allows a
+  partial migration (degenerate bounds for un-ported ops). What is
+  the minimal set of ports needed to unlock measurable tightening
+  at the four bound-consumer sites?
+- **Test strategy.** Unit tests per rule (hand-computed bounds
+  for small graphs)? Property-based comparison against `auto_LiRPA`
+  on simple nets? End-to-end regression on compiled DOOM
+  constants?
+- **`compile_graph` integration.** Where exactly does the auto-
+  `finalize` call land — before scheduling, during, or after? How
+  is the frozen-graph invariant enforced against scheduler mutations?
+
+### E. Adjacent concerns the plan should account for
+
+- **`make measure-noise` re-run per ported op.** Tighter bound-
+  driven constants change compiled op behavior. The numerical-
+  noise data in `docs/op_noise_data.json` and the commentary in
+  `docs/numerical_noise_findings.md` need to be regenerated /
+  updated as ops migrate. See the *Numerical noise* section of
+  `CLAUDE.md` for the exact workflow.
+- **ONNX export.** `AffineBound` is compile-time metadata and is
+  explicitly excluded from export. Verify the existing ONNX
+  export tests still pass after migration — no bound-related
+  state should leak into exported weights.
+- **Compiled-artifact parity.** Migration should be neutral or
+  tightening for compiled artifact behavior. A regression gate
+  that compares compiled behavior on a reference example
+  (walkthrough, adder, calculator) before and after migration is
+  a good guardrail.
