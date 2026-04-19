@@ -124,8 +124,8 @@ ray `(0, vel_dy)`. Each produces a hit/miss flag (±1). Uses
 coordinates and validity checks.
 
 The axis-separated rays enable wall sliding in the EOS stage: if the
-full ray hits but the x-only ray doesn't, the player can still move
-on the x axis.
+full velocity hits a wall but the x-only ray doesn't, the player can
+still slide along the x axis (see EOS below).
 
 **2. BSP rank.**
 `rank = dot(wall_bsp_coeffs, side_P_vec) + wall_bsp_const` — a dot
@@ -189,15 +189,16 @@ A single token marking the end of prefill. Two jobs:
 Aggregates the per-WALL hit flags via `attend_mean_where` over WALL
 positions. If the averaged flag for any ray exceeds a threshold
 (0.05), at least one wall was hit. Applies axis-separated wall
-sliding:
+sliding — movement on an axis is blocked only if **both** the full
+velocity ray and that axis's solo ray hit a wall:
 
-- X-axis: move if neither the full ray nor the x-only ray hit.
-- Y-axis: move if neither the full ray nor the y-only ray hit.
+- X-axis: blocked only if both the full ray and the x-only ray hit.
+- Y-axis: blocked only if both the full ray and the y-only ray hit.
 
-```
-resolved_x = select(can_move_x, player_x + vel_dx, player_x)
-resolved_y = select(can_move_y, player_y + vel_dy, player_y)
-```
+This is what enables wall sliding: if the player walks diagonally
+into a wall, the full velocity ray hits, but the perpendicular
+axis's solo ray may miss, allowing the player to slide along the
+wall on that axis.
 
 **State broadcast.**
 Copies the resolved `(x, y, angle)` to every position via
@@ -373,9 +374,9 @@ overwrite already-filled pixels), and stop when `done > 0`.
 ## How the Graph Becomes a Transformer
 
 The computational graph compiles to a standard transformer via
-`compile_headless`:
+`compile_game` (which calls `compile_headless` internally):
 
-- **Attention heads** implement the five cross-position data flows:
+- **Attention heads** implement the seven cross-position data flows:
   - `attend_mean_where`: broadcast (INPUT→all, BSP→all, EOS→all,
     WALL→EOS for collision aggregation).
   - `attend_argmin_above_integer`: threshold-based selection
@@ -410,12 +411,13 @@ For the default configuration (8 walls, 320×240 screen, 8 textures of
 |-----------|-------|
 | d (residual stream width) | 2048 |
 | d_head | 32 or 64 |
-| Compiled layers | ~200-300 |
-| Total parameters | ~80M (all deterministic, no training) |
 | Prefill tokens | ~570 (512 TEX_COL + 58 game) |
 | Sort tokens | 8 |
 | Render tokens | ~250 (variable) |
-| Wall-clock per frame (A100) | ~35ms |
+
+Layer count and parameters depend on the graph configuration and
+optimization passes. All parameters are deterministic — no training
+is involved.
 
 ## Key Design Decisions
 
