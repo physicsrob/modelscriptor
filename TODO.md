@@ -1,124 +1,5 @@
 # TODO
 
-## `piecewise_linear_2d` interior oscillation
-
-`torchwright.ops.arithmetic_ops.piecewise_linear_2d` reproduces grid
-vertex values exactly but produces wildly wrong values in cell
-**interiors**.  A direct probe at non-vertex point `(-1.25, 8.5)` inside
-the cell `(-1.5, 7)–(-1, 10)` evaluates `atan(x/y)` to `-1.04` where
-bilinear interpolation gives `-0.15` — a 0.9-unit error, which scales
-to ~37 screen columns after `col_scale ≈ 40.7`.  Even the simpler
-`x*y` shows 0.44-unit interior error per cell with the same grid (vs
-zero at vertices).
-
-**Consequence (load-bearing):** this is the mechanism behind the two
-residual `test_game_graph.py` precision failures
-(`test_renders_oblique_angle[20]`,
-`test_renders_off_center_oblique[1.0,-3.0,50]`).  Both touch a wall
-endpoint that lands at `(cross=-1.07, dot=8.88)` — mid-cell — which
-`_endpoint_to_column` projects to `-2.000` (clamp floor) vs oracle
-`3.114`.  Since `multiply_2d` delegates to `piecewise_linear_2d`
-internally, the old `reciprocal → multiply_2d → atan` chain hit the
-same bug through a different path, which is why swapping it for a
-fused `piecewise_linear_2d(cross, |dot|)` lookup produced roughly the
-same residual magnitude rather than a decisive improvement.
-
-### Suspected root cause
-
-The op builds an **overcomplete** hyperplane family — vertical,
-horizontal, sum diagonal (`x+y=const`), and difference diagonal
-(`x-y=const`) through every grid vertex — then solves for output
-weights via `torch.linalg.pinv` least-squares, constraining only the
-grid vertex values.  With N grid points and ~4N hyperplanes the
-system is underdetermined: there is a manifold of solutions that
-exactly interpolate vertices.  `pinv` picks the minimum-L2-norm
-element of that manifold, which has no reason to be the
-piecewise-linear interpolant.  Empirically the min-norm solution
-packs large cancelling ReLU weights that agree at vertices but
-oscillate across cell interiors.
-
-A proper piecewise-linear interpolant on a rectangular grid is
-triangulation-based (one diagonal per cell, linear on each triangle)
-and is representable with a single diagonal family per cell — but the
-op includes *both* diagonals for every vertex, so the triangulation
-isn't enforced by the least-squares constraint set.
-
-### How to verify
-
-Self-contained repro (≤ 50 lines):
-
-```python
-import torch, math
-from torchwright.ops.arithmetic_ops import piecewise_linear_2d
-from torchwright.ops.inout_nodes import create_input
-from torchwright.debug.probe import reference_eval
-
-x = create_input("x", 1); y = create_input("y", 1)
-bp_x = [-2.0, -1.5, -1.0, -0.75, -0.5, -0.25, -0.1, 0.0,
-        0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
-bp_y = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
-
-out = piecewise_linear_2d(x, y, bp_x, bp_y,
-                          lambda a, b: math.atan(a/b), name="atan")
-
-# Grid vertex — exact to float precision.
-# Interior — arbitrarily wrong.
-for pt in [(-1.0, 7.0), (-1.25, 8.5)]:
-    c = reference_eval(out, {"x": torch.tensor([[pt[0]]]),
-                              "y": torch.tensor([[pt[1]]])}, n_pos=1)
-    got = c[out][0].item()
-    print(pt, "→", got, "vs oracle", math.atan(pt[0]/pt[1]))
-```
-
-Two probe tests already saved under `tests/doom/stages/`:
-
-- `test_visibility_probe.py` — compiles `_compute_visibility_columns`
-  on the failing integration scenes and compares against a Python
-  oracle; shows 4.2-column drift on a real endpoint.
-- `test_endpoint_projection.py` — the 2 `xfail`-marked cases live at
-  the same cell interior that `test_visibility_probe` flags.
-
-### Fix candidates
-
-1. **Drop the pinv least-squares, triangulate explicitly.**  For each
-   cell pick one diagonal; build the per-triangle linear function
-   analytically; assemble via ReLU.  Same op count as current,
-   guaranteed to be a proper piecewise-linear interpolant.
-2. **Shrink the hyperplane family.**  Keep only one diagonal direction
-   per cell (not both).  The pinv system becomes square (or nearly so)
-   and the solution is forced close to the triangulated interpolant.
-   Smaller change than (1); may still have numerical wobble at rank
-   boundary.
-3. **Switch to bilinear interpolation.**  Bilinear is quadratic in
-   `(x, y)`, not linear — not representable in a single MLP sublayer.
-   Would require composing via `multiply` or chained 1-D piecewise
-   linears, undoing the point of the op.  Not recommended.
-
-Option 1 is the clean fix.
-
-### Consequences of fixing
-
-- The 2 residual `test_game_graph.py` render failures and the 2
-  `xfail` cases in `test_endpoint_projection.py` should go green.
-- `multiply_2d` (delegates to `piecewise_linear_2d`) gets interior
-  precision for free — tightens any other site living with ~1-col
-  drift, e.g., the frustum-clip `t_star = f_a / (f_a − f_b)` that
-  already has its own scale-by-100 workaround.
-- Rendering-test `matched_fraction` values currently sitting at
-  0.98–0.99 due to projection drift should rise; worst-case pixel
-  errors (0.3–0.5 today) should drop under the 0.15
-  `compare_images` threshold.
-- Walkthrough texture "smearing" at production scale is partly this
-  bug; expect visible improvement.
-
-### Scope
-
-Self-contained change in `torchwright/ops/arithmetic_ops.py:499-696`.
-Existing `tests/ops/test_piecewise_linear_2d.py` is the regression
-barrier and will need new cases covering non-vertex correctness.
-Call-site compatibility is preserved — the only behavioural change
-is that cell interiors now match the advertised docstring behaviour.
-
 ## fp16 inference for Flash Attention
 
 The render decode loop runs at ~35ms/step (GPU-bound). The bottleneck is SDPA
@@ -193,116 +74,48 @@ Options:
 Files: `torchwright/doom/game_graph.py` (state_transitions),
 `torchwright/doom/compile.py` (host-side termination)
 
----
+## Tests that validate Asserts on the compiled graph
 
-# Known test flakiness & intermittent failures
+`check_asserts_on_compiled` (`torchwright/debug/probe.py:964`) already
+runs each `Assert`'s predicate against the compiled transformer's
+residual stream, but no tests currently call it. Asserts today only
+fire during reference evaluation — the whole point of checking them
+post-compile is to catch invariants that exact math satisfies but
+compiled approximations violate (the class of bug Mode C was).
 
-Three distinct failure modes in the full `make test` run that looked
-like flakiness on the surface.  Modes A and B are fixed; Mode C is
-partially localized but not yet root-caused.
+Add tests that exercise it on the DOOM graph and on smaller stage-level
+graphs.  At minimum: collect the asserts via
+`torchwright.graph.asserts.collect_asserts(output_node)` before
+`compile_headless`, compile, then call `check_asserts_on_compiled` on
+a representative input battery and assert no violations.
 
-## Mode A — `test_fuse_chain_of_three` (order-dependent bug) — FIXED
+Files: `torchwright/debug/probe.py` (`check_asserts_on_compiled`,
+`collect_asserts`), new tests under `tests/doom/` and
+`tests/doom/stages/`.
 
-`fuse_consecutive_linears` collected `(L1,L2)` and `(L2,L3)` candidates
-via `for node in all_nodes` (set iteration).  Certain global_node_id
-offsets (e.g., 5, where slot `8 % 8 = 0` puts L3 before L2 in CPython
-set order) caused `(L2,L3)` to be processed first, leaving L3 depending
-on L1 — which a second `while True` pass then fused again, yielding
-`total=3` instead of the expected `2`.
+## Softmax hardness assertion on `attend_*` primitives
 
-Fix: sort the fusion candidate list by `l1.node_id` before the mutation
-loop, so upstream pairs are always fused first.
+Every `attend_*` op in `torchwright/ops/attention_ops.py`
+(`attend_argmin`, `attend_argmax`, `attend_argmin_where`,
+`attend_argmax_where`, `attend_argmin_above_integer`,
+`attend_argmin_unmasked`, `attend_argmin_valid_unmasked`,
+`attend_mean_where`, `attend_argmax_dot`) should accept a
+`assert_hardness_gt=<float>` kwarg that checks, at reference-eval time
+and on the compiled graph, that the softmax weight on the selected key
+is at least that threshold.  E.g. `assert_hardness_gt=0.99` means
+"≥99 % of the attention mass must land on the argmin/argmax key."
 
-Regression test: `test_fuse_chain_ordering_regression` in
-`tests/graph/test_optimize.py` loops through offsets `[0, 5, 101, 997]`
-and asserts `total == 2` at each.
+Today, concentration is verified indirectly via
+`assert_distinct_across` / `assert_score_gap_at_least`
+(`torchwright/graph/asserts.py:490,565`), which reason about
+*score separation* and rely on the caller knowing the op's
+`_QUERY_GAIN` to translate a margin into a hardness.  A direct
+hardness check is (a) easier to reason about at the call site,
+(b) closes the loop without the caller needing to know the gain,
+and (c) catches post-compile precision loss that score-gap asserts
+miss when the gap survives but the logits get squashed.
 
-Files: `torchwright/graph/optimize.py:87-91`,
-`tests/graph/test_optimize.py` (new regression test).
-
-## Mode B — pixel-precision cluster (counter-shift drift) — FIXED
-
-`Node.__hash__` returns `node_id`, so set/dict iteration order in the
-compiler's `graph_analysis.py` and `residual_assignment.py` depends on
-the global counter.  Earlier tests that allocate nodes shift the
-counter, which shifts residual-column assignments, which drifts
-compiled pixel values by a few percent — enough to fail the tightened
-0.45 tolerance in `test_game_graph.py::test_renders_*`.
-
-Fix: autouse fixture `reset_node_id_counter` in `tests/conftest.py`
-resets `torchwright.graph.node.global_node_id = 0` before every test,
-so node IDs are stable regardless of suite ordering.
-
-Files: `tests/conftest.py` (new autouse fixture).
-
-## Mode C — sort concentration failure at angle-192 — FIXED (2026-04-14)
-
-Root cause: `_compute_bsp_rank` packed two unrelated concerns — BSP rank
-and renderability — into a single score via a sentinel-plus-
-`wall_index*0.1`-tiebreak encoding.  The 0.1-wide budget for tiebreak
-survived reference eval but compiled to a 0.053 gap (~47% loss), which
-gave the softmax only 4.25 logit of separation at sort[2] — enough to
-blend 1.4% of west's geometry into north's and produce the observed
-`[4.86, 5.00, -5.00, 4.86]` drift.
-
-### Fix
-
-Surface renderability as a first-class `is_renderable` ±1 validity
-signal from the WALL stage and swap SORTED's argmin over to a new
-`attend_argmin_valid_unmasked` primitive.  The sort score is now a
-clean integer BSP rank (1.0 spacing, no sentinel, no tiebreak); the
-validity path contributes `_QUERY_GAIN · _VALIDITY_LARGE = 80000` to
-every valid key, so valid vs. invalid separation is ~160000 logit
-units — Mode C's concentration failure is now impossible by
-construction.
-
-Asserts tightened at the same time:
-- `assert_distinct_across(sort_score, is_wall, margin=0.8)` (was 0.5)
-- `assert_score_gap_at_least(checked_score, is_wall, margin=0.5)` (was 0.05)
-
-Both are comfortably satisfied by integer-rank spacing.
-
-Files: `torchwright/ops/attention_ops.py` (+
-`attend_argmin_valid_unmasked`), `torchwright/doom/stages/wall.py`
-(`_compute_bsp_rank` returns `(rank, is_renderable)`;
-`WallOutputs.is_renderable`), `torchwright/doom/stages/sorted.py`
-(`SortedInputs.is_renderable`, primitive swap, tighter asserts),
-`torchwright/doom/game_graph.py` (wiring), plus tests.
-
-Commit: see `feat: surface wall renderability as a first-class SORTED
-validity signal`.
-
-### Verification at angle-192
-
-- `test_inspect_sorted_argmin_attention_weights_at_sort2` now runs the
-  capture at sort[0] (the only non-vacuous step — sort[1..3] degenerate
-  into masked-valid re-picks of south).  Weight on south ≈ 1.0;
-  valid/invalid logit gap is orders of magnitude above the design
-  separation needed.
-- `step_frame` debug print at angle-192 shows sort[0..3] all select
-  south cleanly: `wall=[-5.00,-5.00,5.00,-5.00]`.  No blend.
-- `test_angle_192_validity_excludes_invalid_clean_pick` (renamed from
-  `test_angle_192_sentinel_ties_clean_pick`) passes with the new
-  validity-first API.
-
-### Known residual (not Mode C)
-
-`test_bsp_rank_integration.py::test_renders_in_all_four_directions[192]`
-still fails with max pixel error 0.500 (same magnitude as before the
-fix).  The sort is now clean, so this is no longer a wall-selection
-issue — it's a separate render-precision drift at angle 192 that the
-0.35 threshold (originally sized against wrong-wall errors of 0.35-0.7)
-catches.  Also tracked as part of the wider render-precision cluster
-under `test_game_graph.py::test_renders_from_angle[192]`,
-`test_renders_oblique_angle[20/100/160/210]`,
-`test_renders_off_center_oblique[(3,2)@20/(1,-3)@50]` — all 0.4-0.6
-pixel errors that predate this fix.
-
-### End-of-sort wastefulness (follow-up)
-
-With `N_renderable < max_walls`, after all renderable walls are picked
-the masked-valid fallback re-picks the last wall at every subsequent
-sort step.  RENDER overdraws; the host's `filled[y, c]` pixel dedup
-hides the waste.  A principled fix is a compiled "done" signal from
-SORTED that lets downstream stages short-circuit.  Flagged as a TODO
-near the `attend_argmin_valid_unmasked` call site in `sorted.py`.
+Files: `torchwright/ops/attention_ops.py` (add kwarg + hardness
+probe), `torchwright/graph/asserts.py` (new
+`assert_softmax_hardness`), `torchwright/debug/probe.py` (wire into
+`check_asserts_on_compiled` path).

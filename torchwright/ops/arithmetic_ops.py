@@ -276,20 +276,17 @@ def abs(inp: Node) -> Node:
 
 
 def _compare_output_type(true_level: float, false_level: float) -> NodeValueType:
-    from torchwright.graph.value_type import Guarantee
-
     lo = builtins.min(true_level, false_level)
     hi = builtins.max(true_level, false_level)
     is_int = (true_level == round(true_level)) and (false_level == round(false_level))
     is_bin = is_int and lo == 0.0 and hi == 1.0
     is_sgn = is_int and lo == -1.0 and hi == 1.0
-    g = Guarantee.APPROXIMATE
     if is_bin:
-        return NodeValueType.binary(guarantee=g)
+        return NodeValueType.binary()
     if is_sgn:
-        return NodeValueType.sign(guarantee=g)
+        return NodeValueType.sign()
     if is_int:
-        return NodeValueType.integer(lo=lo, hi=hi, guarantee=g)
+        return NodeValueType.integer(lo=lo, hi=hi)
     return NodeValueType.unknown()
 
 
@@ -340,6 +337,15 @@ def compare(
     vt = _compare_output_type(true_level, false_level)
     if vt != NodeValueType.unknown():
         result = assert_matches_value_type(result, vt)
+    from torchwright.graph.affine_rules import (
+        _apply_semantic_override,
+        _compare_semantic_bound,
+    )
+
+    _apply_semantic_override(
+        result,
+        _compare_semantic_bound(inp._affine_bound, thresh, true_level, false_level),
+    )
     return result
 
 
@@ -816,7 +822,45 @@ def piecewise_linear_2d(
     if _builtin_abs(base_sx) > 1e-10 or _builtin_abs(base_sy) > 1e-10:
         base_weight = torch.tensor([[base_sx], [base_sy]])
         base_linear = Linear(inp, base_weight, name=f"{name}_base")
-        return Add(base_linear, result)
+        result = Add(base_linear, result)
+
+    # Declare the tight output range.  Inside the grid the piecewise-
+    # linear interpolation is bounded by the function's vertex min/max.
+    # A non-zero base linear term (base_sx*x + base_sy*y) extrapolates
+    # linearly outside the grid — but grid_lo/grid_hi already include
+    # the base linear contribution at grid vertices, so only the input
+    # range that extends BEYOND the grid boundaries adds extra range.
+    grid_vals = [v for row in values for v in row]
+    grid_lo = builtins.min(grid_vals)
+    grid_hi = builtins.max(grid_vals)
+    base_lo = 0.0
+    base_hi = 0.0
+    can_tighten = True
+    if _builtin_abs(base_sx) > 1e-10:
+        r1 = inp1.value_type.value_range
+        if not r1.is_finite():
+            can_tighten = False
+        else:
+            ext_below = builtins.min(r1.lo - breakpoints1[0], 0.0)
+            ext_above = builtins.max(r1.hi - breakpoints1[-1], 0.0)
+            cand = (base_sx * ext_below, base_sx * ext_above)
+            base_lo += builtins.min(cand)
+            base_hi += builtins.max(cand)
+    if can_tighten and _builtin_abs(base_sy) > 1e-10:
+        r2 = inp2.value_type.value_range
+        if not r2.is_finite():
+            can_tighten = False
+        else:
+            ext_below = builtins.min(r2.lo - breakpoints2[0], 0.0)
+            ext_above = builtins.max(r2.hi - breakpoints2[-1], 0.0)
+            cand = (base_sy * ext_below, base_sy * ext_above)
+            base_lo += builtins.min(cand)
+            base_hi += builtins.max(cand)
+    if can_tighten:
+        result = assert_matches_value_type(
+            result,
+            NodeValueType(value_range=Range(grid_lo + base_lo, grid_hi + base_hi)),
+        )
     return result
 
 
@@ -1286,11 +1330,9 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
         input_scale=step_sharpness,
         name="thermometer_floor_div",
     )
-    from torchwright.graph.value_type import Guarantee
-
     return assert_matches_value_type(
         result,
-        NodeValueType.integer(lo=0, hi=n, guarantee=Guarantee.APPROXIMATE),
+        NodeValueType.integer(lo=0, hi=n),
     )
 
 
@@ -1630,8 +1672,6 @@ def floor_int(
        Max error: 0.9993 abs, 0.953 rel over 8192 samples;
        measured at commit a979f69. See docs/numerical_noise.md.
     """
-    from torchwright.graph.value_type import Guarantee
-
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
 
@@ -1663,9 +1703,7 @@ def floor_int(
     )
     return assert_matches_value_type(
         result,
-        NodeValueType.integer(
-            lo=min_value, hi=max_value, guarantee=Guarantee.APPROXIMATE
-        ),
+        NodeValueType.integer(lo=min_value, hi=max_value),
     )
 
 

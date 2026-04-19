@@ -41,14 +41,14 @@ def test_D_allocate_rejects_overlap_with_live_node():
     """If _free somehow contained a column already owned by a live node,
     allocate's pre-commit check fires with the overlap detail."""
     rmap = ResidualStreamMap(32)
-    a = InputNode("a", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
     rmap.allocate(a)
 
     # Poison: re-add a's columns to _free while leaving a allocated.
     a_cols = rmap.get_indices(a)
     rmap._free |= set(a_cols)
 
-    b = InputNode("b", 4)
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
     with pytest.raises(
         AssertionError, match=r"free set proposed columns already owned"
     ):
@@ -59,7 +59,7 @@ def test_D_check_invariants_catches_missing_column():
     """After mutation, if a column is neither in _free nor in any node's
     indices, _check_invariants names the missing column(s)."""
     rmap = ResidualStreamMap(16)
-    a = InputNode("a", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
     rmap.allocate(a)
 
     # Poison: remove one column from _free without adding it anywhere.
@@ -73,8 +73,8 @@ def test_D_check_invariants_catches_missing_column():
 def test_D_check_invariants_catches_pairwise_overlap():
     """If two nodes' index lists share a column, disjointness check fires."""
     rmap = ResidualStreamMap(16)
-    a = InputNode("a", 4)
-    b = InputNode("b", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
     rmap.allocate(a)
     rmap.allocate(b)
 
@@ -126,7 +126,7 @@ def test_B_attn_rejects_v_source_cols_wrong_length():
     """_write_compute_attn raises when V source_cols length doesn't match
     value_in width."""
     pos = PosEncoding(d_pos=D_HEAD)
-    v_in = InputNode("v", 4)
+    v_in = InputNode("v", 4, value_range=(-100.0, 100.0))
     node = Attn(
         query_in=pos,
         key_in=pos,
@@ -156,7 +156,7 @@ def test_B_attn_rejects_v_source_cols_wrong_length():
 
 def test_B_attn_rejects_q_source_cols_wrong_length():
     pos = PosEncoding(d_pos=D_HEAD)
-    v_in = InputNode("v", 4)
+    v_in = InputNode("v", 4, value_range=(-100.0, 100.0))
     node = Attn(
         query_in=pos,
         key_in=pos,
@@ -194,7 +194,7 @@ def test_A_end_of_layer_catches_freed_too_early(monkeypatch):
     gated end-of-layer check fires with the consumer names."""
     # Two-node linear chain: x -> l (Linear). Compile expects l to read
     # x's columns, so x must stay allocated while l is uncomputed.
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     weight = torch.eye(4, 4)
     bias = torch.zeros(4)
     l = Linear(x, weight, bias)
@@ -226,7 +226,7 @@ def test_A_require_live_raises_for_unallocated_input():
     from torchwright.compiler.forward.scheduler import LayerScheduler
 
     pos = PosEncoding(d_pos=D_HEAD)
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     weight = torch.eye(4, 4)
     bias = torch.zeros(4)
     l = Linear(x, weight, bias)

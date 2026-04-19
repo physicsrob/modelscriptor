@@ -16,8 +16,8 @@ def test_get_prev_value():
     cond_values = torch.tensor([[1.0], [0.0], [0.0], [1.0], [0.0]])
     expected_prev_values = torch.tensor([[1.0], [1.0], [1.0], [4.0], [4.0]])
 
-    value_input = InputNode("value", 1)
-    cond_input = InputNode("cond", 1)
+    value_input = InputNode("value", 1, value_range=(-100.0, 100.0))
+    cond_input = InputNode("cond", 1, value_range=(-100.0, 100.0))
     pos_encoding = PosEncoding(16)
     last_input = pos_encoding.get_prev_value(value_input, cond_input)
     output = last_input.compute(
@@ -28,7 +28,7 @@ def test_get_prev_value():
 
 def test_attend_to_offset():
     input_values = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
-    value_input = InputNode("value", 1)
+    value_input = InputNode("value", 1, value_range=(-100.0, 100.0))
     pos_encoding = PosEncoding(16)
     last_input = pos_encoding.attend_to_offset(value_input, delta_pos=-1)
     output = last_input.compute(n_pos=5, input_values={"value": input_values})

@@ -77,15 +77,10 @@ def map_to_table(
     # the output is approximately integer (softmax-leakage on overlapping
     # keys is the only source of non-integer drift, same reason compare
     # declares APPROXIMATE).
-    from torchwright.graph.value_type import Guarantee
     from torchwright.graph.value_type import is_integer_tensor
 
     all_values = list(key_to_value.values()) + [default]
-    is_int = (
-        Guarantee.APPROXIMATE
-        if all(is_integer_tensor(v) for v in all_values)
-        else False
-    )
+    is_int = all(is_integer_tensor(v) for v in all_values)
     return assert_matches_value_type(
         result,
         NodeValueType(value_range=Range(lo, hi), is_integer=is_int),
@@ -113,17 +108,17 @@ def _select_output_type(
     true_node: Node,
     false_node: Node,
 ) -> NodeValueType:
-    from torchwright.graph.value_type import _min_guarantee
-
-    if not cond.value_type.is_sign:
-        return NodeValueType.unknown()
     tv = true_node.value_type
     fv = false_node.value_type
     r = tv.value_range.union(fv.value_range)
-    cond_g = cond.value_type.is_sign
-    is_int = _min_guarantee(cond_g, _min_guarantee(tv.is_integer, fv.is_integer))
-    is_bin = _min_guarantee(cond_g, _min_guarantee(tv.is_binary, fv.is_binary))
-    is_onehot = _min_guarantee(cond_g, _min_guarantee(tv.is_one_hot, fv.is_one_hot))
+    if not r.is_finite():
+        return NodeValueType.unknown()
+    if not cond.value_type.is_sign:
+        return NodeValueType(value_range=r)
+    is_int = tv.is_integer and fv.is_integer
+    is_bin = tv.is_binary and fv.is_binary
+    is_sgn = tv.is_sign and fv.is_sign
+    is_onehot = tv.is_one_hot and fv.is_one_hot
     if is_onehot:
         return NodeValueType(
             value_range=r,
@@ -133,6 +128,8 @@ def _select_output_type(
         )
     if is_bin:
         return NodeValueType(value_range=r, is_integer=is_int, is_binary=is_bin)
+    if is_sgn:
+        return NodeValueType(value_range=r, is_integer=is_int, is_sign=is_sgn)
     if is_int:
         return NodeValueType(value_range=r, is_integer=is_int)
     return NodeValueType(value_range=r)
@@ -173,17 +170,15 @@ def select(
     Returns:
         Node: Either true_node or false_node based on the condition.
     """
-    assert len(cond) == 1  # Condition must be length 1
+    from torchwright.ops.const import step_sharpness
+
+    assert len(cond) == 1
     assert len(true_node) == len(false_node)
 
     d = len(true_node)
     M = _select_offset(true_node, false_node, "select")
 
     if approximate:
-        # Fused single L→R→L reading [cond, true_node, false_node]:
-        #   unit_a[j] = ReLU( M*cond + true_j)   -- alive when cond=+1
-        #   unit_b[j] = ReLU(-M*cond + false_j)  -- alive when cond=-1
-        #   out_j     = unit_a[j] + unit_b[j] - M
         d_hidden = 2 * d
         input_proj = torch.zeros(d_hidden, 1 + 2 * d)
         input_bias = torch.zeros(d_hidden)
@@ -210,7 +205,6 @@ def select(
             name="select",
         )
     else:
-        # Sublayer 1: c_off = ReLU(-cond), c_on = ReLU(cond) -- both in {0, 1}.
         cond_gates = linear_relu_linear(
             input_node=cond,
             input_proj=torch.tensor([[-1.0], [1.0]]),
@@ -219,12 +213,6 @@ def select(
             output_bias=torch.tensor([0.0, 0.0]),
             name="select_cond_gates",
         )
-        # Sublayer 2 reads [c_off, c_on, true, false]:
-        #   unit_t_pos[j] = ReLU( true[j]  - M*c_off)    alive when cond=+1
-        #   unit_t_neg[j] = ReLU(-true[j]  - M*c_off)
-        #   unit_f_pos[j] = ReLU( false[j] - M*c_on)     alive when cond=-1
-        #   unit_f_neg[j] = ReLU(-false[j] - M*c_on)
-        #   out[j] = (unit_t_pos - unit_t_neg) + (unit_f_pos - unit_f_neg)
         d_hidden = 4 * d
         d_input = 2 + 2 * d
         input_proj = torch.zeros(d_hidden, d_input)
@@ -237,12 +225,10 @@ def select(
             t_neg = d + j
             f_pos = 2 * d + j
             f_neg = 3 * d + j
-            # true-branch units gate by c_off (input col 0)
             input_proj[t_pos, 0] = -M
             input_proj[t_pos, 2 + j] = 1.0
             input_proj[t_neg, 0] = -M
             input_proj[t_neg, 2 + j] = -1.0
-            # false-branch units gate by c_on (input col 1)
             input_proj[f_pos, 1] = -M
             input_proj[f_pos, 2 + d + j] = 1.0
             input_proj[f_neg, 1] = -M
@@ -264,7 +250,17 @@ def select(
 
     vt = _select_output_type(cond, true_node, false_node)
     if vt != NodeValueType.unknown():
-        result = assert_matches_value_type(result, vt)
+        gate_atol = max(1e-3, M / step_sharpness) if approximate else 1e-3
+        result = assert_matches_value_type(result, vt, atol=gate_atol)
+    from torchwright.graph.affine_rules import (
+        _apply_semantic_override,
+        _select_semantic_bound,
+    )
+
+    _apply_semantic_override(
+        result,
+        _select_semantic_bound(true_node._affine_bound, false_node._affine_bound),
+    )
     return result
 
 
@@ -337,11 +333,7 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
         output_bias=output_bias,
         name="in_range",
     )
-    from torchwright.graph.value_type import Guarantee
-
-    return assert_matches_value_type(
-        result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE)
-    )
+    return assert_matches_value_type(result, NodeValueType.sign())
 
 
 def dynamic_extract(

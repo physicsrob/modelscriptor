@@ -22,6 +22,9 @@ through the gate's off-path. The old global ``big_offset = 1000`` gave
 win (M ≈ 2·max_abs rather than 1000) while tolerating modest drift."""
 
 
+_MAX_REASONABLE_OFFSET = 1e6
+
+
 def _max_abs_or_raise(vt: NodeValueType, caller: str) -> float:
     r = vt.value_range
     m = max(abs(r.lo), abs(r.hi))
@@ -31,7 +34,13 @@ def _max_abs_or_raise(vt: NodeValueType, caller: str) -> float:
             f"got {vt}. Wrap the upstream node with "
             f"`assert_matches_value_type(node, NodeValueType(value_range=Range(lo, hi)))`."
         )
-    return _GATE_OFFSET_SAFETY_FACTOR * m
+    M = _GATE_OFFSET_SAFETY_FACTOR * m
+    assert M <= _MAX_REASONABLE_OFFSET, (
+        f"{caller}: M offset {M:.2e} exceeds sanity bound {_MAX_REASONABLE_OFFSET:.0e}. "
+        f"Input value_range={r} is likely a stale or un-clamped range — "
+        f"check that upstream value_type propagation returns bounded ranges."
+    )
+    return M
 
 
 def bool_any_true(inp_list: List[Node]) -> Node:
@@ -136,11 +145,7 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
         output_proj=output_proj,
         output_bias=output_bias,
     )
-    from torchwright.graph.value_type import Guarantee
-
-    return assert_matches_value_type(
-        result, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE)
-    )
+    return assert_matches_value_type(result, NodeValueType.sign())
 
 
 def cond_add_vector(
@@ -192,24 +197,23 @@ def cond_add_vector(
 
 
 def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
-    from torchwright.graph.value_type import _min_guarantee
-
-    if not cond.value_type.is_sign:
-        return NodeValueType.unknown()
     vt = inp.value_type
     r = vt.value_range
+    if not r.is_finite():
+        return NodeValueType.unknown()
     out_range = Range(min(0.0, r.lo), max(0.0, r.hi))
-    cond_g = cond.value_type.is_sign
+    if not cond.value_type.is_sign:
+        return NodeValueType(value_range=out_range)
     if vt.is_binary:
         return NodeValueType(
             value_range=out_range,
-            is_integer=_min_guarantee(cond_g, vt.is_integer),
-            is_binary=_min_guarantee(cond_g, vt.is_binary),
+            is_integer=vt.is_integer,
+            is_binary=vt.is_binary,
         )
     if vt.is_integer:
         return NodeValueType(
             value_range=out_range,
-            is_integer=_min_guarantee(cond_g, vt.is_integer),
+            is_integer=vt.is_integer,
         )
     return NodeValueType(value_range=out_range)
 
@@ -241,15 +245,10 @@ def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
        measured at commit a979f69. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
-
     d = len(inp)
     M = _max_abs_or_raise(inp.value_type, "cond_gate")
 
     if approximate:
-        # Single L->ReLU->L reading [cond, inp]:
-        #   unit_a[j] = ReLU( M * cond + inp[j])  -- alive when cond=+1
-        #   unit_b[j] = ReLU(-M * cond)           -- alive when cond=-1
-        #   out[j]    = unit_a[j] + unit_b[j] - M
         d_hidden = 2 * d
         input_proj = torch.zeros(d_hidden, 1 + d)
         input_bias = torch.zeros(d_hidden)
@@ -275,8 +274,6 @@ def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
             name="cond_gate",
         )
     else:
-        # Two-sublayer cancellation-free gate.
-        # Sublayer 1: c_off = ReLU(-cond)   -- {0, 1} via ReLU clipping
         c_off = linear_relu_linear(
             input_node=cond,
             input_proj=torch.tensor([[-1.0]]),
@@ -285,10 +282,6 @@ def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
             output_bias=torch.tensor([0.0]),
             name="cond_gate_c_off",
         )
-        # Sublayer 2 reads [c_off, inp]:
-        #   unit_pos[j] = ReLU( inp[j] - M * c_off)
-        #   unit_neg[j] = ReLU(-inp[j] - M * c_off)
-        #   out[j]      = unit_pos[j] - unit_neg[j]
         d_hidden = 2 * d
         input_proj = torch.zeros(d_hidden, 1 + d)
         input_bias = torch.zeros(d_hidden)
@@ -317,5 +310,12 @@ def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
 
     vt = _cond_gate_output_type(cond, inp)
     if vt != NodeValueType.unknown():
-        result = assert_matches_value_type(result, vt)
+        gate_atol = max(1e-3, M / step_sharpness) if approximate else 1e-3
+        result = assert_matches_value_type(result, vt, atol=gate_atol)
+    from torchwright.graph.affine_rules import (
+        _apply_semantic_override,
+        _cond_gate_semantic_bound,
+    )
+
+    _apply_semantic_override(result, _cond_gate_semantic_bound(inp._affine_bound, inp))
     return result

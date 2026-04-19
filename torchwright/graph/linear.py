@@ -1,9 +1,9 @@
-from typing import List, Dict, Optional
+from typing import Optional
+
 from torchwright.graph import Node
 from torchwright.graph.value_type import (
     NodeValueType,
     is_integer_tensor,
-    linear_output_range,
 )
 
 import torch
@@ -51,59 +51,11 @@ class Linear(Node):
         return torch.matmul(value_in, self.output_matrix) + self.output_bias
 
     def compute_value_type(self) -> NodeValueType:
-        from torchwright.graph.misc import Concatenate
-        from torchwright.graph.value_type import Range
-
-        inp = self.inputs[0]
-        inp_t = inp.value_type
+        inp_t = self.inputs[0].value_type
         weights_int = is_integer_tensor(self.output_matrix)
         bias_int = is_integer_tensor(self.output_bias)
-        # Preserve the input's guarantee level when weights and bias are integer.
         is_int = inp_t.is_integer if (weights_int and bias_int) else False
-
-        # If the input is a Concatenate, each child slab has its own range;
-        # using the Concatenate's scalar summary (union across all children)
-        # hugely over-estimates the output range when the children have very
-        # different ranges (e.g. ``[cond (-1,1), inp (-30,30)]``).
-        # Do interval arithmetic slab-by-slab for a much tighter bound.
-        if isinstance(inp, Concatenate) and inp.inputs:
-            row = 0
-            per_col_mins = None
-            per_col_maxs = None
-            for child in inp.flatten_inputs():
-                child_range = child.value_type.value_range
-                child_rows = len(child)
-                child_matrix = self.output_matrix[row : row + child_rows]
-                row += child_rows
-                if not child_range.is_finite():
-                    # Bail to the scalar summary path — this child dominates.
-                    per_col_mins = None
-                    break
-                lo_prod = child_range.lo * child_matrix
-                hi_prod = child_range.hi * child_matrix
-                child_mins = torch.minimum(lo_prod, hi_prod).sum(dim=0)
-                child_maxs = torch.maximum(lo_prod, hi_prod).sum(dim=0)
-                if per_col_mins is None:
-                    per_col_mins = child_mins
-                    per_col_maxs = child_maxs
-                else:
-                    per_col_mins = per_col_mins + child_mins
-                    assert per_col_maxs is not None  # set alongside per_col_mins
-                    per_col_maxs = per_col_maxs + child_maxs
-            if per_col_mins is not None:
-                assert per_col_maxs is not None  # set alongside per_col_mins
-                per_col_mins = per_col_mins + self.output_bias
-                per_col_maxs = per_col_maxs + self.output_bias
-                out_range = Range(
-                    float(per_col_mins.min().item()),
-                    float(per_col_maxs.max().item()),
-                )
-                return NodeValueType(value_range=out_range, is_integer=is_int)
-
-        out_range = linear_output_range(
-            inp_t.value_range, self.output_matrix, self.output_bias
-        )
-        return NodeValueType(value_range=out_range, is_integer=is_int)
+        return NodeValueType(is_integer=is_int)
 
     def num_params(self):
         return self.d_input * self.d_output + self.d_output

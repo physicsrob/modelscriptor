@@ -193,7 +193,7 @@ def forward_compile(
     output_node = graph.get_output_node()
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
 
-    # Unwrap any Assert keys in the overlays dict that were stripped above.
+    # Unwrap any Assert keys in the overlays dict.
     if overlays:
         from torchwright.graph.misc import Assert
 

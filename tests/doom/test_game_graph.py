@@ -160,40 +160,14 @@ class TestGameGraph:
         ref = _ref_frame(0.0, 0.0, angle, segs, config, textures)
 
         compare_images(frame, ref).assert_matches(
-            min_matched_fraction=0.95,
-            max_err=0.35,
+            min_matched_fraction=0.96,
+            max_err=0.30,
         )
 
     @pytest.mark.parametrize(
         "px,py,angle",
         [
-            pytest.param(
-                3.0,
-                2.0,
-                20,
-                marks=pytest.mark.xfail(
-                    reason=(
-                        "Phase E regression, root cause partially characterized. "
-                        "At sort[0] the SORTED attend_argmin_above_integer softmax "
-                        "concentrates on SORTED[0] itself (weight=1.0, logit=+800) "
-                        "rather than any WALL position (logits +555..+637, expected "
-                        "+1000).  Raw sel_bsp_rank reads -1171.875 instead of a "
-                        "clean integer in [0, max_walls-1]; sort_done correctly "
-                        "fires and the 99-sentinel replaces the bogus value, but "
-                        "downstream THINKING/RENDER produce incorrect pixels.  The "
-                        "magnitude of the error (score contamination on the order "
-                        "of 100) is outside any documented per-op noise budget and "
-                        "is most naturally explained by residual-column aliasing in "
-                        "the compiled SORTED attention layer — the specific "
-                        "aliasing pair has NOT yet been identified.  See "
-                        "docs/postmortems/phase_e_xfail.md for the full evidence, "
-                        "the calculation that rules out per-op noise, and what "
-                        "would fix it.  Fixing requires compiler-internals work "
-                        "beyond the plan-6 investigation scope; tracked there."
-                    ),
-                    strict=True,
-                ),
-            ),
+            (3.0, 2.0, 20),
             (-2.0, 3.0, 240),  # off-center, looking at wall at steep angle
             (1.0, -3.0, 50),  # off-center, oblique to two walls
         ],
@@ -213,8 +187,8 @@ class TestGameGraph:
         ref = _ref_frame(px, py, angle, segs, config, textures)
 
         compare_images(frame, ref).assert_matches(
-            min_matched_fraction=0.95,
-            max_err=0.35,
+            min_matched_fraction=0.96,
+            max_err=0.30,
         )
 
     # ── Collision detection tests ──────────────────────────────────

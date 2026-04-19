@@ -61,7 +61,20 @@ measure-noise:
 
 .PHONY: walkthrough
 walkthrough:
-	uv run modal run modal_walkthrough.py $(ARGS)
+	@bash -c ' \
+		LOGFILE=/tmp/torchwright-walkthrough-$$(date +%Y%m%d-%H%M%S).log ; \
+		ln -sfn "$$LOGFILE" /tmp/torchwright-walkthrough.log ; \
+		echo "=== Log file: $$LOGFILE ===" | tee "$$LOGFILE" ; \
+		echo "=== Rendering walkthrough on Modal ===" | tee -a "$$LOGFILE" ; \
+		start=$$(date +%s) ; \
+		uv run modal run modal_walkthrough.py $(ARGS) 2>&1 | tee -a "$$LOGFILE" ; \
+		rc=$${PIPESTATUS[0]} ; \
+		end=$$(date +%s) ; \
+		echo "" | tee -a "$$LOGFILE" ; \
+		echo "=== Finished in $$((end - start))s (exit $$rc) ===" | tee -a "$$LOGFILE" ; \
+		echo "=== Log file: $$LOGFILE ===" | tee -a "$$LOGFILE" ; \
+		exit $$rc \
+	'
 	xdg-open walkthrough.gif
 	xdg-open reference.gif
 
@@ -72,8 +85,22 @@ modal-run:
 	    echo "Example: make modal-run MODULE=scripts.investigate_phase_e" >&2 ; \
 	    exit 2 ; \
 	fi
-	uv run modal run modal_run.py \
-	    $(if $(MODULE),--module $(MODULE)) \
-	    $(if $(SCRIPT),--script $(SCRIPT)) \
-	    $(if $(ARGS),--args "$(ARGS)") \
-	    $(if $(CPU_ONLY),--cpu-only)
+	@bash -c ' \
+		LOGFILE=/tmp/torchwright-modal-run-$$(date +%Y%m%d-%H%M%S).log ; \
+		ln -sfn "$$LOGFILE" /tmp/torchwright-modal-run.log ; \
+		echo "=== Log file: $$LOGFILE ===" | tee "$$LOGFILE" ; \
+		echo "=== Running on Modal ===" | tee -a "$$LOGFILE" ; \
+		start=$$(date +%s) ; \
+		uv run modal run modal_run.py \
+		    $(if $(MODULE),--module $(MODULE)) \
+		    $(if $(SCRIPT),--script $(SCRIPT)) \
+		    $(if $(ARGS),--args "$(ARGS)") \
+		    $(if $(CPU_ONLY),--cpu-only) \
+		    2>&1 | tee -a "$$LOGFILE" ; \
+		rc=$${PIPESTATUS[0]} ; \
+		end=$$(date +%s) ; \
+		echo "" | tee -a "$$LOGFILE" ; \
+		echo "=== Finished in $$((end - start))s (exit $$rc) ===" | tee -a "$$LOGFILE" ; \
+		echo "=== Log file: $$LOGFILE ===" | tee -a "$$LOGFILE" ; \
+		exit $$rc \
+	'

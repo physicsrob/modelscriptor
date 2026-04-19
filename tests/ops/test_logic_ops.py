@@ -131,14 +131,13 @@ def test_cond_gate_adaptive_M_uses_value_range():
     assert abs(output.item() - small) < 1.0e-6
 
 
-def test_cond_gate_rejects_unbounded_inp():
-    """Unbounded inp range fails at build time with a TypeError pointing at value_range."""
-    import pytest
-
+def test_cond_gate_builds_eagerly():
+    """cond_gate with bounded inputs builds eagerly (no placeholder)."""
     x = create_input("x", 1)
     cond_input = create_input("cond", 1)
-    with pytest.raises(TypeError, match="value_range"):
-        cond_gate(cond_input, x)
+    result = cond_gate(cond_input, x)
+    assert result._affine_bound is not None
+    assert result.value_type.value_range.is_finite()
 
 
 def test_bool_any_true():

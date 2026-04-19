@@ -37,6 +37,12 @@ class ResidualAssignment:
     def assign(self, state: ResidualStreamState, node: Node, indices: List[int]):
         self.mapping[state][node] = indices
 
+    def add_alias(self, alias: Node, target: Node):
+        """Make *alias* resolve to the same indices as *target* in all states."""
+        for state in self.mapping:
+            if target in self.mapping[state]:
+                self.mapping[state][alias] = self.mapping[state][target]
+
     def duplicate_state(self, src: ResidualStreamState, dst: ResidualStreamState):
         self.mapping[dst] = self.mapping[src]
 

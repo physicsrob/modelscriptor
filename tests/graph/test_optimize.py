@@ -9,7 +9,7 @@ from torchwright.graph.optimize import fuse_consecutive_linears
 
 def test_fuse_simple_chain():
     """Fuse L1 -> L2 into a single Linear."""
-    inp = InputNode("x", 4)
+    inp = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(inp, torch.randn(4, 3), torch.randn(3), name="l1")
     l2 = Linear(l1, torch.randn(3, 2), torch.randn(2), name="l2")
 
@@ -31,7 +31,7 @@ def test_fuse_simple_chain():
 
 def test_fuse_chain_of_three():
     """Fuse L1 -> L2 -> L3 in two passes."""
-    inp = InputNode("x", 4)
+    inp = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(inp, torch.randn(4, 3), name="l1")
     l2 = Linear(l1, torch.randn(3, 2), name="l2")
     l3 = Linear(l2, torch.randn(2, 1), name="l3")
@@ -73,7 +73,7 @@ def test_fuse_chain_ordering_regression():
     for offset in [0, 5, 101, 997]:
         node_module.global_node_id = offset
 
-        inp = InputNode("x", 4)
+        inp = InputNode("x", 4, value_range=(-100.0, 100.0))
         l1 = Linear(inp, torch.randn(4, 3), name="l1")
         l2 = Linear(l1, torch.randn(3, 2), name="l2")
         l3 = Linear(l2, torch.randn(2, 1), name="l3")
@@ -101,7 +101,7 @@ def test_fuse_chain_ordering_regression():
 
 def test_no_fuse_multiple_consumers():
     """Don't fuse when L1 has multiple consumers."""
-    inp = InputNode("x", 4)
+    inp = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(inp, torch.randn(4, 3), name="l1")
     l2 = Linear(l1, torch.randn(3, 2), name="l2")
     l3 = Linear(l1, torch.randn(3, 2), name="l3")  # Another consumer of l1
@@ -112,7 +112,7 @@ def test_no_fuse_multiple_consumers():
 
 def test_no_fuse_concatenate_input():
     """Don't fuse when L2's input is a Concatenate (even if it wraps a Linear)."""
-    inp = InputNode("x", 4)
+    inp = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(inp, torch.randn(4, 3), name="l1")
     concat = Concatenate([l1])  # Wrap l1 in a Concatenate
     l2 = Linear(concat, torch.randn(3, 2), name="l2")
@@ -123,7 +123,7 @@ def test_no_fuse_concatenate_input():
 
 def test_fuse_preserves_annotation():
     """Fused node keeps L2's annotation."""
-    inp = InputNode("x", 4)
+    inp = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(inp, torch.randn(4, 3), name="l1")
     l1.annotation = "first"
     l2 = Linear(l1, torch.randn(3, 2), name="l2")
@@ -142,7 +142,7 @@ def test_no_fuse_param_increase():
     This guards against "inverse bottleneck" patterns where the intermediate
     dimension is smaller than both input and output.
     """
-    inp = InputNode("x", 4)
+    inp = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(inp, torch.randn(4, 1), torch.randn(1), name="bottleneck")
     l2 = Linear(l1, torch.randn(1, 100), torch.randn(100), name="expand")
 
@@ -162,7 +162,7 @@ def test_fuse_param_decrease():
     Example: L1 (100 -> 10) -> L2 (10 -> 3) uses 100*10 + 10 + 10*3 + 3 = 1043 params.
     Fused (100 -> 3) uses 100*3 + 3 = 303 params — ~70% reduction.
     """
-    inp = InputNode("x", 100)
+    inp = InputNode("x", 100, value_range=(-100.0, 100.0))
     l1 = Linear(inp, torch.randn(100, 10), torch.randn(10), name="compress")
     l2 = Linear(l1, torch.randn(10, 3), torch.randn(3), name="final")
 

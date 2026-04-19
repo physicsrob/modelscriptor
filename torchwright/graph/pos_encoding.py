@@ -12,7 +12,7 @@ class PosEncoding(Node):
         super().__init__(d_pos, [])
 
     def compute_value_type(self) -> NodeValueType:
-        return NodeValueType.bounded(-1.0, 1.0)
+        return NodeValueType()
 
     def get_pos_encoding(self, n_pos: int):
         # Compute the positional encodings once in log space.

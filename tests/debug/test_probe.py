@@ -69,8 +69,8 @@ def test_reference_eval_matches_direct_compute_tiny():
     from torchwright.graph.misc import InputNode
     from torchwright.ops.arithmetic_ops import add, add_const, multiply_const
 
-    x = InputNode("x", 1)
-    y = InputNode("y", 1)
+    x = InputNode("x", 1, value_range=(-100.0, 100.0))
+    y = InputNode("y", 1, value_range=(-100.0, 100.0))
     # Graph: output = 2*x + (y + 3)  -- ~4 Linear nodes, easy to reason about.
     scaled = multiply_const(x, 2.0)
     shifted = add_const(y, 3.0)

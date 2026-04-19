@@ -58,7 +58,7 @@ def _make_relu_chain(inp, d_hidden, d_out, name=""):
 def test_schedule_attn_node():
     """Attn node produces AttnHeadOp('compute_attn')."""
     pos = _make_pos_encoding()
-    v = InputNode("v", 4)
+    v = InputNode("v", 4, value_range=(-100.0, 100.0))
     attn_node = pos.attend_to_offset(v, delta_pos=-1)
 
     graph = GraphAnalyzer(attn_node)
@@ -79,7 +79,7 @@ def test_schedule_attn_node():
 def test_schedule_relu_chain():
     """L->R->L chain produces MLPOp('compute_relu'); all 3 nodes marked computed."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l2, r, l1 = _make_relu_chain(x, 8, 3, "chain")
 
     graph = GraphAnalyzer(l2)
@@ -128,7 +128,7 @@ def test_schedule_constant():
 def test_schedule_zero_bias_linear():
     """Zero-bias Linear (len <= d_head) produces AttnHeadOp('compute_linear')."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     linear = _make_linear(x, 3, "lin")
 
     graph = GraphAnalyzer(linear)
@@ -153,7 +153,7 @@ def test_schedule_large_input_linear():
     With d_input=32 and d_head=16, needs multiple attention heads.
     """
     pos = _make_pos_encoding()
-    inputs = [InputNode(f"x{i}", 8) for i in range(4)]
+    inputs = [InputNode(f"x{i}", 8, value_range=(-100.0, 100.0)) for i in range(4)]
     cat = Concatenate(inputs)
     d_out = 8
     W = torch.zeros(32, d_out)
@@ -179,7 +179,7 @@ def test_schedule_large_input_linear():
 def test_schedule_biased_linear():
     """Biased Linear (len <= d_head) produces both AttnHeadOp and MLPOp in same layer."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     linear = _make_biased_linear(x, 3, "biased")
 
     graph = GraphAnalyzer(linear)
@@ -205,7 +205,7 @@ def test_schedule_biased_linear():
 def test_schedule_cancellation():
     """Dead node (all consumers computed) produces cancel AttnHeadOp."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     a = _make_linear(x, 4, "a")
     l2, r, l1 = _make_relu_chain(a, 8, 3, "out")
     # Graph: x -> a -> l1 -> r -> l2 (output)
@@ -245,11 +245,11 @@ def test_schedule_free_add():
     live_node has another consumer (other) that isn't computed — NOT dead for add.
     """
     pos = _make_pos_encoding()
-    dead_node = InputNode("dead", 4)
-    live_node = InputNode("live", 4)
+    dead_node = InputNode("dead", 4, value_range=(-100.0, 100.0))
+    live_node = InputNode("live", 4, value_range=(-100.0, 100.0))
     add_node = Add(dead_node, live_node)
     # Give live_node another consumer so it's NOT dead-for-add
-    other = _make_linear(live_node, 2, "other")
+    other = _make_linear(live_node, 4, "other")
     out = Add(add_node, other)
 
     graph = GraphAnalyzer(out)
@@ -282,8 +282,8 @@ def test_schedule_deferred_add_via_compute():
     # cancellation can push over.
     d_test = 128
     pos = _make_pos_encoding()
-    a = InputNode("a", 4)
-    b = InputNode("b", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
     a_other = _make_linear(a, 2, "a_other")
     b_other = _make_linear(b, 2, "b_other")
@@ -316,11 +316,11 @@ def test_schedule_add_into_preferred_over_compute_add():
     ones. The scheduler should prefer the cheaper option.
     """
     pos = _make_pos_encoding()
-    a = InputNode("a", 4)
-    b = InputNode("b", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
     # Give b another consumer so it's NOT dead-for-add, but a IS dead-for-add
-    b_other = _make_linear(b, 2, "b_other")
+    b_other = _make_linear(b, 4, "b_other")
     out = Add(add_node, b_other)
 
     graph = GraphAnalyzer(out)
@@ -344,8 +344,8 @@ def test_schedule_add_both_addends_dead():
     Both a and b have no consumers besides add_node → both dead-for-add.
     """
     pos = _make_pos_encoding()
-    a = InputNode("a", 4)
-    b = InputNode("b", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
 
     graph = GraphAnalyzer(add_node)
@@ -372,7 +372,7 @@ def test_schedule_add_both_addends_dead():
 def test_head_budget_exhaustion():
     """More ready attn ops than available heads: respects budget, defers excess."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     # 6 zero-bias Linears, but only N_HEADS=4 attention heads available
     linears = [_make_linear(x, 2, f"lin{i}") for i in range(6)]
     out_cat = Concatenate(linears)
@@ -397,7 +397,7 @@ def test_head_budget_exhaustion():
 def test_mlp_slot_exhaustion():
     """More L->R->L chains than MLP slots: respects slot budget."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     # 4 chains × 20 slots each = 80 > D=64
     chains = []
     for i in range(4):
@@ -437,8 +437,10 @@ def test_schedule_under_column_pressure():
     Scheduler must cancel x to free space, then schedule the chain.
     """
     pos = _make_pos_encoding()
-    filler = InputNode("filler", D - D_HEAD - 8)  # 40 cols, not in graph
-    x = InputNode("x", 4)
+    filler = InputNode(
+        "filler", D - D_HEAD - 8, value_range=(-100.0, 100.0)
+    )  # 40 cols, not in graph
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     a = _make_linear(x, 4, "a")
     l2, r, l1 = _make_relu_chain(a, 8, 3, "out")
 
@@ -480,7 +482,7 @@ def test_multi_layer_progression():
     Chain B depends on Chain A's output — must be scheduled in a later layer.
     """
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l2a, ra, l1a = _make_relu_chain(x, 8, 4, "a")
     l2b, rb, l1b = _make_relu_chain(l2a, 6, 3, "b")
 
@@ -509,8 +511,8 @@ def test_deferred_add_fires_via_compute_add():
     The compute_add path copies both inputs to fresh columns alongside the chains.
     """
     pos = _make_pos_encoding()
-    a = InputNode("a", 4)
-    b = InputNode("b", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
     a_chain, _, _ = _make_relu_chain(a, 8, 2, "ac")
     b_chain, _, _ = _make_relu_chain(b, 8, 2, "bc")
     add_node = Add(a, b)
@@ -543,9 +545,9 @@ def test_scheduling_with_concatenate_input():
     until all three children are computed.
     """
     pos = _make_pos_encoding()
-    a = InputNode("a", 4)
-    b = InputNode("b", 4)
-    c = InputNode("c", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
+    c = InputNode("c", 4, value_range=(-100.0, 100.0))
     cat = Concatenate([a, b, c])
     l2, r, l1 = _make_relu_chain(cat, 8, 3, "out")
 
@@ -579,8 +581,8 @@ def test_scheduling_with_concatenate_input():
 def test_mixed_attn_and_mlp():
     """Both Attn node and L->R->L chain ready: both scheduled in same layer."""
     pos = _make_pos_encoding()
-    v = InputNode("v", 4)
-    x = InputNode("x", 4)
+    v = InputNode("v", 4, value_range=(-100.0, 100.0))
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     attn_node = pos.attend_to_offset(v, delta_pos=-1)
     l2, r, l1 = _make_relu_chain(x, 8, 3, "chain")
     out_cat = Concatenate([attn_node, l2])
@@ -614,10 +616,10 @@ def test_schedule_standalone_relu():
     is an Add, not a Linear — so it's not part of any chain.
     """
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     relu_node = ReLU(x, name="standalone")
     # ReLU feeds into an Add, not a Linear → not part of a chain
-    other = InputNode("other", 4)
+    other = InputNode("other", 4, value_range=(-100.0, 100.0))
     add_node = Add(relu_node, other)
 
     graph = GraphAnalyzer(add_node)
@@ -645,7 +647,7 @@ def test_relu_chain_broken_by_fanout():
     strategy, or compute the chain while also placing L1 in the stream).
     """
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
     r = ReLU(l1, name="r")
     l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
@@ -679,7 +681,7 @@ def test_linear_with_computed_relu_input():
     This tests the fix for scheduler deadlock after optimization passes.
     """
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
     r = ReLU(l1, name="r")
     l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
@@ -719,8 +721,8 @@ def test_no_progress_raises_error():
     No dead nodes to cancel. → deadlock → error.
     """
     pos = _make_pos_encoding()
-    a = InputNode("a", 4)
-    b = InputNode("b", 4)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
     a_consumer = _make_linear(a, 2, "ac")
     b_consumer = _make_linear(b, 2, "bc")
     add_node = Add(a, b)
@@ -762,7 +764,9 @@ def test_add_into_shared_addend_not_reassigned():
     shared = LiteralValue(torch.randn(4))
 
     # 3 Add nodes sharing the same LiteralValue, each with a unique dead addend
-    dead_nodes = [InputNode(f"dead{i}", 4) for i in range(3)]
+    dead_nodes = [
+        InputNode(f"dead{i}", 4, value_range=(-100.0, 100.0)) for i in range(3)
+    ]
     adds = [Add(shared, dn) for dn in dead_nodes]
     # Wire into output so graph includes everything
     out_cat = Concatenate(adds)
@@ -802,7 +806,7 @@ def test_add_into_shared_addend_not_reassigned():
 def test_output_already_computed():
     """When all graph nodes are already computed, schedule_layer doesn't error."""
     pos = _make_pos_encoding()
-    x = InputNode("x", 4)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
     out = _make_linear(x, 2, "out")
 
     graph = GraphAnalyzer(out)

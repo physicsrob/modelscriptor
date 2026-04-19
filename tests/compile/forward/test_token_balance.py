@@ -56,6 +56,10 @@ def test_token_balance():
     """Compile and verify equal-count detection for 'a' and 'b'."""
     net, output_node, embedding = _build()
 
+    n_layers = len(net.layers)
+    print(f"token_balance: {n_layers} layers, d={D}, d_head={D_HEAD}")
+    assert n_layers <= 40, f"Too many layers: {n_layers}"
+
     test_cases = [
         # Balanced
         ("ab", "Y"),
@@ -80,11 +84,3 @@ def test_token_balance():
         assert (
             result == expected
         ), f"For '{input_str}': expected '{expected}' but got '{result}'"
-
-
-def test_token_balance_layer_count():
-    """Verify compilation stays within a reasonable layer budget."""
-    net, _, _ = _build()
-    n_layers = len(net.layers)
-    print(f"token_balance: {n_layers} layers, d={D}, d_head={D_HEAD}")
-    assert n_layers <= 40, f"Too many layers: {n_layers}"

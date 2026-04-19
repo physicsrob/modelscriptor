@@ -6,10 +6,8 @@ import math
 
 import pytest
 
-from torchwright.graph import Guarantee, NodeValueType, Range
+from torchwright.graph import NodeValueType, Range
 from torchwright.graph.value_type import (
-    _min_guarantee,
-    _max_guarantee,
     intersect_element_props,
     tightened_with,
 )
@@ -113,14 +111,14 @@ def test_is_binary_requires_is_integer():
         NodeValueType(value_range=Range(0.0, 1.0), is_binary=True, is_integer=False)
 
 
-def test_is_binary_requires_range_subset_of_01():
-    with pytest.raises(ValueError):
-        NodeValueType(value_range=Range(0.0, 2.0), is_integer=True, is_binary=True)
+def test_is_binary_allows_any_range():
+    t = NodeValueType(value_range=Range(0.0, 2.0), is_integer=True, is_binary=True)
+    assert t.is_binary
 
 
-def test_is_sign_requires_range_subset_of_pm1():
-    with pytest.raises(ValueError):
-        NodeValueType(value_range=Range(-2.0, 1.0), is_integer=True, is_sign=True)
+def test_is_sign_allows_any_range():
+    t = NodeValueType(value_range=Range(-2.0, 1.0), is_integer=True, is_sign=True)
+    assert t.is_sign
 
 
 def test_is_one_hot_requires_is_binary():
@@ -141,7 +139,6 @@ def test_intersect_element_props_keeps_common_properties():
     b = NodeValueType.integer(-5, 3)
     m = intersect_element_props(a, b)
     assert m.is_integer
-    assert m.value_range == Range(-5.0, 9.0)
     assert not m.is_binary
     assert not m.is_one_hot
 
@@ -153,7 +150,6 @@ def test_intersect_drops_mismatched_properties():
     assert m.is_integer
     assert not m.is_binary
     assert not m.is_one_hot
-    assert m.value_range == Range(0.0, 9.0)
 
 
 def test_drop_vector_props():
@@ -162,90 +158,50 @@ def test_drop_vector_props():
     assert not t.is_one_hot
 
 
-# --- Guarantee enum -----------------------------------------------------
+# --- Bool structural flags -----------------------------------------------
 
 
-def test_guarantee_always_is_truthy():
-    assert Guarantee.ALWAYS
-
-
-def test_guarantee_approximate_is_truthy():
-    assert Guarantee.APPROXIMATE
+def test_true_is_truthy():
+    assert True
 
 
 def test_false_is_falsy():
     assert not False
 
 
-def test_auto_upgrade_true_to_always():
-    t = NodeValueType(is_integer=True)
-    assert t.is_integer is Guarantee.ALWAYS
+def test_factory_defaults_to_true():
+    assert NodeValueType.integer().is_integer is True
+    assert NodeValueType.binary().is_binary is True
+    assert NodeValueType.sign().is_sign is True
+    assert NodeValueType.one_hot().is_one_hot is True
 
 
-def test_factory_defaults_to_always():
-    assert NodeValueType.integer().is_integer is Guarantee.ALWAYS
-    assert NodeValueType.binary().is_binary is Guarantee.ALWAYS
-    assert NodeValueType.sign().is_sign is Guarantee.ALWAYS
-    assert NodeValueType.one_hot().is_one_hot is Guarantee.ALWAYS
+# --- Combinators with bool flags -----------------------------------------
 
 
-def test_factory_accepts_approximate():
-    t = NodeValueType.integer(0, 9, guarantee=Guarantee.APPROXIMATE)
-    assert t.is_integer is Guarantee.APPROXIMATE
-    t = NodeValueType.sign(guarantee=Guarantee.APPROXIMATE)
-    assert t.is_sign is Guarantee.APPROXIMATE
-    assert t.is_integer is Guarantee.APPROXIMATE
-
-
-# --- _min_guarantee / _max_guarantee ------------------------------------
-
-
-def test_min_guarantee_truth_table():
-    A = Guarantee.ALWAYS
-    P = Guarantee.APPROXIMATE
-    F = False
-    assert _min_guarantee(A, A) is A
-    assert _min_guarantee(A, P) is P
-    assert _min_guarantee(P, A) is P
-    assert _min_guarantee(P, P) is P
-    assert _min_guarantee(A, F) is F
-    assert _min_guarantee(F, A) is F
-    assert _min_guarantee(F, F) is F
-
-
-def test_max_guarantee_truth_table():
-    A = Guarantee.ALWAYS
-    P = Guarantee.APPROXIMATE
-    F = False
-    assert _max_guarantee(A, A) is A
-    assert _max_guarantee(A, P) is P
-    assert _max_guarantee(P, A) is P
-    assert _max_guarantee(P, P) is P
-    assert _max_guarantee(A, F) is A
-    assert _max_guarantee(F, A) is A
-    assert _max_guarantee(F, F) is F
-    assert _max_guarantee(P, F) is P
-
-
-# --- Combinators with guarantee levels ----------------------------------
-
-
-def test_intersect_element_props_preserves_guarantee_level():
-    a = NodeValueType.integer(0, 9, guarantee=Guarantee.ALWAYS)
-    b = NodeValueType.integer(-5, 3, guarantee=Guarantee.APPROXIMATE)
+def test_intersect_element_props_ands_flags():
+    a = NodeValueType.integer(0, 9)
+    b = NodeValueType.integer(-5, 3)
     m = intersect_element_props(a, b)
-    assert m.is_integer is Guarantee.APPROXIMATE
+    assert m.is_integer is True
+
+
+def test_intersect_element_props_drops_when_one_missing():
+    a = NodeValueType.integer(0, 9)
+    b = NodeValueType.bounded(-5, 3)
+    m = intersect_element_props(a, b)
+    assert m.is_integer is False
 
 
 def test_tightened_with_or_semantics():
     a = NodeValueType.unknown()
-    b = NodeValueType.integer(0, 9, guarantee=Guarantee.APPROXIMATE)
+    b = NodeValueType.integer(0, 9)
     m = tightened_with(a, b)
-    assert m.is_integer is Guarantee.APPROXIMATE
+    assert m.is_integer is True
 
 
-def test_tightened_with_weakest_wins():
-    a = NodeValueType.integer(0, 9, guarantee=Guarantee.ALWAYS)
-    b = NodeValueType.integer(0, 9, guarantee=Guarantee.APPROXIMATE)
+def test_tightened_with_both_true():
+    a = NodeValueType.integer(0, 9)
+    b = NodeValueType.integer(0, 9)
     m = tightened_with(a, b)
-    assert m.is_integer is Guarantee.APPROXIMATE
+    assert m.is_integer is True

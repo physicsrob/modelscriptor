@@ -3,7 +3,6 @@ from typing import Callable, List, Dict, Optional, Tuple
 from torchwright.graph import Node
 from torchwright.graph.value_type import (
     NodeValueType,
-    Range,
     intersect_element_props,
     is_integer_tensor,
 )
@@ -26,7 +25,7 @@ class InputNode(Node):
         d_output_or_nothing=None,
         name: str = "",
         *,
-        value_range: Optional[Tuple[float, float]] = None,
+        value_range: Tuple[float, float],
     ):
         # Support both old and new constructor patterns:
         # - InputNode(d_output) - new anonymous pattern
@@ -45,12 +44,12 @@ class InputNode(Node):
                 name = d_output_or_nothing
         self._declared_value_range = value_range
         super().__init__(d_output, [], name=name)
+        from torchwright.graph.session import current_session
+
+        current_session().register_input(self)
 
     def compute_value_type(self) -> NodeValueType:
-        if self._declared_value_range is None:
-            return NodeValueType.unknown()
-        lo, hi = self._declared_value_range
-        return NodeValueType(value_range=Range(float(lo), float(hi)))
+        return NodeValueType()
 
     def compute(
         self, n_pos: int, input_values: dict, name: str | None = None
@@ -86,9 +85,15 @@ class Concatenate(Node):
     def compute_value_type(self) -> NodeValueType:
         if not self.inputs:
             return NodeValueType.unknown()
-        return reduce(
+        result = reduce(
             intersect_element_props,
             (inp.value_type for inp in self.inputs),
+        )
+        return NodeValueType(
+            is_integer=result.is_integer,
+            is_binary=result.is_binary,
+            is_sign=result.is_sign,
+            is_one_hot=result.is_one_hot,
         )
 
     def flatten_inputs(self: Node) -> List[Node]:
@@ -111,12 +116,9 @@ class Add(Node):
         return input1.compute(n_pos, input_values) + input2.compute(n_pos, input_values)
 
     def compute_value_type(self) -> NodeValueType:
-        from torchwright.graph.value_type import _min_guarantee
-
         a, b = self.inputs[0].value_type, self.inputs[1].value_type
         return NodeValueType(
-            value_range=a.value_range + b.value_range,
-            is_integer=_min_guarantee(a.is_integer, b.is_integer),
+            is_integer=a.is_integer and b.is_integer,
         )
 
     def other_input(self, node: Node):
@@ -140,26 +142,16 @@ class LiteralValue(Node):
         return x
 
     def compute_value_type(self) -> NodeValueType:
-        from torchwright.graph.value_type import Guarantee
-
         v = self.value
         if v.numel() == 0:
             return NodeValueType.unknown()
         lo = float(v.min().item())
         hi = float(v.max().item())
-        is_int = Guarantee.ALWAYS if is_integer_tensor(v) else False
-        is_bin = Guarantee.ALWAYS if (is_int and lo >= 0.0 and hi <= 1.0) else False
-        is_sgn = (
-            Guarantee.ALWAYS
-            if (is_int and lo >= -1.0 and hi <= 1.0 and not is_bin)
-            else False
-        )
-        # one-hot: exactly one element is 1, rest are 0 (binary vector with sum == 1)
-        is_one_hot = (
-            Guarantee.ALWAYS if (is_bin and bool(v.sum().eq(1).item())) else False
-        )
+        is_int = is_integer_tensor(v)
+        is_bin = is_int and lo >= 0.0 and hi <= 1.0
+        is_sgn = is_int and lo >= -1.0 and hi <= 1.0 and not is_bin
+        is_one_hot = is_bin and bool(v.sum().eq(1).item())
         return NodeValueType(
-            value_range=Range(lo, hi),
             is_integer=is_int,
             is_binary=is_bin,
             is_sign=is_sgn,
@@ -241,7 +233,13 @@ class Assert(Node):
 
     def compute_value_type(self) -> NodeValueType:
         if self._claimed_type is not None:
-            return self._claimed_type
+            ct = self._claimed_type
+            return NodeValueType(
+                is_integer=ct.is_integer,
+                is_binary=ct.is_binary,
+                is_sign=ct.is_sign,
+                is_one_hot=ct.is_one_hot,
+            )
         return self.inputs[0].value_type
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:

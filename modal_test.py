@@ -39,6 +39,7 @@ _MEDIUM_FILES = [
     "tests/debug/test_probe.py",
     "tests/doom/test_parametric_render.py",
     "tests/doom/test_parametric_intersection.py",
+    "tests/doom/test_render_graph_precision.py",
 ]
 
 SHARDS = [

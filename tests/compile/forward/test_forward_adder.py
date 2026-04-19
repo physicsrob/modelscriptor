@@ -2,6 +2,7 @@
 verify arithmetic correctness.
 """
 
+import pytest
 import torch
 
 from torchwright.compiler.forward.compile import forward_compile
@@ -40,11 +41,6 @@ def run_autoregressive(
     return "".join(tokens[len(input_tokens) :])
 
 
-# ---------------------------------------------------------------------------
-# 1-digit adder
-# ---------------------------------------------------------------------------
-
-
 def _build_1digit():
     import examples.adder as adder_module
 
@@ -57,8 +53,18 @@ def _build_1digit():
     return output_node, pos_encoding, embedding
 
 
-def test_1digit_adder():
-    """Compile 1-digit adder and verify arithmetic at the '\\n' position."""
+def _build_3digit():
+    output_node, pos_encoding, embedding = create_network_parts()
+    return output_node, pos_encoding, embedding
+
+
+# ---------------------------------------------------------------------------
+# Fixtures — compile once per digit count, share across tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def net_1digit():
     output_node, pos_encoding, embedding = _build_1digit()
     net = forward_compile(
         d=D,
@@ -67,6 +73,34 @@ def test_1digit_adder():
         pos_encoding=pos_encoding,
         verbose=True,
     )
+    return net, output_node, embedding
+
+
+@pytest.fixture(scope="module")
+def net_3digit():
+    output_node, pos_encoding, embedding = _build_3digit()
+    net = forward_compile(
+        d=D,
+        d_head=D_HEAD,
+        output_node=output_node,
+        pos_encoding=pos_encoding,
+        verbose=True,
+    )
+    return net, output_node, embedding
+
+
+# ---------------------------------------------------------------------------
+# 1-digit adder
+# ---------------------------------------------------------------------------
+
+
+def test_1digit_adder(net_1digit):
+    """Compile 1-digit adder and verify arithmetic at the '\\n' position."""
+    net, output_node, embedding = net_1digit
+
+    n_layers = len(net.layers)
+    print(f"1-digit adder: {n_layers} layers")
+    assert n_layers <= 20, f"Too many layers: {n_layers}"
 
     test_cases = [
         ("1+1\n", "2"),
@@ -84,42 +118,18 @@ def test_1digit_adder():
         ), f"For {input_str}: expected '{expected}' but got '{result}'"
 
 
-def test_1digit_layer_count():
-    """Verify 1-digit adder compiles in a reasonable number of layers."""
-    output_node, pos_encoding, embedding = _build_1digit()
-    net = forward_compile(
-        d=D,
-        d_head=D_HEAD,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=False,
-    )
-
-    n_layers = len(net.layers)
-    print(f"1-digit adder: {n_layers} layers")
-    assert n_layers <= 20, f"Too many layers: {n_layers}"
-
-
 # ---------------------------------------------------------------------------
 # 3-digit adder
 # ---------------------------------------------------------------------------
 
 
-def _build_3digit():
-    output_node, pos_encoding, embedding = create_network_parts()
-    return output_node, pos_encoding, embedding
-
-
-def test_3digit_adder():
+def test_3digit_adder(net_3digit):
     """Compile 3-digit adder, verify arithmetic at the position after '\\n'."""
-    output_node, pos_encoding, embedding = _build_3digit()
-    net = forward_compile(
-        d=D,
-        d_head=D_HEAD,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=True,
-    )
+    net, output_node, embedding = net_3digit
+
+    n_layers = len(net.layers)
+    print(f"3-digit adder: {n_layers} layers, d={D}, d_head={D_HEAD}")
+    assert n_layers <= 50, f"Too many layers: {n_layers}"
 
     test_cases = [
         ("1+1\n", "2"),
@@ -137,16 +147,9 @@ def test_3digit_adder():
         ), f"For {input_str}: expected '{expected}' but got '{result}'"
 
 
-def test_3digit_autoregressive():
+def test_3digit_autoregressive(net_3digit):
     """Run 3-digit adder autoregressively and verify complete output sequences."""
-    output_node, pos_encoding, embedding = _build_3digit()
-    net = forward_compile(
-        d=D,
-        d_head=D_HEAD,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=False,
-    )
+    net, output_node, embedding = net_3digit
 
     test_cases = [
         ("1+2\n", "3"),
@@ -161,20 +164,3 @@ def test_3digit_autoregressive():
         assert (
             result == expected
         ), f"For {input_str}: expected '{expected}' but got '{result}'"
-
-
-def test_3digit_resource_usage():
-    """Log layers and peak column utilization for the 3-digit adder."""
-    output_node, pos_encoding, embedding = _build_3digit()
-    net = forward_compile(
-        d=D,
-        d_head=D_HEAD,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=True,
-    )
-
-    n_layers = len(net.layers)
-    print(f"3-digit adder: {n_layers} layers, d={D}, d_head={D_HEAD}")
-    # Sanity bound — should compile in well under 100 layers
-    assert n_layers <= 50, f"Too many layers: {n_layers}"

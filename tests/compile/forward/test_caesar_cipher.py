@@ -60,6 +60,10 @@ def test_caesar_cipher():
     """Compile and verify Caesar cipher on various inputs."""
     net, output_node, embedding = _build()
 
+    n_layers = len(net.layers)
+    print(f"caesar_cipher: {n_layers} layers, d={D}, d_head={D_HEAD}")
+    assert n_layers <= 40, f"Too many layers: {n_layers}"
+
     test_cases = [
         # shift=0: identity
         ("0", "hello", "hello"),
@@ -88,11 +92,3 @@ def test_caesar_cipher():
             f"For shift={shift}, '{plaintext}': "
             f"expected '{expected}' but got '{result}'"
         )
-
-
-def test_caesar_cipher_layer_count():
-    """Verify compilation stays within a reasonable layer budget."""
-    net, _, _ = _build()
-    n_layers = len(net.layers)
-    print(f"caesar_cipher: {n_layers} layers, d={D}, d_head={D_HEAD}")
-    assert n_layers <= 40, f"Too many layers: {n_layers}"

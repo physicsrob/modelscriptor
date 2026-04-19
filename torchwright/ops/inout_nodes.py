@@ -5,6 +5,8 @@ import torch
 
 from torchwright.graph.embedding import Unembedding
 
+_DEFAULT_VALUE_RANGE = (-1e4, 1e4)
+
 
 def create_input(
     name_or_width,
@@ -22,13 +24,14 @@ def create_input(
     Args:
     - name_or_width: Either the input name (str) or width (int)
     - width: Width when name is provided (optional)
-    - value_range: Optional (lo, hi) bound on the input tensor values.
-      Declaring this lets downstream ops like ``cond_gate`` / ``select``
-      derive a tight offset instead of failing at graph-build time.
+    - value_range: (lo, hi) bound on the input tensor values.
+      Defaults to (-1e4, 1e4) if not specified.
 
     Returns:
     - Node: The created input node.
     """
+    if value_range is None:
+        value_range = _DEFAULT_VALUE_RANGE
     if isinstance(name_or_width, int):
         # New pattern: create_input(width)
         return InputNode(name_or_width, value_range=value_range)

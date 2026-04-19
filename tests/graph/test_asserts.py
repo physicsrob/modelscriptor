@@ -53,18 +53,24 @@ def _eval(node, inputs: dict, n_pos: int = 1) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def test_assert_in_range_accepts_within_bounds():
+@pytest.mark.parametrize(
+    "values,should_raise",
+    [
+        ([-0.5, 0.0, 0.9], False),
+        ([-0.5, 0.0, 2.5], True),
+    ],
+    ids=["accepts_within_bounds", "rejects_outside_bounds"],
+)
+def test_assert_in_range(values, should_raise):
     x = create_input("x", 3)
     wrapped = assert_in_range(x, -1.0, 1.0)
-    out = _eval(wrapped, {"x": torch.tensor([[-0.5, 0.0, 0.9]])})
-    assert torch.allclose(out, torch.tensor([[-0.5, 0.0, 0.9]]))
-
-
-def test_assert_in_range_rejects_outside_bounds():
-    x = create_input("x", 3)
-    wrapped = assert_in_range(x, -1.0, 1.0)
-    with pytest.raises(AssertionError, match=r"\[-1\.0, 1\.0\]"):
-        _eval(wrapped, {"x": torch.tensor([[-0.5, 0.0, 2.5]])})
+    inputs = {"x": torch.tensor([values])}
+    if should_raise:
+        with pytest.raises(AssertionError, match=r"\[-1\.0, 1\.0\]"):
+            _eval(wrapped, inputs)
+    else:
+        out = _eval(wrapped, inputs)
+        assert torch.allclose(out, torch.tensor([values]))
 
 
 # ---------------------------------------------------------------------------
@@ -72,17 +78,23 @@ def test_assert_in_range_rejects_outside_bounds():
 # ---------------------------------------------------------------------------
 
 
-def test_assert_bool_accepts_pm1():
-    x = create_input("x", 4)
+@pytest.mark.parametrize(
+    "values,should_raise",
+    [
+        ([1.0, -1.0, 1.0, -1.0], False),
+        ([1.0, 0.0, -1.0], True),
+    ],
+    ids=["accepts_pm1", "rejects_non_pm1"],
+)
+def test_assert_bool(values, should_raise):
+    x = create_input("x", len(values))
     wrapped = assert_bool(x)
-    _eval(wrapped, {"x": torch.tensor([[1.0, -1.0, 1.0, -1.0]])})
-
-
-def test_assert_bool_rejects_non_pm1():
-    x = create_input("x", 3)
-    wrapped = assert_bool(x)
-    with pytest.raises(AssertionError, match=r"±1"):
-        _eval(wrapped, {"x": torch.tensor([[1.0, 0.0, -1.0]])})
+    inputs = {"x": torch.tensor([values])}
+    if should_raise:
+        with pytest.raises(AssertionError, match=r"±1"):
+            _eval(wrapped, inputs)
+    else:
+        _eval(wrapped, inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -90,17 +102,23 @@ def test_assert_bool_rejects_non_pm1():
 # ---------------------------------------------------------------------------
 
 
-def test_assert_01_accepts_zero_one():
-    x = create_input("x", 4)
+@pytest.mark.parametrize(
+    "values,should_raise",
+    [
+        ([0.0, 1.0, 0.0, 1.0], False),
+        ([0.0, 0.5, 1.0], True),
+    ],
+    ids=["accepts_zero_one", "rejects_other"],
+)
+def test_assert_01(values, should_raise):
+    x = create_input("x", len(values))
     wrapped = assert_01(x)
-    _eval(wrapped, {"x": torch.tensor([[0.0, 1.0, 0.0, 1.0]])})
-
-
-def test_assert_01_rejects_other():
-    x = create_input("x", 3)
-    wrapped = assert_01(x)
-    with pytest.raises(AssertionError, match=r"\{0,1\}"):
-        _eval(wrapped, {"x": torch.tensor([[0.0, 0.5, 1.0]])})
+    inputs = {"x": torch.tensor([values])}
+    if should_raise:
+        with pytest.raises(AssertionError, match=r"\{0,1\}"):
+            _eval(wrapped, inputs)
+    else:
+        _eval(wrapped, inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -108,24 +126,25 @@ def test_assert_01_rejects_other():
 # ---------------------------------------------------------------------------
 
 
-def test_assert_onehot_accepts_valid_onehot():
+@pytest.mark.parametrize(
+    "values,should_raise,match",
+    [
+        ([0.0, 1.0, 0.0, 0.0], False, None),
+        ([1.0, 1.0, 0.0, 0.0], True, r"not one-hot"),
+        ([0.0, 0.0, 0.0, 0.0], True, None),
+    ],
+    ids=["accepts_valid", "rejects_double_one", "rejects_all_zero"],
+)
+def test_assert_onehot(values, should_raise, match):
     x = create_input("x", 4)
     wrapped = assert_onehot(x)
-    _eval(wrapped, {"x": torch.tensor([[0.0, 1.0, 0.0, 0.0]])})
-
-
-def test_assert_onehot_rejects_double_one():
-    x = create_input("x", 4)
-    wrapped = assert_onehot(x)
-    with pytest.raises(AssertionError, match=r"not one-hot"):
-        _eval(wrapped, {"x": torch.tensor([[1.0, 1.0, 0.0, 0.0]])})
-
-
-def test_assert_onehot_rejects_all_zero():
-    x = create_input("x", 4)
-    wrapped = assert_onehot(x)
-    with pytest.raises(AssertionError):
-        _eval(wrapped, {"x": torch.tensor([[0.0, 0.0, 0.0, 0.0]])})
+    inputs = {"x": torch.tensor([values])}
+    if should_raise:
+        kwargs = {"match": match} if match else {}
+        with pytest.raises(AssertionError, **kwargs):
+            _eval(wrapped, inputs)
+    else:
+        _eval(wrapped, inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -182,17 +201,23 @@ def test_assert_strictly_less_rejects_equal_at_zero_margin():
 # ---------------------------------------------------------------------------
 
 
-def test_assert_unique_values_accepts_distinct():
-    x = create_input("x", 4)
+@pytest.mark.parametrize(
+    "values,should_raise",
+    [
+        ([0.0, 1.0, 2.0, 3.0], False),
+        ([0.0, 1.0, 1.2], True),  # 1.0 ≈ 1.2 at margin 0.5
+    ],
+    ids=["accepts_distinct", "rejects_close_pair"],
+)
+def test_assert_unique_values(values, should_raise):
+    x = create_input("x", len(values))
     wrapped = assert_unique_values(x, margin=0.5)
-    _eval(wrapped, {"x": torch.tensor([[0.0, 1.0, 2.0, 3.0]])})
-
-
-def test_assert_unique_values_rejects_close_pair():
-    x = create_input("x", 3)
-    wrapped = assert_unique_values(x, margin=0.5)
-    with pytest.raises(AssertionError, match=r"duplicate values"):
-        _eval(wrapped, {"x": torch.tensor([[0.0, 1.0, 1.2]])})  # 1.0 ≈ 1.2
+    inputs = {"x": torch.tensor([values])}
+    if should_raise:
+        with pytest.raises(AssertionError, match=r"duplicate values"):
+            _eval(wrapped, inputs)
+    else:
+        _eval(wrapped, inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -595,49 +620,19 @@ def test_picked_from_returns_result_width():
 # exercised by torchwright/doom/stages/sorted.py + tests/doom/.
 
 
-# --- Guarantee level: APPROXIMATE warns, ALWAYS raises ------------------
+# --- All violations are hard errors now -----------------------------------
 
 
-def test_approximate_integer_warns_instead_of_raising():
-    """APPROXIMATE integer violation should warn, not raise."""
-    from torchwright.graph.value_type import Guarantee
-
-    inp = LiteralValue(torch.tensor([6.5]))  # non-integer
-    node = assert_matches_value_type(
-        inp, NodeValueType.integer(0, 9, guarantee=Guarantee.APPROXIMATE)
-    )
-    # Should not raise — just warn
-    node.compute(1, {})
-
-
-def test_always_integer_raises():
-    """ALWAYS integer violation should still raise."""
+def test_integer_violation_raises():
     inp = LiteralValue(torch.tensor([6.5]))  # non-integer
     node = assert_matches_value_type(inp, NodeValueType.integer(0, 9))
     with pytest.raises(AssertionError, match="not integer"):
         node.compute(1, {})
 
 
-def test_approximate_sign_warns_instead_of_raising():
-    """APPROXIMATE sign violation should warn, not raise."""
-    from torchwright.graph.value_type import Guarantee
-
-    inp = LiteralValue(torch.tensor([0.5]))  # not ±1
-    node = assert_matches_value_type(
-        inp, NodeValueType.sign(guarantee=Guarantee.APPROXIMATE)
-    )
-    # Should not raise
-    node.compute(1, {})
-
-
-def test_require_integer_accepts_approximate():
-    """require_integer should accept both ALWAYS and APPROXIMATE."""
-    from torchwright.graph.value_type import Guarantee
+def test_require_integer_accepts_true():
     from torchwright.graph.asserts import require_integer
 
     inp = LiteralValue(torch.tensor([3.0]))
-    node = assert_matches_value_type(
-        inp, NodeValueType.integer(0, 9, guarantee=Guarantee.APPROXIMATE)
-    )
-    # Should not raise TypeError
+    node = assert_matches_value_type(inp, NodeValueType.integer(0, 9))
     require_integer(node, "test")
