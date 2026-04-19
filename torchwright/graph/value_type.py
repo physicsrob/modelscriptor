@@ -65,10 +65,10 @@ class Range:
         lo = max(self.lo, other.lo)
         hi = min(self.hi, other.hi)
         if lo > hi:
-            # Empty intersection — fall back to the narrower side of other
-            # so downstream rules stay total. Callers that care about
-            # emptiness should check explicitly.
-            return Range(lo, lo)
+            raise ValueError(
+                f"Empty range intersection: {self} \u2229 {other}. Both should be "
+                f"sound over-approximations; disjointness indicates a bug."
+            )
         return Range(lo, hi)
 
     def relu(self) -> "Range":
