@@ -83,6 +83,13 @@ def compute_affine_bound(node: "Node") -> AffineBound:
         assert ab.n_cols > 0, "PosEncoding must produce non-degenerate affine bound"
         return ab
 
+    from torchwright.graph.misc import Placeholder
+
+    if not isinstance(node, Placeholder):
+        raise NotImplementedError(
+            f"No affine rule for {type(node).__name__}. Add one to "
+            f"affine_rules.py or register it as an explicit pass-through."
+        )
     return AffineBound.degenerate(node.d_output)
 
 
@@ -117,7 +124,10 @@ def _add_rule(node) -> AffineBound:
     u = node.inputs[0]._affine_bound
     v = node.inputs[1]._affine_bound
     if u.d_output != v.d_output:
-        return AffineBound.degenerate(node.d_output)
+        raise ValueError(
+            f"Add node {node.node_id}: input affine bounds have mismatched "
+            f"d_output ({u.d_output} vs {v.d_output})"
+        )
     u, v = AffineBound.align(u, v)
     return AffineBound(
         A_lo=u.A_lo + v.A_lo,
@@ -181,6 +191,16 @@ def _relu_rule(node) -> AffineBound:
         elif h <= 0:
             pass
         elif math.isinf(l) or math.isinf(h):
+            vt_range = node.inputs[0].value_type.value_range
+            if math.isfinite(vt_range.lo) and math.isfinite(vt_range.hi):
+                import warnings
+
+                warnings.warn(
+                    f"Node {node.node_id}: ReLU input affine interval is "
+                    f"infinite ({l}, {h}) but value_type is finite "
+                    f"{vt_range}. Upstream affine rule may be missing or "
+                    f"degenerate."
+                )
             b_hi[i] = float(h)
         else:
             slope = h / (h - l)
@@ -342,10 +362,18 @@ def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -
     """Replace *node*'s affine bound with a semantic override."""
     if semantic_ab is None:
         return
+    propagated = node._affine_bound.to_scalar_range()
+    semantic = semantic_ab.to_scalar_range()
+    assert semantic.lo <= propagated.hi and semantic.hi >= propagated.lo, (
+        f"Semantic override on node {node.node_id} is disjoint from "
+        f"propagated bound: semantic={semantic}, propagated={propagated}"
+    )
     node._affine_bound = semantic_ab
 
 
-def _cond_gate_semantic_bound(inp_ab: AffineBound) -> AffineBound:
+def _cond_gate_semantic_bound(
+    inp_ab: AffineBound, inp_node: Optional["Node"] = None
+) -> AffineBound:
     """Per-component [min(0, inp), max(0, inp)] envelope for cond_gate."""
     intervals = inp_ab.to_interval()
     d = inp_ab.d_output
@@ -365,6 +393,17 @@ def _cond_gate_semantic_bound(inp_ab: AffineBound) -> AffineBound:
             A_lo[i] = inp_ab.A_lo[i]
             b_lo[i] = inp_ab.b_lo[i]
         elif math.isinf(l) or math.isinf(h):
+            if inp_node is not None:
+                vt_range = inp_node.value_type.value_range
+                if math.isfinite(vt_range.lo) and math.isfinite(vt_range.hi):
+                    import warnings
+
+                    warnings.warn(
+                        f"Node {inp_node.node_id}: cond_gate input affine "
+                        f"interval is infinite ({l}, {h}) but value_type is "
+                        f"finite {vt_range}. Upstream affine rule may be "
+                        f"missing or degenerate."
+                    )
             b_lo[i] = float(min(0, l))
             b_hi[i] = float(max(0, h))
         else:

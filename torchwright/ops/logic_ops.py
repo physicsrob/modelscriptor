@@ -317,5 +317,5 @@ def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
         _cond_gate_semantic_bound,
     )
 
-    _apply_semantic_override(result, _cond_gate_semantic_bound(inp._affine_bound))
+    _apply_semantic_override(result, _cond_gate_semantic_bound(inp._affine_bound, inp))
     return result
