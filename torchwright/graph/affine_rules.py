@@ -86,9 +86,13 @@ def _linear_rule(node) -> AffineBound:
     W_minus = torch.clamp(W, max=0)
 
     A_lo = W_plus.T @ inp_ab.A_lo + W_minus.T @ inp_ab.A_hi
-    b_lo = _safe_matvec(W_plus.T, inp_ab.b_lo) + _safe_matvec(W_minus.T, inp_ab.b_hi) + c
+    b_lo = (
+        _safe_matvec(W_plus.T, inp_ab.b_lo) + _safe_matvec(W_minus.T, inp_ab.b_hi) + c
+    )
     A_hi = W_plus.T @ inp_ab.A_hi + W_minus.T @ inp_ab.A_lo
-    b_hi = _safe_matvec(W_plus.T, inp_ab.b_hi) + _safe_matvec(W_minus.T, inp_ab.b_lo) + c
+    b_hi = (
+        _safe_matvec(W_plus.T, inp_ab.b_hi) + _safe_matvec(W_minus.T, inp_ab.b_lo) + c
+    )
 
     return AffineBound(
         A_lo=A_lo,
@@ -258,9 +262,13 @@ def _attn_rule(node) -> AffineBound:
     V_plus = torch.clamp(V, min=0)
     V_minus = torch.clamp(V, max=0)
     proj_A_lo = V_plus.T @ value_ab.A_lo + V_minus.T @ value_ab.A_hi
-    proj_b_lo = _safe_matvec(V_plus.T, value_ab.b_lo) + _safe_matvec(V_minus.T, value_ab.b_hi)
+    proj_b_lo = _safe_matvec(V_plus.T, value_ab.b_lo) + _safe_matvec(
+        V_minus.T, value_ab.b_hi
+    )
     proj_A_hi = V_plus.T @ value_ab.A_hi + V_minus.T @ value_ab.A_lo
-    proj_b_hi = _safe_matvec(V_plus.T, value_ab.b_hi) + _safe_matvec(V_minus.T, value_ab.b_lo)
+    proj_b_hi = _safe_matvec(V_plus.T, value_ab.b_hi) + _safe_matvec(
+        V_minus.T, value_ab.b_lo
+    )
 
     O_plus = torch.clamp(O, min=0)
     O_minus = torch.clamp(O, max=0)
