@@ -218,8 +218,33 @@ def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
     return NodeValueType(value_range=out_range)
 
 
-def _build_cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
-    """Build the actual cond_gate subgraph using current value_type bounds."""
+def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
+    """
+    Gates the value of a node based on a condition. If the condition is true,
+    outputs the value. If false, outputs a zero tensor of the same shape as value.
+
+    Args:
+        cond (Node): Condition node.
+        inp (Node): The node whose value is to be gated.
+        approximate: When ``True`` (default), uses a single L→ReLU→L sublayer
+            with an additive cancellation trick. The on-path computes
+            ``(M + v) − M`` where ``M`` is derived from ``inp.value_type``; this
+            loses precision for ``|v| ≪ ULP(M)`` and amplifies approximate-cond
+            error as ``M·ε``. When ``False``, uses two sublayers: the first
+            maps ``cond`` to ``c_off = ReLU(−cond) ∈ {0, 1}`` (clipping cond
+            noise on the on-side); the second gates ``inp`` via
+            ``ReLU(±inp − M·c_off)``. The on-path is float-exact and immune to
+            cond noise; costs one extra MLP sublayer.
+
+    Returns:
+        Node: Output node after applying the gate based on condition.
+
+    .. noise-footer::
+
+       Max error: 3.052e-05 abs, 0.00399 rel over 4096 samples;
+       measured at commit a979f69. See docs/numerical_noise.md.
+    """
+    assert len(cond) == 1
     d = len(inp)
     M = _max_abs_or_raise(inp.value_type, "cond_gate")
 
@@ -294,33 +319,3 @@ def _build_cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node
 
     _apply_semantic_override(result, _cond_gate_semantic_bound(inp._affine_bound))
     return result
-
-
-def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
-    """
-    Gates the value of a node based on a condition. If the condition is true,
-    outputs the value. If false, outputs a zero tensor of the same shape as value.
-
-    Args:
-        cond (Node): Condition node.
-        inp (Node): The node whose value is to be gated.
-        approximate: When ``True`` (default), uses a single L→ReLU→L sublayer
-            with an additive cancellation trick. The on-path computes
-            ``(M + v) − M`` where ``M`` is derived from ``inp.value_type``; this
-            loses precision for ``|v| ≪ ULP(M)`` and amplifies approximate-cond
-            error as ``M·ε``. When ``False``, uses two sublayers: the first
-            maps ``cond`` to ``c_off = ReLU(−cond) ∈ {0, 1}`` (clipping cond
-            noise on the on-side); the second gates ``inp`` via
-            ``ReLU(±inp − M·c_off)``. The on-path is float-exact and immune to
-            cond noise; costs one extra MLP sublayer.
-
-    Returns:
-        Node: Output node after applying the gate based on condition.
-
-    .. noise-footer::
-
-       Max error: 3.052e-05 abs, 0.00399 rel over 4096 samples;
-       measured at commit a979f69. See docs/numerical_noise.md.
-    """
-    assert len(cond) == 1
-    return _build_cond_gate(cond, inp, approximate=approximate)
