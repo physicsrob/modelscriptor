@@ -51,6 +51,13 @@ changing Basis. Which do you prefer?" Don't commit to elaborate
 machinery without explicit agreement. If the user says "that feels
 gross," trust that instinct and look for the direct path.
 
+# DOOM game graph
+
+Before working on anything under `torchwright/doom/`, `torchwright/doom/stages/`,
+or `tests/doom/`, read `docs/doom_graph.md`. It documents the full pipeline:
+token sequence, phase structure, every stage's computation, feedback layouts,
+and how the graph compiles to a transformer.
+
 # Testing
 
 ## Running Tests
