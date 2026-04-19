@@ -16,11 +16,9 @@ class ReLU(Node):
 
     def compute_value_type(self) -> NodeValueType:
         t = self.inputs[0].value_type
-        new_range = t.value_range.relu()
         new_binary = t.is_binary or (t.is_sign and t.is_integer)
         new_one_hot = t.is_one_hot and t.is_binary
         return NodeValueType(
-            value_range=new_range,
             is_integer=t.is_integer,
             is_binary=new_binary,
             is_sign=False,

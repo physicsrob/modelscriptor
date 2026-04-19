@@ -230,6 +230,14 @@ def _build_select(
     if vt != NodeValueType.unknown():
         gate_atol = max(1e-3, M / step_sharpness) if approximate else 1e-3
         result = assert_matches_value_type(result, vt, atol=gate_atol)
+    from torchwright.graph.affine_rules import (
+        _apply_semantic_override,
+        _select_semantic_bound,
+    )
+    _apply_semantic_override(
+        result,
+        _select_semantic_bound(true_node._affine_bound, false_node._affine_bound),
+    )
     return result
 
 

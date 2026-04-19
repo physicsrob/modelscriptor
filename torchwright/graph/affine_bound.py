@@ -39,7 +39,7 @@ class AffineBound:
     b_lo: torch.Tensor
     b_hi: torch.Tensor
     columns: Dict[int, Tuple[int, int]]
-    input_ranges: Dict[int, Tuple[float, float]]
+    input_ranges: Dict[int, Tuple[torch.Tensor, torch.Tensor]]
 
     def __post_init__(self):
         d = self.A_lo.shape[0]
@@ -66,14 +66,16 @@ class AffineBound:
         d = input_node.d_output
         A = torch.eye(d, dtype=torch.float64)
         b = torch.zeros(d, dtype=torch.float64)
-        r = input_node.value_type.value_range
+        lo_val, hi_val = input_node._declared_value_range
+        lo = torch.full((d,), float(lo_val), dtype=torch.float64)
+        hi = torch.full((d,), float(hi_val), dtype=torch.float64)
         return cls(
             A_lo=A.clone(),
             A_hi=A.clone(),
             b_lo=b.clone(),
             b_hi=b.clone(),
             columns={input_node.node_id: (0, d)},
-            input_ranges={input_node.node_id: (r.lo, r.hi)},
+            input_ranges={input_node.node_id: (lo, hi)},
         )
 
     @classmethod
@@ -119,7 +121,9 @@ class AffineBound:
         """Reindex *a* and *b* to share the same column layout."""
         if a.columns == b.columns:
             merged_ranges = _merge_ranges(a.input_ranges, b.input_ranges)
-            if merged_ranges == a.input_ranges and merged_ranges == b.input_ranges:
+            if _ranges_equal(merged_ranges, a.input_ranges) and _ranges_equal(
+                merged_ranges, b.input_ranges
+            ):
                 return a, b
             a = AffineBound(
                 a.A_lo, a.A_hi, a.b_lo, a.b_hi, a.columns, merged_ranges
@@ -161,8 +165,6 @@ class AffineBound:
 
     def _basis_box(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (x_lo, x_hi) vectors for the input basis box."""
-        import math
-
         n = self.n_cols
         x_lo = torch.full((n,), float("-inf"), dtype=torch.float64)
         x_hi = torch.full((n,), float("inf"), dtype=torch.float64)
@@ -170,12 +172,9 @@ class AffineBound:
         for node_id, (start, width) in self.columns.items():
             if node_id not in self.input_ranges:
                 continue
-            lo, hi = self.input_ranges[node_id]
-            for j in range(width):
-                if math.isfinite(lo):
-                    x_lo[start + j] = lo
-                if math.isfinite(hi):
-                    x_hi[start + j] = hi
+            lo_vec, hi_vec = self.input_ranges[node_id]
+            x_lo[start : start + width] = lo_vec
+            x_hi[start : start + width] = hi_vec
         return x_lo, x_hi
 
     def _eval_lower(self, i: int, x_lo: torch.Tensor, x_hi: torch.Tensor) -> float:
@@ -208,15 +207,27 @@ class AffineBound:
         )
 
 
+def _ranges_equal(
+    a: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+    b: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+) -> bool:
+    if a.keys() != b.keys():
+        return False
+    return all(
+        torch.equal(a[k][0], b[k][0]) and torch.equal(a[k][1], b[k][1]) for k in a
+    )
+
+
 def _merge_ranges(
-    a: Dict[int, Tuple[float, float]], b: Dict[int, Tuple[float, float]]
-) -> Dict[int, Tuple[float, float]]:
+    a: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+    b: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
     """Intersect input ranges from two bounds."""
     merged = dict(a)
     for k, (blo, bhi) in b.items():
         if k in merged:
             alo, ahi = merged[k]
-            merged[k] = (max(alo, blo), min(ahi, bhi))
+            merged[k] = (torch.maximum(alo, blo), torch.minimum(ahi, bhi))
         else:
             merged[k] = (blo, bhi)
     return merged
@@ -224,10 +235,12 @@ def _merge_ranges(
 
 def _merge_layouts(
     *bounds: AffineBound,
-) -> tuple[Dict[int, Tuple[int, int]], Dict[int, Tuple[float, float]], int]:
+) -> tuple[
+    Dict[int, Tuple[int, int]], Dict[int, Tuple[torch.Tensor, torch.Tensor]], int
+]:
     """Build a merged column layout from multiple bounds."""
     merged_columns: Dict[int, Tuple[int, int]] = {}
-    merged_ranges: Dict[int, Tuple[float, float]] = {}
+    merged_ranges: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
     offset = 0
     all_keys = sorted(set().union(*(b.columns for b in bounds)))
     for key in all_keys:
@@ -245,7 +258,10 @@ def _merge_layouts(
                 else:
                     old_lo, old_hi = merged_ranges[key]
                     new_lo, new_hi = b.input_ranges[key]
-                    merged_ranges[key] = (max(old_lo, new_lo), min(old_hi, new_hi))
+                    merged_ranges[key] = (
+                        torch.maximum(old_lo, new_lo),
+                        torch.minimum(old_hi, new_hi),
+                    )
         offset += width
     return merged_columns, merged_ranges, offset
 
@@ -253,7 +269,7 @@ def _merge_layouts(
 def _scatter(
     ab: AffineBound,
     merged_columns: Dict[int, Tuple[int, int]],
-    merged_ranges: Dict[int, Tuple[float, float]],
+    merged_ranges: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
     n: int,
 ) -> AffineBound:
     """Scatter *ab*'s columns into a merged layout."""

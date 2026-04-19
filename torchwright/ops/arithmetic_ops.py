@@ -337,6 +337,14 @@ def compare(
     vt = _compare_output_type(true_level, false_level)
     if vt != NodeValueType.unknown():
         result = assert_matches_value_type(result, vt)
+    from torchwright.graph.affine_rules import (
+        _apply_semantic_override,
+        _compare_semantic_bound,
+    )
+    _apply_semantic_override(
+        result,
+        _compare_semantic_bound(inp._affine_bound, thresh, true_level, false_level),
+    )
     return result
 
 

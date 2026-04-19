@@ -141,13 +141,11 @@ class Node:
 
         self._affine_bound = compute_affine_bound(self)
         affine_range = self._affine_bound.to_scalar_range()
-        eager_range = self._value_type_eager.value_range
-        tightened = eager_range.intersect(affine_range)
-        if tightened != eager_range:
+        if affine_range != self._value_type_eager.value_range:
             from dataclasses import replace
 
             self._value_type_eager = replace(
-                self._value_type_eager, value_range=tightened
+                self._value_type_eager, value_range=affine_range
             )
 
     @property

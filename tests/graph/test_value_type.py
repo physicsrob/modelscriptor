@@ -111,14 +111,14 @@ def test_is_binary_requires_is_integer():
         NodeValueType(value_range=Range(0.0, 1.0), is_binary=True, is_integer=False)
 
 
-def test_is_binary_requires_range_subset_of_01():
-    with pytest.raises(ValueError):
-        NodeValueType(value_range=Range(0.0, 2.0), is_integer=True, is_binary=True)
+def test_is_binary_allows_any_range():
+    t = NodeValueType(value_range=Range(0.0, 2.0), is_integer=True, is_binary=True)
+    assert t.is_binary
 
 
-def test_is_sign_requires_range_subset_of_pm1():
-    with pytest.raises(ValueError):
-        NodeValueType(value_range=Range(-2.0, 1.0), is_integer=True, is_sign=True)
+def test_is_sign_allows_any_range():
+    t = NodeValueType(value_range=Range(-2.0, 1.0), is_integer=True, is_sign=True)
+    assert t.is_sign
 
 
 def test_is_one_hot_requires_is_binary():

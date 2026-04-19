@@ -8,7 +8,7 @@ a dataflow graph) and produces the output bound.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from torchwright.graph.affine_bound import AffineBound
 
@@ -26,7 +26,9 @@ def compute_affine_bound(node: "Node") -> AffineBound:
     from torchwright.graph.attn import Attn
 
     if isinstance(node, InputNode):
-        return AffineBound.identity(node)
+        ab = AffineBound.identity(node)
+        assert ab.n_cols > 0, "InputNode must produce non-degenerate affine bound"
+        return ab
 
     if isinstance(node, LiteralValue):
         import torch
@@ -52,10 +54,14 @@ def compute_affine_bound(node: "Node") -> AffineBound:
         return _attn_rule(node)
 
     if isinstance(node, Embedding):
-        return _embedding_rule(node)
+        ab = _embedding_rule(node)
+        assert ab.n_cols > 0, "Embedding must produce non-degenerate affine bound"
+        return ab
 
     if isinstance(node, PosEncoding):
-        return AffineBound.degenerate(node.d_output, lo=-1.0, hi=1.0)
+        ab = _pos_encoding_rule(node)
+        assert ab.n_cols > 0, "PosEncoding must produce non-degenerate affine bound"
+        return ab
 
     r = node._value_type_eager.value_range
     return AffineBound.degenerate(node.d_output, lo=r.lo, hi=r.hi)
@@ -160,9 +166,6 @@ def _relu_rule(node) -> AffineBound:
             slope = h / (h - l)
             A_hi[i] = slope * inp_ab.A_hi[i]
             b_hi[i] = slope * (inp_ab.b_hi[i] - l)
-            alpha = 1.0 if h >= -l else 0.0
-            A_lo[i] = alpha * inp_ab.A_lo[i]
-            b_lo[i] = alpha * inp_ab.b_lo[i]
 
     return AffineBound(
         A_lo=A_lo,
@@ -176,20 +179,30 @@ def _relu_rule(node) -> AffineBound:
 
 def _assert_rule(node) -> AffineBound:
     """Assert: pass through coefficients, optionally tighten input_ranges."""
+    import torch
+
     from torchwright.graph.misc import Assert, InputNode
+    from torchwright.graph.embedding import Embedding
+    from torchwright.graph.pos_encoding import PosEncoding
 
     inp_ab = node.inputs[0]._affine_bound
     if node.claimed_type is not None:
+        claimed_range = node.claimed_type.value_range
+
         target = node.inputs[0]
         while isinstance(target, Assert):
             target = target.inputs[0]
-        if isinstance(target, InputNode):
-            claimed_range = node.claimed_type.value_range
+
+        if isinstance(target, (InputNode, Embedding, PosEncoding)):
             new_ranges = dict(inp_ab.input_ranges)
             if target.node_id in new_ranges:
                 old_lo, old_hi = new_ranges[target.node_id]
-                new_lo = max(old_lo, claimed_range.lo)
-                new_hi = min(old_hi, claimed_range.hi)
+                new_lo = torch.maximum(
+                    old_lo, torch.full_like(old_lo, claimed_range.lo)
+                )
+                new_hi = torch.minimum(
+                    old_hi, torch.full_like(old_hi, claimed_range.hi)
+                )
                 new_ranges[target.node_id] = (new_lo, new_hi)
                 return AffineBound(
                     A_lo=inp_ab.A_lo,
@@ -199,11 +212,36 @@ def _assert_rule(node) -> AffineBound:
                     columns=inp_ab.columns,
                     input_ranges=new_ranges,
                 )
+
+        if claimed_range.is_finite():
+            intervals = inp_ab.to_interval()
+            d = node.d_output
+            b_lo = torch.tensor(
+                [max(iv.lo, claimed_range.lo) for iv in intervals],
+                dtype=torch.float64,
+            )
+            b_hi = torch.tensor(
+                [min(iv.hi, claimed_range.hi) for iv in intervals],
+                dtype=torch.float64,
+            )
+            return AffineBound(
+                A_lo=torch.zeros(d, 0, dtype=torch.float64),
+                A_hi=torch.zeros(d, 0, dtype=torch.float64),
+                b_lo=b_lo,
+                b_hi=b_hi,
+                columns={},
+                input_ranges={},
+            )
     return inp_ab
 
 
 def _attn_rule(node) -> AffineBound:
-    """Attn three-step degenerate rule."""
+    """Attn: propagate value bounds through V then O.
+
+    Softmax produces convex-combination weights, so per-component
+    affine bounds on ``value @ V`` carry through unchanged.  O is
+    then a standard linear step.
+    """
     import torch
 
     value_ab = node.inputs[2]._affine_bound
@@ -217,39 +255,163 @@ def _attn_rule(node) -> AffineBound:
     proj_A_hi = V_plus.T @ value_ab.A_hi + V_minus.T @ value_ab.A_lo
     proj_b_hi = V_plus.T @ value_ab.b_hi + V_minus.T @ value_ab.b_lo
 
-    proj_ab = AffineBound(
-        A_lo=proj_A_lo,
-        A_hi=proj_A_hi,
-        b_lo=proj_b_lo,
-        b_hi=proj_b_hi,
-        columns=value_ab.columns,
-        input_ranges=value_ab.input_ranges,
-    )
-    proj_intervals = proj_ab.to_interval()
-
-    d_v = len(proj_intervals)
-    vlo = torch.tensor([iv.lo for iv in proj_intervals], dtype=torch.float64)
-    vhi = torch.tensor([iv.hi for iv in proj_intervals], dtype=torch.float64)
-
     O_plus = torch.clamp(O, min=0)
     O_minus = torch.clamp(O, max=0)
-    out_lo = O_plus.T @ vlo + O_minus.T @ vhi
-    out_hi = O_plus.T @ vhi + O_minus.T @ vlo
+    A_lo = O_plus.T @ proj_A_lo + O_minus.T @ proj_A_hi
+    b_lo = O_plus.T @ proj_b_lo + O_minus.T @ proj_b_hi
+    A_hi = O_plus.T @ proj_A_hi + O_minus.T @ proj_A_lo
+    b_hi = O_plus.T @ proj_b_hi + O_minus.T @ proj_b_lo
 
-    return AffineBound.degenerate(
-        node.d_output,
-        lo=float(out_lo.min().item()),
-        hi=float(out_hi.max().item()),
+    return AffineBound(
+        A_lo=A_lo, A_hi=A_hi,
+        b_lo=b_lo, b_hi=b_hi,
+        columns=value_ab.columns,
+        input_ranges=value_ab.input_ranges,
     )
 
 
 def _embedding_rule(node) -> AffineBound:
-    """Degenerate with per-component min/max over table rows."""
+    """Identity A-matrix with per-column min/max ranges from the embedding table."""
     import torch
 
     t = node.table.to(torch.float64)
-    if t.numel() == 0:
-        return AffineBound.degenerate(node.d_output)
-    lo = float(t.min().item())
-    hi = float(t.max().item())
-    return AffineBound.degenerate(node.d_output, lo=lo, hi=hi)
+    d = node.d_output
+    assert t.numel() > 0
+    A = torch.eye(d, dtype=torch.float64)
+    b = torch.zeros(d, dtype=torch.float64)
+    col_lo = t.min(dim=0).values
+    col_hi = t.max(dim=0).values
+    return AffineBound(
+        A_lo=A.clone(),
+        A_hi=A.clone(),
+        b_lo=b.clone(),
+        b_hi=b.clone(),
+        columns={node.node_id: (0, d)},
+        input_ranges={node.node_id: (col_lo, col_hi)},
+    )
+
+
+def _pos_encoding_rule(node) -> AffineBound:
+    """Identity A-matrix with [-1, 1] per-column ranges for positional encoding."""
+    import torch
+
+    d = node.d_output
+    A = torch.eye(d, dtype=torch.float64)
+    b = torch.zeros(d, dtype=torch.float64)
+    lo = torch.full((d,), -1.0, dtype=torch.float64)
+    hi = torch.full((d,), 1.0, dtype=torch.float64)
+    return AffineBound(
+        A_lo=A.clone(),
+        A_hi=A.clone(),
+        b_lo=b.clone(),
+        b_hi=b.clone(),
+        columns={node.node_id: (0, d)},
+        input_ranges={node.node_id: (lo, hi)},
+    )
+
+
+# --- Semantic overrides for composite ops ----------------------------------
+
+
+def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -> None:
+    """Replace *node*'s affine bound with a semantic override and re-tighten."""
+    if semantic_ab is None:
+        return
+    node._affine_bound = semantic_ab
+    affine_range = semantic_ab.to_scalar_range()
+    if affine_range != node._value_type_eager.value_range:
+        from dataclasses import replace
+
+        node._value_type_eager = replace(node._value_type_eager, value_range=affine_range)
+
+
+def _cond_gate_semantic_bound(inp_ab: AffineBound) -> AffineBound:
+    """Per-component [min(0, inp), max(0, inp)] envelope for cond_gate."""
+    import torch
+
+    intervals = inp_ab.to_interval()
+    d = inp_ab.d_output
+    n = inp_ab.n_cols
+
+    A_lo = torch.zeros(d, n, dtype=torch.float64)
+    A_hi = torch.zeros(d, n, dtype=torch.float64)
+    b_lo = torch.zeros(d, dtype=torch.float64)
+    b_hi = torch.zeros(d, dtype=torch.float64)
+
+    for i in range(d):
+        l, h = intervals[i].lo, intervals[i].hi
+        if l >= 0:
+            # max(0, x) = x (identity), min(0, x) = 0
+            A_hi[i] = inp_ab.A_hi[i]
+            b_hi[i] = inp_ab.b_hi[i]
+        elif h <= 0:
+            # max(0, x) = 0, min(0, x) = x (identity)
+            A_lo[i] = inp_ab.A_lo[i]
+            b_lo[i] = inp_ab.b_lo[i]
+        else:
+            # Straddling: upper = chord of max(0,x), lower = secant of min(0,x)
+            s_hi = h / (h - l)
+            A_hi[i] = s_hi * inp_ab.A_hi[i]
+            b_hi[i] = s_hi * (inp_ab.b_hi[i] - l)
+            s_lo = -l / (h - l)
+            A_lo[i] = s_lo * inp_ab.A_lo[i]
+            b_lo[i] = s_lo * inp_ab.b_lo[i] + l * h / (h - l)
+
+    return AffineBound(
+        A_lo=A_lo,
+        A_hi=A_hi,
+        b_lo=b_lo,
+        b_hi=b_hi,
+        columns=inp_ab.columns,
+        input_ranges=inp_ab.input_ranges,
+    )
+
+
+def _select_semantic_bound(a_ab: AffineBound, b_ab: AffineBound) -> AffineBound:
+    """Per-component hull of a and b intervals for select."""
+    import torch
+
+    from torchwright.graph.affine_bound import _merge_layouts, _scatter
+
+    a_ab, b_ab = AffineBound.align(a_ab, b_ab)
+    a_intervals = a_ab.to_interval()
+    b_intervals = b_ab.to_interval()
+    d = a_ab.d_output
+
+    b_lo = torch.zeros(d, dtype=torch.float64)
+    b_hi = torch.zeros(d, dtype=torch.float64)
+    for i in range(d):
+        b_lo[i] = min(a_intervals[i].lo, b_intervals[i].lo)
+        b_hi[i] = max(a_intervals[i].hi, b_intervals[i].hi)
+
+    return AffineBound(
+        A_lo=torch.zeros(d, a_ab.n_cols, dtype=torch.float64),
+        A_hi=torch.zeros(d, a_ab.n_cols, dtype=torch.float64),
+        b_lo=b_lo,
+        b_hi=b_hi,
+        columns=a_ab.columns,
+        input_ranges=a_ab.input_ranges,
+    )
+
+
+def _compare_semantic_bound(
+    inp_ab: AffineBound,
+    thresh: float,
+    true_level: float,
+    false_level: float,
+) -> AffineBound:
+    """Constant or degenerate bound for compare, depending on inp vs thresh."""
+    import torch
+
+    intervals = inp_ab.to_interval()
+    assert len(intervals) == 1
+    l, h = intervals[0].lo, intervals[0].hi
+
+    lo = min(true_level, false_level)
+    hi = max(true_level, false_level)
+
+    if l > thresh:
+        return AffineBound.constant(torch.tensor([true_level], dtype=torch.float64))
+    if h <= thresh:
+        return AffineBound.constant(torch.tensor([false_level], dtype=torch.float64))
+    return AffineBound.degenerate(1, lo=lo, hi=hi)

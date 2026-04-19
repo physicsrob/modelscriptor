@@ -96,20 +96,10 @@ class NodeValueType:
     is_one_hot: bool = False
 
     def __post_init__(self):
-        if self.is_binary:
-            if not self.is_integer:
-                raise ValueError("is_binary implies is_integer")
-            if not Range(0.0, 1.0).contains(self.value_range):
-                raise ValueError(
-                    f"is_binary requires range ⊆ [0, 1], got {self.value_range}"
-                )
-        if self.is_sign:
-            if not self.is_integer:
-                raise ValueError("is_sign implies is_integer")
-            if not Range(-1.0, 1.0).contains(self.value_range):
-                raise ValueError(
-                    f"is_sign requires range ⊆ [-1, 1], got {self.value_range}"
-                )
+        if self.is_binary and not self.is_integer:
+            raise ValueError("is_binary implies is_integer")
+        if self.is_sign and not self.is_integer:
+            raise ValueError("is_sign implies is_integer")
         if self.is_one_hot and not self.is_binary:
             raise ValueError("is_one_hot implies is_binary")
 
@@ -181,27 +171,6 @@ def is_integer_tensor(t) -> bool:
     if t.numel() == 0:
         return True
     return bool(torch.all(t == t.round()).item())
-
-
-def linear_output_range(input_range: Range, matrix, bias=None) -> Range:
-    """Interval range of ``x @ matrix + bias`` given ``x`` elements ∈ input_range.
-
-    Returns the union over output columns of each column's interval
-    (per-scalar range). Unbounded input ⇒ unbounded output.
-    """
-    import torch
-
-    if not input_range.is_finite():
-        return Range.unbounded()
-    m = matrix
-    lo_prod = input_range.lo * m
-    hi_prod = input_range.hi * m
-    mins = torch.minimum(lo_prod, hi_prod).sum(dim=0)
-    maxs = torch.maximum(lo_prod, hi_prod).sum(dim=0)
-    if bias is not None:
-        mins = mins + bias
-        maxs = maxs + bias
-    return Range(float(mins.min().item()), float(maxs.max().item()))
 
 
 def tightened_with(a: NodeValueType, b: NodeValueType) -> NodeValueType:

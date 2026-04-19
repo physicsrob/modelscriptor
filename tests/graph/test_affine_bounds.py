@@ -127,7 +127,10 @@ class TestAlign:
                 b_lo=torch.zeros(1, dtype=torch.float64),
                 b_hi=torch.zeros(1, dtype=torch.float64),
                 columns={x.node_id: (0, 1)},
-                input_ranges={x.node_id: (-5.0, 5.0)},
+                input_ranges={x.node_id: (
+                    torch.tensor([-5.0], dtype=torch.float64),
+                    torch.tensor([5.0], dtype=torch.float64),
+                )},
             )
             b = AffineBound(
                 A_lo=torch.ones(1, 1, dtype=torch.float64),
@@ -135,11 +138,18 @@ class TestAlign:
                 b_lo=torch.zeros(1, dtype=torch.float64),
                 b_hi=torch.zeros(1, dtype=torch.float64),
                 columns={x.node_id: (0, 1)},
-                input_ranges={x.node_id: (-2.0, 3.0)},
+                input_ranges={x.node_id: (
+                    torch.tensor([-2.0], dtype=torch.float64),
+                    torch.tensor([3.0], dtype=torch.float64),
+                )},
             )
             a2, b2 = AffineBound.align(a, b)
-            assert a2.input_ranges[x.node_id] == (-2.0, 3.0)
-            assert b2.input_ranges[x.node_id] == (-2.0, 3.0)
+            lo, hi = a2.input_ranges[x.node_id]
+            assert lo.item() == pytest.approx(-2.0)
+            assert hi.item() == pytest.approx(3.0)
+            lo2, hi2 = b2.input_ranges[x.node_id]
+            assert lo2.item() == pytest.approx(-2.0)
+            assert hi2.item() == pytest.approx(3.0)
 
 
 # --- Session management --------------------------------------------------
@@ -505,6 +515,221 @@ class TestAssertRule:
 
 
 # --- Attn degenerate ------------------------------------------------------
+
+
+class TestSemanticBounds:
+    """Semantic affine bounds for composite ops: cond_gate, select, compare."""
+
+    def test_cond_gate_positive_input(self):
+        """cond_gate with positive input: upper = identity, lower = 0."""
+        with fresh_graph_session():
+            cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
+            inp = InputNode(2, name="inp", value_range=(1.0, 5.0))
+            from torchwright.ops.logic_ops import cond_gate
+
+            result = cond_gate(cond, inp)
+            intervals = result.affine_bound.to_interval()
+            for iv in intervals:
+                assert iv.lo == pytest.approx(0.0, abs=1e-5)
+                assert iv.hi == pytest.approx(5.0, abs=1e-5)
+
+    def test_cond_gate_negative_input(self):
+        """cond_gate with negative input: upper = 0, lower = identity."""
+        with fresh_graph_session():
+            cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
+            inp = InputNode(2, name="inp", value_range=(-5.0, -1.0))
+            from torchwright.ops.logic_ops import cond_gate
+
+            result = cond_gate(cond, inp)
+            intervals = result.affine_bound.to_interval()
+            for iv in intervals:
+                assert iv.lo == pytest.approx(-5.0, abs=1e-5)
+                assert iv.hi == pytest.approx(0.0, abs=1e-5)
+
+    def test_cond_gate_straddling(self):
+        """cond_gate with straddling input: bounded by [lo, hi]."""
+        with fresh_graph_session():
+            cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
+            inp = InputNode(1, name="inp", value_range=(-3.0, 5.0))
+            from torchwright.ops.logic_ops import cond_gate
+
+            result = cond_gate(cond, inp)
+            iv = result.affine_bound.to_interval()[0]
+            assert iv.lo >= -3.0 - 1e-5
+            assert iv.hi <= 5.0 + 1e-5
+            assert iv.lo <= 0.0
+            assert iv.hi >= 0.0
+
+    def test_cond_gate_soundness(self):
+        """Randomized: actual cond_gate output within semantic bounds."""
+        with fresh_graph_session():
+            cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
+            inp = InputNode(2, name="inp", value_range=(-3.0, 7.0))
+            from torchwright.ops.logic_ops import cond_gate
+
+            result = cond_gate(cond, inp)
+            intervals = result.affine_bound.to_interval()
+            for _ in range(200):
+                c = torch.FloatTensor(1).uniform_(-1.0, 1.0)
+                v = torch.FloatTensor(2).uniform_(-3.0, 7.0)
+                actual = torch.where(c > 0, v, torch.zeros_like(v))
+                for j in range(2):
+                    assert actual[j].item() >= intervals[j].lo - 1e-5
+                    assert actual[j].item() <= intervals[j].hi + 1e-5
+
+    def test_cond_gate_tighter_than_naive(self):
+        """Semantic bound should be tighter than the MLP-derived bound."""
+        with fresh_graph_session():
+            cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
+            inp = InputNode(1, name="inp", value_range=(1.0, 5.0))
+            from torchwright.ops.logic_ops import cond_gate
+
+            result = cond_gate(cond, inp)
+            iv = result.affine_bound.to_interval()[0]
+            width = iv.hi - iv.lo
+            assert width <= 6.0, f"Semantic bound width {width} should be <= 6 (0 to 5)"
+
+    def test_select_hull(self):
+        """select bound is the hull of true/false intervals."""
+        with fresh_graph_session():
+            cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
+            a = InputNode(1, name="a", value_range=(2.0, 5.0))
+            b = InputNode(1, name="b", value_range=(-1.0, 3.0))
+            from torchwright.ops.map_select import select
+
+            result = select(cond, a, b)
+            iv = result.affine_bound.to_interval()[0]
+            assert iv.lo == pytest.approx(-1.0, abs=1e-5)
+            assert iv.hi == pytest.approx(5.0, abs=1e-5)
+
+    def test_select_soundness(self):
+        """Randomized: actual select output within semantic bounds."""
+        with fresh_graph_session():
+            cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
+            a = InputNode(2, name="a", value_range=(0.0, 10.0))
+            b = InputNode(2, name="b", value_range=(-5.0, 3.0))
+            from torchwright.ops.map_select import select
+
+            result = select(cond, a, b)
+            intervals = result.affine_bound.to_interval()
+            for _ in range(200):
+                c = torch.FloatTensor(1).uniform_(-1.0, 1.0)
+                av = torch.FloatTensor(2).uniform_(0.0, 10.0)
+                bv = torch.FloatTensor(2).uniform_(-5.0, 3.0)
+                actual = av if c.item() > 0 else bv
+                for j in range(2):
+                    assert actual[j].item() >= intervals[j].lo - 1e-5
+                    assert actual[j].item() <= intervals[j].hi + 1e-5
+
+    def test_compare_definite_above(self):
+        """When input is definitely above threshold, compare is constant."""
+        with fresh_graph_session():
+            inp = InputNode(1, name="inp", value_range=(5.0, 10.0))
+            from torchwright.ops.arithmetic_ops import compare
+
+            result = compare(inp, thresh=3.0, true_level=1.0, false_level=-1.0)
+            iv = result.affine_bound.to_interval()[0]
+            assert iv.lo == pytest.approx(1.0, abs=1e-5)
+            assert iv.hi == pytest.approx(1.0, abs=1e-5)
+
+    def test_compare_definite_below(self):
+        """When input is definitely below threshold, compare is constant."""
+        with fresh_graph_session():
+            inp = InputNode(1, name="inp", value_range=(-10.0, -1.0))
+            from torchwright.ops.arithmetic_ops import compare
+
+            result = compare(inp, thresh=0.0, true_level=1.0, false_level=-1.0)
+            iv = result.affine_bound.to_interval()[0]
+            assert iv.lo == pytest.approx(-1.0, abs=1e-5)
+            assert iv.hi == pytest.approx(-1.0, abs=1e-5)
+
+    def test_compare_straddling(self):
+        """When input straddles threshold, compare bound is [min, max] of levels."""
+        with fresh_graph_session():
+            inp = InputNode(1, name="inp", value_range=(-5.0, 5.0))
+            from torchwright.ops.arithmetic_ops import compare
+
+            result = compare(inp, thresh=0.0, true_level=1.0, false_level=-1.0)
+            iv = result.affine_bound.to_interval()[0]
+            assert iv.lo == pytest.approx(-1.0, abs=1e-5)
+            assert iv.hi == pytest.approx(1.0, abs=1e-5)
+
+    def test_compare_soundness(self):
+        """Randomized: actual compare output within semantic bounds."""
+        with fresh_graph_session():
+            inp = InputNode(1, name="inp", value_range=(-5.0, 5.0))
+            from torchwright.ops.arithmetic_ops import compare
+
+            result = compare(inp, thresh=2.0, true_level=7.0, false_level=-3.0)
+            iv = result.affine_bound.to_interval()[0]
+            for _ in range(200):
+                v = torch.FloatTensor(1).uniform_(-5.0, 5.0).item()
+                actual = 7.0 if v > 2.0 else -3.0
+                assert actual >= iv.lo - 1e-5
+                assert actual <= iv.hi + 1e-5
+
+    def test_cond_gate_preserves_correlation(self):
+        """Semantic bound preserves inp correlation through the gate."""
+        with fresh_graph_session():
+            cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
+            inp = InputNode(1, name="inp", value_range=(2.0, 5.0))
+            from torchwright.ops.logic_ops import cond_gate
+
+            result = cond_gate(cond, inp)
+            ab = result.affine_bound
+            assert inp.node_id in ab.columns
+
+
+
+class TestEmbeddingRule:
+    def test_embedding_identity_bound(self):
+        """Embedding produces an identity A-matrix with per-column ranges."""
+        from torchwright.graph import Embedding
+
+        emb = Embedding(vocab=["a", "b", "c"])
+        ab = emb.affine_bound
+        assert ab.n_cols > 0, "Embedding must have non-degenerate bound"
+        assert ab.d_output == emb.d_output
+        assert emb.node_id in ab.columns
+        assert emb.node_id in ab.input_ranges
+        assert torch.equal(ab.A_lo, torch.eye(emb.d_output, dtype=torch.float64))
+        intervals = ab.to_interval()
+        t = emb.table.to(torch.float64)
+        for i in range(emb.d_output):
+            assert intervals[i].lo == pytest.approx(t[:, i].min().item())
+            assert intervals[i].hi == pytest.approx(t[:, i].max().item())
+
+    def test_embedding_per_column_no_wider_than_global(self):
+        """Per-column ranges must never be wider than global min/max."""
+        from torchwright.graph import Embedding
+
+        emb = Embedding(vocab=["a", "b", "c"])
+        ab = emb.affine_bound
+        intervals = ab.to_interval()
+        t = emb.table.to(torch.float64)
+        global_lo = float(t.min().item())
+        global_hi = float(t.max().item())
+        for iv in intervals:
+            assert iv.lo >= global_lo - 1e-10
+            assert iv.hi <= global_hi + 1e-10
+
+
+class TestPosEncodingRule:
+    def test_pos_encoding_identity_bound(self):
+        """PosEncoding produces an identity A-matrix with [-1, 1] per column."""
+        from torchwright.graph import PosEncoding
+
+        pe = PosEncoding(d_pos=8)
+        ab = pe.affine_bound
+        assert ab.n_cols > 0, "PosEncoding must have non-degenerate bound"
+        assert ab.d_output == 8
+        assert pe.node_id in ab.columns
+        assert pe.node_id in ab.input_ranges
+        assert torch.equal(ab.A_lo, torch.eye(8, dtype=torch.float64))
+        intervals = ab.to_interval()
+        for iv in intervals:
+            assert iv.lo == pytest.approx(-1.0)
+            assert iv.hi == pytest.approx(1.0)
 
 
 class TestAttnRule:

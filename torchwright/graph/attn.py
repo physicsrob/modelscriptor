@@ -117,19 +117,9 @@ class Attn(Node):
         super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
 
     def compute_value_type(self):
-        from torchwright.graph.value_type import (
-            NodeValueType,
-            linear_output_range,
-        )
+        from torchwright.graph.value_type import NodeValueType
 
-        # softmax returns non-negative weights summing to 1, so each output
-        # position is a convex combination of rows of (V @ output_matrix).
-        # Convex combinations don't expand per-element range, so we can bound
-        # the output by applying linear_output_range to (value_matrix @ output_matrix).
-        value_range = self.inputs[2].value_type.value_range
-        composed = self.value_matrix @ self.output_matrix
-        out_range = linear_output_range(value_range, composed)
-        return NodeValueType(value_range=out_range)
+        return NodeValueType()
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         query_in_node, key_in_node, value_in_node = self.inputs
