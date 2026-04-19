@@ -68,16 +68,45 @@ class GraphAnalyzer:
                 node = node.inputs[0]
             return node
 
-        # Transfer each Assert's ``claimed_type`` onto the node it wraps,
-        # so downstream graph analysis that runs after stripping still
-        # sees the strengthened type.  Iterate deepest-to-shallowest so
-        # nested Assert chains compose their claims onto the innermost
-        # non-Assert node.
+        # Transfer each Assert's structural flags and tightened
+        # input_ranges onto the node it wraps, so downstream graph
+        # analysis that runs after stripping still sees the
+        # strengthened type and tight ranges.
         for a in asserts:
             if a.claimed_type is None:
                 continue
             target = unwrap(a)
-            target._value_type = tightened_with(target.value_type, a.claimed_type)
+            target._structural_type = tightened_with(
+                target._structural_type, a.claimed_type
+            )
+
+            import torch
+            from torchwright.graph.affine_bound import AffineBound
+
+            a_ab = a._affine_bound
+            t_ab = target._affine_bound
+            new_ranges = dict(t_ab.input_ranges)
+            changed = False
+            for nid, (a_lo, a_hi) in a_ab.input_ranges.items():
+                if nid in new_ranges:
+                    old_lo, old_hi = new_ranges[nid]
+                    tighter_lo = torch.maximum(old_lo, a_lo)
+                    tighter_hi = torch.minimum(old_hi, a_hi)
+                    if not (
+                        torch.equal(tighter_lo, old_lo)
+                        and torch.equal(tighter_hi, old_hi)
+                    ):
+                        new_ranges[nid] = (tighter_lo, tighter_hi)
+                        changed = True
+            if changed:
+                target._affine_bound = AffineBound(
+                    A_lo=t_ab.A_lo,
+                    A_hi=t_ab.A_hi,
+                    b_lo=t_ab.b_lo,
+                    b_hi=t_ab.b_hi,
+                    columns=t_ab.columns,
+                    input_ranges=new_ranges,
+                )
 
         for node in pre_strip_nodes:
             if isinstance(node, Assert):

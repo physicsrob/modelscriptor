@@ -209,14 +209,10 @@ def intersect_element_props(a: NodeValueType, b: NodeValueType) -> NodeValueType
     Used by ops like ``Concatenate`` where the output's per-scalar
     properties must hold across every contributing input. Vector
     properties are dropped unconditionally — they rarely survive
-    concatenation.
+    concatenation. Ranges are not computed here — they come from
+    the affine bound system.
     """
-    r = Range(
-        min(a.value_range.lo, b.value_range.lo),
-        max(a.value_range.hi, b.value_range.hi),
-    )
     return NodeValueType(
-        value_range=r,
         is_integer=a.is_integer and b.is_integer,
         is_binary=a.is_binary and b.is_binary,
         is_sign=a.is_sign and b.is_sign,

@@ -139,7 +139,6 @@ def test_intersect_element_props_keeps_common_properties():
     b = NodeValueType.integer(-5, 3)
     m = intersect_element_props(a, b)
     assert m.is_integer
-    assert m.value_range == Range(-5.0, 9.0)
     assert not m.is_binary
     assert not m.is_one_hot
 
@@ -151,7 +150,6 @@ def test_intersect_drops_mismatched_properties():
     assert m.is_integer
     assert not m.is_binary
     assert not m.is_one_hot
-    assert m.value_range == Range(0.0, 9.0)
 
 
 def test_drop_vector_props():

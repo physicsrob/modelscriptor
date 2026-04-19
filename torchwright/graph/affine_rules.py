@@ -28,7 +28,9 @@ def _safe_matvec(W: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def compute_affine_bound(node: "Node") -> AffineBound:
     """Dispatch to the appropriate affine rule for *node*."""
-    from torchwright.graph.misc import InputNode, LiteralValue, Add, Concatenate, Assert
+    from torchwright.graph.misc import (
+        InputNode, LiteralValue, Add, Concatenate, Assert, ValueLogger,
+    )
     from torchwright.graph.linear import Linear
     from torchwright.graph.relu import ReLU
     from torchwright.graph.embedding import Embedding
@@ -44,6 +46,9 @@ def compute_affine_bound(node: "Node") -> AffineBound:
         import torch
 
         return AffineBound.constant(node.value.to(dtype=torch.float64))
+
+    if isinstance(node, ValueLogger):
+        return node.inputs[0]._affine_bound
 
     if isinstance(node, Linear):
         return _linear_rule(node)
@@ -73,8 +78,7 @@ def compute_affine_bound(node: "Node") -> AffineBound:
         assert ab.n_cols > 0, "PosEncoding must produce non-degenerate affine bound"
         return ab
 
-    r = node._value_type_eager.value_range
-    return AffineBound.degenerate(node.d_output, lo=r.lo, hi=r.hi)
+    return AffineBound.degenerate(node.d_output)
 
 
 def _linear_rule(node) -> AffineBound:
@@ -108,8 +112,7 @@ def _add_rule(node) -> AffineBound:
     u = node.inputs[0]._affine_bound
     v = node.inputs[1]._affine_bound
     if u.d_output != v.d_output:
-        r = node._value_type_eager.value_range
-        return AffineBound.degenerate(node.d_output, lo=r.lo, hi=r.hi)
+        return AffineBound.degenerate(node.d_output)
     u, v = AffineBound.align(u, v)
     return AffineBound(
         A_lo=u.A_lo + v.A_lo,
@@ -331,17 +334,10 @@ def _pos_encoding_rule(node) -> AffineBound:
 
 
 def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -> None:
-    """Replace *node*'s affine bound with a semantic override and re-tighten."""
+    """Replace *node*'s affine bound with a semantic override."""
     if semantic_ab is None:
         return
     node._affine_bound = semantic_ab
-    affine_range = semantic_ab.to_scalar_range()
-    if affine_range != node._value_type_eager.value_range:
-        from dataclasses import replace
-
-        node._value_type_eager = replace(
-            node._value_type_eager, value_range=affine_range
-        )
 
 
 def _cond_gate_semantic_bound(inp_ab: AffineBound) -> AffineBound:

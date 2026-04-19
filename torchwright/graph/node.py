@@ -136,29 +136,24 @@ class Node:
         # ``computed_nodes``.  Empty by default.
         self.scheduling_predecessors: Set["Node"] = set()
         global_node_id += 1
-        self._value_type_eager = self.compute_value_type()
+        self._structural_type = self.compute_value_type()
         from torchwright.graph.affine_rules import compute_affine_bound
 
         self._affine_bound = compute_affine_bound(self)
-        affine_range = self._affine_bound.to_scalar_range()
-        if affine_range != self._value_type_eager.value_range:
-            from dataclasses import replace
-
-            self._value_type_eager = replace(
-                self._value_type_eager, value_range=affine_range
-            )
 
     @property
     def value_type(self) -> NodeValueType:
-        return self._value_type_eager
-
-    @property
-    def _value_type(self) -> NodeValueType:
-        return self._value_type_eager
-
-    @_value_type.setter
-    def _value_type(self, val: NodeValueType) -> None:
-        self._value_type_eager = val
+        r = self._affine_bound.to_scalar_range()
+        sr = self._structural_type.value_range
+        if sr.lo > r.lo or sr.hi < r.hi:
+            r = r.intersect(sr)
+        return NodeValueType(
+            value_range=r,
+            is_integer=self._structural_type.is_integer,
+            is_binary=self._structural_type.is_binary,
+            is_sign=self._structural_type.is_sign,
+            is_one_hot=self._structural_type.is_one_hot,
+        )
 
     @property
     def affine_bound(self):
