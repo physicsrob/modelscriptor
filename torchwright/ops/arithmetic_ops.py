@@ -824,16 +824,12 @@ def piecewise_linear_2d(
         base_linear = Linear(inp, base_weight, name=f"{name}_base")
         result = Add(base_linear, result)
 
-    # Declare the tight output range.  The piecewise-ReLU chain is
-    # interpolated inside the grid and clamped to nearest edge/corner
-    # outside (per docstring: constant extrapolation), so its
-    # contribution is always bounded by the function's min/max over the
-    # grid vertices.  When a non-zero base linear term (base_sx*x +
-    # base_sy*y) is present, it extrapolates linearly with the inputs —
-    # add its contribution over the inputs' declared ranges.  Without
-    # this tightening, downstream consumers see the Linear's worst-case
-    # ``linear_output_range`` bound, which for a typical 300-unit hidden
-    # layer overestimates the true bound by 4–7 orders of magnitude.
+    # Declare the tight output range.  Inside the grid the piecewise-
+    # linear interpolation is bounded by the function's vertex min/max.
+    # A non-zero base linear term (base_sx*x + base_sy*y) extrapolates
+    # linearly outside the grid — but grid_lo/grid_hi already include
+    # the base linear contribution at grid vertices, so only the input
+    # range that extends BEYOND the grid boundaries adds extra range.
     grid_vals = [v for row in values for v in row]
     grid_lo = builtins.min(grid_vals)
     grid_hi = builtins.max(grid_vals)
@@ -845,7 +841,9 @@ def piecewise_linear_2d(
         if not r1.is_finite():
             can_tighten = False
         else:
-            cand = (base_sx * r1.lo, base_sx * r1.hi)
+            ext_below = builtins.min(r1.lo - breakpoints1[0], 0.0)
+            ext_above = builtins.max(r1.hi - breakpoints1[-1], 0.0)
+            cand = (base_sx * ext_below, base_sx * ext_above)
             base_lo += builtins.min(cand)
             base_hi += builtins.max(cand)
     if can_tighten and _builtin_abs(base_sy) > 1e-10:
@@ -853,7 +851,9 @@ def piecewise_linear_2d(
         if not r2.is_finite():
             can_tighten = False
         else:
-            cand = (base_sy * r2.lo, base_sy * r2.hi)
+            ext_below = builtins.min(r2.lo - breakpoints2[0], 0.0)
+            ext_above = builtins.max(r2.hi - breakpoints2[-1], 0.0)
+            cand = (base_sy * ext_below, base_sy * ext_above)
             base_lo += builtins.min(cand)
             base_hi += builtins.max(cand)
     if can_tighten:
