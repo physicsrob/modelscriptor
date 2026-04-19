@@ -57,6 +57,10 @@ def test_fibonacci():
     """Compile and verify Fibonacci sequence generation."""
     net, output_node, embedding = _build()
 
+    n_layers = len(net.layers)
+    print(f"fibonacci: {n_layers} layers, d={D}, d_head={D_HEAD}")
+    assert n_layers <= 50, f"Too many layers: {n_layers}"
+
     # Use "fibonacci" as the prompt — 9 letters provides enough tokens
     # before \n to avoid OOB attention for 17 output entries.
     prompt = list("fibonacci")
@@ -70,11 +74,3 @@ def test_fibonacci():
     expected = "".join(f"{f:02d}" for f in expected_fibs)
 
     assert result == expected, f"Expected '{expected}' but got '{result}'"
-
-
-def test_fibonacci_layer_count():
-    """Verify compilation stays within a reasonable layer budget."""
-    net, _, _ = _build()
-    n_layers = len(net.layers)
-    print(f"fibonacci: {n_layers} layers, d={D}, d_head={D_HEAD}")
-    assert n_layers <= 50, f"Too many layers: {n_layers}"

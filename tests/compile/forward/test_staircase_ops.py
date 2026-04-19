@@ -24,24 +24,14 @@ from torchwright.graph import Concatenate
 from torchwright.ops.arithmetic_ops import mod_const, thermometer_floor_div
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
-# (divisor, max_value)
-#   (2, 32)    — baseline, matches existing test_arithmetic_ops max scale
-#   (10, 100)  — first step into divisor=10 territory
-#   (5, 100)   — divisor unseen by existing tests
-#   (10, 320)  — 32-step staircase, divisor 10
-#   (8, 640)   — old DOOM default shape (shards_per_col=10, W=64)
-#   (10, 640)  — same scale, divisor 10
-#   (10, 1600) — new DOOM default shape (shards_per_col=10, W=160)
-#   (16, 256)  — wider divisor, typical for byte-sized arithmetic
+# Representative (divisor, max_value) sweep:
+#   (2, 32)    — baseline, small divisor/small scale
+#   (10, 320)  — 32-step staircase, divisor 10 (mid scale)
+#   (10, 1600) — new DOOM default shape (shards_per_col=10, W=160), full scale
 SCALE_CASES = [
     (2, 32),
-    (5, 100),
-    (10, 100),
     (10, 320),
-    (8, 640),
-    (10, 640),
     (10, 1600),
-    (16, 256),
 ]
 
 

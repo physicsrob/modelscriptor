@@ -1,3 +1,63 @@
+# Communication
+
+## Use plain English; reintroduce terms on every use
+
+When explaining technical concepts, describe the mechanics in plain
+English rather than introducing named abstractions. Say "the input
+range crosses zero" not "straddling." Say "the slope of the line
+connecting the endpoints" not "the chord relaxation." If a term
+doesn't already exist in the codebase, prefer the description — the
+user will name it if it needs a name.
+
+When a named term genuinely earns its keep (you'll reference the
+concept many times and the name saves confusion), define it inline on
+every use until the user starts using it themselves — that's the
+signal they've adopted it. "The PL-drift (the gap between the
+piecewise-linear approximation and the exact function) compounds
+through..." not just "The PL-drift compounds through..."
+
+Never stack coined terms. "The chord relaxation of the straddling ReLU
+in the forward-mode LiRPA" is four layers of undefined vocabulary.
+Each layer of jargon you build on top of another layer compounds
+confusion. If you need multiple concepts, introduce them one at a time
+with plain-English definitions between them.
+
+The user manages multiple projects and does not have your earlier
+definitions loaded. Write every explanation so it can be understood
+cold.
+
+## Admit uncertainty; don't fill gaps with plausible stories
+
+When you aren't sure whether two things are really the same, whether a
+mechanism works the way you think, or whether a number is right — say
+so. "I think these might be the same thing but I'm not sure" is always
+better than treating them as interchangeable and building an
+explanation on top. Check the code before building an explanation on
+any factual claim (a constant's value, what a function reads, how a
+data structure is used). Never construct a narrative that "sounds
+right" without tracing the actual code path — the most dangerous
+explanations are the ones that are internally consistent but don't
+match reality.
+
+## Flag complexity before building it
+
+Before introducing a new abstraction, indirection layer, or
+deferred-execution pattern, flag it to the user: what it is, why you
+think you need it, and what the simpler alternative would be. "I'm
+about to add a placeholder system because the basis needs to be fully
+known before computing bounds — the simpler alternative is making the
+basis mutable. The placeholder approach is more complex but avoids
+changing Basis. Which do you prefer?" Don't commit to elaborate
+machinery without explicit agreement. If the user says "that feels
+gross," trust that instinct and look for the direct path.
+
+# DOOM game graph
+
+Before working on anything under `torchwright/doom/`, `torchwright/doom/stages/`,
+or `tests/doom/`, read `docs/doom_graph.md`. It documents the full pipeline:
+token sequence, phase structure, every stage's computation, feedback layouts,
+and how the graph compiles to a transformer.
+
 # Testing
 
 ## Running Tests
