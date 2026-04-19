@@ -29,7 +29,12 @@ def _safe_matvec(W: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def compute_affine_bound(node: "Node") -> AffineBound:
     """Dispatch to the appropriate affine rule for *node*."""
     from torchwright.graph.misc import (
-        InputNode, LiteralValue, Add, Concatenate, Assert, ValueLogger,
+        InputNode,
+        LiteralValue,
+        Add,
+        Concatenate,
+        Assert,
+        ValueLogger,
     )
     from torchwright.graph.linear import Linear
     from torchwright.graph.relu import ReLU
