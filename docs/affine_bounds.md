@@ -997,276 +997,192 @@ emitting a zero-coefficient `AffineBound`.
 
 ---
 
-## Appendix: context for plan-mode and future maintainers
+## Appendix: implementation notes
 
-This appendix holds context that shaped the design but does not
-belong in the design proper — rejected alternatives, validation
-steps that were discussed but deferred, claims that should be
-verified during implementation, and open questions that plan mode
-needs to resolve. None of it changes the design; all of it is
-useful when deciding *how* to implement or *whether* to revisit a
-choice.
-
-### A. Design alternatives considered and rejected
-
-- **Forward-mode vs backward-mode LiRPA / CROWN.** Backward-mode is
-  tighter per query (relaxations picked per output), but requires
-  re-walking ancestors per bound-consumer site; this design has
-  many such sites across the graph. Forward-mode was chosen for fit
-  with the per-node `compute_value_type()` contract. If forward
-  bounds prove too loose in practice, backward-mode is the
-  documented upgrade path.
-- **Basis construction timing.** Earlier options: (a) convention —
-  require all `InputNode`s to be declared first and auto-freeze the
-  basis on the first non-`InputNode` construction; (c) dynamic
-  basis that widens as new `InputNode`s arrive. Both were rejected
-  in favor of (b) — explicit `finalize(root)` with compile / compute
-  auto-trigger — because it cleanly separates graph construction
-  from bound computation without imposing construction order and
-  without the complexity of growing-basis bookkeeping.
-- **`Guarantee` removal as a gradual migration.** A shim where
-  `Guarantee.ALWAYS` aliases `True` and `APPROXIMATE` silently
-  promotes (or warns) was rejected in favor of all-at-once
-  deletion. The scope is small and the shim would leave two
-  spellings of the same concept alive in the code indefinitely.
-- **auto_LiRPA as a runtime / compile-time dependency.** Rejected.
-  auto_LiRPA wraps `nn.Module`s, expects a query-driven workflow,
-  and carries its own softmax / bilinear relaxations that this
-  design does not use. Adopting it would mean writing an IR-to-
-  Module adapter per primitive and running the library in a mode
-  it is not designed for. A from-scratch implementation of
-  forward-mode LiRPA inside `compute_value_type()` is both smaller
-  and a better fit.
-- **Affine-preserving attention.** Published softmax and bilinear
-  `Q·K^T` relaxations (see *Related prior work* in the `Attn`
-  section) could tighten attention bounds but introduce
-  cross-position coupling that the single-position basis cannot
-  represent. Rejected for v1; not for reasons of mathematical
-  impossibility.
-- **α-CROWN for the `ReLU` lower bound.** Rejected for v1 because
-  it is not a local rule change — it requires autograd through
-  bounds and a per-query optimization pass. Treated in the doc as
-  a future upgrade with non-trivial architectural cost.
-
-### B. Validation step discussed but not performed
-
-Before committing to implementation, a diagnostic measurement was
-proposed: wrap the compiled `HeadlessTransformer` (walkthrough or
-similar real graph) in `auto_LiRPA`'s `BoundedModule`, run CROWN,
-and compare the resulting interval widths at the four bound-
-consumer sites (`cond_gate._max_abs_or_raise`,
-`floor_int`'s breakpoint span, `assert_in_range`'s inferred claim,
-`attend_mean`'s `atol`) against the current scalar-IBP widths.
-The expected ratios are what justify the implementation cost.
-
-This step was not performed. The decision to proceed rested on
-qualitative reasoning: the codebase already has hand-rolled
-workarounds for correlation-blindness (`linear_output_range`'s
-per-component arithmetic, the cond_gate offset pattern), which
-suggests the gap is meaningful. Plan mode should decide whether to
-run the measurement as a first milestone to set an empirical
-expectation, or proceed directly.
-
-### C. Claims to verify during implementation
-
-The design makes several empirical claims that are plausible but
-uncorroborated. Each should be checked when the relevant code is
-touched:
-
-- **"The scheduler does not build graphs that rely on
-  cancellation through a straddling `ReLU`."** Stated in the `Add`
-  caveat. Before trusting it, grep for patterns like
-  `ReLU(x) - ReLU(x)` or structural equivalents and confirm no
-  compiled op depends on exact cancellation downstream of a
-  straddling ReLU.
-- **"Typical `n` is on the order of tens to low hundreds."**
-  Stated in the sizing subsection. Verify by computing
-  `sum_of_input_widths` on the actual compiled DOOM graph and any
-  other non-trivial example.
-- **"`float64` is sufficient under bounded weight norms."**
-  Stated in the sizing subsection. Verify by running a test
-  pipeline that compares `to_interval()` output between
-  `float32` and `float64` coefficient storage on a 50-70 layer
-  graph. If divergence is larger than bound-consumer tolerance,
-  the claim fails.
-- **Structural flag composition rules match existing compiled
-  behavior.** The tables in *Structural flag composition*
-  were derived from first principles. Compare against the
-  current `_min_guarantee`-based composition on a representative
-  set of real nodes to confirm no semantic drift.
-
-### D. Open implementation questions
-
-The design says *what* happens but not always *how*. Plan mode
-needs to pin these down:
-
-- **Placeholder Python class.** Is there a single
-  `ConsumerPlaceholder(Node)` class parameterized by op type and
-  config, or one subclass per consumer op? What attributes does
-  it carry for materialize? How are downstream references to it
-  rebound when materialization replaces it with a subgraph —
-  mutation of `inputs` lists on descendants, or a separate indirection?
-- **`fresh_graph_session` scope and semantics.** Context manager
-  vs explicit reset? What state is per-session vs global? What
-  happens if nested?
-- **`AffineBound` factory signatures.** The appendix in the doc
-  sketches `identity`, `constant`, `degenerate`. Exact signatures
-  (keyword args, dtype handling, what accepts `None`) are
-  undecided.
-- **Migration ordering.** Which primitive ports first? Option (b)
-  in *Ops with custom `compute_value_type` overrides* allows a
-  partial migration (degenerate bounds for un-ported ops). What is
-  the minimal set of ports needed to unlock measurable tightening
-  at the four bound-consumer sites?
-- **Test strategy.** Unit tests per rule (hand-computed bounds
-  for small graphs)? Property-based comparison against `auto_LiRPA`
-  on simple nets? End-to-end regression on compiled DOOM
-  constants?
-- **`compile_graph` integration.** Where exactly does the auto-
-  `finalize` call land — before scheduling, during, or after? How
-  is the frozen-graph invariant enforced against scheduler mutations?
-
-### E. Adjacent concerns the plan should account for
-
-- **`make measure-noise` re-run per ported op.** Tighter bound-
-  driven constants change compiled op behavior. The numerical-
-  noise data in `docs/op_noise_data.json` and the commentary in
-  `docs/numerical_noise_findings.md` need to be regenerated /
-  updated as ops migrate. See the *Numerical noise* section of
-  `CLAUDE.md` for the exact workflow.
-- **ONNX export.** `AffineBound` is compile-time metadata and is
-  explicitly excluded from export. Verify the existing ONNX
-  export tests still pass after migration — no bound-related
-  state should leak into exported weights.
-- **Compiled-artifact parity.** Migration should be neutral or
-  tightening for compiled artifact behavior. A regression gate
-  that compares compiled behavior on a reference example
-  (walkthrough, adder, calculator) before and after migration is
-  a good guardrail.
+This appendix documents decisions made during implementation that
+diverge from or extend the main document's design. The main
+document describes the design intent; this appendix describes
+what we built and why.
 
 ---
 
-## Appendix F: Revised direction — eager bounds, no finalize
+### Eager bounds and self-keyed basis
 
-The placeholder/finalize architecture described in the main document
-was implemented and found to be **actively harmful**. This appendix
-describes the replacement direction.
+The main document's *Graph lifecycle* section describes a
+`finalize(root)` pass that builds a global `Basis` from all
+`InputNode`s, then propagates bounds in topological order. This
+was implemented and found to be actively harmful: placeholder
+nodes' `compute_value_type()` returned pessimistic types that
+downstream nodes cached during construction and never recomputed
+after finalization. The result was silent M-value explosions
+(M = 3.3e21 observed in `balanced_parens`).
 
-### What went wrong
+The replacement computes affine bounds eagerly in `Node.__init__`,
+immediately after `compute_value_type()`. Each `AffineBound`
+carries its own column map (`Dict[int, Tuple[int, int]]` mapping
+`InputNode.node_id` to `(start_col, width)`) and its own
+`input_ranges` dict. Binary ops merge column maps via a scatter
+into a wider tensor. This eliminates the global `Basis`, the
+`finalize` pass, `ConsumerPlaceholder`, and all their helpers.
+`cond_gate` and `select` build their subgraphs eagerly.
 
-The finalize-based design required every `cond_gate` and `select` to
-return a `ConsumerPlaceholder` during construction, deferring the
-real subgraph to a later `finalize(root)` pass. This introduced:
+---
 
-1. **`_rebind_downstream`** — after materializing a placeholder,
-   walk every node in the graph and rewrite `inputs` lists that
-   referenced the placeholder to point at the materialized output.
-2. **`_compute_all_ready`** — after each materialization, re-walk
-   the graph to compute affine bounds for nodes that are now ready.
-3. **Auto-finalize in `Node.__init_subclass__`** — wrap every
-   `Node.compute()` to call `finalize(self)` if affine bounds are
-   missing, so reference evaluation works transparently.
-4. **Stale eager types** — placeholder nodes' `compute_value_type()`
-   returned value types that were sometimes more pessimistic than
-   what the real subgraph would produce (e.g. `unknown()` when the
-   cond wasn't `is_sign`). Downstream nodes built during
-   construction used these pessimistic types for their own
-   `_value_type_eager`. After finalize replaced the placeholder
-   with the real subgraph, the downstream nodes' eager types were
-   NOT recomputed — they stayed stale. The affine bound's
-   `_value_type_affine` is the intersection of eager and affine
-   ranges, so a stale `(-inf, inf)` eager range meant the affine
-   range (however wide) passed through unclamped.
+### Attn propagates value coefficients
 
-This produced silent M-value explosions (M = 3.3e21 observed in
-`balanced_parens`) that caused the compiled transformer to output
-garbage. The failure was silent — no assertion, no error, just
-wrong output. An M sanity bound was added as a guardrail, but the
-root cause was architectural: the placeholder indirection made
-value-type propagation unsound.
+The main document says `Attn` emits a zero-coefficient (degenerate)
+`AffineBound`. The implementation propagates the value input's
+affine bound through V and O matrices via sign-split, producing
+non-zero coefficients. This is tighter: downstream ops that
+skip-connect around the attention sublayer retain cancellation
+with the Attn output's basis variables. Soundness holds because
+softmax produces convex-combination weights, so per-component
+affine bounds on `value @ V` carry through.
 
-### The replacement: eager bounds at init time
+---
 
-Affine bounds are computed in `Node.__init__`, immediately after
-`compute_value_type()`. Each node's bound is derived from its
-inputs' bounds, which are already available (inputs are constructed
-before the node that consumes them).
+### ReLU uses continuous chord, not α ∈ {0, 1}
 
-`cond_gate` and `select` build their subgraphs eagerly, as they
-did before the placeholder experiment. No placeholders, no
-finalize, no `_rebind_downstream`, no auto-finalize wrapper.
+The main document specifies `α = 1 if h >= -l else 0` for the
+straddling lower bound. The implementation uses
+`α = h / (h - l)` for both upper and lower envelopes. This
+is strictly tighter: the continuous chord tracks correlation
+through straddling ReLU. For example, `ReLU(x) + (-ReLU(x))`
+with `x ∈ [-2, 4]` gives `[-4/3, 4/3]` instead of `[-4, 4]`.
 
-### Self-keyed basis
+When either endpoint is infinite (unbounded straddling), the
+chord computation would produce `inf/inf = NaN`. A guard falls
+back to degenerate `[0, h]` (or `[0, +inf]`) for those
+components.
 
-The main document assumes a single shared `Basis` object built from
-ALL `InputNode`s in the graph — a fact only known after
-construction is complete. This was the original motivation for the
-finalize pass.
+---
 
-The replacement uses a **self-keyed basis**: each `AffineBound`
-carries a column map `Dict[int, int]` that maps `InputNode.node_id`
-to column index. The `A` matrices are dense tensors whose columns
-correspond to the entries in that map.
+### Assert on non-InputNode: degenerate collapse
 
-- **`InputNode`** creates a 1-column bound keyed to itself.
-- **`LiteralValue`, `Embedding`, `PosEncoding`** create 0-column
-  (degenerate) bounds with an empty column map.
-- **Binary ops** (`Add`, `Concatenate`, `Attn` value path) merge
-  their inputs' column maps into a union, reindexing the `A`
-  matrices so columns align. Merging is a scatter into a
-  wider tensor — the cost is proportional to `n_input_nodes`,
-  which is small (1 for simple examples, ~20 for DOOM).
-- **Unary ops** (`Linear`, `ReLU`, `Assert`) inherit the input's
-  column map unchanged. No reindexing needed.
+The main document (lines 364–378) says an Assert on a non-InputNode
+should copy the wrapped node's coefficients unchanged and intersect
+only at `to_interval()` time. This was explored thoroughly and
+found to produce worse bounds than the alternative. The
+implementation uses **degenerate collapse**: zero A matrices,
+per-component intervals from the intersection of the affine
+evaluation with the claimed range.
 
-This eliminates the global basis entirely. Each `AffineBound` is
-self-contained. No construction-order constraints. No basis
-invalidation when a new `InputNode` is created. Two bounds from
-unrelated subgraphs can be combined without prior coordination.
+Four approaches to coefficient preservation were tried and
+rejected:
 
-### Column map merging
+**1. Full passthrough with `claimed_range` clipping.** The
+Assert's `AffineBound` keeps the input's A/b coefficients and
+adds a `claimed_range` field that `to_interval()` clips against.
+Problem: downstream `Linear` nodes multiply the A matrices by
+their weight matrices, producing new `AffineBound`s without
+`claimed_range`. The unclamped coefficients, evaluated against
+the full input basis box, produce ranges in the millions. In the
+3-digit adder, this caused M-offset values of 1.1e7 (sanity bound
+is 1e6).
 
-When combining two `AffineBound`s with column maps
-`{A: 0, B: 1}` and `{B: 0, C: 1}`:
+**2. Assert as a new basis variable.** The Assert creates a fresh
+identity A-matrix keyed by the Assert's own `node_id`, with the
+claimed range as the basis variable's range. This gives tight
+ranges for one downstream Linear (identity × claimed range =
+claimed range). But when the Assert basis variable merges with
+original `InputNode` basis variables through `Add`/`Concatenate`
+and feeds into a second Linear, cross-terms between the two
+basis families widen the result. In the DOOM graph, worst-case
+bound width went from 42M to 189M, and gate M from 43K to 75K,
+causing new rendering test failures.
 
-1. Build the union map: `{A: 0, B: 1, C: 2}`.
-2. Create new `A` matrices with 3 columns, initialized to zero.
-3. Scatter the first bound's columns: column 0 → position 0
-   (A), column 1 → position 1 (B).
-4. Scatter the second bound's columns: column 0 → position 1
-   (B), column 1 → position 2 (C).
-5. Apply the rule (e.g. element-wise addition for `Add`).
+**3. Back-projection of claim onto input_ranges.** Given
+`A · x + b ∈ [C_lo, C_hi]`, derive tighter ranges on each basis
+variable `x_j`. For each variable, the tightest bound assumes all
+other variables take their most favorable values (minimizing their
+contribution for upper-bound constraints, maximizing for
+lower-bound constraints — NOT worst-case, which over-constrains).
+This is mathematically sound but was shown to be unnecessary:
+forward IBP propagation of the claim through downstream weight
+matrices is always at least as tight as affine evaluation against
+the back-projected box, because the back-projected box is a
+conservative (axis-aligned) approximation of the true feasible
+polytope.
 
-The scatter is O(d_output × n_columns) per operand — negligible
-for the matrix sizes involved.
+**4. IBP fields inside AffineBound.** Add per-component interval
+bounds (`ibp_lo`, `ibp_hi`) that propagate via interval arithmetic
+through each rule alongside the A/b coefficients. `to_interval()`
+returns the tighter of (coefficient evaluation, IBP) per component.
+This is the most principled approach — two complementary systems
+in one object. Problem: it fails for the same reason as approach 1,
+just less severely. The degenerate collapse kills upstream columns;
+with 2 basis columns through a 434-unit ReLU hidden layer, the
+coefficient evaluation stays tight (two terms per component). With
+coefficient passthrough, the Assert preserves 3 additional columns
+from the Attn upstream, each tracking InputNode components with
+range ±10000. Through the same ReLU layer, the coefficient
+evaluation explodes to 366K. IBP recovers partially (to 16K via
+`clamp(ibp, min=0)` through ReLU then interval arithmetic through
+the output matrix), but the old 2-column bound gave 5.7K. In the
+DOOM graph, 83 of 1722 nodes regressed (worst case: 3x wider).
 
-### Basis range information
+**Why degenerate collapse is the right choice.** The column-count
+effect is structural, not accidental. At an Assert boundary, the
+upstream chain has mapped many `InputNode` components through
+many weights into a value the Assert claims is in a narrow range.
+Downstream ops don't need to track which combination of upstream
+inputs produced that value — they need to know it's in the
+narrow range. Degenerate collapse expresses this: "the upstream
+relationship is consumed; downstream, this is a fresh bounded
+value." Preserving the upstream coefficients forces downstream
+ReLU layers to evaluate those coefficients against the full
+upstream input ranges, accumulating width through every hidden
+unit.
 
-The shared `Basis` object in the main document stores `x_lo` /
-`x_hi` per variable. With self-keyed bounds, this information lives
-on the `InputNode` objects themselves (their `value_range`). When
-`to_interval()` needs the basis box, it reads ranges from the
-`InputNode`s referenced by the column map.
+No current graph pattern exercises cancellation through Assert
+boundaries. Gate outputs (cond_gate, select, compare) have
+semantic overrides that replace the Assert's bound. Digit
+extractions, score assertions, and similar claims are consumed by
+a single downstream path with no fan-out-and-recombine. If a
+future pattern requires cancellation through Assert, the design
+space is well-understood; the constraint is finding a mechanism
+that preserves coefficients without adding columns that widen
+downstream ReLU evaluations.
 
-This is equivalent and avoids a separate object. `InputNode`s
-already store their declared ranges; `to_interval()` just looks
-them up by node_id.
+---
 
-### What stays the same
+### Architecture: single source of truth for ranges
 
-The per-op propagation rules (Linear, Add, ReLU, Concatenate,
-Attn, Assert, etc.) are unchanged in their math. Only the basis
-bookkeeping differs. The structural flag composition rules are
-unchanged. The `to_interval()` sign-split formula is unchanged.
-The degenerate-bound escape hatch for ops that can't compute
-affine bounds is unchanged.
+The implementation eliminates the dual range system that the main
+document's `NodeValueType.value_range` + `AffineBound` design
+implied. `AffineBound` is the sole source of truth for ranges:
 
-### What is deleted
+- `Node.__init__` stores `_structural_type` (from
+  `compute_value_type()`, carrying only structural flags like
+  `is_integer`, `is_binary`, `is_sign`, `is_one_hot`) and
+  `_affine_bound` (from `compute_affine_bound()`).
+- `Node.value_type` is a derived property that combines
+  `_affine_bound.to_scalar_range()` with `_structural_type`'s
+  flags. When `_structural_type` has a finite `value_range`
+  (e.g., from an Assert's `claimed_type`), the property
+  intersects it with the affine-derived range.
+- `compute_value_type()` returns structural flags only. No op
+  computes or propagates `value_range` through
+  `compute_value_type`; all range information flows through the
+  affine system.
+- The compiler's `_strip_asserts` pass transfers both structural
+  flags (via `tightened_with`) and tightened `input_ranges` (from
+  the Assert's `AffineBound`) onto the unwrapped target node.
 
-- `ConsumerPlaceholder`, `CondGatePlaceholder`, `SelectPlaceholder`
-- `finalize()` and all its helpers (`_rebind_downstream`,
-  `_compute_all_ready`, `_tighten_basis_from_input_asserts`)
-- Auto-finalize wrapper in `Node.__init_subclass__`
-- The `Basis` class (replaced by per-bound column maps)
-- `ValueTypeNotFinalized` exception
-- The *Graph lifecycle* section's two-phase model
+---
+
+### NaN guards for unbounded inputs
+
+Three guard sites prevent `0 × ±inf = NaN` and `inf / inf = NaN`
+when `InputNode`s have unbounded declared ranges:
+
+1. `_eval_lower` / `_eval_upper`: separate `pos == 0` and
+   `neg == 0` guards instead of a single `a == 0` check, because
+   `clamp(a, min=0) * x_lo` can produce `0 × (-inf) = NaN` even
+   when `a > 0` (the negative clamp is zero but IEEE computes both
+   branches of `pos * x_lo + neg * x_hi` before the where-select).
+2. `_safe_matvec(W, b)`: treats `0 × ±inf → 0` in bias
+   propagation through Linear and Attn rules.
+3. ReLU and cond_gate straddling: when either endpoint is
+   infinite, falls back to degenerate bounds instead of computing
+   `h / (h - l)`.
