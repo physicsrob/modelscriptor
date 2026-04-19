@@ -249,7 +249,7 @@ def test_schedule_free_add():
     live_node = InputNode("live", 4, value_range=(-100.0, 100.0))
     add_node = Add(dead_node, live_node)
     # Give live_node another consumer so it's NOT dead-for-add
-    other = _make_linear(live_node, 2, "other")
+    other = _make_linear(live_node, 4, "other")
     out = Add(add_node, other)
 
     graph = GraphAnalyzer(out)
@@ -320,7 +320,7 @@ def test_schedule_add_into_preferred_over_compute_add():
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
     # Give b another consumer so it's NOT dead-for-add, but a IS dead-for-add
-    b_other = _make_linear(b, 2, "b_other")
+    b_other = _make_linear(b, 4, "b_other")
     out = Add(add_node, b_other)
 
     graph = GraphAnalyzer(out)
