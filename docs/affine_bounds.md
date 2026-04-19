@@ -1,8 +1,9 @@
 # Affine bound propagation
 
-Design of the affine-bound replacement for `Range` inside
-`NodeValueType`. This document describes the completed system —
-not the steps to get there.
+Design of the affine-bound system that replaced scalar `Range`
+propagation as the source of truth for value ranges. This
+document describes the completed system — not the steps to get
+there.
 
 ---
 
@@ -31,16 +32,16 @@ consumers; `cond_gate` adds `M` and a later `Add` subtracts it;
 sum chains are frequently dominated by correlated or identical
 operands.
 
-The primary workaround already in the codebase lives in
-`linear_output_range` (`graph/value_type.py:257-275`), the helper
-called by `Linear.compute_value_type()`. It performs per-column
-interval arithmetic over the weight matrix (each output
-component's contribution computed independently, then the
-componentwise min/max is aggregated into a single `Range`). This
-recovers some tightness inside each `Linear`, but the per-component
-information is lost at the aggregate `Range` boundary — downstream
-`Linear`s consuming that output see only the scalar union, so the
-recovered tightness doesn't compose through the graph.
+The primary workaround in the pre-affine codebase was
+`linear_output_range` (since removed), a helper called by
+`Linear.compute_value_type()`. It performed per-column interval
+arithmetic over the weight matrix (each output component's
+contribution computed independently, then the componentwise
+min/max aggregated into a single `Range`). This recovered some
+tightness inside each `Linear`, but the per-component information
+was lost at the aggregate `Range` boundary — downstream `Linear`s
+consuming that output saw only the scalar union, so the recovered
+tightness didn't compose through the graph.
 
 The motivating cancellation pattern is `cond_gate`: add a large
 offset `M`, do gated work, subtract `M`. The two `M` constants
@@ -74,8 +75,9 @@ Affine bound propagation fixes that at the abstraction layer —
 `ReLU`'s linear envelope — a pair of affine functions that
 sandwich the true `ReLU` output when the input straddles zero; see
 the `ReLU` rule below), and downstream constants come out tighter
-as a consequence. The per-component min/max logic inside
-`linear_output_range` becomes redundant.
+as a consequence. The per-component min/max logic that
+`linear_output_range` provided is now redundant and has been
+removed.
 
 ### Why forward propagation
 
@@ -88,49 +90,42 @@ per query — because it picks a relaxation optimized for the
 specific output — but it re-walks the graph per query.
 
 Torchwright's per-node `compute_value_type()` contract fits
-forward-mode natively: bounds are computed once, at finalization,
-and stored on each node where every bound-consumer op picks them up
-by reading `node.value_type` at the materialization step. Backward
-queries would pay re-propagation cost per consumer, which there
-are many of (one per `cond_gate`, `floor_int`, `assert_in_range`,
-`attend_mean` call in the compiled graph). Tighter-per-query
-backward-mode is a real option to consider if forward bounds prove
-insufficient in practice, but it would require restructuring the
-finalization pass around query nodes and is deliberately not part
-of v1.
+forward-mode natively: bounds are computed once, eagerly at
+construction time, and stored on each node where every
+bound-consumer op picks them up by reading `node.value_type`.
+Backward queries would pay re-propagation cost per consumer,
+which there are many of (one per `cond_gate`, `floor_int`,
+`assert_in_range`, `attend_mean` call in the compiled graph).
+Tighter-per-query backward-mode is a real option to consider if
+forward bounds prove insufficient in practice, but it would
+require restructuring bound computation around query nodes and is
+deliberately not part of v1.
 
 ---
 
 ## The basis
 
-Every affine expression in the system is written over the same set
-of variables, called **the basis**. The term is local to this
-system; it is unrelated to the "residual-stream column basis" used
-elsewhere in the codebase. The basis of affine bounds is the set
-of every component of every `InputNode` in the graph.
+Every affine expression in the system is written over a set of
+variables called **the basis**. The term is local to this system;
+it is unrelated to the "residual-stream column basis" used
+elsewhere in the codebase. The basis consists of the components
+of every **source node** in the graph — `InputNode`, `Embedding`,
+and `PosEncoding` nodes.
 
-Concretely, if the graph has `InputNode`s with widths
-`d_1, d_2, ..., d_k`, the basis has `n = d_1 + d_2 + ... + d_k`
-variables. Basis variable `j` corresponds to one specific component
-of one specific `InputNode`, and it takes values in the range that
-`InputNode`'s declared bounds give it (from `assert_in_range` on
-the input, or an equivalent declaration at `InputNode`
-construction).
+Each `AffineBound` carries a **self-keyed** column map: a
+`columns` dict mapping each source node's `node_id` to its
+`(start_col, width)` in the A matrices, and an `input_ranges`
+dict mapping each source node's `node_id` to its `(lo, hi)`
+declared range. There is no shared `Basis` object; column layouts
+are local to each bound and are merged on demand when binary ops
+combine bounds from different source paths.
 
-The basis is fixed for the lifetime of the graph. It does not grow
-as the graph gets deeper. It does not change when we encounter
-`Attn` or any other op. Every `AffineBound` in the graph is
-expressed over the same `Basis` object, so affine expressions
-compose directly: row-wise addition for `Add`, matrix multiply for
-`Linear`, and so on.
-
-```python
-@dataclass(frozen=True)
-class Basis:
-    x_lo: torch.Tensor    # shape [n]; per-variable lower bound
-    x_hi: torch.Tensor    # shape [n]; per-variable upper bound
-    # metadata mapping variable index → (InputNode, component)
-```
+A given bound's `n_cols` is typically much smaller than the total
+number of source-node components in the graph, because each bound
+only tracks the source nodes that are reachable upstream. As
+bounds merge through `Add` or `Concatenate`, `n_cols` grows and
+the A matrices are scattered into a wider common layout via
+`AffineBound.align()`.
 
 ### Position semantics
 
@@ -138,33 +133,38 @@ Torchwright's `compute_value_type()` is position-agnostic: it
 produces one `NodeValueType` per node that describes every
 component of the node's output at every token position. The affine
 bound system inherits this. A basis variable represents the
-per-position value of its corresponding `InputNode` component, with
-an interval wide enough to hold every possible value at every
+per-position value of its corresponding source-node component,
+with an interval wide enough to hold every possible value at every
 position. An affine expression `A[i, :] · x + b[i]` describes the
 node's value at component `i` at *whatever position it is evaluated
-at*, in terms of that same position's `InputNode`-component values.
+at*, in terms of that same position's source-node-component values.
 
 Soundness follows pointwise: for any concrete position `p` and any
-concrete sample of `InputNode` values at that position drawn from
+concrete sample of source-node values at that position drawn from
 the basis box, the node's per-position value at component `i` lies
 in the interval derived from the affine expression at those input
 values. Because every position draws from the same basis box, the
 derived component interval covers every position simultaneously.
 
-This is why `Attn` is the only op that cannot produce a non-zero
-`A` matrix. The attention output at position `p` is a function of
-`InputNode` values at positions `0, 1, ..., p` — not just position
-`p` — and the affine framework has no way to express that
-dependency in one position-local basis.
+The `Attn` rule leverages this: the attention output at position
+`p` is a function of source-node values at positions
+`0, 1, ..., p` — not just position `p`. The rule handles this by
+observing that softmax produces convex-combination weights, so
+per-component affine bounds on `value @ V` carry through unchanged
+(a convex combination of values that each satisfy the same
+per-component affine bound also satisfies that bound). The Q/K
+logits, which determine which positions contribute, are not
+tracked — only the value input's coefficients propagate.
 
 ### Sizing
 
-For a typical compiled program, `n` is on the order of tens to low
-hundreds — game-state inputs, cursor positions, flags — not
-thousands. Per-node storage is `[d_output × n]` floats per bound,
-so typical cost per node stays modest. Bound coefficients are held
-in `torch.float64` regardless of the transformer's forward-pass
-dtype; scalar-interval error compounds over many `Linear` / `Add`
+For a given bound, `n_cols` is on the order of tens to low
+hundreds — game-state inputs, cursor positions, flags,
+embedding/encoding components from upstream. Per-node storage is
+`[d_output × n_cols]` floats per bound, so typical cost per node
+stays modest. Bound coefficients are held in `torch.float64`
+regardless of the transformer's forward-pass dtype;
+scalar-interval error compounds over many `Linear` / `Add`
 steps and the extra precision buys headroom for free. This
 assumes weight matrices with bounded spectral norm (condition number
 roughly O(1) per `Linear`), which is the regime compiled torchwright
@@ -179,26 +179,36 @@ that regime out of scope.
 ## `AffineBound`
 
 ```python
-@dataclass(frozen=True)
+@dataclass
 class AffineBound:
-    """Per-component affine lower and upper bounds on a node's output.
+    """Per-component affine lower/upper bounds with self-keyed basis.
 
-    For a node with width ``d_output``, bounded over the graph's
-    basis (see ``Basis``):
+    For a node with width ``d_output``:
 
         lower(x)[i] = A_lo[i, :] · x + b_lo[i]
         upper(x)[i] = A_hi[i, :] · x + b_hi[i]
 
-    with the invariant, for every x in the basis's declared box:
+    with the invariant, for every x in the basis box:
 
         lower(x)[i] ≤ node_output[i] ≤ upper(x)[i]
     """
-    basis: Basis                # the graph's single basis
-    A_lo: torch.Tensor          # shape [d_output, n]
+    A_lo: torch.Tensor          # shape [d_output, n_cols]
+    A_hi: torch.Tensor          # shape [d_output, n_cols]
     b_lo: torch.Tensor          # shape [d_output]
-    A_hi: torch.Tensor          # shape [d_output, n]
     b_hi: torch.Tensor          # shape [d_output]
+    columns: Dict[int, Tuple[int, int]]
+        # Maps source node_id → (start_col, width)
+    input_ranges: Dict[int, Tuple[torch.Tensor, torch.Tensor]]
+        # Maps source node_id → (lo, hi) declared range
 ```
+
+Each `AffineBound` carries its own column layout and input ranges
+— there is no shared `Basis` object. The `columns` dict says
+which columns of the A matrices correspond to which source node's
+components; `input_ranges` stores the declared range for each
+source node. Binary ops (`Add`, `Concatenate`) merge their
+operands' column maps via `AffineBound.align()`, which scatters
+both operands' A matrices into a common wider layout.
 
 ### Deriving per-component intervals
 
@@ -218,41 +228,38 @@ term_hi(a, lo, hi) = 0            if a == 0
 ```
 
 Two sign-split reductions. `AffineBound.to_interval()` returns
-per-component `lo`, `hi` tensors (each of shape `[d_output]`).
+a list of per-component `Range` objects.
+`AffineBound.to_scalar_range()` returns the hull (union) of all
+per-component intervals as a single `Range`.
 
 The explicit `a == 0` branch is not cosmetic: the basis may contain
 unbounded variables (`x_lo[j] = -inf` or `x_hi[j] = +inf`) for
 inputs without declared ranges, and IEEE `0 * inf = NaN` would
 corrupt every downstream bound. The short-circuit keeps zeroed
-coefficients out of the sum. Vectorised form:
-
-```python
-term_lo = torch.where(A_lo > 0, A_lo * x_lo,
-          torch.where(A_lo < 0, A_lo * x_hi, 0))
-```
+coefficients out of the sum.
 
 ### API surface
 
-`AffineBound` is a value object; instances are frozen. The public
-API is intentionally small:
+The public API is intentionally small:
 
 - **Factory methods.**
-  `AffineBound.identity(basis, input_node)` — one-hot rows picking
-  out the basis slice belonging to `input_node`; offsets zero.
-  `AffineBound.constant(basis, values)` — zero `A`; `b_lo = b_hi =
-  values`. `AffineBound.degenerate(basis, lo, hi)` — zero `A`;
+  `AffineBound.identity(input_node)` — identity A-matrix with
+  columns keyed by `input_node.node_id`; offsets zero; ranges
+  from the input's declared range.
+  `AffineBound.constant(values)` — zero `A`; `b_lo = b_hi =
+  values`; empty column map.
+  `AffineBound.degenerate(d_output, lo, hi)` — zero `A`;
   scalar `lo` and `hi` broadcast to `[d_output]`, used as the
   escape hatch when an op cannot compute affine bounds.
-- **`to_interval()`** — per-component `(lo, hi)` tensors of shape
-  `[d_output]`, computed via the sign-split formula above.
-- **`__repr__`** — summary only (basis id, `d_output`, coarse
-  stats of `A_lo` / `A_hi` magnitudes). The full coefficient
-  tensors are not dumped; use direct attribute access when
-  debugging.
+- **`align(a, b)`** — reindex two bounds to share the same column
+  layout, merging column maps and intersecting input ranges.
+- **`to_interval()`** — per-component list of `Range` objects,
+  computed via the sign-split formula above.
+- **`to_scalar_range()`** — hull of all per-component intervals.
+- **`__repr__`** — summary only (`d_output`, `n_cols`, coarse
+  interval display).
 - **Serialization.** `AffineBound`s are not persisted to the
-  compiled artifact — ONNX export strips them, as they are
-  compile-time metadata. Bounds can be recomputed from the graph
-  by calling `finalize(root)` on a rebuilt graph.
+  compiled artifact — they are compile-time metadata.
 
 Arithmetic (addition, matrix multiply, scalar scale) is not
 exposed as operator overloads; the per-op rules in
@@ -260,41 +267,45 @@ exposed as operator overloads; the per-op rules in
 
 ---
 
-## The new `NodeValueType`
+## Integration with `Node` and `NodeValueType`
+
+`AffineBound` is stored on `Node` directly, not inside
+`NodeValueType`. The two are combined at access time:
 
 ```python
-@dataclass(frozen=True)
-class NodeValueType:
-    bounds: AffineBound
-
-    # Structural claims about the output (retained from the prior design).
-    is_integer: bool = False
-    is_binary: bool = False   # implies is_integer and 0 ≤ value ≤ 1
-    is_sign: bool = False     # implies is_integer and -1 ≤ value ≤ 1
-    is_one_hot: bool = False  # vector-level; implies is_binary
+class Node:
+    def __init__(self, ...):
+        self._structural_type = self.compute_value_type()
+        self._affine_bound = compute_affine_bound(self)
 
     @property
-    def value_range(self) -> Range:
-        """Aggregate scalar interval covering every component.
-
-        Derived from ``bounds`` as
-        ``Range(bounds.to_interval().lo.min(),
-                bounds.to_interval().hi.max())``.
-
-        Preserves the pre-existing semantics: "every component of
-        the node's output lies in this range" holds exactly as
-        before, just derived now from ``bounds`` rather than stored
-        independently.
-        """
-        ...
+    def value_type(self) -> NodeValueType:
+        r = self._affine_bound.to_scalar_range()
+        sr = self._structural_type.value_range
+        if sr.lo > r.lo or sr.hi < r.hi:
+            r = r.intersect(sr)
+        return NodeValueType(
+            value_range=r,
+            is_integer=self._structural_type.is_integer,
+            is_binary=self._structural_type.is_binary,
+            is_sign=self._structural_type.is_sign,
+            is_one_hot=self._structural_type.is_one_hot,
+        )
 ```
 
-- `bounds` is the source of truth for numeric bounds. Every
-  `compute_value_type()` produces an `AffineBound`; every rule that
-  reads numeric bounds reads through `bounds`.
-- `value_range` becomes a derived property. Every existing consumer
-  that reads `node.value_type.value_range` keeps working; the
-  returned `Range` is strictly inside (or equal to) the old one.
+- `_affine_bound` is the source of truth for numeric bounds.
+  `to_scalar_range()` returns the hull of all per-component
+  intervals.
+- `_structural_type` carries structural flags and, for `Assert`
+  nodes, an optional `value_range` from the `claimed_type`. When
+  this range is finite, `value_type` intersects it with the
+  affine-derived range.
+- `NodeValueType` itself carries `value_range`, `is_integer`,
+  `is_binary`, `is_sign`, and `is_one_hot`. It does not hold an
+  `AffineBound`.
+- Every existing consumer that reads `node.value_type.value_range`
+  keeps working; the returned `Range` is strictly inside (or equal
+  to) the old scalar-interval-based one.
 - The structural flags (`is_integer`, `is_binary`, `is_sign`,
   `is_one_hot`) are kept as plain booleans. They carry semantics
   that interval bounds alone cannot — e.g. `floor_int` skips
@@ -354,122 +365,66 @@ the finished system:
 Assertions enter the system at two different places depending on
 what they wrap:
 
-- **Asserts on an `InputNode`** tighten the basis itself. The
-  asserted `[lo, hi]` replaces the corresponding `x_lo[j]` /
-  `x_hi[j]` entries for each of that `InputNode`'s components. Every
-  downstream `AffineBound.to_interval()` that consults the basis
-  box automatically sees the tighter bounds. No `AffineBound`
-  coefficients change.
+- **Asserts on a source node** (`InputNode`, `Embedding`, or
+  `PosEncoding`) tighten the source's `input_ranges` entry in the
+  returned `AffineBound`. No coefficients change; every downstream
+  `to_interval()` that evaluates against the basis box
+  automatically sees the tighter ranges.
 
-- **Asserts on a non-`InputNode`** clamp the wrapped node's derived
-  interval. The `Assert` node's `AffineBound` *copies the wrapped
-  node's `A_lo` / `A_hi` / `b_lo` / `b_hi` coefficients
-  unchanged*, so downstream ops that read affine coefficients
-  (`Linear`, `Add`, `Concatenate`) retain every cancellation
-  opportunity from the wrapped node. The assertion is applied
-  only inside `to_interval()` — which intersects the derived
-  per-component interval with the asserted range.
+- **Asserts on a non-source node** with a finite claimed range use
+  **degenerate collapse**: the `Assert` node's `AffineBound` has
+  zero A matrices and per-component intervals from the intersection
+  of the upstream affine evaluation with the claimed range.
+  Upstream coefficients are discarded. The appendix (*Why Assert on
+  non-InputNode uses degenerate collapse*) documents the four
+  coefficient-preservation alternatives that were explored and why
+  each was rejected.
 
-  Downstream ops that read an interval (`ReLU` for its
-  straddling-case analysis, `Attn` for V's interval) therefore see
-  the tightened interval; downstream ops that read coefficients
-  see the unmodified ones. If the inferred interval was already
-  tighter than what the user asserted, the assert is a no-op
-  statically (the runtime predicate still runs).
+  The runtime predicate still runs and catches cases where the
+  actual tensor exceeds the claimed range.
 
 ---
 
-## Graph lifecycle
+## Bound computation lifecycle
 
-The previous `NodeValueType` model was eager: `Node.__init__`
-computed the node's value type on the spot, from already-constructed
-parents. That no longer works. A non-`InputNode`'s `AffineBound` is
-expressed over a basis whose variables are *every* `InputNode` in
-the graph — a fact only known once graph construction is complete.
+Affine bounds are computed **eagerly** during graph construction.
+`Node.__init__` runs two steps immediately after recording inputs:
 
-Under the new model, graph construction and bound computation are
-separate phases. Users writing the happy path (build a graph, run
-or compile it) do not need to think about the phase boundary —
-compile and compute trigger finalization automatically. This section
-describes the lifecycle for completeness; users writing consumer
-ops, diagnostic tools, or tests that want to inspect bounds
-directly need to know it.
+```python
+self._structural_type = self.compute_value_type()
+self._affine_bound = compute_affine_bound(self)
+```
 
-### Construction phase
+`compute_value_type()` returns structural flags only (`is_integer`,
+`is_binary`, `is_sign`, `is_one_hot`); it does not compute or
+propagate ranges. `compute_affine_bound()` dispatches to the
+appropriate per-op rule (see *Per-op propagation rules*) and
+returns the node's `AffineBound`.
 
-- `InputNode(d_output, ...)` registers a new basis contribution.
-  `compute_value_type` does not run.
-- `Linear`, `Add`, `ReLU`, `Concatenate`, `Attn`, `Assert`,
-  `Embedding`, `PosEncoding`, `LiteralValue` record their inputs
-  and structural parameters. `compute_value_type` does not run.
-- Bound-consumer ops (`cond_gate`, `floor_int`, `assert_in_range`,
-  `attend_mean`) return a **placeholder node** with a known
-  `d_output` and a recorded reference to the wrapped input and
-  op-specific configuration. The subgraph that materializes the
-  consumer's internal constants is not yet built.
+Because each `AffineBound` carries its own column map and input
+ranges (see *The basis*), there is no need for a global basis or
+finalization pass — each rule reads its inputs' already-computed
+`_affine_bound` attributes, which are available because inputs are
+constructed before the nodes that consume them.
 
-During construction, access to `node.value_type` or
-`node.value_type.bounds` raises `ValueTypeNotFinalized` with a
-message naming `finalize(root)`, `compile_graph(root)`, and
-`node.compute(...)` as ways to trigger finalization.
+Bound-consumer ops (`cond_gate`, `floor_int`, `assert_in_range`,
+`attend_mean`) read their inputs' `value_type.value_range` — which
+is available eagerly — and build their full subgraphs immediately
+at construction time.
 
-### `finalize(root: Node)`
-
-A single public entry point that runs, in order:
-
-1. Walk the ancestors of `root` topologically. Collect every
-   `InputNode` reachable. Construct the `Basis`: `n = sum of
-   d_output` over `InputNode`s; `x_lo`, `x_hi` populated from each
-   `InputNode`'s declared range (or ±∞ if none).
-2. For each non-placeholder node in topo order, run
-   `compute_value_type()` and cache the resulting `NodeValueType`
-   on the node.
-3. For each consumer-op placeholder in topo order, call its
-   **materialize hook**. The hook sees the wrapped input's now-known
-   `AffineBound` (or its `to_interval()`), derives the scalar
-   constants it needs (`M` for `cond_gate`; breakpoint grid for
-   `floor_int`; etc.), and constructs the actual subgraph in place
-   of the placeholder. Downstream references to the placeholder are
-   rebound to the subgraph's output node.
-4. Run `compute_value_type()` on the primitives created during
-   step 3.
-5. Mark the graph frozen.
-
-`finalize` is **idempotent** — calling it on an already-frozen
-graph is a no-op.
-
-### Triggering
-
-- `compile_graph(root)` calls `finalize(root)` as its first step if
-  the graph is not already frozen.
-- `Node.compute(n_pos, input_values)` does the same, using the node
-  it's called on as the root.
-- Users who only build and compile never need to call `finalize`.
-- Users who want to inspect bounds before compile (tests, debugging)
-  or who author consumer ops or diagnostic tooling call
-  `finalize(root)` explicitly.
-
-### Frozen graph invariants
-
-After finalization:
-
-- Every reachable node has a valid `node.value_type`.
-- No consumer placeholders remain anywhere under `root`.
-- Adding a new `InputNode` to the same session raises.
-- Structural modification (re-parenting, rewriting) to frozen
-  nodes is an error.
-
-For tests that build multiple graphs in one process, a scoped
-helper (`with fresh_graph_session():` or equivalent) resets the
-per-session state.
+There is no separate `finalize()` pass, no placeholder nodes, and
+no deferred materialization. An earlier design attempted a
+two-phase model (construction, then finalization) but it was
+found to cause silent M-value explosions; see the appendix
+(*Why eager bounds replaced the finalize pass*) for details.
 
 ---
 
 ## Per-op propagation rules
 
-Each `compute_value_type()` below consumes its inputs' `AffineBound`
-and produces this node's `AffineBound`. All inputs and outputs
-share the graph's single basis.
+Each rule below consumes its inputs' `AffineBound`s and produces
+this node's `AffineBound`. Column maps are merged as needed via
+`AffineBound.align()`.
 
 ### `Linear` — `y = W · v + c`
 
@@ -491,15 +446,19 @@ the dominant compile-time cost of the bound-propagation pass
 itself; it is separate from the compiled transformer's runtime
 forward-pass compute.
 
-The per-component min/max aggregation inside
-`linear_output_range` is no longer needed — per-component
-tightness is already present in the input's `A`.
+The per-component min/max aggregation that the old
+`linear_output_range` helper performed is no longer needed and
+has been removed — per-component tightness is already present in
+the input's `A`.
 
 ### `Add` — `z = u + v`
 
-Preserves affine structure exactly. Addition of affine expressions:
+Preserves affine structure exactly. The two operands' column maps
+are first merged via `AffineBound.align()`, then their A matrices
+and offsets are added element-wise:
 
 ```
+u, v = AffineBound.align(u, v)
 A_lo(z) = A_lo(u) + A_lo(v)
 b_lo(z) = b_lo(u) + b_lo(v)
 
@@ -518,11 +477,10 @@ Two important caveats on "exactly":
 
 1. *Degenerate operands do not cancel against each other.* If
    either operand has a degenerate `AffineBound` (zero `A`
-   matrices — e.g. the output of `Attn`), `Add` correctly sums
-   their intervals but no coefficient cancellation is possible
-   because there are no coefficients. A cancellation intended
-   between two nodes that both passed through `Attn` will not be
-   recovered.
+   matrices — e.g. the output of a semantic override on
+   `cond_gate` or `select`), `Add` correctly sums their intervals
+   but no coefficient cancellation is possible because there are
+   no coefficients.
 
 2. *Straddling `ReLU` breaks exact cancellation through the ReLU.*
    When a node passes through `ReLU` in the straddling case, its
@@ -567,40 +525,39 @@ slope = h[i] / (h[i] - l[i])
 A_hi(z)[i, :] = slope * A_hi(v)[i, :]
 b_hi(z)[i]    = slope * (b_hi(v)[i] - l[i])
 
-# Lower bound: α · v, α ∈ [0, 1].  Heuristic: α = 1 if h >= -l else 0.
-alpha = 1.0 if h[i] >= -l[i] else 0.0
+# Lower bound: α · v, with continuous chord α = h / (h - l).
+alpha = h[i] / (h[i] - l[i])
 A_lo(z)[i, :] = alpha * A_lo(v)[i, :]
 b_lo(z)[i]    = alpha * b_lo(v)[i]
 ```
 
+The continuous chord `α = h / (h - l)` is strictly tighter than
+the simpler `α ∈ {0, 1}` heuristic. It tracks correlation through
+straddling ReLU: for example, `ReLU(x) + (-ReLU(x))` with
+`x ∈ [-2, 4]` gives `[-4/3, 4/3]` instead of `[-4, 4]`.
+
 Soundness sketch for the lower bound. Pointwise, `ReLU(v) ≥ α · v`
 holds for every `v` and every `α ∈ [0, 1]` (at `v ≥ 0`,
 `ReLU(v) = v ≥ α · v`; at `v < 0`, `ReLU(v) = 0 ≥ α · v`).
-Substituting `v`'s lower affine envelope `v_lower(x)` and using
-`α ≥ 0`: `ReLU(v(x)) ≥ α · v(x) ≥ α · v_lower(x)`. When
+Since `h / (h - l) ∈ (0, 1)` for strictly straddling intervals,
+this is always sound. Substituting `v`'s lower affine envelope
+`v_lower(x)` and using `α ≥ 0`:
+`ReLU(v(x)) ≥ α · v(x) ≥ α · v_lower(x)`. When
 `α · v_lower(x)` happens to be negative on part of the box, this
 is trivially true (`ReLU` outputs are non-negative); the bound is
-loose there but still sound. `α = 0` reduces to the trivial
-`ReLU(v) ≥ 0` bound; `α = 1` is tight at `v = h` and loose at
-`v = l`. The heuristic picks whichever gives the smaller expected
-gap.
+loose there but still sound.
 
-The `α ∈ {0, 1}` choice flips at the boundary `h == -l` (the
-symmetric-straddling case). The chosen `α` value is therefore
-discontinuous in the input range: a small perturbation of the
-input's bounds across that boundary changes the component's
-lower-bound coefficients from `0` to the full `A_lo(v)` row or
-vice versa. Downstream bounds are sound in both regimes, but the
-specific lower bound values can jump. Tests that compare bounds
-across small input-range perturbations should not assume
-continuity.
+When either endpoint is infinite (unbounded straddling), the
+chord computation `h / (h - l)` would produce `inf/inf = NaN`.
+A guard falls back to degenerate `[0, h]` (or `[0, +inf]`) for
+those components.
 
 `ReLU` is the **only** primitive rule that introduces looseness.
 Every other primitive rule is exact; any slack in a downstream
-interval traces back to a straddling-`ReLU` envelope or to an
-`Attn` (see below).
+interval traces back to a straddling-`ReLU` envelope. (Composite
+ops introduce additional looseness via semantic overrides; see
+*Composite ops and semantic overrides*.)
 
-The α heuristic above is sufficient for the first-cut system.
 A tighter choice — learning α per component via gradient descent
 against a specific output bound — is known in the bound-propagation
 literature as α-CROWN. It is *not* a drop-in swap of this rule:
@@ -610,52 +567,69 @@ backward-propagation of gradients from that query through every
 intermediate `AffineBound`. Adopting it would mean adding autograd
 through the bound computation and a per-query optimization pass —
 a meaningful architectural addition, not a local rule upgrade. If
-the heuristic bounds prove too loose in practice, that work is
-well-understood in the literature; it just isn't small.
+the continuous-chord bounds prove too loose in practice, that work
+is well-understood in the literature; it just isn't small.
 
 ### `Concatenate` — row-stacking
 
-Exact. Stack the inputs' `A` matrices row-wise and their offset
-vectors element-wise:
+Exact. The inputs' column maps are first merged via
+`_merge_layouts`, then each input's A matrices are scattered into
+the common layout. The result stacks the scattered A matrices
+row-wise and their offset vectors element-wise:
 
 ```
-A_lo(z) = vstack([A_lo(inp) for inp in inputs])
+merged_columns, merged_ranges, n = _merge_layouts(*inputs)
+A_lo(z) = vstack([scatter(A_lo(inp)) for inp in inputs])
 b_lo(z) = concat([b_lo(inp) for inp in inputs])
 # same for A_hi, b_hi
 ```
 
-The existing `intersect_element_props`-based implementation and its
-"union of child ranges" aggregate are replaced by this exact
-concatenation. Downstream `Linear`s read the stacked `A` directly,
-which is where per-component tightness now comes from — no
-`linear_output_range`-style aggregation needed.
+Downstream `Linear`s read the stacked `A` directly, which is
+where per-component tightness comes from.
 
 ### `LiteralValue`
 
 ```
-A_lo(z) = A_hi(z) = zeros([d_output, n])
+A_lo(z) = A_hi(z) = zeros([d_output, 0])
 b_lo(z) = b_hi(z) = value
+columns = {}; input_ranges = {}
 ```
+
+A constant has no dependence on any source node.
 
 ### `InputNode`
 
-Row `i` is the one-hot vector picking out the basis variable that
-*is* component `i` of this `InputNode`:
+Identity A-matrix with columns keyed by the `InputNode`'s own
+`node_id`:
 
 ```
-A_lo(z)[i, j] = A_hi(z)[i, j] = 1 if j == basis_index_of(input_node, i)
-                                else 0
+A_lo(z) = A_hi(z) = eye(d_output)
 b_lo(z) = b_hi(z) = 0
+columns = {node_id: (0, d_output)}
+input_ranges = {node_id: (declared_lo, declared_hi)}
 ```
 
 ### `Assert`
 
 The `Assert` node wraps another node and attaches an asserted range
-(and an optional structural claim). Its `AffineBound` copies the
-wrapped node's coefficients unchanged; its `to_interval()`
-intersects with the asserted range. See
-*How `assert_in_range` interacts with bounds* above for the full
-story.
+(and an optional structural claim). Its affine rule has three
+branches depending on what it wraps:
+
+- **Wrapping a source node** (`InputNode`, `Embedding`, or
+  `PosEncoding`): the Assert tightens the wrapped node's
+  `input_ranges` entry in the returned `AffineBound`. The A/b
+  coefficients pass through unchanged. This is the tightest
+  path — all downstream `to_interval()` calls that consult the
+  basis box automatically see the tighter ranges.
+- **Wrapping a non-source node with a finite claimed range**: the
+  Assert uses **degenerate collapse** — zero A matrices,
+  per-component intervals from the intersection of the upstream
+  affine evaluation with the claimed range. The appendix
+  (*Why Assert on non-InputNode uses degenerate collapse*)
+  documents why coefficient preservation was explored and
+  rejected.
+- **No claimed type, or non-finite claimed range**: the Assert
+  passes through the wrapped node's `AffineBound` unchanged.
 
 Structural flags (`is_integer`, etc.) on the `Assert`'s
 `NodeValueType` come from the user's declaration, OR-ed with
@@ -664,33 +638,37 @@ whatever the wrapped node already claimed.
 ### `Embedding`
 
 An `Embedding` node is an integer-indexed lookup into a constant
-table whose values are known at construction time. Its
-`AffineBound` is a degenerate (zero-coefficient) bound whose
-offsets are the per-component min and max over the full embedding
-table:
+table whose values are known at construction time. It is a
+**basis source**: its `AffineBound` has an identity A-matrix
+keyed by the `Embedding`'s own `node_id`, with per-component
+input ranges from the table's column-wise min and max:
 
 ```
-A_lo = A_hi = zeros([d_output, n])
-b_lo[k] = min over rows r of table[r, k]
-b_hi[k] = max over rows r of table[r, k]
+A_lo = A_hi = eye(d_output)
+b_lo = b_hi = zeros(d_output)
+columns = {node_id: (0, d_output)}
+input_ranges = {node_id: (col_min, col_max)}
 ```
 
-Tightening the min/max by restricting to rows the index input can
-actually reach (via its own bound) is a future optimization; the
-full-table rule is always sound.
+where `col_min[k]` and `col_max[k]` are the min and max of
+column `k` over all rows of the embedding table. This is
+structurally identical to an `InputNode`'s identity bound, just
+with ranges derived from the table rather than from a user
+declaration.
 
 ### `PosEncoding`
 
 Position encodings are position-dependent constants whose component
 range is a property of the encoding function itself, not of the
-graph's sequence length. For the standard sin/cos encoding, every
-component lies in `[-1, 1]` regardless of position; the
-`AffineBound` is degenerate with those offsets:
+graph's sequence length. `PosEncoding` is a **basis source** with
+an identity A-matrix and per-component ranges appropriate to the
+encoding function. For the standard sin/cos encoding:
 
 ```
-A_lo = A_hi = zeros([d_output, n])
-b_lo[k] = -1.0    # for sin/cos; different encodings give different ranges
-b_hi[k] = +1.0
+A_lo = A_hi = eye(d_output)
+b_lo = b_hi = zeros(d_output)
+columns = {node_id: (0, d_output)}
+input_ranges = {node_id: ([-1, ..., -1], [1, ..., 1])}
 ```
 
 Other encoding functions substitute their own per-component range.
@@ -698,11 +676,9 @@ Other encoding functions substitute their own per-component range.
 ### `Placeholder`
 
 `Placeholder` is a zero-width sentinel used where a real node is
-not yet available. Its `AffineBound` has shape `[0, n]` for `A`
-and `[0]` for `b` — technically valid, contributes nothing to
-downstream consumers. A `Placeholder` should never end up
-reachable from a finalized graph's root; if one does, finalization
-raises.
+not yet available. Its `AffineBound` is degenerate with shape
+`[0, 0]` — technically valid, contributes nothing to downstream
+consumers.
 
 ### `ValueLogger`
 
@@ -759,8 +735,7 @@ element-range and sum checks. Same as today.
 
 **`InputNode`:**
 Flags come from the user's declaration at construction, or from
-`assert_integer` / `assert_onehot` / similar applied to the input
-before the basis is frozen.
+`assert_integer` / `assert_onehot` / similar applied to the input.
 
 **`Assert`:**
 Flags compose by OR: either the wrapped node's inferred flag holds
@@ -776,43 +751,52 @@ that need a flag on one of these outputs should wrap in
 
 ---
 
-### Composite ops
+### Composite ops and semantic overrides
 
 Composite ops are Python functions, not `Node` subclasses. They
 split into two groups depending on whether they read their inputs'
 bounds.
 
 **Pure subgraph constructors** — `sum_nodes`, `thermometer_*`, and
-similar ops that never read `.value_type` — continue to build their
-subgraphs immediately from primitive nodes and return one of those
+similar ops that never read `.value_type` — build their subgraphs
+immediately from primitive nodes and return one of those
 primitives. They need no affine rule; their return node is a
-`Linear` / `Add` / `ReLU` / `Concatenate`, each of which has a rule.
+`Linear` / `Add` / `ReLU` / `Concatenate`, each of which has a
+rule.
 
 **Bound-consumer ops** — `cond_gate`, `floor_int`,
 `assert_in_range`, `attend_mean`, and any other op that reads its
-input's `value_type.value_range` or
-`value_type.bounds.to_interval()` to pick a constant — return a
-**placeholder node** at construction time. See the
-*Graph lifecycle* section above: the placeholder carries enough
-information (wrapped input, op configuration) for `finalize(root)`
-to materialize the subgraph later, once bounds are known.
+input's `value_type.value_range` to pick a constant — read bounds
+eagerly and build their full subgraphs at construction time.
+Because bounds are computed eagerly in `Node.__init__`, the
+input's `value_type` is already available when the consumer op
+runs.
 
-From the caller's perspective this is invisible: `cond_gate(x,
-cond, val)` still returns "a node representing the cond-gate's
-output" with the right `d_output` — just backed by a placeholder
-instead of a fully-built subgraph until finalization. Downstream
-code that treats it as a `Node` input to further ops works
-unchanged.
+Three composite ops apply a **semantic override** after building
+their subgraph. The override replaces the propagated
+`AffineBound` on the output node with a degenerate
+(zero-coefficient) bound that captures the op's mathematical
+output semantics rather than the internal MLP's interval
+arithmetic:
 
-### Ops with custom `compute_value_type` overrides
+- **`cond_gate`**: per-component `[min(0, inp), max(0, inp)]`
+  envelope. When the input's interval is entirely non-negative
+  or entirely non-positive, the override preserves the input's
+  affine coefficients for that component (identity through the
+  gate). In the straddling case, it uses a linear envelope with
+  slope `h / (h - l)`.
+- **`select`**: per-component hull of both branches' intervals.
+  Zero A matrices.
+- **`compare`**: constant bound (`true_level` or `false_level`)
+  when the input interval is fully above or below the threshold;
+  degenerate interval `[min(levels), max(levels)]` otherwise.
 
-Any `Node` subclass that currently defines its own
-`compute_value_type` (other than the primitives listed above) needs
-to be ported: either (a) write an affine rule specific to the op,
-or (b) fall back to a degenerate `AffineBound` (zero `A`; `b_lo`,
-`b_hi` set to whatever scalar interval the current rule produces).
-Option (b) is sound and matches today's tightness; option (a) is
-the upgrade path that unlocks the affine benefits for that op.
+These overrides are a source of looseness in the system: they kill
+upstream coefficient tracking through the gate. This is deliberate
+— the alternative (propagating coefficients through the gate's
+internal `linear_relu_linear` subgraph) produces correct but
+extremely wide bounds because the cancellation offset `M` appears
+in the coefficients.
 
 ---
 
@@ -832,66 +816,60 @@ work). We do not adopt them here. The reasons are design-local: the
 published relaxations introduce coupling between token positions
 that a single-position basis cannot represent, and the compile-time
 benefit at torchwright's specific bound-consumer sites is
-unmeasured. Treating `Attn` as an affine-terminating op is a
-deliberate scope choice, not a mathematical impossibility.
+unmeasured.
 
-`Attn.compute_value_type()` therefore produces a degenerate
-`AffineBound` for the whole op, via three steps that mirror the
-actual forward pass:
+The Attn rule propagates value-input coefficients through V and O,
+but does not model Q/K logits. Softmax produces convex-combination
+weights (non-negative, summing to 1), so per-component affine
+bounds on `value @ V` carry through unchanged — a convex
+combination of values that each satisfy the same affine bound
+also satisfies that bound. This preserves the value input's
+relationship to the basis, while Q/K correlation is lost.
+
+Concretely, the rule performs two sign-split GEMMs:
 
 1. **Propagate `value_in`'s `AffineBound` through `value_matrix`**
-   using the same sign-split rule as `Linear` (`value_matrix` plays
-   the role of `W`; bias is zero). This gives an `AffineBound` for
-   the projected V in the graph's basis. Call `to_interval()` on
-   it to get per-component intervals `[vproj_lo[k], vproj_hi[k]]`
-   for `k = 0 .. d_v - 1`. Because `NodeValueType` is
-   position-agnostic, these bounds hold at every token position by
-   construction.
-2. **Apply the "any probability vector" relaxation.** The attention
-   output at component `k` (before the output projection) is a
-   convex combination over token positions of the projected V at
-   that position, each of which lies in
-   `[vproj_lo[k], vproj_hi[k]]`. A convex combination of values all
-   lying in one interval lies in the same interval. (Q and K are
-   not consulted; the probability-vector assumption is a strict
-   over-approximation of what softmax actually produces.)
-3. **Propagate through `output_matrix`** using a sign-split on
-   scalar intervals:
+   using the same sign-split rule as `Linear`:
 
    ```
-   out_matrix_plus  = clamp(output_matrix, min=0)   # shape [d_v, d_output]
-   out_matrix_minus = clamp(output_matrix, max=0)
+   V_plus  = clamp(value_matrix, min=0)
+   V_minus = clamp(value_matrix, max=0)
 
-   b_lo = vproj_lo @ out_matrix_plus + vproj_hi @ out_matrix_minus
-   b_hi = vproj_hi @ out_matrix_plus + vproj_lo @ out_matrix_minus
+   proj_A_lo = V_plus^T · A_lo(value) + V_minus^T · A_hi(value)
+   proj_A_hi = V_plus^T · A_hi(value) + V_minus^T · A_lo(value)
+   proj_b_lo = V_plus^T · b_lo(value) + V_minus^T · b_hi(value)
+   proj_b_hi = V_plus^T · b_hi(value) + V_minus^T · b_lo(value)
    ```
 
-   Emit the final `AffineBound`:
+2. **Propagate through `output_matrix`** with another sign-split:
 
    ```
-   A_lo = A_hi = zeros([d_output, n])
-   b_lo, b_hi = the interval computed above
+   O_plus  = clamp(output_matrix, min=0)
+   O_minus = clamp(output_matrix, max=0)
+
+   A_lo = O_plus^T · proj_A_lo + O_minus^T · proj_A_hi
+   A_hi = O_plus^T · proj_A_hi + O_minus^T · proj_A_lo
+   b_lo = O_plus^T · proj_b_lo + O_minus^T · proj_b_hi
+   b_hi = O_plus^T · proj_b_hi + O_minus^T · proj_b_lo
    ```
 
-   The attention output has no dependence on the basis. Its
-   interval is carried in the offset vectors. Note that query and
-   key matrices never appear in the bound — the probability-vector
-   relaxation makes them irrelevant to output range.
-
-Downstream ops consume this `AffineBound` normally. Their own `A`
-matrices keep non-zero coefficients for *their other inputs*, so
-any cancellation that flows through a skip connection around the
-attention (e.g. an `InputNode` component that passes the attention
-sublayer unchanged and is later subtracted) is preserved exactly.
+The returned `AffineBound` carries non-zero coefficients — the
+value input's columns and input_ranges pass through. Downstream
+ops that skip-connect around the attention sublayer retain
+cancellation with the Attn output's basis variables. Query and
+key matrices never appear in the bound — the convex-combination
+relaxation makes them irrelevant to the output's relationship to
+the basis.
 
 ### What is lost
 
-Any cancellation whose two sides both pass *through* an `Attn`
-cannot be recovered, because both sides have zero coefficients in
-the basis after attention. In practice the scheduler does not
-build graphs that rely on such patterns; when they occur, an
-explicit `assert_in_range` on a post-attention quantity gives the
-following `Add` something tight to cancel against.
+Cancellation that depends on Q/K correlation — i.e. knowing
+*which* softmax weights are large — cannot be recovered, because
+the rule assumes any probability vector is possible. In practice
+the scheduler does not build graphs that rely on Q/K-dependent
+cancellation; when tight post-attention bounds are needed, an
+explicit `assert_in_range` on the post-attention quantity gives
+downstream `Add` something tight to cancel against.
 
 ### Related prior work
 
@@ -925,112 +903,120 @@ change at these call sites is tighter constants:
 | `attend_mean` | V input's range for `atol` | Smaller tolerance on the downstream assert |
 
 Consumers that want per-component precision (instead of the
-node-wide aggregate) call `node.value_type.bounds.to_interval()`
-and index into `lo[i]` / `hi[i]`. In most cases they don't need
-that granularity anymore, because downstream `Linear`s already see
-per-component tightness through the input's `A`.
+node-wide aggregate) can call `node.affine_bound.to_interval()`
+and index into individual `Range` objects. In most cases they
+don't need that granularity, because downstream `Linear`s already
+see per-component tightness through the input's `A`.
 
 ---
 
 ## Runtime verification
 
-`TW_VERIFY_VALUE_TYPES` continues to wrap each `Node.compute` and
-check the observed tensor against the declared `value_type`. Two
-changes:
+`TW_VERIFY_VALUE_TYPES` wraps each `Node.compute` and checks the
+observed tensor against the declared `value_type`:
 
-- The range check is per-component: each `observed[i]` is checked
-  against `bounds.to_interval().lo[i]` / `.hi[i]`, not the aggregate.
-  The old aggregate check was strictly coarser; violations that the
-  old check missed now surface.
+- The range check uses the aggregate `value_type.value_range`:
+  `t.min()` and `t.max()` are compared against `Range(lo, hi)`
+  with tolerance `1e-4`. Because `value_range` is now derived
+  from the affine bound (via `to_scalar_range()`), the aggregate
+  range is tighter than it was under the old scalar-interval
+  system, so the check catches more violations than before even
+  though it operates on the aggregate.
 - Structural-flag checks (`is_integer`, `is_binary`, `is_sign`,
-  `is_one_hot`) still run, identically to today, but without the
-  `APPROXIMATE` tolerance tier — every violation is a hard
-  assertion failure.
-
-An optional debug check (`TW_VERIFY_AFFINE=1`, off by default)
-samples a small number of points from the basis box, evaluates the
-affine expressions at those points, and asserts
-`A_lo · x + b_lo ≤ observed(x) ≤ A_hi · x + b_hi`. Used while
-developing new rules; never on in production runs.
+  `is_one_hot`) run without the old `APPROXIMATE` tolerance
+  tier — every violation is a hard assertion failure.
 
 ---
 
 ## Deliberately out of scope
 
-- **Affine-preserving attention rules.** Published linear
-  relaxations for softmax and bilinear `Q·K^T` exist but are not
-  adopted here (see the `Attn` section for the rationale). `Attn`
-  emits a degenerate `AffineBound` whose `A` matrices are zero.
-- **Cancellation through attention.** Not recovered; see the
-  `Attn` section above.
-- **Learnable α on `ReLU`.** The `α ∈ {0, 1}` heuristic is used.
-  Per-component learnable α (α-CROWN) is a real tightness upgrade,
-  but adopting it requires backward-mode infrastructure (autograd
-  through bounds, per-query optimization) — not a local change to
-  the `ReLU` rule alone. See the `ReLU` section for details.
+- **Full softmax / bilinear relaxation for attention.** Published
+  linear relaxations for softmax and `Q·K^T` exist but are not
+  adopted here (see the `Attn` section for the rationale). The
+  current rule propagates value-input coefficients through V and
+  O but does not model Q/K correlation.
+- **Cancellation through the Q/K path of attention.** The Attn
+  rule propagates coefficients from the value input only. Any
+  cancellation that requires tracking which Q/K logits produced
+  the softmax weights is not recovered.
+- **Per-component learnable α on `ReLU` (α-CROWN).** The current
+  continuous-chord `α = h / (h - l)` is tighter than a discrete
+  `{0, 1}` choice but still fixed per component.  Per-component
+  learnable α (α-CROWN) is a real tightness upgrade, but adopting
+  it requires backward-mode infrastructure (autograd through
+  bounds, per-query optimization) — not a local change to the
+  `ReLU` rule alone. See the `ReLU` section for details.
 - **Piecewise-affine joint reasoning.** Each component's bound is
   a single pair of affine expressions, not a union over cases.
-- **`Guarantee.APPROXIMATE`.** Removed. Structural flags are
-  treated as unconditional claims; ops that previously declared
-  `APPROXIMATE` either drop the claim or pair it with an explicit
-  `assert_in_range`.
 
 ---
 
 ## Data flow summary
 
 ```
-InputNodes ──► Linear ─► Add ─► ReLU ─► Linear ─► Add ─► ... ─► Attn ─► Linear ─► ...
-           │                                                         │
-           │      all AffineBounds over the graph's single basis     │
-           │           (InputNode components, declared ranges)       │
-           │                                                         │
-           │ exact propagation for Linear/Add/Concatenate            │
-           │ linear-envelope relaxation for straddling ReLU          │
-           │ zero-coefficient AffineBound emitted by Attn            │
+Source nodes ──► Linear ─► Add ─► ReLU ─► Linear ─► Add ─► ... ─► Attn ─► Linear ─► ...
+            │                                                          │
+            │   all AffineBounds with self-keyed column maps           │
+            │   (InputNode / Embedding / PosEncoding components)       │
+            │                                                          │
+            │ exact propagation for Linear/Add/Concatenate             │
+            │ linear-envelope relaxation for straddling ReLU           │
+            │ value-coefficient propagation through Attn (V → O)      │
 ```
 
 Every bit of bound tightness comes from exact affine algebra on
-`Linear` / `Add` / `Concatenate`. Every bit of looseness comes
-from one of two places: straddling-`ReLU` envelopes, or `Attn`
-emitting a zero-coefficient `AffineBound`.
+`Linear` / `Add` / `Concatenate`, and from `Attn`'s
+value-coefficient propagation through V and O.
+
+Three sources of looseness:
+
+1. **Straddling-`ReLU` envelopes.** The only primitive rule that
+   introduces gap between the affine bounds and the true function.
+2. **Semantic overrides on composite ops.** `cond_gate`, `select`,
+   and `compare` replace the propagated `AffineBound` with a
+   degenerate (zero-coefficient) semantic bound that captures
+   the op's mathematical output range. This kills upstream
+   coefficient tracking through the gate.
+3. **Assert degenerate collapse.** An `Assert` on a
+   non-source-node with a finite claimed range collapses to a
+   zero-coefficient bound (see the *Assert* rule and the appendix
+   for why).
 
 ---
 
-## Appendix: implementation notes
+## Appendix: development history
 
-This appendix documents decisions made during implementation that
-diverge from or extend the main document's design. The main
-document describes the design intent; this appendix describes
-what we built and why.
+This appendix records alternatives that were explored during
+development and why they were rejected. The main document above
+describes the system as built; this appendix preserves the
+reasoning behind key design choices for future reference.
 
 ---
 
-### Eager bounds and self-keyed basis
+### Why eager bounds replaced the finalize pass
 
-The main document's *Graph lifecycle* section describes a
-`finalize(root)` pass that builds a global `Basis` from all
-`InputNode`s, then propagates bounds in topological order. This
-was implemented and found to be actively harmful: placeholder
+The original design called for a `finalize(root)` pass that
+built a global `Basis` from all `InputNode`s, then propagated
+bounds in topological order. Consumer ops (`cond_gate`,
+`floor_int`, etc.) would return placeholder nodes during
+construction and materialize their subgraphs during finalization.
+
+This was implemented and found to be actively harmful: placeholder
 nodes' `compute_value_type()` returned pessimistic types that
 downstream nodes cached during construction and never recomputed
 after finalization. The result was silent M-value explosions
 (M = 3.3e21 observed in `balanced_parens`).
 
-The replacement computes affine bounds eagerly in `Node.__init__`,
-immediately after `compute_value_type()`. Each `AffineBound`
-carries its own column map (`Dict[int, Tuple[int, int]]` mapping
-`InputNode.node_id` to `(start_col, width)`) and its own
-`input_ranges` dict. Binary ops merge column maps via a scatter
-into a wider tensor. This eliminates the global `Basis`, the
-`finalize` pass, `ConsumerPlaceholder`, and all their helpers.
-`cond_gate` and `select` build their subgraphs eagerly.
+The replacement — eager bounds computed in `Node.__init__` with a
+self-keyed column map per `AffineBound` — eliminates the global
+`Basis`, the `finalize` pass, `ConsumerPlaceholder`, and all their
+helpers. `cond_gate` and `select` build their subgraphs eagerly.
 
 ---
 
-### Attn propagates value coefficients
+### Why Attn propagates value coefficients
 
-The main document says `Attn` emits a zero-coefficient (degenerate)
+The original design had `Attn` emit a zero-coefficient (degenerate)
 `AffineBound`. The implementation propagates the value input's
 affine bound through V and O matrices via sign-split, producing
 non-zero coefficients. This is tighter: downstream ops that
@@ -1041,10 +1027,10 @@ affine bounds on `value @ V` carry through.
 
 ---
 
-### ReLU uses continuous chord, not α ∈ {0, 1}
+### Why continuous chord replaced α ∈ {0, 1}
 
-The main document specifies `α = 1 if h >= -l else 0` for the
-straddling lower bound. The implementation uses
+The original design specified `α = 1 if h >= -l else 0` for the
+straddling ReLU lower bound. The implementation uses
 `α = h / (h - l)` for both upper and lower envelopes. This
 is strictly tighter: the continuous chord tracks correlation
 through straddling ReLU. For example, `ReLU(x) + (-ReLU(x))`
@@ -1057,18 +1043,10 @@ components.
 
 ---
 
-### Assert on non-InputNode: degenerate collapse
+### Why Assert on non-InputNode uses degenerate collapse
 
-The main document (lines 364–378) says an Assert on a non-InputNode
-should copy the wrapped node's coefficients unchanged and intersect
-only at `to_interval()` time. This was explored thoroughly and
-found to produce worse bounds than the alternative. The
-implementation uses **degenerate collapse**: zero A matrices,
-per-component intervals from the intersection of the affine
-evaluation with the claimed range.
-
-Four approaches to coefficient preservation were tried and
-rejected:
+Four approaches to preserving the wrapped node's affine
+coefficients through an Assert boundary were explored and rejected:
 
 **1. Full passthrough with `claimed_range` clipping.** The
 Assert's `AffineBound` keeps the input's A/b coefficients and
@@ -1123,7 +1101,7 @@ DOOM graph, 83 of 1722 nodes regressed (worst case: 3x wider).
 
 **Why degenerate collapse is the right choice.** The column-count
 effect is structural, not accidental. At an Assert boundary, the
-upstream chain has mapped many `InputNode` components through
+upstream chain has mapped many source-node components through
 many weights into a value the Assert claims is in a narrow range.
 Downstream ops don't need to track which combination of upstream
 inputs produced that value — they need to know it's in the
@@ -1146,35 +1124,10 @@ downstream ReLU evaluations.
 
 ---
 
-### Architecture: single source of truth for ranges
-
-The implementation eliminates the dual range system that the main
-document's `NodeValueType.value_range` + `AffineBound` design
-implied. `AffineBound` is the sole source of truth for ranges:
-
-- `Node.__init__` stores `_structural_type` (from
-  `compute_value_type()`, carrying only structural flags like
-  `is_integer`, `is_binary`, `is_sign`, `is_one_hot`) and
-  `_affine_bound` (from `compute_affine_bound()`).
-- `Node.value_type` is a derived property that combines
-  `_affine_bound.to_scalar_range()` with `_structural_type`'s
-  flags. When `_structural_type` has a finite `value_range`
-  (e.g., from an Assert's `claimed_type`), the property
-  intersects it with the affine-derived range.
-- `compute_value_type()` returns structural flags only. No op
-  computes or propagates `value_range` through
-  `compute_value_type`; all range information flows through the
-  affine system.
-- The compiler's `_strip_asserts` pass transfers both structural
-  flags (via `tightened_with`) and tightened `input_ranges` (from
-  the Assert's `AffineBound`) onto the unwrapped target node.
-
----
-
 ### NaN guards for unbounded inputs
 
 Three guard sites prevent `0 × ±inf = NaN` and `inf / inf = NaN`
-when `InputNode`s have unbounded declared ranges:
+when source nodes have unbounded declared ranges:
 
 1. `_eval_lower` / `_eval_upper`: separate `pos == 0` and
    `neg == 0` guards instead of a single `a == 0` check, because
