@@ -11,7 +11,6 @@ from torchwright.graph import InputNode, LiteralValue
 from torchwright.graph.affine_bound import AffineBound
 from torchwright.graph.session import fresh_graph_session
 
-
 # --- AffineBound factories -----------------------------------------------
 
 
@@ -127,10 +126,12 @@ class TestAlign:
                 b_lo=torch.zeros(1, dtype=torch.float64),
                 b_hi=torch.zeros(1, dtype=torch.float64),
                 columns={x.node_id: (0, 1)},
-                input_ranges={x.node_id: (
-                    torch.tensor([-5.0], dtype=torch.float64),
-                    torch.tensor([5.0], dtype=torch.float64),
-                )},
+                input_ranges={
+                    x.node_id: (
+                        torch.tensor([-5.0], dtype=torch.float64),
+                        torch.tensor([5.0], dtype=torch.float64),
+                    )
+                },
             )
             b = AffineBound(
                 A_lo=torch.ones(1, 1, dtype=torch.float64),
@@ -138,10 +139,12 @@ class TestAlign:
                 b_lo=torch.zeros(1, dtype=torch.float64),
                 b_hi=torch.zeros(1, dtype=torch.float64),
                 columns={x.node_id: (0, 1)},
-                input_ranges={x.node_id: (
-                    torch.tensor([-2.0], dtype=torch.float64),
-                    torch.tensor([3.0], dtype=torch.float64),
-                )},
+                input_ranges={
+                    x.node_id: (
+                        torch.tensor([-2.0], dtype=torch.float64),
+                        torch.tensor([3.0], dtype=torch.float64),
+                    )
+                },
             )
             a2, b2 = AffineBound.align(a, b)
             lo, hi = a2.input_ranges[x.node_id]
@@ -678,7 +681,6 @@ class TestSemanticBounds:
             result = cond_gate(cond, inp)
             ab = result.affine_bound
             assert inp.node_id in ab.columns
-
 
 
 class TestEmbeddingRule:

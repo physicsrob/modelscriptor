@@ -234,6 +234,7 @@ def _build_select(
         _apply_semantic_override,
         _select_semantic_bound,
     )
+
     _apply_semantic_override(
         result,
         _select_semantic_bound(true_node._affine_bound, false_node._affine_bound),

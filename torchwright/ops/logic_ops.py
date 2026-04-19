@@ -24,6 +24,7 @@ win (M ≈ 2·max_abs rather than 1000) while tolerating modest drift."""
 
 _MAX_REASONABLE_OFFSET = 1e6
 
+
 def _max_abs_or_raise(vt: NodeValueType, caller: str) -> float:
     r = vt.value_range
     m = max(abs(r.lo), abs(r.hi))
@@ -290,6 +291,7 @@ def _build_cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node
         _apply_semantic_override,
         _cond_gate_semantic_bound,
     )
+
     _apply_semantic_override(result, _cond_gate_semantic_bound(inp._affine_bound))
     return result
 

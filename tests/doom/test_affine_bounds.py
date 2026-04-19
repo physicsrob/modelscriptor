@@ -44,7 +44,6 @@ from torchwright.reference_renderer.textures import default_texture_atlas
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
-
 # ---------------------------------------------------------------------------
 # Scene setup
 # ---------------------------------------------------------------------------
@@ -67,10 +66,18 @@ def _config() -> RenderConfig:
 
 def _segments(half=5.0) -> List[Segment]:
     return [
-        Segment(ax=half, ay=-half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=0),
-        Segment(ax=-half, ay=-half, bx=-half, by=half, color=(0.8, 0.2, 0.1), texture_id=1),
-        Segment(ax=-half, ay=half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=2),
-        Segment(ax=-half, ay=-half, bx=half, by=-half, color=(0.8, 0.2, 0.1), texture_id=3),
+        Segment(
+            ax=half, ay=-half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=0
+        ),
+        Segment(
+            ax=-half, ay=-half, bx=-half, by=half, color=(0.8, 0.2, 0.1), texture_id=1
+        ),
+        Segment(
+            ax=-half, ay=half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=2
+        ),
+        Segment(
+            ax=-half, ay=-half, bx=half, by=-half, color=(0.8, 0.2, 0.1), texture_id=3
+        ),
     ]
 
 
@@ -178,16 +185,24 @@ def _build_input_values(
 # Token-type taint tracking
 # ---------------------------------------------------------------------------
 
-_GATE_MLP_INTERNAL_NAMES = frozenset([
-    "select_linear1", "select_relu",
-    "cond_gate_linear1", "cond_gate_relu",
-    "cond_gate_c_off_linear1", "cond_gate_c_off_relu",
-    "cond_gate_c_off_linear2",
-])
+_GATE_MLP_INTERNAL_NAMES = frozenset(
+    [
+        "select_linear1",
+        "select_relu",
+        "cond_gate_linear1",
+        "cond_gate_relu",
+        "cond_gate_c_off_linear1",
+        "cond_gate_c_off_relu",
+        "cond_gate_c_off_linear2",
+    ]
+)
 
 
 def _find_tainted_nodes(
-    all_nodes, start_node, *, stop_at_overrides: bool = True,
+    all_nodes,
+    start_node,
+    *,
+    stop_at_overrides: bool = True,
 ) -> Set[int]:
     """Find nodes whose affine bounds are tainted by a wrong input range.
 
@@ -270,17 +285,17 @@ def doom_graph_eval():
         tainted: Set[int] = set()
         for n in input_nodes:
             if n.name in e8_names:
-                tainted |= _find_tainted_nodes(
-                    all_nodes, n, stop_at_overrides=True
-                )
+                tainted |= _find_tainted_nodes(all_nodes, n, stop_at_overrides=True)
             elif n.name in feedback_names:
-                tainted |= _find_tainted_nodes(
-                    all_nodes, n, stop_at_overrides=False
-                )
+                tainted |= _find_tainted_nodes(all_nodes, n, stop_at_overrides=False)
 
         input_values = _build_input_values(
-            input_nodes, subset, textures,
-            px=0.0, py=0.0, angle=45.0,
+            input_nodes,
+            subset,
+            textures,
+            px=0.0,
+            py=0.0,
+            angle=45.0,
         )
 
         n_pos = next(iter(input_values.values())).shape[0]
@@ -359,8 +374,7 @@ class TestAffineBoundSoundness:
         assert checked > 0, "No nodes were checked — filter too aggressive"
         assert not violations, (
             f"{len(violations)} affine bound violations "
-            f"({checked} nodes checked):\n"
-            + "\n".join(violations[:30])
+            f"({checked} nodes checked):\n" + "\n".join(violations[:30])
         )
 
 
@@ -376,13 +390,12 @@ class TestAffineBoundFiniteness:
                 continue
             r = node.value_type.value_range
             if not r.is_finite():
-                infinite_nodes.append(
-                    f"{_node_label(node)}: range=[{r.lo}, {r.hi}]"
-                )
+                infinite_nodes.append(f"{_node_label(node)}: range=[{r.lo}, {r.hi}]")
 
-        assert not infinite_nodes, (
-            f"{len(infinite_nodes)} nodes with infinite bounds:\n"
-            + "\n".join(infinite_nodes[:30])
+        assert (
+            not infinite_nodes
+        ), f"{len(infinite_nodes)} nodes with infinite bounds:\n" + "\n".join(
+            infinite_nodes[:30]
         )
 
 
@@ -416,9 +429,10 @@ class TestAffineBoundTightness:
                     f"range=[{r.lo:.0f}, {r.hi:.0f}]"
                 )
 
-        assert not wide_nodes, (
-            f"{len(wide_nodes)} nodes with width > {MAX_WIDTH}:\n"
-            + "\n".join(wide_nodes[:30])
+        assert (
+            not wide_nodes
+        ), f"{len(wide_nodes)} nodes with width > {MAX_WIDTH}:\n" + "\n".join(
+            wide_nodes[:30]
         )
 
     def test_bound_coverage(self, doom_graph_eval):
@@ -563,11 +577,11 @@ class TestAffineBoundTightness:
             M = _GATE_OFFSET_SAFETY_FACTOR * max(abs(r.lo), abs(r.hi))
             if M > MAX_M:
                 bad_gates.append(
-                    f"{_node_label(node)}: M={M:.1f} "
-                    f"range=[{r.lo:.4f}, {r.hi:.4f}]"
+                    f"{_node_label(node)}: M={M:.1f} " f"range=[{r.lo:.4f}, {r.hi:.4f}]"
                 )
 
-        assert not bad_gates, (
-            f"{len(bad_gates)} gate sites with M > {MAX_M}:\n"
-            + "\n".join(bad_gates[:30])
+        assert (
+            not bad_gates
+        ), f"{len(bad_gates)} gate sites with M > {MAX_M}:\n" + "\n".join(
+            bad_gates[:30]
         )

@@ -437,7 +437,9 @@ def test_schedule_under_column_pressure():
     Scheduler must cancel x to free space, then schedule the chain.
     """
     pos = _make_pos_encoding()
-    filler = InputNode("filler", D - D_HEAD - 8, value_range=(-100.0, 100.0))  # 40 cols, not in graph
+    filler = InputNode(
+        "filler", D - D_HEAD - 8, value_range=(-100.0, 100.0)
+    )  # 40 cols, not in graph
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     a = _make_linear(x, 4, "a")
     l2, r, l1 = _make_relu_chain(a, 8, 3, "out")
@@ -762,7 +764,9 @@ def test_add_into_shared_addend_not_reassigned():
     shared = LiteralValue(torch.randn(4))
 
     # 3 Add nodes sharing the same LiteralValue, each with a unique dead addend
-    dead_nodes = [InputNode(f"dead{i}", 4, value_range=(-100.0, 100.0)) for i in range(3)]
+    dead_nodes = [
+        InputNode(f"dead{i}", 4, value_range=(-100.0, 100.0)) for i in range(3)
+    ]
     adds = [Add(shared, dn) for dn in dead_nodes]
     # Wire into output so graph includes everything
     out_cat = Concatenate(adds)

@@ -125,12 +125,8 @@ class AffineBound:
                 merged_ranges, b.input_ranges
             ):
                 return a, b
-            a = AffineBound(
-                a.A_lo, a.A_hi, a.b_lo, a.b_hi, a.columns, merged_ranges
-            )
-            b = AffineBound(
-                b.A_lo, b.A_hi, b.b_lo, b.b_hi, b.columns, merged_ranges
-            )
+            a = AffineBound(a.A_lo, a.A_hi, a.b_lo, a.b_hi, a.columns, merged_ranges)
+            b = AffineBound(b.A_lo, b.A_hi, b.b_lo, b.b_hi, b.columns, merged_ranges)
             return a, b
 
         merged_columns, merged_ranges, n = _merge_layouts(a, b)

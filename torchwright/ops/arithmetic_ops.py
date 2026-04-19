@@ -341,6 +341,7 @@ def compare(
         _apply_semantic_override,
         _compare_semantic_bound,
     )
+
     _apply_semantic_override(
         result,
         _compare_semantic_bound(inp._affine_bound, thresh, true_level, false_level),

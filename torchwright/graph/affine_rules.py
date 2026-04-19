@@ -263,8 +263,10 @@ def _attn_rule(node) -> AffineBound:
     b_hi = O_plus.T @ proj_b_hi + O_minus.T @ proj_b_lo
 
     return AffineBound(
-        A_lo=A_lo, A_hi=A_hi,
-        b_lo=b_lo, b_hi=b_hi,
+        A_lo=A_lo,
+        A_hi=A_hi,
+        b_lo=b_lo,
+        b_hi=b_hi,
         columns=value_ab.columns,
         input_ranges=value_ab.input_ranges,
     )
@@ -322,7 +324,9 @@ def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -
     if affine_range != node._value_type_eager.value_range:
         from dataclasses import replace
 
-        node._value_type_eager = replace(node._value_type_eager, value_range=affine_range)
+        node._value_type_eager = replace(
+            node._value_type_eager, value_range=affine_range
+        )
 
 
 def _cond_gate_semantic_bound(inp_ab: AffineBound) -> AffineBound:

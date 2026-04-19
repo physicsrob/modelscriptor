@@ -116,7 +116,6 @@ def test_broadcast_select_exact_branch():
     assert torch.equal(output, expected)
 
 
-
 def test_switch():
     """Select one of three values based on which condition is true."""
     c1 = create_input("c1", 1)

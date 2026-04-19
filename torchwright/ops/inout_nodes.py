@@ -5,7 +5,6 @@ import torch
 
 from torchwright.graph.embedding import Unembedding
 
-
 _DEFAULT_VALUE_RANGE = (-1e4, 1e4)
 
 
