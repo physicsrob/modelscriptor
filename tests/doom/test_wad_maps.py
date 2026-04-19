@@ -89,32 +89,20 @@ def test_find_map_missing_raises(wad: WADReader) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_vertex_count(e1m1: MapData) -> None:
-    assert len(e1m1.vertices) == 467
-
-
-def test_linedef_count(e1m1: MapData) -> None:
-    assert len(e1m1.linedefs) == 475
-
-
-def test_sidedef_count(e1m1: MapData) -> None:
-    assert len(e1m1.sidedefs) == 648
-
-
-def test_sector_count(e1m1: MapData) -> None:
-    assert len(e1m1.sectors) == 85
-
-
-def test_seg_count(e1m1: MapData) -> None:
-    assert len(e1m1.segs) == 732
-
-
-def test_subsector_count(e1m1: MapData) -> None:
-    assert len(e1m1.subsectors) == 237
-
-
-def test_bsp_node_count(e1m1: MapData) -> None:
-    assert len(e1m1.nodes) == 236
+@pytest.mark.parametrize(
+    "lump,expected",
+    [
+        ("vertices", 467),
+        ("linedefs", 475),
+        ("sidedefs", 648),
+        ("sectors", 85),
+        ("segs", 732),
+        ("subsectors", 237),
+        ("nodes", 236),
+    ],
+)
+def test_e1m1_lump_counts(e1m1: MapData, lump: str, expected: int) -> None:
+    assert len(getattr(e1m1, lump)) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -418,52 +406,31 @@ def test_assign_tex_id_assigns_incrementally() -> None:
     assert name_to_id == {"BRICK": 0, "STONE": 1}
 
 
-def test_pick_seg_texture_prefers_middle() -> None:
+@pytest.mark.parametrize(
+    "upper,lower,middle,expected",
+    [
+        ("UP", "LO", "MID", "MID"),  # prefers middle
+        ("UP", "LO", "-", "LO"),  # falls back to lower
+        ("UP", "-", "-", "UP"),  # falls back to upper
+        ("-", "-", "-", "-"),  # none → dash
+    ],
+    ids=[
+        "prefers_middle",
+        "falls_back_to_lower",
+        "falls_back_to_upper",
+        "none_returns_dash",
+    ],
+)
+def test_pick_seg_texture(upper: str, lower: str, middle: str, expected: str) -> None:
     sd = Sidedef(
         x_offset=0,
         y_offset=0,
-        upper="UP",
-        lower="LO",
-        middle="MID",
+        upper=upper,
+        lower=lower,
+        middle=middle,
         sector=0,
     )
-    assert _pick_seg_texture(sd) == "MID"
-
-
-def test_pick_seg_texture_falls_back_to_lower() -> None:
-    sd = Sidedef(
-        x_offset=0,
-        y_offset=0,
-        upper="UP",
-        lower="LO",
-        middle="-",
-        sector=0,
-    )
-    assert _pick_seg_texture(sd) == "LO"
-
-
-def test_pick_seg_texture_falls_back_to_upper() -> None:
-    sd = Sidedef(
-        x_offset=0,
-        y_offset=0,
-        upper="UP",
-        lower="-",
-        middle="-",
-        sector=0,
-    )
-    assert _pick_seg_texture(sd) == "UP"
-
-
-def test_pick_seg_texture_none_returns_dash() -> None:
-    sd = Sidedef(
-        x_offset=0,
-        y_offset=0,
-        upper="-",
-        lower="-",
-        middle="-",
-        sector=0,
-    )
-    assert _pick_seg_texture(sd) == "-"
+    assert _pick_seg_texture(sd) == expected
 
 
 def test_sector_color_deterministic() -> None:

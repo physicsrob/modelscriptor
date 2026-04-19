@@ -449,19 +449,18 @@ def test_compile_switch_with_attention_conditions():
 # ---------------------------------------------------------------------------
 
 
-def test_compile_add_shared_inputs():
+@pytest.mark.parametrize("width", [1, 8], ids=["scalar", "wide"])
+def test_compile_add_shared_inputs(width):
     """Multiple Add nodes sharing the same inputs must not deadlock the scheduler.
 
     The scheduler only schedules Add via add_into when one input is "dead"
     (all its other consumers already computed). When two Add nodes share both
     inputs, neither input can become dead because each has the other Add as
-    an unconsumed consumer — a circular dependency.
-
-    This is the minimal reproduction: x and y feed two separate Add nodes,
-    whose results are combined via a Linear (add_scaled_nodes).
+    an unconsumed consumer — a circular dependency. The wide variant also
+    exercises multi-head compute_add.
     """
-    x = create_input("x", 1)
-    y = create_input("y", 1)
+    x = create_input("x", width)
+    y = create_input("y", width)
 
     # Two Add nodes sharing both inputs — deadlocks if not handled
     sum1 = add(x, y)
@@ -470,34 +469,19 @@ def test_compile_add_shared_inputs():
     # Combine via Linear (not Add) so the output itself isn't blocked
     output = add_scaled_nodes(1.0, sum1, 1.0, sum2)
 
-    _verify(
-        output,
-        n_pos=2,
-        input_values={
+    if width == 1:
+        inputs = {
             "x": torch.tensor([[3.0], [7.0]]),
             "y": torch.tensor([[4.0], [2.0]]),
-        },
-        max_layers=10,  # Deadlock manifests immediately; don't spin for 100 layers
-    )
-
-
-def test_compile_add_shared_inputs_wide():
-    """Shared-input Add deadlock with wider vectors (multi-head compute_add)."""
-    x = create_input("x", 8)
-    y = create_input("y", 8)
-
-    sum1 = add(x, y)
-    sum2 = add(x, y)
-    output = add_scaled_nodes(1.0, sum1, 1.0, sum2)
+        }
+    else:
+        inputs = {"x": torch.randn(2, width), "y": torch.randn(2, width)}
 
     _verify(
         output,
         n_pos=2,
-        input_values={
-            "x": torch.randn(2, 8),
-            "y": torch.randn(2, 8),
-        },
-        max_layers=10,
+        input_values=inputs,
+        max_layers=10,  # Deadlock manifests immediately; don't spin for 100 layers
     )
 
 
@@ -571,24 +555,19 @@ def test_compile_rejects_d_qk_too_large():
         )
 
 
-def test_compile_split_vo_exact_divisible():
-    """d_v=32, d_head=16 — splits V/O across exactly 2 heads."""
+@pytest.mark.parametrize(
+    "d_qk,d_v",
+    [
+        (4, 32),  # d_head=16 default — 2 heads exact
+        (4, 48),  # 3 heads, last chunk padded
+        (1, 32),  # scalar attention logit, 2 V/O heads
+    ],
+    ids=["exact_divisible", "with_remainder", "single_dim_qk"],
+)
+def test_compile_split_vo(d_qk, d_v):
+    """V/O split across heads at default d_head=16."""
     x = create_input("x", 8)
-    out = _build_attn(x, x, x, d_qk=4, d_v=32, d_out=8)
-    _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
-
-
-def test_compile_split_vo_with_remainder():
-    """d_v=48, d_head=16 — 3 heads, last chunk padded."""
-    x = create_input("x", 8)
-    out = _build_attn(x, x, x, d_qk=4, d_v=48, d_out=8)
-    _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
-
-
-def test_compile_split_vo_single_dim_qk():
-    """d_qk=1 — scalar attention logit, wide V/O split across 2 heads."""
-    x = create_input("x", 8)
-    out = _build_attn(x, x, x, d_qk=1, d_v=32, d_out=8)
+    out = _build_attn(x, x, x, d_qk=d_qk, d_v=d_v, d_out=8)
     _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
 
 
