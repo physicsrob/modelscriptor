@@ -8,12 +8,22 @@ a dataflow graph) and produces the output bound.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Optional
+
+import torch
 
 from torchwright.graph.affine_bound import AffineBound
 
 if TYPE_CHECKING:
     from torchwright.graph.node import Node
+
+
+def _safe_matvec(W: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``W @ b`` treating ``0 * ±inf`` as 0."""
+    product = W * b.unsqueeze(0)
+    product = torch.where(W == 0, torch.zeros_like(product), product)
+    return product.sum(dim=1)
 
 
 def compute_affine_bound(node: "Node") -> AffineBound:
@@ -69,8 +79,6 @@ def compute_affine_bound(node: "Node") -> AffineBound:
 
 def _linear_rule(node) -> AffineBound:
     """y = x @ W + c: sign-split GEMM."""
-    import torch
-
     inp_ab = node.inputs[0]._affine_bound
     W = node.output_matrix.to(torch.float64)
     c = node.output_bias.to(torch.float64)
@@ -78,9 +86,9 @@ def _linear_rule(node) -> AffineBound:
     W_minus = torch.clamp(W, max=0)
 
     A_lo = W_plus.T @ inp_ab.A_lo + W_minus.T @ inp_ab.A_hi
-    b_lo = W_plus.T @ inp_ab.b_lo + W_minus.T @ inp_ab.b_hi + c
+    b_lo = _safe_matvec(W_plus.T, inp_ab.b_lo) + _safe_matvec(W_minus.T, inp_ab.b_hi) + c
     A_hi = W_plus.T @ inp_ab.A_hi + W_minus.T @ inp_ab.A_lo
-    b_hi = W_plus.T @ inp_ab.b_hi + W_minus.T @ inp_ab.b_lo + c
+    b_hi = _safe_matvec(W_plus.T, inp_ab.b_hi) + _safe_matvec(W_minus.T, inp_ab.b_lo) + c
 
     return AffineBound(
         A_lo=A_lo,
@@ -141,8 +149,6 @@ def _concat_rule(node) -> AffineBound:
 
 def _relu_rule(node) -> AffineBound:
     """ReLU per-component case analysis using linear envelope."""
-    import torch
-
     inp_ab = node.inputs[0]._affine_bound
     intervals = inp_ab.to_interval()
     d = node.d_output
@@ -162,10 +168,15 @@ def _relu_rule(node) -> AffineBound:
             b_hi[i] = inp_ab.b_hi[i]
         elif h <= 0:
             pass
+        elif math.isinf(l) or math.isinf(h):
+            b_hi[i] = float(h)
         else:
             slope = h / (h - l)
             A_hi[i] = slope * inp_ab.A_hi[i]
             b_hi[i] = slope * (inp_ab.b_hi[i] - l)
+            alpha = h / (h - l)
+            A_lo[i] = alpha * inp_ab.A_lo[i]
+            b_lo[i] = alpha * inp_ab.b_lo[i]
 
     return AffineBound(
         A_lo=A_lo,
@@ -179,8 +190,6 @@ def _relu_rule(node) -> AffineBound:
 
 def _assert_rule(node) -> AffineBound:
     """Assert: pass through coefficients, optionally tighten input_ranges."""
-    import torch
-
     from torchwright.graph.misc import Assert, InputNode
     from torchwright.graph.embedding import Embedding
     from torchwright.graph.pos_encoding import PosEncoding
@@ -242,8 +251,6 @@ def _attn_rule(node) -> AffineBound:
     affine bounds on ``value @ V`` carry through unchanged.  O is
     then a standard linear step.
     """
-    import torch
-
     value_ab = node.inputs[2]._affine_bound
     V = node.value_matrix.to(torch.float64)
     O = node.output_matrix.to(torch.float64)
@@ -251,16 +258,16 @@ def _attn_rule(node) -> AffineBound:
     V_plus = torch.clamp(V, min=0)
     V_minus = torch.clamp(V, max=0)
     proj_A_lo = V_plus.T @ value_ab.A_lo + V_minus.T @ value_ab.A_hi
-    proj_b_lo = V_plus.T @ value_ab.b_lo + V_minus.T @ value_ab.b_hi
+    proj_b_lo = _safe_matvec(V_plus.T, value_ab.b_lo) + _safe_matvec(V_minus.T, value_ab.b_hi)
     proj_A_hi = V_plus.T @ value_ab.A_hi + V_minus.T @ value_ab.A_lo
-    proj_b_hi = V_plus.T @ value_ab.b_hi + V_minus.T @ value_ab.b_lo
+    proj_b_hi = _safe_matvec(V_plus.T, value_ab.b_hi) + _safe_matvec(V_minus.T, value_ab.b_lo)
 
     O_plus = torch.clamp(O, min=0)
     O_minus = torch.clamp(O, max=0)
     A_lo = O_plus.T @ proj_A_lo + O_minus.T @ proj_A_hi
-    b_lo = O_plus.T @ proj_b_lo + O_minus.T @ proj_b_hi
+    b_lo = _safe_matvec(O_plus.T, proj_b_lo) + _safe_matvec(O_minus.T, proj_b_hi)
     A_hi = O_plus.T @ proj_A_hi + O_minus.T @ proj_A_lo
-    b_hi = O_plus.T @ proj_b_hi + O_minus.T @ proj_b_lo
+    b_hi = _safe_matvec(O_plus.T, proj_b_hi) + _safe_matvec(O_minus.T, proj_b_lo)
 
     return AffineBound(
         A_lo=A_lo,
@@ -331,8 +338,6 @@ def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -
 
 def _cond_gate_semantic_bound(inp_ab: AffineBound) -> AffineBound:
     """Per-component [min(0, inp), max(0, inp)] envelope for cond_gate."""
-    import torch
-
     intervals = inp_ab.to_interval()
     d = inp_ab.d_output
     n = inp_ab.n_cols
@@ -345,15 +350,15 @@ def _cond_gate_semantic_bound(inp_ab: AffineBound) -> AffineBound:
     for i in range(d):
         l, h = intervals[i].lo, intervals[i].hi
         if l >= 0:
-            # max(0, x) = x (identity), min(0, x) = 0
             A_hi[i] = inp_ab.A_hi[i]
             b_hi[i] = inp_ab.b_hi[i]
         elif h <= 0:
-            # max(0, x) = 0, min(0, x) = x (identity)
             A_lo[i] = inp_ab.A_lo[i]
             b_lo[i] = inp_ab.b_lo[i]
+        elif math.isinf(l) or math.isinf(h):
+            b_lo[i] = float(min(0, l))
+            b_hi[i] = float(max(0, h))
         else:
-            # Straddling: upper = chord of max(0,x), lower = secant of min(0,x)
             s_hi = h / (h - l)
             A_hi[i] = s_hi * inp_ab.A_hi[i]
             b_hi[i] = s_hi * (inp_ab.b_hi[i] - l)

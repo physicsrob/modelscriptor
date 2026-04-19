@@ -178,8 +178,9 @@ class AffineBound:
         a = self.A_lo[i]
         pos = torch.clamp(a, min=0)
         neg = torch.clamp(a, max=0)
-        term = torch.where(a == 0, torch.zeros_like(a), pos * x_lo + neg * x_hi)
-        val = term.sum() + self.b_lo[i]
+        term_pos = torch.where(pos == 0, torch.zeros_like(pos), pos * x_lo)
+        term_neg = torch.where(neg == 0, torch.zeros_like(neg), neg * x_hi)
+        val = (term_pos + term_neg).sum() + self.b_lo[i]
         return float(val.item())
 
     def _eval_upper(self, i: int, x_lo: torch.Tensor, x_hi: torch.Tensor) -> float:
@@ -187,8 +188,9 @@ class AffineBound:
         a = self.A_hi[i]
         pos = torch.clamp(a, min=0)
         neg = torch.clamp(a, max=0)
-        term = torch.where(a == 0, torch.zeros_like(a), pos * x_hi + neg * x_lo)
-        val = term.sum() + self.b_hi[i]
+        term_pos = torch.where(pos == 0, torch.zeros_like(pos), pos * x_hi)
+        term_neg = torch.where(neg == 0, torch.zeros_like(neg), neg * x_lo)
+        val = (term_pos + term_neg).sum() + self.b_hi[i]
         return float(val.item())
 
     def __repr__(self) -> str:

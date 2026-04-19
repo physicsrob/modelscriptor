@@ -242,13 +242,23 @@ def _find_tainted_nodes(
 
 
 # ---------------------------------------------------------------------------
-# Shared fixture
+# Shared fixtures
 # ---------------------------------------------------------------------------
+
+_CANONICAL_POSES = [
+    (0.0, 0.0, 0.0),
+    (0.0, 0.0, 45.0),
+    (0.0, 0.0, 64.0),
+    (0.0, 0.0, 128.0),
+    (0.0, 0.0, 192.0),
+    (3.0, 2.0, 20.0),
+    (1.0, -3.0, 50.0),
+]
 
 
 @pytest.fixture(scope="module")
-def doom_graph_eval():
-    """Build doom graph + run reference_eval; shared across all tests."""
+def doom_graph():
+    """Build doom graph and tainted set (pose-independent)."""
     config = _config()
     textures = default_texture_atlas()
     segs = _segments()
@@ -267,19 +277,8 @@ def doom_graph_eval():
         all_nodes = get_ancestor_nodes({output, pos_enc})
         input_nodes = [n for n in all_nodes if isinstance(n, InputNode)]
 
-        # Known input-range mismatches:
-        # - token_type, texture_id_e8: E8 spherical codes have components
-        #   up to +/-30, but these InputNodes declare value_range=(-1, 1).
-        # - sort_feedback, render_feedback: composite vectors whose
-        #   sub-fields have heterogeneous ranges (E8 codes, column
-        #   indices, coordinates) covered by a single (-max_coord,
-        #   max_coord) declaration that doesn't fit all sub-fields.
-        # Taint all nodes whose affine bounds are derived from these.
-        # E8 inputs: condition channel is wrong, data channel is
-        # correct after semantic overrides.
+        # Known input-range mismatches (see module docstring).
         e8_names = {"token_type", "texture_id_e8"}
-        # Feedback inputs: the data itself has wrong declared range,
-        # so taint propagates through semantic overrides.
         feedback_names = {"sort_feedback", "render_feedback"}
 
         tainted: Set[int] = set()
@@ -289,28 +288,50 @@ def doom_graph_eval():
             elif n.name in feedback_names:
                 tainted |= _find_tainted_nodes(all_nodes, n, stop_at_overrides=False)
 
-        input_values = _build_input_values(
-            input_nodes,
-            subset,
-            textures,
-            px=0.0,
-            py=0.0,
-            angle=45.0,
-        )
-
-        n_pos = next(iter(input_values.values())).shape[0]
-
-        orig_check = Assert._check
-        Assert._check = lambda self, x: None
-        try:
-            cache = reference_eval(output, input_values, n_pos)
-        finally:
-            Assert._check = orig_check
-
     return {
         "all_nodes": all_nodes,
-        "cache": cache,
+        "input_nodes": input_nodes,
+        "output": output,
         "tainted": tainted,
+        "subset": subset,
+        "textures": textures,
+    }
+
+
+def _run_reference_eval(doom_graph, px, py, angle):
+    """Run reference_eval at a specific pose and return cache."""
+    input_nodes = doom_graph["input_nodes"]
+    output = doom_graph["output"]
+    subset = doom_graph["subset"]
+    textures = doom_graph["textures"]
+
+    input_values = _build_input_values(
+        input_nodes,
+        subset,
+        textures,
+        px=px,
+        py=py,
+        angle=angle,
+    )
+    n_pos = next(iter(input_values.values())).shape[0]
+
+    orig_check = Assert._check
+    Assert._check = lambda self, x: None
+    try:
+        cache = reference_eval(output, input_values, n_pos)
+    finally:
+        Assert._check = orig_check
+    return cache
+
+
+@pytest.fixture(scope="module")
+def doom_graph_eval(doom_graph):
+    """Single-pose eval for backward compatibility with non-parameterized tests."""
+    cache = _run_reference_eval(doom_graph, px=0.0, py=0.0, angle=45.0)
+    return {
+        "all_nodes": doom_graph["all_nodes"],
+        "cache": cache,
+        "tainted": doom_graph["tainted"],
     }
 
 
@@ -326,63 +347,65 @@ def _node_label(node) -> str:
     return f"{node.node_type()}(id={node.node_id}, name='{node.name}', ann='{ann}')"
 
 
+def _check_soundness(all_nodes, cache, tainted):
+    """Check that observed values fall within affine bounds. Returns violations list."""
+    checked = 0
+    violations = []
+    for node in all_nodes:
+        if isinstance(node, _SKIP_TYPES):
+            continue
+        if node.node_id in tainted:
+            continue
+        tensor = cache.get(node)
+        if tensor is None:
+            continue
+        checked += 1
+        intervals = node.affine_bound.to_interval()
+        for j in range(node.d_output):
+            observed_lo = tensor[:, j].min().item()
+            observed_hi = tensor[:, j].max().item()
+            bound_lo = intervals[j].lo
+            bound_hi = intervals[j].hi
+            tol = 0.1
+            if observed_lo < bound_lo - tol:
+                violations.append(
+                    f"{_node_label(node)} component {j}: "
+                    f"observed_lo={observed_lo:.6f} < bound_lo={bound_lo:.6f}"
+                )
+            if observed_hi > bound_hi + tol:
+                violations.append(
+                    f"{_node_label(node)} component {j}: "
+                    f"observed_hi={observed_hi:.6f} > bound_hi={bound_hi:.6f}"
+                )
+    return checked, violations
+
+
 class TestAffineBoundSoundness:
     """Observed values from reference_eval must be within affine bounds.
 
-    Nodes tainted by the token_type value_range mismatch are excluded:
-    the E8 spherical codes have components up to +/-30 but the InputNode
-    declares value_range=(-1, 1).  The taint propagates through the
-    detection chain and gate-MLP internals, but semantic overrides at
-    cond_gate/select boundaries create firewalls — everything after a
-    semantic override IS checked.
+    Runs across all canonical poses to catch angle-specific violations.
+    Nodes tainted by known input-range mismatches are excluded.
     """
 
-    def test_all_nodes_within_bounds(self, doom_graph_eval):
-        all_nodes = doom_graph_eval["all_nodes"]
-        cache = doom_graph_eval["cache"]
-        tainted = doom_graph_eval["tainted"]
-
-        checked = 0
-        violations = []
-        for node in all_nodes:
-            if isinstance(node, _SKIP_TYPES):
-                continue
-            if node.node_id in tainted:
-                continue
-            tensor = cache.get(node)
-            if tensor is None:
-                continue
-            checked += 1
-            intervals = node.affine_bound.to_interval()
-            for j in range(node.d_output):
-                observed_lo = tensor[:, j].min().item()
-                observed_hi = tensor[:, j].max().item()
-                bound_lo = intervals[j].lo
-                bound_hi = intervals[j].hi
-                tol = 0.1
-                if observed_lo < bound_lo - tol:
-                    violations.append(
-                        f"{_node_label(node)} component {j}: "
-                        f"observed_lo={observed_lo:.6f} < bound_lo={bound_lo:.6f}"
-                    )
-                if observed_hi > bound_hi + tol:
-                    violations.append(
-                        f"{_node_label(node)} component {j}: "
-                        f"observed_hi={observed_hi:.6f} > bound_hi={bound_hi:.6f}"
-                    )
-
+    @pytest.mark.parametrize("px,py,angle", _CANONICAL_POSES)
+    def test_all_nodes_within_bounds(self, doom_graph, px, py, angle):
+        cache = _run_reference_eval(doom_graph, px, py, angle)
+        checked, violations = _check_soundness(
+            doom_graph["all_nodes"], cache, doom_graph["tainted"]
+        )
         assert checked > 0, "No nodes were checked — filter too aggressive"
         assert not violations, (
-            f"{len(violations)} affine bound violations "
-            f"({checked} nodes checked):\n" + "\n".join(violations[:30])
+            f"{len(violations)} affine bound violations at pose "
+            f"({px}, {py}, {angle}) ({checked} nodes checked):\n"
+            + "\n".join(violations[:30])
         )
 
 
 class TestAffineBoundFiniteness:
     """Every non-input node should have finite affine bounds."""
 
-    def test_no_infinite_bounds(self, doom_graph_eval):
-        all_nodes = doom_graph_eval["all_nodes"]
+    def test_no_infinite_bounds(self, doom_graph):
+        all_nodes = doom_graph["all_nodes"]
 
         infinite_nodes = []
         for node in all_nodes:
@@ -405,14 +428,14 @@ class TestAffineBoundTightness:
     Thresholds are ratchets: as affine bounds tighten, lower them.
     """
 
-    def test_max_width(self, doom_graph_eval):
+    def test_max_width(self, doom_graph):
         """Track the worst-case bound width across the graph.
 
         Current worst case: ~42 million in wall/visibility
         (squared-distance chain through multiply_const).  Threshold
         is a ratchet — lower it as bounds tighten.
         """
-        all_nodes = doom_graph_eval["all_nodes"]
+        all_nodes = doom_graph["all_nodes"]
 
         MAX_WIDTH = 50_000_000
         wide_nodes = []
@@ -435,26 +458,12 @@ class TestAffineBoundTightness:
             wide_nodes[:30]
         )
 
-    def test_bound_coverage(self, doom_graph_eval):
-        """Affine bounds should not be wildly wider than observed values.
-
-        For each non-tainted node with a non-trivial observed range,
-        computes the overestimation ratio:
-
-            overestimation = bound_width / observed_width
-
-        A ratio of 1 is perfect tightness; 1000 means the bound is
-        1000x wider than what the game actually produces at this
-        scene/camera.
-
-        The test checks the 90th-percentile overestimation across all
-        such nodes.  With a single prefill scene the observed ranges
-        are narrow (many code paths inactive), so some overestimation
-        is expected.  Threshold is a ratchet.
-        """
-        all_nodes = doom_graph_eval["all_nodes"]
-        cache = doom_graph_eval["cache"]
-        tainted = doom_graph_eval["tainted"]
+    @pytest.mark.parametrize("px,py,angle", _CANONICAL_POSES)
+    def test_bound_coverage(self, doom_graph, px, py, angle):
+        """Affine bounds should not be wildly wider than observed values."""
+        cache = _run_reference_eval(doom_graph, px, py, angle)
+        all_nodes = doom_graph["all_nodes"]
+        tainted = doom_graph["tainted"]
 
         MIN_OBSERVED_WIDTH = 0.01
         ratios = []
@@ -482,38 +491,20 @@ class TestAffineBoundTightness:
         assert len(ratios) > 0, "No nodes with non-trivial observed range"
 
         ratios.sort()
-        p50 = ratios[len(ratios) // 2]
         p90 = ratios[int(len(ratios) * 0.9)]
-        worst = ratios[-1]
-
-        # Current state: p50=20x, p90=1199x, max=21064419x.
-        # The long tail is wall/visibility squared-distance chains.
         MAX_P90 = 5_000
         assert p90 <= MAX_P90, (
             f"90th-percentile overestimation {p90:.0f}x exceeds "
-            f"{MAX_P90}x (median={p50:.0f}x, worst={worst:.0f}x, "
-            f"n={len(ratios)} nodes)"
+            f"{MAX_P90}x at pose ({px}, {py}, {angle})"
         )
 
-    def test_gate_coverage(self, doom_graph_eval):
-        """Gate M values should not be wildly larger than needed.
-
-        For each cond_gate/select output with non-trivial observed
-        range, computes:
-
-            M_overestimation = M_from_bound / M_from_observed
-
-        A ratio of 1 means M is exactly as large as needed; 100
-        means M (and the associated precision loss) is 100x larger
-        than the game actually requires.
-
-        Threshold is a ratchet — lower it as bounds tighten.
-        """
+    @pytest.mark.parametrize("px,py,angle", _CANONICAL_POSES)
+    def test_gate_coverage(self, doom_graph, px, py, angle):
+        """Gate M values should not be wildly larger than needed."""
         from torchwright.graph.linear import Linear
-        from torchwright.ops.logic_ops import _GATE_OFFSET_SAFETY_FACTOR
 
-        all_nodes = doom_graph_eval["all_nodes"]
-        cache = doom_graph_eval["cache"]
+        cache = _run_reference_eval(doom_graph, px, py, angle)
+        all_nodes = doom_graph["all_nodes"]
 
         MIN_OBSERVED_ABS = 0.01
         ratios = []
@@ -538,19 +529,14 @@ class TestAffineBoundTightness:
         assert len(ratios) > 0, "No gate sites with non-trivial observed range"
 
         ratios.sort()
-        p50 = ratios[len(ratios) // 2]
         p90 = ratios[int(len(ratios) * 0.9)]
-        worst = ratios[-1]
-
-        # Current state: p50=5x, p90=1231x, max=4990x.
         MAX_P90 = 5_000
         assert p90 <= MAX_P90, (
             f"90th-percentile gate M overestimation {p90:.0f}x exceeds "
-            f"{MAX_P90}x (median={p50:.0f}x, worst={worst:.0f}x, "
-            f"n={len(ratios)} gates)"
+            f"{MAX_P90}x at pose ({px}, {py}, {angle})"
         )
 
-    def test_gate_M_bounded(self, doom_graph_eval):
+    def test_gate_M_bounded(self, doom_graph):
         """cond_gate/select offset M should not exceed 50000.
 
         M = 2 * max(|lo|, |hi|) on the gated input.  Current worst
@@ -560,7 +546,7 @@ class TestAffineBoundTightness:
         from torchwright.graph.linear import Linear
         from torchwright.ops.logic_ops import _GATE_OFFSET_SAFETY_FACTOR
 
-        all_nodes = doom_graph_eval["all_nodes"]
+        all_nodes = doom_graph["all_nodes"]
 
         MAX_M = 50_000
         bad_gates = []

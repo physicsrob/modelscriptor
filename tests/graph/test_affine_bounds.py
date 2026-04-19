@@ -10,6 +10,7 @@ import torch
 from torchwright.graph import InputNode, LiteralValue
 from torchwright.graph.affine_bound import AffineBound
 from torchwright.graph.session import fresh_graph_session
+from torchwright.graph.value_type import Range
 
 # --- AffineBound factories -----------------------------------------------
 
@@ -753,3 +754,149 @@ class TestAttnRule:
             r = attn.affine_bound.to_scalar_range()
             assert r.lo <= 2.0 + 1e-5
             assert r.hi >= 3.0 - 1e-5
+
+
+# --- NaN safety ---------------------------------------------------------------
+
+
+class TestNanSafety:
+    """Unbounded InputNode ranges must not produce NaN in bounds."""
+
+    def test_unbounded_relu(self):
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(float("-inf"), float("inf")))
+            from torchwright.graph import ReLU
+
+            r = ReLU(x)
+            iv = r.affine_bound.to_interval()[0]
+            assert not math.isnan(iv.lo)
+            assert not math.isnan(iv.hi)
+            assert iv.lo == 0.0
+            assert iv.hi == float("inf")
+
+    def test_unbounded_linear(self):
+        with fresh_graph_session():
+            x = InputNode(2, name="x", value_range=(float("-inf"), float("inf")))
+            from torchwright.graph import Linear
+
+            W = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+            lin = Linear(x, W)
+            for iv in lin.affine_bound.to_interval():
+                assert not math.isnan(iv.lo)
+                assert not math.isnan(iv.hi)
+
+    def test_unbounded_relu_then_linear(self):
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(float("-inf"), float("inf")))
+            from torchwright.graph import Linear, ReLU
+
+            r = ReLU(x)
+            lin = Linear(r, torch.tensor([[2.0]]))
+            iv = lin.affine_bound.to_interval()[0]
+            assert not math.isnan(iv.lo)
+            assert not math.isnan(iv.hi)
+
+    def test_half_bounded_relu(self):
+        """ReLU with finite upper, infinite lower."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(float("-inf"), 5.0))
+            from torchwright.graph import ReLU
+
+            r = ReLU(x)
+            iv = r.affine_bound.to_interval()[0]
+            assert not math.isnan(iv.lo)
+            assert not math.isnan(iv.hi)
+            assert iv.lo == 0.0
+            assert iv.hi == pytest.approx(5.0)
+
+
+# --- ReLU chord tightness ----------------------------------------------------
+
+
+class TestReluChord:
+    """Continuous chord lower bound tightens cancellation through ReLU."""
+
+    def test_chord_tighter_than_zero(self):
+        """ReLU(x) + (-ReLU(x)) with chord should be tighter than [-4, 4]."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-2.0, 4.0))
+            from torchwright.graph import Add, Linear, ReLU
+
+            r = ReLU(x)
+            neg_r = Linear(r, torch.tensor([[-1.0]]))
+            cancel = Add(r, neg_r)
+            iv = cancel.affine_bound.to_interval()[0]
+            # With chord alpha=h/(h-l)=4/6=2/3: interval is [-4/3, 4/3]
+            assert iv.lo == pytest.approx(-4.0 / 3.0, abs=1e-10)
+            assert iv.hi == pytest.approx(4.0 / 3.0, abs=1e-10)
+
+    def test_chord_soundness(self):
+        """Actual ReLU values must remain within chord-derived bounds."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-3.0, 5.0))
+            from torchwright.graph import ReLU
+
+            r = ReLU(x)
+            intervals = r.affine_bound.to_interval()
+            for _ in range(200):
+                xv = torch.FloatTensor(1).uniform_(-3.0, 5.0)
+                yv = torch.clamp(xv, min=0.0).item()
+                assert yv >= intervals[0].lo - 1e-5
+                assert yv <= intervals[0].hi + 1e-5
+
+    def test_chord_lower_bound_negative(self):
+        """Chord lower bound is negative for straddling (looser per-component, tighter correlation)."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-2.0, 4.0))
+            from torchwright.graph import ReLU
+
+            r = ReLU(x)
+            iv = r.affine_bound.to_interval()[0]
+            # alpha = 4/6, lower = alpha * (-2) = -4/3
+            assert iv.lo == pytest.approx(-4.0 / 3.0, abs=1e-10)
+            assert iv.hi == pytest.approx(4.0)
+
+
+# --- Assert coefficient passthrough ------------------------------------------
+
+
+class TestAssertDegenerate:
+    """Assert on non-InputNode collapses to degenerate with per-component intervals."""
+
+    def test_degenerate_tight_range(self):
+        """Assert on Linear gives per-component intersected intervals."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-10.0, 10.0))
+            from torchwright.graph import Linear
+            from torchwright.graph.asserts import assert_in_range
+
+            scaled = Linear(x, torch.tensor([[2.0]]))
+            asserted = assert_in_range(scaled, -5.0, 5.0)
+            iv = asserted.affine_bound.to_interval()[0]
+            assert iv.lo == pytest.approx(-5.0)
+            assert iv.hi == pytest.approx(5.0)
+
+    def test_degenerate_zero_coefficients(self):
+        """Assert on non-InputNode produces zero A matrices."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-10.0, 10.0))
+            from torchwright.graph import Linear
+            from torchwright.graph.asserts import assert_in_range
+
+            scaled = Linear(x, torch.tensor([[2.0]]))
+            asserted = assert_in_range(scaled, -5.0, 5.0)
+            ab = asserted.affine_bound
+            assert ab.n_cols == 0
+
+    def test_value_type_reflects_claimed_range(self):
+        """Assert's value_type.value_range should reflect the claimed range."""
+        with fresh_graph_session():
+            x = InputNode(1, name="x", value_range=(-10.0, 10.0))
+            from torchwright.graph import Linear
+            from torchwright.graph.asserts import assert_in_range
+
+            scaled = Linear(x, torch.tensor([[2.0]]))
+            asserted = assert_in_range(scaled, -3.0, 7.0)
+            r = asserted.value_type.value_range
+            assert r.lo == pytest.approx(-3.0)
+            assert r.hi == pytest.approx(7.0)
