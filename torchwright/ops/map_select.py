@@ -143,15 +143,37 @@ def _select_offset(true_node: Node, false_node: Node, caller: str) -> float:
     return _max_abs_or_raise(union_vt, caller)
 
 
-def _build_select(
+def select(
     cond: Node,
     true_node: Node,
     false_node: Node,
     *,
     approximate: bool = True,
 ) -> Node:
-    """Build the actual select subgraph using current value_type bounds."""
+    """
+    Outputs one of two nodes based on a boolean condition.
+
+    Args:
+        cond (Node): Condition node that outputs either true or false.
+        true_node (Node): Node to be outputted if the condition is true.
+        false_node (Node): Node to be outputted if the condition is false.
+        approximate: When ``True`` (default), uses a single L→ReLU→L sublayer
+            with an additive cancellation trick. Both branches compute
+            ``(M + v) − M`` where ``M`` is derived from the union of
+            ``true_node`` / ``false_node`` ranges; this loses precision for
+            ``|v| ≪ ULP(M)``. When ``False``, uses two sublayers: the first
+            maps ``cond`` to ``c_on = ReLU(cond)`` and ``c_off = ReLU(−cond)``;
+            the second gates each branch with ReLU clipping (no cancellation).
+            The winning branch is float-exact and immune to cond noise; costs
+            one extra MLP sublayer.
+
+    Returns:
+        Node: Either true_node or false_node based on the condition.
+    """
     from torchwright.ops.const import step_sharpness
+
+    assert len(cond) == 1
+    assert len(true_node) == len(false_node)
 
     d = len(true_node)
     M = _select_offset(true_node, false_node, "select")
@@ -240,38 +262,6 @@ def _build_select(
         _select_semantic_bound(true_node._affine_bound, false_node._affine_bound),
     )
     return result
-
-
-def select(
-    cond: Node,
-    true_node: Node,
-    false_node: Node,
-    *,
-    approximate: bool = True,
-) -> Node:
-    """
-    Outputs one of two nodes based on a boolean condition.
-
-    Args:
-        cond (Node): Condition node that outputs either true or false.
-        true_node (Node): Node to be outputted if the condition is true.
-        false_node (Node): Node to be outputted if the condition is false.
-        approximate: When ``True`` (default), uses a single L→ReLU→L sublayer
-            with an additive cancellation trick. Both branches compute
-            ``(M + v) − M`` where ``M`` is derived from the union of
-            ``true_node`` / ``false_node`` ranges; this loses precision for
-            ``|v| ≪ ULP(M)``. When ``False``, uses two sublayers: the first
-            maps ``cond`` to ``c_on = ReLU(cond)`` and ``c_off = ReLU(−cond)``;
-            the second gates each branch with ReLU clipping (no cancellation).
-            The winning branch is float-exact and immune to cond noise; costs
-            one extra MLP sublayer.
-
-    Returns:
-        Node: Either true_node or false_node based on the condition.
-    """
-    assert len(cond) == 1
-    assert len(true_node) == len(false_node)
-    return _build_select(cond, true_node, false_node, approximate=approximate)
 
 
 def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
