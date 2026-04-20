@@ -34,6 +34,7 @@ def compute_affine_bound(node: "Node") -> AffineBound:
         Add,
         Concatenate,
         Assert,
+        DebugWatch,
         ValueLogger,
     )
     from torchwright.graph.linear import Linear
@@ -52,7 +53,7 @@ def compute_affine_bound(node: "Node") -> AffineBound:
 
         return AffineBound.constant(node.value.to(dtype=torch.float64))
 
-    if isinstance(node, ValueLogger):
+    if isinstance(node, (ValueLogger, DebugWatch)):
         return node.inputs[0]._affine_bound
 
     if isinstance(node, Linear):

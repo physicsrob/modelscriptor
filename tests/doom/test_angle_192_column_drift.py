@@ -91,18 +91,6 @@ def graph_and_module():
         if fuse_consecutive_linears(output_nodes, verbose=False) == 0:
             break
 
-    from torchwright.graph.asserts import collect_asserts
-
-    collected_asserts: list = []
-    _seen_ids: set = set()
-    for out_node in list(graph_io.overlaid_outputs.values()) + list(
-        graph_io.overflow_outputs.values()
-    ):
-        for a in collect_asserts(out_node):
-            if a.node_id not in _seen_ids:
-                _seen_ids.add(a.node_id)
-                collected_asserts.append(a)
-
     module = compile_headless(
         pos_encoding,
         io=io,
@@ -115,7 +103,6 @@ def graph_and_module():
             "max_walls": _MAX_WALLS,
             "max_bsp_nodes": _MAX_BSP_NODES,
             "tex_h": subset.textures[0].shape[1],
-            "asserts": collected_asserts,
         },
     )
     module.eval()
@@ -301,7 +288,7 @@ def test_score_gap_assert_at_angle_192_compiled(graph_and_module):
     and this assertion would fire.
     """
     _graph_io, module, subset, config = graph_and_module
-    asserts = module.metadata["asserts"]
+    asserts = module._asserts
     score_gap_asserts = [
         a for a in asserts if "score_gap_at_least" in (a.message or "")
     ]

@@ -7,6 +7,7 @@ from .misc import (
     Add,
     Assert,
     Concatenate,
+    DebugWatch,
     InputNode,
     LiteralValue,
     Predicate,

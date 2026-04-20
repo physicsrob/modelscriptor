@@ -28,12 +28,12 @@ layer; invariants that hold on aggregated values (``{0, 1}`` bools
 after broadcast) take a tolerance large enough to absorb that fuzz.
 """
 
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 import torch
 
 from torchwright.graph import Node, Concatenate
-from torchwright.graph.misc import Assert, Predicate
+from torchwright.graph.misc import Assert, DebugWatch, Predicate
 from torchwright.graph.value_type import NodeValueType, Range
 
 # ---------------------------------------------------------------------
@@ -69,6 +69,54 @@ def collect_asserts(output_node: Node) -> List[Assert]:
         for inp in node.inputs:
             stack.append(inp)
     return asserts
+
+
+def collect_watches(output_node: Node) -> List[DebugWatch]:
+    """Walk the graph from ``output_node`` and collect every reachable DebugWatch.
+
+    Call this **before** passing the graph to ``compile_headless`` —
+    compile-time analysis strips DebugWatch nodes in-place.
+    """
+    seen: Set[int] = set()
+    watches: List[DebugWatch] = []
+    stack: List[Node] = [output_node]
+    while stack:
+        node = stack.pop()
+        if node.node_id in seen:
+            continue
+        seen.add(node.node_id)
+        if isinstance(node, DebugWatch):
+            watches.append(node)
+        for inp in node.inputs:
+            stack.append(inp)
+    return watches
+
+
+def collect_debug_nodes(
+    output_node: Node,
+) -> Tuple[List[Assert], List[DebugWatch]]:
+    """Walk the graph once, collecting both Assert and DebugWatch nodes."""
+    seen: Set[int] = set()
+    asserts: List[Assert] = []
+    watches: List[DebugWatch] = []
+    stack: List[Node] = [output_node]
+    while stack:
+        node = stack.pop()
+        if node.node_id in seen:
+            continue
+        seen.add(node.node_id)
+        if isinstance(node, Assert):
+            asserts.append(node)
+        elif isinstance(node, DebugWatch):
+            watches.append(node)
+        for inp in node.inputs:
+            stack.append(inp)
+    return asserts, watches
+
+
+def debug_watch(node: Node, predicate: Predicate, message: str = "") -> Node:
+    """Wrap ``node`` with a DebugWatch that prints when ``predicate`` fires."""
+    return DebugWatch(node, predicate, message)
 
 
 def _format_bad(x: torch.Tensor, mask: torch.Tensor, *, max_show: int = 3) -> str:

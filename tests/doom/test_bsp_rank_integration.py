@@ -274,13 +274,13 @@ class TestBspIntegration:
         """
         from torchwright.graph.misc import Assert
 
-        asserts = module.metadata.get("asserts", [])
+        asserts = module._asserts
         assert isinstance(
             asserts, list
-        ), f"expected 'asserts' metadata entry to be a list, got {type(asserts)}"
+        ), f"expected '_asserts' to be a list, got {type(asserts)}"
         assert all(
             isinstance(a, Assert) for a in asserts
-        ), "'asserts' metadata must contain Assert nodes"
+        ), "'_asserts' must contain Assert nodes"
         assert len(asserts) >= 3, (
             f"expected ≥3 annotated invariants after compile_game; "
             f"got {len(asserts)}.  Check that the SORTED stage's "
