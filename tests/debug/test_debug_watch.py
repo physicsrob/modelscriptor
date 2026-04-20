@@ -27,7 +27,6 @@ from torchwright.graph.asserts import (
 from torchwright.ops.arithmetic_ops import clamp
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
