@@ -687,23 +687,21 @@ def _print_per_token_type_analysis(all_nodes: Set[Node], node_to_layer: dict):
     print(f"{'─' * 72}")
     print()
     print(f"  Own depth:  longest sequential chain within the token type's own ops")
-    print(f"  Input ready: compiled layer at which each cross-position input is available")
+    print(
+        f"  Input ready: compiled layer at which each cross-position input is available"
+    )
 
     summary_rows = []
 
     for type_name, prefix in _TOKEN_TYPE_PREFIXES:
-        type_nodes = {
-            n for n in all_nodes if (n.annotation or "").startswith(prefix)
-        }
+        type_nodes = {n for n in all_nodes if (n.annotation or "").startswith(prefix)}
         if not type_nodes:
             continue
 
         own_depth = _subgraph_critical_depth(type_nodes)
 
         layers = [
-            node_to_layer[n.node_id]
-            for n in type_nodes
-            if n.node_id in node_to_layer
+            node_to_layer[n.node_id] for n in type_nodes if n.node_id in node_to_layer
         ]
         if layers:
             lo, hi = min(layers), max(layers)
@@ -730,7 +728,9 @@ def _print_per_token_type_analysis(all_nodes: Set[Node], node_to_layer: dict):
         summary_rows.append((type_name, own_depth, span_str, bottleneck_str, boundary))
 
     # Summary table
-    print(f"\n  {'Token Type':<12s} {'Own Depth':>10s} {'Layer Span':>14s}   {'Bottleneck Input'}")
+    print(
+        f"\n  {'Token Type':<12s} {'Own Depth':>10s} {'Layer Span':>14s}   {'Bottleneck Input'}"
+    )
     print(f"  {'─' * 12} {'─' * 10} {'─' * 14}   {'─' * 30}")
     for type_name, own_depth, span_str, bottleneck_str, _ in summary_rows:
         print(
@@ -747,7 +747,9 @@ def _print_per_token_type_analysis(all_nodes: Set[Node], node_to_layer: dict):
         print(f"\n  {type_name} (own depth: {own_depth} ops)")
         for source_label, max_layer, count in boundary:
             layer_str = f"layer {max_layer}" if max_layer >= 0 else "layer 0"
-            print(f"    {source_label:<25s} → {layer_str:>10s}   ({count} boundary nodes)")
+            print(
+                f"    {source_label:<25s} → {layer_str:>10s}   ({count} boundary nodes)"
+            )
 
     print()
 

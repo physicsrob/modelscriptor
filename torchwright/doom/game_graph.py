@@ -112,26 +112,13 @@ class GameGraphIO:
     overflow_outputs: Dict[str, Node]
 
     def concat_output(self) -> Node:
-        """Single concatenated output node for legacy callers.
-
-        Order: token_type, render_feedback, pixels, col,
-        start, length, done, eos_resolved_x, eos_resolved_y,
-        eos_new_angle.
-        """
-        return Concatenate(
-            [
-                self.overlaid_outputs["token_type"],
-                self.overlaid_outputs["render_feedback"],
-                self.overflow_outputs["pixels"],
-                self.overflow_outputs["col"],
-                self.overflow_outputs["start"],
-                self.overflow_outputs["length"],
-                self.overflow_outputs["done"],
-                self.overflow_outputs["eos_resolved_x"],
-                self.overflow_outputs["eos_resolved_y"],
-                self.overflow_outputs["eos_new_angle"],
-            ]
-        )
+        """Single concatenated output node for legacy callers."""
+        parts = []
+        for name, node in self.overlaid_outputs.items():
+            parts.append(node)
+        for name, node in self.overflow_outputs.items():
+            parts.append(node)
+        return Concatenate(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +403,9 @@ def _create_inputs(
         "sort_position_index", 1, value_range=(0.0, float(max_walls))
     )
 
-    d_render_fb = 2 * max_walls + 11
+    # Render precompute feedback — 5-wide (sort_den, C, D, E, H_inv).
+    # Populated by THINKING, forwarded unchanged through RENDER tokens.
+    d_render_fb = 5
     render_feedback = create_input(
         "render_feedback",
         d_render_fb,
@@ -424,64 +413,47 @@ def _create_inputs(
     )
     inputs["render_feedback"] = render_feedback
 
+    # Discrete render state — separate overlaid inputs so the host can
+    # copy them from output to input without interpreting them.
+    inputs["render_mask"] = create_input(
+        "render_mask", max_walls, value_range=(0.0, 1.0)
+    )
+    inputs["render_col"] = create_input(
+        "render_col", 1, value_range=(0.0, 255.0)
+    )
+    inputs["render_is_new_wall"] = create_input(
+        "render_is_new_wall", 1, value_range=(-1.0, 1.0)
+    )
+    inputs["render_chunk_start"] = create_input(
+        "render_chunk_start", 1, value_range=(-1.0, 255.0)
+    )
+    inputs["render_tex_id"] = create_input(
+        "render_tex_id", 1, value_range=(0.0, 255.0)
+    )
+    inputs["render_vis_lo"] = create_input(
+        "render_vis_lo", 1, value_range=(-2.0, 255.0)
+    )
+    inputs["render_vis_hi"] = create_input(
+        "render_vis_hi", 1, value_range=(-2.0, 255.0)
+    )
+    inputs["render_wall_j_onehot"] = create_input(
+        "render_wall_j_onehot", max_walls, value_range=(0.0, 1.0)
+    )
+
     fields: Dict[str, Node] = {
-        "render_mask": extract_from(
-            render_feedback,
-            d_render_fb,
-            0,
-            max_walls,
-            "render_mask",
-        ),
-        "render_col": extract_from(
-            render_feedback,
-            d_render_fb,
-            max_walls,
-            1,
-            "render_col",
-        ),
-        "render_is_new_wall": extract_from(
-            render_feedback,
-            d_render_fb,
-            max_walls + 1,
-            1,
-            "render_is_new_wall",
-        ),
-        "render_chunk_start": extract_from(
-            render_feedback,
-            d_render_fb,
-            max_walls + 2,
-            1,
-            "render_chunk_start",
-        ),
-        "fb_sort_den": extract_from(
-            render_feedback,
-            d_render_fb,
-            max_walls + 3,
-            1,
-            "fb_sort_den",
-        ),
-        "fb_C": extract_from(render_feedback, d_render_fb, max_walls + 4, 1, "fb_C"),
-        "fb_D": extract_from(render_feedback, d_render_fb, max_walls + 5, 1, "fb_D"),
-        "fb_E": extract_from(render_feedback, d_render_fb, max_walls + 6, 1, "fb_E"),
-        "fb_H_inv": extract_from(
-            render_feedback, d_render_fb, max_walls + 7, 1, "fb_H_inv"
-        ),
-        "fb_tex_id": extract_from(
-            render_feedback, d_render_fb, max_walls + 8, 1, "fb_tex_id"
-        ),
-        "fb_col_lo": extract_from(
-            render_feedback, d_render_fb, max_walls + 9, 1, "fb_col_lo"
-        ),
-        "fb_col_hi": extract_from(
-            render_feedback, d_render_fb, max_walls + 10, 1, "fb_col_hi"
-        ),
-        "fb_onehot": extract_from(
-            render_feedback,
-            d_render_fb,
-            max_walls + 11,
-            max_walls,
-            "fb_onehot",
-        ),
+        "render_mask": inputs["render_mask"],
+        "render_col": inputs["render_col"],
+        "render_is_new_wall": inputs["render_is_new_wall"],
+        "render_chunk_start": inputs["render_chunk_start"],
+        "fb_sort_den": extract_from(render_feedback, d_render_fb, 0, 1, "fb_sort_den"),
+        "fb_C": extract_from(render_feedback, d_render_fb, 1, 1, "fb_C"),
+        "fb_D": extract_from(render_feedback, d_render_fb, 2, 1, "fb_D"),
+        "fb_E": extract_from(render_feedback, d_render_fb, 3, 1, "fb_E"),
+        "fb_H_inv": extract_from(render_feedback, d_render_fb, 4, 1, "fb_H_inv"),
+        "fb_tex_id": inputs["render_tex_id"],
+        "fb_col_lo": inputs["render_vis_lo"],
+        "fb_col_hi": inputs["render_vis_hi"],
+        "fb_onehot": inputs["render_wall_j_onehot"],
     }
     return inputs, fields
 
@@ -516,53 +488,116 @@ def _assemble_output(
     """Build the overlaid outputs + overflow outputs.
 
     Overlaid outputs fed back into the next step's input:
-        token_type, render_feedback
+        token_type, render_feedback (5-wide precomputes),
+        render_mask, render_col, render_is_new_wall,
+        render_chunk_start, render_tex_id, render_vis_lo,
+        render_vis_hi, render_wall_j_onehot
     Overflow outputs bitblitted by the host:
         pixels, col, start, length, done, eos_resolved_x,
         eos_resolved_y, eos_new_angle
     """
-    d_render_fb = 2 * max_walls + 11
+    d_render_fb = 5
 
     with annotate("output"):
         zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
         zero_8 = create_literal_value(torch.zeros(8), name="zero_8")
         zero_rf = create_literal_value(torch.zeros(d_render_fb), name="zero_rf")
+        zero_mw = create_literal_value(torch.zeros(max_walls), name="zero_mw")
         zero_pixels = create_literal_value(
             torch.zeros(chunk_size * 3),
             name="zero_pixels",
         )
         pos_one = create_literal_value(torch.tensor([1.0]), name="pos_one_out")
+        neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one_out")
         chunk_sentinel = create_literal_value(
             torch.tensor([-1.0]),
             name="chunk_sentinel_out",
         )
 
-        # THINKING's render_feedback output: seed the next block of RENDER
-        # tokens with the picked wall's data.  render_mask is forwarded
-        # unchanged (the advance_wall bit was added by the RENDER token
-        # that transitioned to THINKING, then fed back through the
-        # overlay — so fb_fields["render_mask"] already includes it).
-        thinking_render_fb = Concatenate(
+        # --- render_feedback: 5-wide precomputes ---
+        # THINKING produces them from the selected wall; RENDER forwards.
+        thinking_precomputes = Concatenate(
             [
-                fb_fields["render_mask"],
-                thinking_out.t_col_lo,  # render_col = first column of this wall
-                pos_one,  # is_new_wall = +1
-                chunk_sentinel,  # chunk_start = -1 → start at wall_top
                 thinking_out.t_sort_den,
                 thinking_out.t_C,
                 thinking_out.t_D,
                 thinking_out.t_E,
                 thinking_out.t_H_inv,
-                thinking_out.t_tex_id,
-                thinking_out.t_col_lo,
-                thinking_out.t_col_hi,
-                thinking_out.t_onehot,
             ]
         )
+        out_render_fb = select(
+            token_flags["is_thinking"],
+            thinking_precomputes,
+            select(token_flags["is_render"], render_out.next_render_feedback, zero_rf),
+        )
 
-        # Next token type per source:
-        #   THINKING → E8_RENDER (start rendering the picked wall)
-        #   RENDER   → render_out.render_next_type (E8_THINKING or E8_RENDER)
+        # --- Discrete render state (separate overlaid outputs) ---
+        # THINKING seeds the first RENDER with the picked wall's identity.
+        # RENDER's state machine advances col/chunk/wall.
+
+        # render_mask: THINKING forwards from input; RENDER advances.
+        out_render_mask = select(
+            token_flags["is_thinking"],
+            fb_fields["render_mask"],
+            select(
+                token_flags["is_render"], render_out.next_render_mask, zero_mw
+            ),
+        )
+
+        # render_col: THINKING sets to vis_lo; RENDER advances.
+        out_render_col = select(
+            token_flags["is_thinking"],
+            thinking_out.t_col_lo,
+            select(token_flags["is_render"], render_out.next_col, zero_1),
+        )
+
+        # render_is_new_wall: THINKING sets +1; RENDER sets per state.
+        out_render_is_new_wall = select(
+            token_flags["is_thinking"],
+            pos_one,
+            select(
+                token_flags["is_render"], render_out.next_is_new_wall, neg_one
+            ),
+        )
+
+        # render_chunk_start: THINKING sets sentinel -1; RENDER advances.
+        out_render_chunk_start = select(
+            token_flags["is_thinking"],
+            chunk_sentinel,
+            select(token_flags["is_render"], render_out.next_chunk, zero_1),
+        )
+
+        # render_tex_id: THINKING sets from wall; RENDER forwards.
+        out_render_tex_id = select(
+            token_flags["is_thinking"],
+            thinking_out.t_tex_id,
+            select(token_flags["is_render"], render_out.next_tex_id, zero_1),
+        )
+
+        # render_vis_lo/hi: THINKING sets from wall; RENDER forwards.
+        out_render_vis_lo = select(
+            token_flags["is_thinking"],
+            thinking_out.t_col_lo,
+            select(token_flags["is_render"], render_out.next_vis_lo, zero_1),
+        )
+        out_render_vis_hi = select(
+            token_flags["is_thinking"],
+            thinking_out.t_col_hi,
+            select(token_flags["is_render"], render_out.next_vis_hi, zero_1),
+        )
+
+        # render_wall_j_onehot: THINKING sets from wall; RENDER forwards.
+        out_render_wall_j_onehot = select(
+            token_flags["is_thinking"],
+            thinking_out.t_onehot,
+            select(
+                token_flags["is_render"],
+                render_out.next_wall_j_onehot,
+                zero_mw,
+            ),
+        )
+
+        # --- Token type ---
         out_token_type = select(
             token_flags["is_thinking"],
             create_literal_value(E8_RENDER, name="thinking_next_type"),
@@ -573,21 +608,12 @@ def _assemble_output(
             ),
         )
 
-        out_render_fb = select(
-            token_flags["is_thinking"],
-            thinking_render_fb,
-            select(token_flags["is_render"], render_out.next_render_feedback, zero_rf),
-        )
-
         out_pixels = select(token_flags["is_render"], render_out.pixels, zero_pixels)
         out_col = select(token_flags["is_render"], render_out.active_col, zero_1)
         out_start = select(token_flags["is_render"], render_out.active_start, zero_1)
         out_length = select(token_flags["is_render"], render_out.chunk_length, zero_1)
-        neg_1 = create_literal_value(torch.tensor([-1.0]), name="done_default")
-        out_done = select(token_flags["is_render"], render_out.done_flag, neg_1)
+        out_done = select(token_flags["is_render"], render_out.done_flag, neg_one)
 
-        # EOS overflow: resolved player state for the host to read after
-        # prefill.  Gated to zero at non-EOS positions.
         out_eos_rx = select(token_flags["is_eos"], eos_out.resolved_x, zero_1)
         out_eos_ry = select(token_flags["is_eos"], eos_out.resolved_y, zero_1)
         out_eos_angle = select(token_flags["is_eos"], input_out.new_angle, zero_1)
@@ -595,6 +621,14 @@ def _assemble_output(
     overlaid = {
         "token_type": out_token_type,
         "render_feedback": out_render_fb,
+        "render_mask": out_render_mask,
+        "render_col": out_render_col,
+        "render_is_new_wall": out_render_is_new_wall,
+        "render_chunk_start": out_render_chunk_start,
+        "render_tex_id": out_render_tex_id,
+        "render_vis_lo": out_render_vis_lo,
+        "render_vis_hi": out_render_vis_hi,
+        "render_wall_j_onehot": out_render_wall_j_onehot,
     }
     overflow = {
         "pixels": out_pixels,

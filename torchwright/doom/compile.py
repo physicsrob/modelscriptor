@@ -224,7 +224,6 @@ def _build_row(compiled, max_walls, **kwargs):
     device = compiled._net.device
     tex_h = int(compiled.metadata.get("tex_h", 8))
     max_walls_meta = int(compiled.metadata.get("max_walls", 8))
-    d_render_fb = 2 * max_walls_meta + 11
     max_bsp_nodes = int(compiled.metadata.get("max_bsp_nodes", 48))
     defaults = {
         "input_backward": torch.zeros(1, device=device),
@@ -236,7 +235,15 @@ def _build_row(compiled, max_walls, **kwargs):
         "player_angle": torch.zeros(1, device=device),
         "player_x": torch.zeros(1, device=device),
         "player_y": torch.zeros(1, device=device),
-        "render_feedback": torch.zeros(d_render_fb, device=device),
+        "render_feedback": torch.zeros(5, device=device),
+        "render_mask": torch.zeros(max_walls_meta, device=device),
+        "render_col": torch.zeros(1, device=device),
+        "render_is_new_wall": torch.zeros(1, device=device),
+        "render_chunk_start": torch.zeros(1, device=device),
+        "render_tex_id": torch.zeros(1, device=device),
+        "render_vis_lo": torch.zeros(1, device=device),
+        "render_vis_hi": torch.zeros(1, device=device),
+        "render_wall_j_onehot": torch.zeros(max_walls_meta, device=device),
         "sort_position_index": torch.zeros(1, device=device),
         "tex_col_input": torch.zeros(1, device=device),
         "tex_pixels": torch.zeros(tex_h * 3, device=device),
@@ -332,7 +339,6 @@ def step_frame(
 
     # Compute layout from compiled module
     d_input = max(s + w for _, s, w in module._input_specs)
-    d_render_fb = 2 * max_walls + 11
     device = module._net.device
 
     # Field offsets resolved by name — host stays layout-agnostic.
@@ -341,10 +347,8 @@ def step_frame(
 
     # Input-side offsets (overlaid fields' write targets on the next input)
     tt_off, _ = in_by_name["token_type"]
-    rf_off, _ = in_by_name["render_feedback"]
 
     # Output-side offsets in the gathered output tensor
-    rf_out_s, _ = out_by_name["render_feedback"]
     pix_out_s, _ = out_by_name["pixels"]
     col_out_s, _ = out_by_name["col"]
     start_out_s, _ = out_by_name["start"]
@@ -353,6 +357,12 @@ def step_frame(
     eos_rx_out_s, _ = out_by_name["eos_resolved_x"]
     eos_ry_out_s, _ = out_by_name["eos_resolved_y"]
     eos_angle_out_s, _ = out_by_name["eos_new_angle"]
+
+    # Debug: print overlaid mapping
+    print("  Output spec:")
+    for n, s, w in module._output_specs:
+        overlaid = "overlaid" if n in out_by_name and n in in_by_name else "overflow"
+        print(f"    {n}: out_offset={s} width={w} ({overlaid})")
 
     # Overlaid fields: any name appearing in both input and output specs.
     # The host copies these from output to input each step (delta transfer
@@ -512,7 +522,12 @@ def step_frame(
         )
         out, past = _step(sort_row, past, step)
         step += 1
-        print(f"  sort[{k}]")
+        if "_debug_grd" in out_by_name:
+            grd_s, grd_w = out_by_name["_debug_grd"]
+            grd = out[0, grd_s : grd_s + grd_w].cpu().numpy()
+            print(f"  sort[{k}] grd=[{','.join(f'{v:.3f}' for v in grd)}]")
+        else:
+            print(f"  sort[{k}]")
 
     t_sort = time.perf_counter() - t0
     print(f"  sort     {N} steps  kv={_kv_len(past)}  {t_sort*1000:.0f}ms")
@@ -525,13 +540,14 @@ def step_frame(
     frame = np.full((H, W, 3), -1.0, dtype=np.float32)
     filled = np.zeros((H, W), dtype=bool)
 
-    # Seed: E8_THINKING + render_feedback with is_new_wall=+1, chunk_start=-1
-    prev = torch.zeros(1, d_input, device=device)
-    prev[0, tt_off : tt_off + 8] = E8_THINKING.to(device)
-    seed_rf = torch.zeros(d_render_fb, device=device)
-    seed_rf[max_walls + 1] = 1.0  # is_new_wall = +1
-    seed_rf[max_walls + 2] = -1.0  # chunk_start = sentinel
-    prev[0, rf_off : rf_off + d_render_fb] = seed_rf
+    # Seed: E8_THINKING with is_new_wall=+1, chunk_start=-1
+    prev = _build_row(
+        module,
+        max_walls,
+        token_type=E8_THINKING,
+        render_is_new_wall=torch.tensor([1.0]),
+        render_chunk_start=torch.tensor([-1.0]),
+    )
 
     max_render_steps = N * W * (H // cs + 1) + N + 10
     render_steps = 0
@@ -556,14 +572,46 @@ def step_frame(
                 frame[y, col] = pix[row_idx]
                 filled[y, col] = True
 
+        # Debug: show render state
+        tt_out_s, _ = out_by_name["token_type"]
+        tt_vec = out[0, tt_out_s : tt_out_s + 8].cpu()
+        rm_out_s, rm_out_w = out_by_name["render_mask"]
+        mask_vals = out[0, rm_out_s : rm_out_s + rm_out_w].cpu().numpy()
+        rc_out_s, _ = out_by_name["render_col"]
+        rc_val = out[0, rc_out_s].item()
+        vh_out_s, _ = out_by_name["render_vis_hi"]
+        vh_val = out[0, vh_out_s].item()
+        vl_out_s, _ = out_by_name["render_vis_lo"]
+        vl_val = out[0, vl_out_s].item()
+        is_thinking_next = (tt_vec - E8_THINKING.cpu()).abs().sum().item() < 1.0
+        n_masked = int(np.sum(np.round(mask_vals).clip(0, 1)))
+        if k == 0:
+            label = "T" if length == 0 else "R"
+            rf_out_s, rf_out_w = out_by_name["render_feedback"]
+            rf_vals = out[0, rf_out_s : rf_out_s + rf_out_w].cpu().numpy()
+            rf_in_s, rf_in_w = in_by_name["render_feedback"]
+            rf_in_vals = prev[0, rf_in_s : rf_in_s + rf_in_w].cpu().numpy()
+            print(
+                f"    [{k:3d}] {label} col={rc_val:.0f} vis=[{vl_val:.0f},{vh_val:.0f})"
+                f" len={length} mask={n_masked} done={done:.1f}"
+                f" next={'THINK' if is_thinking_next else 'RENDER'}"
+                f"\n           rf_in=[{','.join(f'{v:.3f}' for v in rf_in_vals)}]"
+                f" rf_out=[{','.join(f'{v:.3f}' for v in rf_vals)}]"
+            )
+            print("           All overlaid outputs at step 0:")
+            for oname in overlaid_names:
+                os, ow = out_by_name[oname]
+                ov = out[0, os : os + ow].cpu().numpy()
+                ins, iw = in_by_name[oname]
+                iv = prev[0, ins : ins + iw].cpu().numpy()
+                if ow <= 8:
+                    print(f"             {oname}: in=[{','.join(f'{v:.3f}' for v in iv)}] out=[{','.join(f'{v:.3f}' for v in ov)}]")
+
         if done > 0.0:
             break
 
         # Map compact output to input layout
         prev = _out_to_input(out)
-
-        # Host-side termination: check render_mask from render_feedback
-        mask_vals = out[0, rf_out_s : rf_out_s + max_walls].cpu().numpy()
         n_masked = int(np.sum(np.round(mask_vals).clip(0, 1)))
         if n_masked >= N:
             break

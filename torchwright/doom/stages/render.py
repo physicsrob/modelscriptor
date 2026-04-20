@@ -122,7 +122,9 @@ class RenderOutputs:
     * ``pixels`` / ``active_col`` / ``active_start`` / ``chunk_length``
       land in overflow (host bitblits them to the framebuffer).
     * ``next_render_feedback`` feeds back through the render_feedback
-      overlay on the next step.
+      overlay (5-wide precomputes, forwarded unchanged).
+    * Discrete state (mask, col, chunk, tex_id, vis bounds, onehot)
+      are separate overlaid outputs copied by the host.
     * ``render_next_type`` is the next token type at RENDER positions:
       ``E8_THINKING`` on advance_wall, else ``E8_RENDER``.
     * ``done_flag`` signals to the host that all walls are fully
@@ -134,8 +136,17 @@ class RenderOutputs:
     active_start: Node
     chunk_length: Node
     done_flag: Node
-    next_render_feedback: Node
+    next_render_feedback: Node  # 5-wide precomputes
     render_next_type: Node  # 8-wide: E8_THINKING or E8_RENDER
+    # Discrete state outputs (overlaid separately from render_feedback).
+    next_render_mask: Node
+    next_col: Node
+    next_is_new_wall: Node
+    next_chunk: Node
+    next_tex_id: Node
+    next_vis_lo: Node
+    next_vis_hi: Node
+    next_wall_j_onehot: Node
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +234,14 @@ def build_render(
             next_render_feedback,
             done_flag,
             render_next_type,
+            next_render_mask,
+            next_col,
+            next_is_new_wall,
+            next_chunk,
+            next_tex_id,
+            next_vis_lo,
+            next_vis_hi,
+            next_wall_j_onehot,
         ) = _compute_next_state(
             active_col=active_col,
             active_start=active_start,
@@ -249,6 +268,14 @@ def build_render(
         done_flag=done_flag,
         next_render_feedback=next_render_feedback,
         render_next_type=render_next_type,
+        next_render_mask=next_render_mask,
+        next_col=next_col,
+        next_is_new_wall=next_is_new_wall,
+        next_chunk=next_chunk,
+        next_tex_id=next_tex_id,
+        next_vis_lo=next_vis_lo,
+        next_vis_hi=next_vis_hi,
+        next_wall_j_onehot=next_wall_j_onehot,
     )
 
 
@@ -522,10 +549,8 @@ def _compute_next_state(
 ):
     """Three-way state transition: more chunks / advance col / advance wall.
 
-    Emits ``next_render_feedback`` (packed state + forwarded wall data),
-    ``done_flag`` (set when the advance_wall transition completes the
-    last wall's mask bit), and ``render_next_type`` (E8_THINKING on
-    advance_wall, else E8_RENDER).
+    Returns the 5-wide precompute feedback (forwarded unchanged), the
+    discrete state outputs, ``done_flag``, and ``render_next_type``.
     """
     next_chunk_start_val = add_const(active_start, float(chunk_size))
     has_more_chunks = compare(
@@ -573,21 +598,19 @@ def _compute_next_state(
     )
 
     next_render_feedback = Concatenate(
-        [
-            next_render_mask,
-            next_col_output,
-            next_is_new_wall,
-            next_chunk,
-            fb_sort_den,
-            fb_C,
-            fb_D,
-            fb_E,
-            fb_H_inv,
-            fb_tex_id,
-            fb_col_lo,
-            fb_col_hi,
-            fb_onehot,
-        ]
+        [fb_sort_den, fb_C, fb_D, fb_E, fb_H_inv]
     )
 
-    return next_render_feedback, done_flag, render_next_type
+    return (
+        next_render_feedback,
+        done_flag,
+        render_next_type,
+        next_render_mask,
+        next_col_output,
+        next_is_new_wall,
+        next_chunk,
+        fb_tex_id,
+        fb_col_lo,
+        fb_col_hi,
+        fb_onehot,
+    )

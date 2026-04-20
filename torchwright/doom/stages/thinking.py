@@ -129,6 +129,59 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
             assert_hardness_gt=0.99,
         )
 
+        # Debug: find the Attn node by BFS from selected_render.
+        from torchwright.graph.attn import Attn as _Attn
+
+        def _find_attn(node):
+            seen = set()
+            stack = [node]
+            while stack:
+                n = stack.pop()
+                if id(n) in seen:
+                    continue
+                seen.add(id(n))
+                if isinstance(n, _Attn):
+                    return n
+                for inp in getattr(n, "inputs", []):
+                    stack.append(inp)
+            return None
+
+        _inner = _find_attn(selected_render)
+        if isinstance(_inner, _Attn):
+            _a = _inner
+            print(f"\n[THINKING Attn debug]")
+            print(f"  query_in width: {len(_a.inputs[0])}")
+            print(f"  key_in width:   {len(_a.inputs[1])}")
+            print(f"  value_in width: {len(_a.inputs[2])}")
+            print(f"  d_head (d_qk):  {_a.query_matrix.shape[1]}")
+            print(f"  query_matrix shape: {_a.query_matrix.shape}")
+            print(f"  key_matrix shape:   {_a.key_matrix.shape}")
+            print(f"  value_matrix shape: {_a.value_matrix.shape}")
+            print(f"  output_matrix shape: {_a.output_matrix.shape}")
+            d_qk = _a.query_matrix.shape[1]
+            d_v = _a.value_matrix.shape[1]
+            print(f"  d_qk={d_qk}, d_v={d_v}")
+            # Show which value_matrix rows are non-zero
+            vm = _a.value_matrix
+            for row in range(vm.shape[0]):
+                nz = vm[row].nonzero(as_tuple=True)[0].tolist()
+                if nz:
+                    print(
+                        f"  value_matrix[{row}] -> d_head cols {nz}, "
+                        f"vals={vm[row, nz].tolist()}"
+                    )
+            # Show which output_matrix rows are non-zero
+            om = _a.output_matrix
+            for col in range(min(om.shape[1], 5)):
+                nz = om[:, col].nonzero(as_tuple=True)[0].tolist()
+                if nz:
+                    print(
+                        f"  output_matrix[:,{col}] <- d_head rows {nz}, "
+                        f"vals={om[nz, col].tolist()}"
+                    )
+        else:
+            print(f"[THINKING] could not find Attn node, got {type(_inner).__name__}")
+
         d_rv = 8 + max_walls
         t_sort_den = extract_from(selected_render, d_rv, 0, 1, "t_sort_den")
         t_C = extract_from(selected_render, d_rv, 1, 1, "t_C")
