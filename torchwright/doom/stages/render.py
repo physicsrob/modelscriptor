@@ -448,6 +448,7 @@ def _attend_to_texture_column(
         key_vector=cond_gate(is_tex_col, Concatenate([texture_id_e8, scaled_tc])),
         value=cond_gate(is_tex_col, tex_pixels),
         match_gain=TEX_MATCH_GAIN,
+        assert_hardness_gt=0.99,
     )
 
 

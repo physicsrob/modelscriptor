@@ -28,7 +28,7 @@ layer; invariants that hold on aggregated values (``{0, 1}`` bools
 after broadcast) take a tolerance large enough to absorb that fuzz.
 """
 
-from typing import List, Set
+from typing import List, Optional, Set
 
 import torch
 
@@ -676,4 +676,104 @@ def assert_picked_from(
     projected = Linear(wrapped, proj, name="picked_from_result")
     if result.value_type != NodeValueType.unknown():
         return assert_matches_value_type(projected, result.value_type)
+    return projected
+
+
+def assert_softmax_hardness(
+    attn_node: Node,
+    threshold: float,
+) -> Node:
+    """Assert the attention's softmax concentrates at least ``threshold``
+    mass on the winning key at every query position.
+
+    Wraps the Attn node's output in an Assert whose predicate
+    re-derives the softmax weights from the Attn's Q/K matrices and
+    input values, then checks ``max(weights, dim=keys) >= threshold``
+    per query.
+
+    ``threshold=0.99`` means 99% of the attention mass must land on a
+    single key.  This directly catches the blending failure mode where
+    the softmax spreads mass across multiple keys and the output is a
+    garbage weighted average.
+
+    **Safe placement**: on any hard-selection attention output (argmin,
+    argmax, argmin_unmasked, etc.).  Not appropriate for
+    ``attend_mean_where`` which intentionally spreads mass.
+    """
+    from torchwright.graph.attn import Attn, CAUSAL_MASK_SENTINEL
+
+    if not isinstance(attn_node, Attn):
+        from torchwright.graph.misc import Assert as AssertNode
+
+        inner = attn_node
+        while isinstance(inner, AssertNode):
+            inner = inner.inputs[0]
+        if not isinstance(inner, Attn):
+            raise TypeError(
+                f"assert_softmax_hardness expects an Attn node (possibly "
+                f"wrapped in Assert), got {type(inner).__name__}"
+            )
+        attn = inner
+    else:
+        attn = attn_node
+
+    query_in_node = attn.inputs[0]
+    key_in_node = attn.inputs[1]
+    query_matrix = attn.query_matrix.clone()
+    key_matrix = attn.key_matrix.clone()
+    d_qi = len(query_in_node)
+    d_ki = len(key_in_node)
+    d_out = len(attn_node)
+
+    attn_name = attn.name or attn.annotation or "attn"
+
+    def predicate(x: torch.Tensor) -> tuple:
+        qi = x[:, :d_qi]
+        ki = x[:, d_qi : d_qi + d_ki]
+        n_pos = qi.shape[0]
+
+        Q = qi @ query_matrix
+        K = ki @ key_matrix
+        logits = Q @ K.t()
+
+        mask = torch.triu(torch.ones(n_pos, n_pos, device=x.device), diagonal=1)
+        logits = torch.where(
+            mask == 1,
+            torch.full_like(logits, CAUSAL_MASK_SENTINEL),
+            logits,
+        )
+        weights = torch.softmax(logits, dim=1)
+        max_weights = weights.max(dim=1).values
+
+        min_hw = max_weights.min().item()
+        print(
+            f"  [hardness] {attn_name}: "
+            f"min={min_hw:.6f} mean={max_weights.mean().item():.6f} "
+            f"(threshold={threshold}, n_pos={n_pos})"
+        )
+
+        bad = max_weights < threshold
+        if not bad.any():
+            return True, ""
+        q = int(bad.nonzero(as_tuple=False)[0].item())
+        return False, (
+            f"softmax not hard enough at query {q}: "
+            f"max_weight={max_weights[q].item():.6f} < {threshold}; "
+            f"top-3 weights: {weights[q].topk(min(3, n_pos)).values.tolist()}"
+        )
+
+    composite = Concatenate([query_in_node, key_in_node, attn_node])
+    wrapped = Assert(
+        composite,
+        predicate,
+        message=f"softmax_hardness >= {threshold}",
+    )
+    from torchwright.graph import Linear
+
+    proj = torch.zeros(d_qi + d_ki + d_out, d_out)
+    for i in range(d_out):
+        proj[d_qi + d_ki + i, i] = 1.0
+    projected = Linear(wrapped, proj, name="hardness_checked")
+    if attn_node.value_type != NodeValueType.unknown():
+        return assert_matches_value_type(projected, attn_node.value_type)
     return projected
