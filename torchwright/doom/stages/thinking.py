@@ -184,9 +184,7 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
                     print(f"  [watch:t_sort_den] pos={pos}: {v:.4f}")
             return True, ""
 
-        t_sort_den = debug_watch(
-            t_sort_den, _watch_sort_den, message="t_sort_den"
-        )
+        t_sort_den = debug_watch(t_sort_den, _watch_sort_den, message="t_sort_den")
 
     return ThinkingOutputs(
         t_sort_den=t_sort_den,
