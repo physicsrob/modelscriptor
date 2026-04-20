@@ -70,6 +70,7 @@ from torchwright.doom.graph_constants import (
     TEX_E8_OFFSET,
     TRIG_BP,
 )
+from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.renderer import _textured_column_fill
 
 # ---------------------------------------------------------------------------
@@ -92,15 +93,18 @@ class RenderInputs:
     render_is_new_wall: Node  # +1 if just transitioned to a new wall
     render_chunk_start: Node  # current chunk start row; sentinel -1 = "new col"
 
-    # Wall identity + geometry (overlay; host-fed on transitions).
+    # Wall identity (overlay; host-fed on transitions).
     render_tex_id: Node
     render_vis_lo: Node  # first visible column for this wall
     render_vis_hi: Node  # last visible column for this wall
     render_wall_j_onehot: Node  # max_walls-wide
-    render_wall_ax: Node  # host-fed wall geometry for the current wall
-    render_wall_ay: Node
-    render_wall_bx: Node
-    render_wall_by: Node
+
+    # WALL geometry inputs (for wall geometry attention).
+    wall_ax: Node  # host-fed at WALL positions
+    wall_ay: Node
+    wall_bx: Node
+    wall_by: Node
+    wall_position_onehot: Node  # position one-hot at WALL positions
 
     # Player state (from PLAYER broadcasts).
     player_x: Node  # resolved x
@@ -117,6 +121,7 @@ class RenderInputs:
 
     # Token-type flags.
     is_render: Node
+    is_wall: Node
     is_tex_col: Node
 
     pos_encoding: PosEncoding
@@ -150,10 +155,6 @@ class RenderOutputs:
     next_vis_lo: Node
     next_vis_hi: Node
     next_wall_j_onehot: Node
-    next_wall_ax: Node
-    next_wall_ay: Node
-    next_wall_bx: Node
-    next_wall_by: Node
 
 
 # ---------------------------------------------------------------------------
@@ -176,12 +177,25 @@ def build_render(
     tex_w, tex_h = textures[0].shape[0], textures[0].shape[1]
     cs = chunk_size
 
+    with annotate("render/wall_geom_attention"):
+        sel_ax, sel_ay, sel_bx, sel_by = _attend_wall_geometry(
+            inputs.pos_encoding,
+            is_render=inputs.is_render,
+            is_wall=inputs.is_wall,
+            wall_j_onehot=inputs.render_wall_j_onehot,
+            wall_position_onehot=inputs.wall_position_onehot,
+            wall_ax=inputs.wall_ax,
+            wall_ay=inputs.wall_ay,
+            wall_bx=inputs.wall_bx,
+            wall_by=inputs.wall_by,
+        )
+
     with annotate("render/precompute"):
         sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv = _compute_precomputes(
-            inputs.render_wall_ax,
-            inputs.render_wall_ay,
-            inputs.render_wall_bx,
-            inputs.render_wall_by,
+            sel_ax,
+            sel_ay,
+            sel_bx,
+            sel_by,
             inputs.player_x,
             inputs.player_y,
             inputs.player_cos,
@@ -290,11 +304,44 @@ def build_render(
         next_vis_lo=next_vis_lo,
         next_vis_hi=next_vis_hi,
         next_wall_j_onehot=next_wall_j_onehot,
-        next_wall_ax=inputs.render_wall_ax,
-        next_wall_ay=inputs.render_wall_ay,
-        next_wall_bx=inputs.render_wall_bx,
-        next_wall_by=inputs.render_wall_by,
     )
+
+
+# ---------------------------------------------------------------------------
+# Wall geometry attention
+# ---------------------------------------------------------------------------
+
+
+def _attend_wall_geometry(
+    pos_encoding: PosEncoding,
+    *,
+    is_render: Node,
+    is_wall: Node,
+    wall_j_onehot: Node,
+    wall_position_onehot: Node,
+    wall_ax: Node,
+    wall_ay: Node,
+    wall_bx: Node,
+    wall_by: Node,
+) -> tuple[Node, Node, Node, Node]:
+    """Read (ax, ay, bx, by) from the WALL position matching wall_j_onehot."""
+    GEOM_MATCH_GAIN = 1000.0
+    wall_geom = attend_argmax_dot(
+        pos_encoding,
+        query_vector=cond_gate(is_render, wall_j_onehot),
+        key_vector=cond_gate(is_wall, wall_position_onehot),
+        value=cond_gate(
+            is_wall,
+            Concatenate([wall_ax, wall_ay, wall_bx, wall_by]),
+        ),
+        match_gain=GEOM_MATCH_GAIN,
+        assert_hardness_gt=0.99,
+    )
+    sel_ax = extract_from(wall_geom, 4, 0, 1, "rsel_ax")
+    sel_ay = extract_from(wall_geom, 4, 1, 1, "rsel_ay")
+    sel_bx = extract_from(wall_geom, 4, 2, 1, "rsel_bx")
+    sel_by = extract_from(wall_geom, 4, 3, 1, "rsel_by")
+    return sel_ax, sel_ay, sel_bx, sel_by
 
 
 # ---------------------------------------------------------------------------

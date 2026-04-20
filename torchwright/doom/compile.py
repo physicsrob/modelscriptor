@@ -97,15 +97,18 @@ def print_graph_stats(output_node, pos_encoding=None):
 def compute_min_d_head(max_walls: int, tex_w: int) -> int:
     """Minimum d_head required by the game graph's attention heads.
 
-    Two attention patterns drive the requirement:
+    Three attention patterns drive the requirement:
     - Sort (attend_argmin_above_integer):
           1 + n_thresholds + d_value = 1 + max_walls + (8 + max_walls)
+    - Render wall geometry (attend_argmax_dot):
+          max_walls + 4  (query/key = one-hot, value = geometry)
     - TEX_COL (attend_argmax_dot): 8 + tex_w + 1
     """
     d_sort_val = 8 + max_walls
     sort_d = 1 + max_walls + d_sort_val
+    render_geom_d = max_walls + 4
     tex_d = 8 + tex_w + 1
-    return max(sort_d, tex_d)
+    return max(sort_d, render_geom_d, tex_d)
 
 
 def compile_game(
@@ -224,10 +227,6 @@ def _build_row(compiled, max_walls, **kwargs):
         "render_vis_lo": torch.zeros(1, device=device),
         "render_vis_hi": torch.zeros(1, device=device),
         "render_wall_j_onehot": torch.zeros(max_walls_meta, device=device),
-        "render_wall_ax": torch.zeros(1, device=device),
-        "render_wall_ay": torch.zeros(1, device=device),
-        "render_wall_bx": torch.zeros(1, device=device),
-        "render_wall_by": torch.zeros(1, device=device),
         "sort_position_index": torch.zeros(1, device=device),
         "tex_col_input": torch.zeros(1, device=device),
         "tex_pixels": torch.zeros(tex_h * 3, device=device),
@@ -504,16 +503,13 @@ def step_frame(
     # Each SORTED token gets its position_index from the host (no feedback).
     # Host caches sorted wall data from overlaid outputs.
     t0 = time.perf_counter()
-    sorted_walls = []  # list of dicts with wall identity + geometry
+    sorted_walls = []  # list of (wall_j_onehot, vis_lo, vis_hi, tex_id)
 
     # Output field offsets for sorted wall data
     wj_out_s, wj_out_w = out_by_name["render_wall_j_onehot"]
     vlo_out_s, _ = out_by_name["render_vis_lo"]
     vhi_out_s, _ = out_by_name["render_vis_hi"]
     tid_out_s, _ = out_by_name["render_tex_id"]
-    geom_out = {}
-    for g in ("render_wall_ax", "render_wall_ay", "render_wall_bx", "render_wall_by"):
-        geom_out[g] = out_by_name[g][0]
 
     for k in range(N):
         sort_row = _build_row(
@@ -525,31 +521,18 @@ def step_frame(
         out, past = _step(sort_row, past, step)
         step += 1
 
+        # Check sort exhaustion
         sort_done_val = out[0, sort_done_out_s].item()
         if sort_done_val > 0.0:
             print(f"  sort[{k}] exhausted")
             break
 
+        # Cache sorted wall data from overlaid outputs
         wall_j_oh = out[0, wj_out_s : wj_out_s + wj_out_w].clone()
         v_lo = out[0, vlo_out_s].item()
         v_hi = out[0, vhi_out_s].item()
         t_id = out[0, tid_out_s].item()
-        w_ax = out[0, geom_out["render_wall_ax"]].item()
-        w_ay = out[0, geom_out["render_wall_ay"]].item()
-        w_bx = out[0, geom_out["render_wall_bx"]].item()
-        w_by = out[0, geom_out["render_wall_by"]].item()
-        sorted_walls.append(
-            {
-                "onehot": wall_j_oh,
-                "vis_lo": v_lo,
-                "vis_hi": v_hi,
-                "tex_id": t_id,
-                "ax": w_ax,
-                "ay": w_ay,
-                "bx": w_bx,
-                "by": w_by,
-            }
-        )
+        sorted_walls.append((wall_j_oh, v_lo, v_hi, t_id))
         print(f"  sort[{k}] vis=[{v_lo:.0f},{v_hi:.0f}] tex={t_id:.0f}")
 
     t_sort = time.perf_counter() - t0
@@ -569,19 +552,15 @@ def step_frame(
         render_steps = 0
     else:
         # Seed first wall
-        sw = sorted_walls[0]
+        wall_j_oh, v_lo, v_hi, t_id = sorted_walls[0]
         prev = _build_row(
             module,
             max_walls,
             token_type=E8_RENDER,
-            render_wall_j_onehot=sw["onehot"],
-            render_vis_lo=torch.tensor([sw["vis_lo"]]),
-            render_vis_hi=torch.tensor([sw["vis_hi"]]),
-            render_tex_id=torch.tensor([sw["tex_id"]]),
-            render_wall_ax=torch.tensor([sw["ax"]]),
-            render_wall_ay=torch.tensor([sw["ay"]]),
-            render_wall_bx=torch.tensor([sw["bx"]]),
-            render_wall_by=torch.tensor([sw["by"]]),
+            render_wall_j_onehot=wall_j_oh,
+            render_vis_lo=torch.tensor([v_lo]),
+            render_vis_hi=torch.tensor([v_hi]),
+            render_tex_id=torch.tensor([t_id]),
             render_is_new_wall=torch.tensor([1.0]),
             render_chunk_start=torch.tensor([-1.0]),
         )
@@ -623,24 +602,16 @@ def step_frame(
                 wall_idx += 1
                 if wall_idx >= n_renderable:
                     break
-                # Feed next sorted wall's identity + geometry
-                sw = sorted_walls[wall_idx]
-                for field, input_name in [
-                    ("onehot", "render_wall_j_onehot"),
-                ]:
-                    fs, fw = in_by_name[input_name]
-                    prev[0, fs : fs + fw] = sw[field].to(device)
-                for field, input_name in [
-                    ("vis_lo", "render_vis_lo"),
-                    ("vis_hi", "render_vis_hi"),
-                    ("tex_id", "render_tex_id"),
-                    ("ax", "render_wall_ax"),
-                    ("ay", "render_wall_ay"),
-                    ("bx", "render_wall_bx"),
-                    ("by", "render_wall_by"),
-                ]:
-                    fs, _ = in_by_name[input_name]
-                    prev[0, fs] = sw[field]
+                # Feed next sorted wall's identity
+                wall_j_oh, v_lo, v_hi, t_id = sorted_walls[wall_idx]
+                wj_in_s, wj_in_w = in_by_name["render_wall_j_onehot"]
+                vlo_in_s, _ = in_by_name["render_vis_lo"]
+                vhi_in_s, _ = in_by_name["render_vis_hi"]
+                tid_in_s, _ = in_by_name["render_tex_id"]
+                prev[0, wj_in_s : wj_in_s + wj_in_w] = wall_j_oh.to(device)
+                prev[0, vlo_in_s] = v_lo
+                prev[0, vhi_in_s] = v_hi
+                prev[0, tid_in_s] = t_id
 
             # Host-side termination: check render_mask
             rm_out_s, rm_out_w = out_by_name["render_mask"]
