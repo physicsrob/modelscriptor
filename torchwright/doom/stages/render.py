@@ -597,9 +597,7 @@ def _compute_next_state(
         create_literal_value(E8_RENDER, name="type_render"),
     )
 
-    next_render_feedback = Concatenate(
-        [fb_sort_den, fb_C, fb_D, fb_E, fb_H_inv]
-    )
+    next_render_feedback = Concatenate([fb_sort_den, fb_C, fb_D, fb_E, fb_H_inv])
 
     return (
         next_render_feedback,

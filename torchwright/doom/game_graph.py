@@ -418,18 +418,14 @@ def _create_inputs(
     inputs["render_mask"] = create_input(
         "render_mask", max_walls, value_range=(0.0, 1.0)
     )
-    inputs["render_col"] = create_input(
-        "render_col", 1, value_range=(0.0, 255.0)
-    )
+    inputs["render_col"] = create_input("render_col", 1, value_range=(0.0, 255.0))
     inputs["render_is_new_wall"] = create_input(
         "render_is_new_wall", 1, value_range=(-1.0, 1.0)
     )
     inputs["render_chunk_start"] = create_input(
         "render_chunk_start", 1, value_range=(-1.0, 255.0)
     )
-    inputs["render_tex_id"] = create_input(
-        "render_tex_id", 1, value_range=(0.0, 255.0)
-    )
+    inputs["render_tex_id"] = create_input("render_tex_id", 1, value_range=(0.0, 255.0))
     inputs["render_vis_lo"] = create_input(
         "render_vis_lo", 1, value_range=(-2.0, 255.0)
     )
@@ -539,9 +535,7 @@ def _assemble_output(
         out_render_mask = select(
             token_flags["is_thinking"],
             fb_fields["render_mask"],
-            select(
-                token_flags["is_render"], render_out.next_render_mask, zero_mw
-            ),
+            select(token_flags["is_render"], render_out.next_render_mask, zero_mw),
         )
 
         # render_col: THINKING sets to vis_lo; RENDER advances.
@@ -555,9 +549,7 @@ def _assemble_output(
         out_render_is_new_wall = select(
             token_flags["is_thinking"],
             pos_one,
-            select(
-                token_flags["is_render"], render_out.next_is_new_wall, neg_one
-            ),
+            select(token_flags["is_render"], render_out.next_is_new_wall, neg_one),
         )
 
         # render_chunk_start: THINKING sets sentinel -1; RENDER advances.

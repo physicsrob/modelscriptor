@@ -605,7 +605,9 @@ def step_frame(
                 ins, iw = in_by_name[oname]
                 iv = prev[0, ins : ins + iw].cpu().numpy()
                 if ow <= 8:
-                    print(f"             {oname}: in=[{','.join(f'{v:.3f}' for v in iv)}] out=[{','.join(f'{v:.3f}' for v in ov)}]")
+                    print(
+                        f"             {oname}: in=[{','.join(f'{v:.3f}' for v in iv)}] out=[{','.join(f'{v:.3f}' for v in ov)}]"
+                    )
 
         if done > 0.0:
             break
