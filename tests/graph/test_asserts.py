@@ -610,7 +610,7 @@ def test_picked_from_returns_result_width():
 # to live here.  It deliberately constructed sub-unit-gap fractional
 # scores (0.0, 0.01, 0.02, 0.03) on attend_argmin_unmasked to force a
 # compile-side softmax blend that assert_picked_from would catch.  With
-# attend_*'s require_integer contract enforced at graph construction,
+# attend_*'s integer-score contract enforced at graph construction,
 # that scenario is now rejected upstream and can't be built — the
 # blending it tested is no longer reachable through normal API usage.
 #
@@ -623,16 +623,8 @@ def test_picked_from_returns_result_width():
 # --- All violations are hard errors now -----------------------------------
 
 
-def test_integer_violation_raises():
-    inp = LiteralValue(torch.tensor([6.5]))  # non-integer
-    node = assert_matches_value_type(inp, NodeValueType.integer(0, 9))
-    with pytest.raises(AssertionError, match="not integer"):
+def test_range_violation_raises():
+    inp = LiteralValue(torch.tensor([15.0]))  # outside [0, 9]
+    node = assert_matches_value_type(inp, NodeValueType.bounded(0, 9))
+    with pytest.raises(AssertionError, match="range"):
         node.compute(1, {})
-
-
-def test_require_integer_accepts_true():
-    from torchwright.graph.asserts import require_integer
-
-    inp = LiteralValue(torch.tensor([3.0]))
-    node = assert_matches_value_type(inp, NodeValueType.integer(0, 9))
-    require_integer(node, "test")

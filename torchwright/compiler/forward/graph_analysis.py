@@ -68,7 +68,7 @@ class GraphAnalyzer:
                 node = node.inputs[0]
             return node
 
-        # Transfer each Assert's structural flags and tightened
+        # Transfer each Assert's claimed range and tightened
         # input_ranges onto the node it wraps, so downstream graph
         # analysis that runs after stripping still sees the
         # strengthened type and tight ranges.

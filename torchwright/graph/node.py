@@ -31,28 +31,6 @@ def _verify_tensor_against_value_type(node: "Node", tensor: torch.Tensor) -> Non
             f"{name}: value_range mismatch — declared {r}, "
             f"observed [{actual_lo}, {actual_hi}]"
         )
-    if vt.is_integer:
-        diff = (t - t.round()).abs().max().item()
-        if diff > tol:
-            raise AssertionError(
-                f"{name}: declared is_integer but observed max deviation {diff}"
-            )
-    if vt.is_binary:
-        if not torch.all((t.round() == 0) | (t.round() == 1)).item():
-            raise AssertionError(
-                f"{name}: declared is_binary but values outside {{0,1}}"
-            )
-    if vt.is_sign:
-        if not torch.all((t.round() == -1) | (t.round() == 1)).item():
-            raise AssertionError(
-                f"{name}: declared is_sign but values outside {{-1,+1}}"
-            )
-    if vt.is_one_hot:
-        sums = t.round().sum(dim=-1)
-        if not torch.all(sums == 1).item():
-            raise AssertionError(
-                f"{name}: declared is_one_hot but per-row sum not equal to 1"
-            )
 
 
 _current_annotation: ContextVar[Optional[str]] = ContextVar(
@@ -147,13 +125,7 @@ class Node:
         sr = self._structural_type.value_range
         if sr.lo > r.lo or sr.hi < r.hi:
             r = r.intersect(sr)
-        return NodeValueType(
-            value_range=r,
-            is_integer=self._structural_type.is_integer,
-            is_binary=self._structural_type.is_binary,
-            is_sign=self._structural_type.is_sign,
-            is_one_hot=self._structural_type.is_one_hot,
-        )
+        return NodeValueType(value_range=r)
 
     @property
     def affine_bound(self):

@@ -278,16 +278,7 @@ def abs(inp: Node) -> Node:
 def _compare_output_type(true_level: float, false_level: float) -> NodeValueType:
     lo = builtins.min(true_level, false_level)
     hi = builtins.max(true_level, false_level)
-    is_int = (true_level == round(true_level)) and (false_level == round(false_level))
-    is_bin = is_int and lo == 0.0 and hi == 1.0
-    is_sgn = is_int and lo == -1.0 and hi == 1.0
-    if is_bin:
-        return NodeValueType.binary()
-    if is_sgn:
-        return NodeValueType.sign()
-    if is_int:
-        return NodeValueType.integer(lo=lo, hi=hi)
-    return NodeValueType.unknown()
+    return NodeValueType(value_range=Range(lo, hi))
 
 
 def compare(
@@ -1332,7 +1323,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     )
     return assert_matches_value_type(
         result,
-        NodeValueType.integer(lo=0, hi=n),
+        NodeValueType(value_range=Range(0.0, float(n))),
     )
 
 
@@ -1703,7 +1694,7 @@ def floor_int(
     )
     return assert_matches_value_type(
         result,
-        NodeValueType.integer(lo=min_value, hi=max_value),
+        NodeValueType(value_range=Range(float(min_value), float(max_value))),
     )
 
 
