@@ -502,8 +502,16 @@ def _broadcast_select_semantic_bound(
             out_idx = i * d_fill + j
             t_idx = j if true_is_broadcast else out_idx
             f_idx = j if false_is_broadcast else out_idx
-            t_iv = true_intervals[t_idx] if t_idx < len(true_intervals) else true_intervals[j]
-            f_iv = false_intervals[f_idx] if f_idx < len(false_intervals) else false_intervals[j]
+            t_iv = (
+                true_intervals[t_idx]
+                if t_idx < len(true_intervals)
+                else true_intervals[j]
+            )
+            f_iv = (
+                false_intervals[f_idx]
+                if f_idx < len(false_intervals)
+                else false_intervals[j]
+            )
             b_lo[out_idx] = min(t_iv.lo, f_iv.lo)
             b_hi[out_idx] = max(t_iv.hi, f_iv.hi)
 

@@ -145,7 +145,9 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
         output_proj=output_proj,
         output_bias=output_bias,
     )
-    return assert_matches_value_type(result, NodeValueType(value_range=Range(-1.0, 1.0)))
+    return assert_matches_value_type(
+        result, NodeValueType(value_range=Range(-1.0, 1.0))
+    )
 
 
 def cond_add_vector(
@@ -255,9 +257,7 @@ def cond_gate(
                 return True, ""
             from torchwright.graph.asserts import _format_bad
 
-            return False, (
-                f"expected ||cond| - 1| <= {c_tol}; {_format_bad(x, bad)}"
-            )
+            return False, (f"expected ||cond| - 1| <= {c_tol}; {_format_bad(x, bad)}")
 
         cond = Assert(
             cond,

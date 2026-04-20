@@ -167,9 +167,7 @@ def select(
                 return True, ""
             from torchwright.graph.asserts import _format_bad
 
-            return False, (
-                f"expected ||cond| - 1| <= {c_tol}; {_format_bad(x, bad)}"
-            )
+            return False, (f"expected ||cond| - 1| <= {c_tol}; {_format_bad(x, bad)}")
 
         cond = Assert(
             cond,
@@ -334,7 +332,9 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
         output_bias=output_bias,
         name="in_range",
     )
-    return assert_matches_value_type(result, NodeValueType(value_range=Range(-1.0, 1.0)))
+    return assert_matches_value_type(
+        result, NodeValueType(value_range=Range(-1.0, 1.0))
+    )
 
 
 def dynamic_extract(
