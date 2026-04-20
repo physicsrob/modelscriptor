@@ -46,7 +46,16 @@ from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.doom.compile import compute_min_d_head
 from torchwright.doom.game_graph import build_game_graph
-from torchwright.graph import Add, Attn, Concatenate, Node
+from torchwright.graph import (
+    Add,
+    Attn,
+    Concatenate,
+    Embedding,
+    InputNode,
+    LiteralValue,
+    Node,
+    PosEncoding,
+)
 from torchwright.graph.linear import Linear
 from torchwright.graph.relu import ReLU
 from torchwright.reference_renderer.scenes import (
@@ -530,6 +539,219 @@ def _print_critical_path_analysis(all_nodes: Set[Node], output_nodes: Set[Node])
     print()
 
 
+# ── Per-Token-Type Depth Analysis ───────────────────────────────────
+
+
+_TOKEN_TYPE_PREFIXES = [
+    ("RENDER", "render/"),
+    ("SORTED", "sort/"),
+    ("THINKING", "thinking/"),
+    ("WALL", "wall/"),
+    ("BSP", "bsp/"),
+    ("INPUT", "input/"),
+    ("EOS", "eos/"),
+    ("TEX_COL", "tex_col"),
+]
+
+
+def _annotation_to_token_type(annotation: str | None) -> str | None:
+    if not annotation:
+        return None
+    for name, prefix in _TOKEN_TYPE_PREFIXES:
+        if annotation.startswith(prefix):
+            return name
+    return None
+
+
+def _effective_layer(node: Node, node_to_layer: dict, cache: dict) -> int:
+    """Recursively find the compiled layer at which a node's value is ready.
+
+    InputNode/LiteralValue/PosEncoding → -1 (always available).
+    Concatenate (not scheduled) → max of its inputs' layers.
+    Scheduled nodes → their layer assignment.
+    """
+    nid = node.node_id
+    if nid in cache:
+        return cache[nid]
+    if nid in node_to_layer:
+        cache[nid] = node_to_layer[nid]
+        return cache[nid]
+    if isinstance(node, (InputNode, LiteralValue, PosEncoding, Embedding)):
+        cache[nid] = -1
+        return -1
+    if node.inputs:
+        layer = max(_effective_layer(inp, node_to_layer, cache) for inp in node.inputs)
+    else:
+        layer = -1
+    cache[nid] = layer
+    return layer
+
+
+def _subgraph_critical_depth(type_nodes: Set[Node]) -> int:
+    """Longest chain of non-Concatenate nodes within the subgraph."""
+    in_degree: Dict[int, int] = defaultdict(int)
+    sub_consumers: Dict[int, List[Node]] = defaultdict(list)
+    node_by_id = {n.node_id: n for n in type_nodes}
+    for node in type_nodes:
+        for inp in node.inputs:
+            if inp.node_id in node_by_id:
+                in_degree[node.node_id] = in_degree.get(node.node_id, 0) + 1
+                sub_consumers[inp.node_id].append(node)
+
+    queue = deque(n for n in type_nodes if in_degree.get(n.node_id, 0) == 0)
+    longest: Dict[int, int] = {}
+    while queue:
+        node = queue.popleft()
+        max_pred = 0
+        for inp in node.inputs:
+            if inp.node_id in node_by_id and inp.node_id in longest:
+                max_pred = max(max_pred, longest[inp.node_id])
+        is_real = not isinstance(node, Concatenate)
+        longest[node.node_id] = max_pred + (1 if is_real else 0)
+        for consumer in sub_consumers.get(node.node_id, []):
+            in_degree[consumer.node_id] -= 1
+            if in_degree[consumer.node_id] == 0:
+                queue.append(consumer)
+
+    return max(longest.values()) if longest else 0
+
+
+def _is_host_derived(node: Node, cache: dict) -> bool:
+    """True if this node's value depends only on host inputs (InputNode/LiteralValue/PosEncoding).
+
+    Feedback extract_from Linears are host-derived: they just reshape host-fed data.
+    Token type detection flags are NOT host-derived: they involve real computation.
+    """
+    nid = node.node_id
+    if nid in cache:
+        return cache[nid]
+    if isinstance(node, (InputNode, LiteralValue, PosEncoding, Embedding)):
+        cache[nid] = True
+        return True
+    if isinstance(node, Concatenate):
+        result = all(_is_host_derived(inp, cache) for inp in node.inputs)
+        cache[nid] = result
+        return result
+    if isinstance(node, Linear) and len(node.inputs) == 1:
+        result = _is_host_derived(node.inputs[0], cache)
+        cache[nid] = result
+        return result
+    cache[nid] = False
+    return False
+
+
+def _find_boundary_inputs(
+    type_nodes: Set[Node],
+    all_nodes: Set[Node],
+    node_to_layer: dict,
+) -> List[Tuple[str, int, int]]:
+    """Find inputs from outside the type's node set, grouped by source.
+
+    Returns list of (source_label, max_ready_layer, unique_node_count),
+    sorted by max_ready_layer ascending.  Host-derived boundary nodes
+    (feedback extracts, literal values) are grouped as "host inputs"
+    separately from shared computations.
+    """
+    type_node_ids = {n.node_id for n in type_nodes}
+    by_source: Dict[str, List[Node]] = defaultdict(list)
+    layer_cache: dict = {}
+    host_cache: dict = {}
+
+    for node in type_nodes:
+        for inp in node.inputs:
+            if inp.node_id not in type_node_ids and inp in all_nodes:
+                if _is_host_derived(inp, host_cache):
+                    by_source["host inputs"].append(inp)
+                else:
+                    source = _annotation_to_token_type(inp.annotation)
+                    label = source or "shared"
+                    by_source[label].append(inp)
+
+    results = []
+    for source_label, nodes in by_source.items():
+        unique_ids = {n.node_id for n in nodes}
+        max_layer = max(
+            (_effective_layer(n, node_to_layer, layer_cache) for n in nodes),
+            default=-1,
+        )
+        results.append((source_label, max_layer, len(unique_ids)))
+
+    results.sort(key=lambda x: x[1])
+    return results
+
+
+def _print_per_token_type_analysis(all_nodes: Set[Node], node_to_layer: dict):
+    """Per-token-type critical depth and input readiness analysis."""
+    print(f"\n{'─' * 72}")
+    print(f"  PER-TOKEN-TYPE DEPTH ANALYSIS")
+    print(f"{'─' * 72}")
+    print()
+    print(f"  Own depth:  longest sequential chain within the token type's own ops")
+    print(f"  Input ready: compiled layer at which each cross-position input is available")
+
+    summary_rows = []
+
+    for type_name, prefix in _TOKEN_TYPE_PREFIXES:
+        type_nodes = {
+            n for n in all_nodes if (n.annotation or "").startswith(prefix)
+        }
+        if not type_nodes:
+            continue
+
+        own_depth = _subgraph_critical_depth(type_nodes)
+
+        layers = [
+            node_to_layer[n.node_id]
+            for n in type_nodes
+            if n.node_id in node_to_layer
+        ]
+        if layers:
+            lo, hi = min(layers), max(layers)
+            n_layers = len(set(layers))
+            span_str = f"{lo}–{hi} ({n_layers})"
+        else:
+            lo, hi, n_layers = 0, 0, 0
+            span_str = "—"
+
+        boundary = _find_boundary_inputs(type_nodes, all_nodes, node_to_layer)
+
+        bottleneck_layer = -1
+        bottleneck_source = "host inputs"
+        for source_label, max_layer, count in boundary:
+            if max_layer > bottleneck_layer:
+                bottleneck_layer = max_layer
+                bottleneck_source = source_label
+
+        if bottleneck_layer <= 0:
+            bottleneck_str = "(host inputs only)"
+        else:
+            bottleneck_str = f"{bottleneck_source} @ layer {bottleneck_layer}"
+
+        summary_rows.append((type_name, own_depth, span_str, bottleneck_str, boundary))
+
+    # Summary table
+    print(f"\n  {'Token Type':<12s} {'Own Depth':>10s} {'Layer Span':>14s}   {'Bottleneck Input'}")
+    print(f"  {'─' * 12} {'─' * 10} {'─' * 14}   {'─' * 30}")
+    for type_name, own_depth, span_str, bottleneck_str, _ in summary_rows:
+        print(
+            f"  {type_name:<12s} {own_depth:>7d} ops {span_str:>14s}   {bottleneck_str}"
+        )
+
+    # Detailed per-type breakdown
+    print(f"\n  {'─' * 68}")
+    print(f"  CROSS-POSITION INPUT DETAILS")
+    print(f"  {'─' * 68}")
+    for type_name, own_depth, span_str, _, boundary in summary_rows:
+        if not boundary:
+            continue
+        print(f"\n  {type_name} (own depth: {own_depth} ops)")
+        for source_label, max_layer, count in boundary:
+            layer_str = f"layer {max_layer}" if max_layer >= 0 else "layer 0"
+            print(f"    {source_label:<25s} → {layer_str:>10s}   ({count} boundary nodes)")
+
+    print()
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 
@@ -646,6 +868,9 @@ def main():
 
     # Critical path analysis
     _print_critical_path_analysis(all_nodes, {output, pos})
+
+    # Per-token-type depth analysis
+    _print_per_token_type_analysis(all_nodes, node_to_layer)
 
 
 if __name__ == "__main__":
