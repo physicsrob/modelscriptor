@@ -187,17 +187,20 @@ Regenerate the auto-artefacts with:
 
     make measure-noise
 
-**Any change to a piecewise op's implementation, breakpoint grid, or
-`step_sharpness` requires a re-measurement before you commit.** The
-consistency test only verifies that JSON, markdown, and footers agree with
-each other — it cannot tell that the numbers were measured against old code.
-Skipping `make measure-noise` after editing an op leaves stale numbers in the
-docstring and markdown with a commit SHA that no longer matches HEAD.
+Two tests in `tests/docs/` keep this machinery honest:
+
+- `test_numerical_noise_consistency.py` — JSON, markdown, and docstring
+  footers agree with each other (format/schema drift).
+- `test_numerical_noise_drift.py` — the committed JSON matches what a
+  fresh `_measure_all()` run produces against the current code (number
+  drift). CI fails if you edit an op's implementation or breakpoint grid
+  without re-running `make measure-noise`, and the failure message tells
+  you exactly what to do.
 
 Workflow when you change a piecewise op's implementation or breakpoint grid:
 
 1. Run `make measure-noise` to regenerate the JSON, markdown, and docstring
-   footers at the new commit.
+   footers.
 2. Review the diff in `docs/op_noise_data.json` and update
    `docs/numerical_noise_findings.md` to reflect anything newly surprising
    or newly resolved.
@@ -205,10 +208,6 @@ Workflow when you change a piecewise op's implementation or breakpoint grid:
    should be noise numbers and commit SHAs; the findings-doc changes are
    yours.
 4. Commit.
-
-The consistency test `tests/docs/test_numerical_noise_consistency.py` fails in
-CI if the three artefacts drift out of sync. The error message points back to
-`make measure-noise`.
 
 To add a new op, append a `TargetOp(...)` to `_target_ops()` in
 `scripts/measure_op_noise.py`. See the "Adding a new op" section at the end

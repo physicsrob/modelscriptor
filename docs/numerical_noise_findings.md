@@ -107,6 +107,40 @@ numbers in `numerical_noise.md` at e.g. `compare_near_thresh_0` (abs
 op. Read ramp-zone distribution rows as "here is how the ramp looks,"
 not as "here is an error budget."
 
+### Known gap: reciprocal sorted callsite blocked on op-math
+
+`doom_reciprocal_sorted` is defined in `scripts/measure_op_noise.py` but
+temporarily **not** wired into the `reciprocal` `TargetOp`. The
+production callsite at `torchwright/doom/stages/wall.py:813` uses
+`reciprocal(denom_abs, min_value=0.1, max_value=max_denom, step=0.1)`,
+which creates ~500 geometric breakpoints. Summing that many ReLU terms
+in float32 accumulates ~2e-3 of error at the tail of the output range,
+exceeding `piecewise_linear(clamp=True)`'s declared `atol=1e-3` on its
+output `value_range`. The runtime assertion in
+`assert_matches_value_type` fires on the trailing samples, and the
+measurement pipeline can't complete.
+
+This is an **op-math precision-claim mismatch**, not a measurement
+issue. Two fixes are both op-math:
+- `piecewise_linear(clamp=True)` could pass a looser `atol` to
+  `assert_matches_value_type` proportional to breakpoint count (the
+  expected float32 accumulation).
+- The compiled implementation of `piecewise_linear` could be tightened
+  so its output genuinely honors the declared range to 1e-3.
+
+**Latent production implication.** The same assertion would fire at
+runtime in the DOOM game graph if `denom_abs` ever clamps up to
+`max_denom` during play — the measurement pipeline just surfaces it
+first because it probes the edge regime deliberately. A fix should be
+cross-referenced against `wall.py:813` to confirm both callsites
+benefit.
+
+Restore the measurement by (a) re-adding `doom_reciprocal_sorted` to
+`reciprocal`'s `distribution_names`, and (b) providing a
+`build_graphs_per_distribution` entry `reciprocal(nodes["x"],
+min_value=0.1, max_value=50.0, step=0.1)` — both are left as NOTEs in
+`scripts/measure_op_noise.py`.
+
 ## Production call-sites
 
 Which DOOM callsite each `doom_*` distribution covers. Callers editing any
@@ -115,12 +149,12 @@ changes.
 
 | Callsite | What it computes | Distribution | Op |
 | --- | --- | --- | --- |
-| `torchwright/doom/stages/wall.py:339` | `inv_abs_num_t = reciprocal(abs_num_t, min=0.3, max=…)` | `doom_reciprocal_wall` | `reciprocal` |
-| `torchwright/doom/stages/sorted.py:439` | `inv_denom_abs = reciprocal(denom_abs, min=0.1, max=…)` | `doom_reciprocal_sorted` | `reciprocal` |
-| `torchwright/doom/stages/wall.py:263` family | `sort_ey_cos`, `sort_ex_sin`, etc. via `piecewise_linear_2d` | `doom_diff_trig` | `piecewise_linear_2d` |
-| `torchwright/doom/stages/wall.py:205` family | `p_dx_ey`, `p_dy_ex`, etc. via `piecewise_linear_2d` | `doom_diff_vel` | `piecewise_linear_2d` |
-| `torchwright/doom/stages/sorted.py:549` | `atan_front_* = low_rank_2d(cross, dot, …, rank=3)` | `doom_atan_cross_dot` | `low_rank_2d` |
-| `torchwright/doom/stages/wall.py:386` | BSP side-bit compare (threshold 0.5) | `compare_near_thresh_05` | `compare` |
+| `torchwright/doom/stages/wall.py:431` | `inv_abs_num_t = reciprocal(abs_num_t, min=0.3, max=…)` | `doom_reciprocal_wall` | `reciprocal` |
+| `torchwright/doom/stages/wall.py:813` | `inv_denom_abs = reciprocal(denom_abs, min=0.1, max=…)` | `doom_reciprocal_sorted` (currently unwired, see "Known gap" above) | `reciprocal` |
+| `torchwright/doom/stages/wall.py` (family) | `sort_ey_cos`, `sort_ex_sin`, etc. via `piecewise_linear_2d` | `doom_diff_trig` | `piecewise_linear_2d` |
+| `torchwright/doom/stages/wall.py` (family) | `p_dx_ey`, `p_dy_ex`, etc. via `piecewise_linear_2d` | `doom_diff_vel` | `piecewise_linear_2d` |
+| `torchwright/doom/stages/sorted.py` | `atan_front_* = low_rank_2d(cross, dot, …, rank=3)` | `doom_atan_cross_dot` | `low_rank_2d` |
+| `torchwright/doom/stages/wall.py` | BSP side-bit compare (threshold 0.5) | `compare_near_thresh_05` | `compare` |
 
 Foundation ops (`piecewise_linear`, `square`, `square_signed`,
 `multiply_integers`, the exact negative controls, and the logic ops) are

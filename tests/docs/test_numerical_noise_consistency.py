@@ -5,6 +5,9 @@ These tests do NOT re-measure. They verify that the committed artefacts
 footers) agree with each other and cover every op declared in
 `scripts/measure_op_noise.py`.
 
+Number drift (code edited, numbers not regenerated) is a separate check
+— see ``tests/docs/test_numerical_noise_drift.py``.
+
 If any of these tests fail, the fix is::
 
     make measure-noise
