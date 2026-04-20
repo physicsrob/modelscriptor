@@ -136,15 +136,29 @@ def _find_indicators_above_node(attn_node):
 
 
 def _find_sel_bsp_rank_effective(graph_io):
-    """Walk sort_feedback to get the post-sentinel sel_bsp_rank (slot 2)."""
+    """Find the post-sentinel sel_bsp_rank node in the graph.
+
+    Walks all output nodes looking for the sentinel literal (99.0)
+    used in the sort_done select. The sel_bsp_rank_effective is the
+    select node whose true-branch is the 99.0 sentinel.
+    """
     roots = set(graph_io.overlaid_outputs.values())
+    roots.update(graph_io.overflow_outputs.values())
     for node in get_ancestor_nodes(roots):
-        if not isinstance(node, Concatenate) or len(node.inputs) != 6:
-            continue
-        first = node.inputs[0]
-        if isinstance(first, LiteralValue) and first.name == "sort_type":
-            return node.inputs[2]
-    raise AssertionError("sort_feedback Concatenate not found")
+        if isinstance(node, Linear) and len(node.inputs) == 1:
+            inner = node.inputs[0]
+            if isinstance(inner, ReLU) and len(inner.inputs) == 1:
+                first_lin = inner.inputs[0]
+                if isinstance(first_lin, Linear) and len(first_lin.inputs) == 1:
+                    cat = first_lin.inputs[0]
+                    if isinstance(cat, Concatenate) and len(cat.inputs) == 3:
+                        true_node = cat.inputs[1]
+                        if (
+                            isinstance(true_node, LiteralValue)
+                            and true_node.name == "sort_done_sentinel"
+                        ):
+                            return node
+    raise AssertionError("sel_bsp_rank_effective (sort_done sentinel select) not found")
 
 
 def _unwrap_asserts(node):
@@ -335,24 +349,27 @@ def main():
     print("Building prefill for (px=3, py=2, angle=20)...")
     prefill = _build_prefill(module, subset, px=3.0, py=2.0, angle=20.0)
 
-    # Drive prefill -> EOS, then build sort[0] input from EOS overlaid outputs.
+    # Drive prefill -> EOS, then build sort[0] input from scratch.
     print("Running prefill...")
     past = module.empty_past()
     with torch.no_grad():
         pre_out, past = module.step(prefill, past, past_len=0)
     step = prefill.shape[0]
 
-    out_specs = {n: (s, w) for n, s, w in module._output_specs}
-    in_specs = {n: (s, w) for n, s, w in module._input_specs}
-    overlaid_names = [n for n in in_specs if n in out_specs]
     d_input = max(s + w for _, s, w in module._input_specs)
     device = module._net.device
 
-    sort0_in = torch.zeros(1, d_input, device=device)
-    for name in overlaid_names:
-        in_s, w = in_specs[name]
-        out_s, _ = out_specs[name]
-        sort0_in[0, in_s : in_s + w] = pre_out[-1, out_s : out_s + w]
+    from torchwright.doom.game_graph import E8_SORTED_WALL
+
+    sort0_in = _build_row(
+        module,
+        _MAX_WALLS,
+        token_type=E8_SORTED_WALL,
+        sort_position_index=torch.tensor([0.0]),
+        player_x=torch.tensor([3.0]),
+        player_y=torch.tensor([2.0]),
+        player_angle=torch.tensor([20.0]),
+    )
 
     past_K, past_V = past
     past_kvs = [(past_K[i], past_V[i]) for i in range(len(past_K))]
@@ -579,12 +596,12 @@ def main():
     print(f"  raw sel_bsp_rank = {raw_final}")
     print(f"  sort_done        = {done_final}")
     print(f"  sel_eff          = {eff_final}")
-    prev = -1.0  # EOS seed
+    pos_idx = 0.0  # sort[0]
     if raw_final is not None:
-        expected_sort_done = +1.0 if (prev - raw_final) > -0.5 else -1.0
-        print(f"  prev_bsp_rank (EOS seed) = {prev}")
+        expected_sort_done = +1.0 if (pos_idx - raw_final) > 0.5 else -1.0
+        print(f"  position_index = {pos_idx}")
         print(
-            f"  prev - raw = {prev - raw_final:+.4f} → sort_done expected = {expected_sort_done:+.0f}"
+            f"  pos_idx - raw = {pos_idx - raw_final:+.4f} → sort_done expected = {expected_sort_done:+.0f}"
         )
 
 

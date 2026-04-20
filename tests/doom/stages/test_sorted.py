@@ -1,10 +1,11 @@
 """Unit tests for the SORTED stage (torchwright.doom.stages.sorted).
 
-Post-Phase-E: SORTED uses ``attend_argmin_above_integer``.  The
-attention selects the smallest ``bsp_rank`` strictly greater than
-``prev_bsp_rank`` among renderable walls.  Non-renderable walls have
-all-zero ``indicators_above`` and can never win the "above" logit,
-so they drop out of the selection without a separate validity gate.
+SORTED uses ``attend_argmin_above_integer``.  Each SORTED token's
+threshold is derived from its ``position_index``: position i uses
+threshold slot i, picking the wall with the i-th smallest BSP rank
+among renderable walls.  Non-renderable walls have all-zero
+``indicators_above`` and can never win the "above" logit, so they
+drop out of the selection without a separate validity gate.
 """
 
 from typing import List
@@ -38,7 +39,7 @@ def sorted_module():
     """Compile build_sorted's outputs for unit testing.
 
     ``sort_value`` (packed payload), ``indicators_above``, and
-    ``prev_bsp_rank`` are fed as multi-wide ``create_input`` nodes so the
+    ``position_index`` are fed as multi-wide ``create_input`` nodes so the
     test controls every position independently.
     """
     from torchwright.doom.wall_payload import payload_width
@@ -55,7 +56,7 @@ def sorted_module():
         _MAX_WALLS,
         value_range=(0.0, 1.0),
     )
-    prev_bsp_rank = create_input("prev_bsp_rank", 1, value_range=(-1.0, 100.0))
+    position_index = create_input("position_index", 1, value_range=(0.0, 100.0))
     is_sorted = create_input("is_sorted", 1, value_range=(-1.0, 1.0))
     is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
 
@@ -64,7 +65,7 @@ def sorted_module():
             sort_score=sort_score,
             sort_value=sort_value,
             indicators_above=indicators_above,
-            prev_bsp_rank=prev_bsp_rank,
+            position_index=position_index,
             is_sorted=is_sorted,
             is_wall=is_wall,
             pos_encoding=pos,
@@ -147,27 +148,26 @@ def _onehot(i: int, n: int) -> List[float]:
 
 
 @pytest.mark.parametrize(
-    "prev_bsp_rank,expected_rank,label",
+    "position_index,expected_rank,label",
     [
-        # EOS seed: threshold = 0, so we pick the smallest bsp_rank >= 0,
-        # which is 0 (wall at rank 0).
-        (-1.0, 0, "eos_seed_picks_rank_0"),
-        # prev=0: threshold slot 1, picks rank 1.
-        (0.0, 1, "pick_rank_1_after_0"),
-        # prev=1: threshold slot 2, picks rank 2.
-        (1.0, 2, "pick_rank_2_after_1"),
-        # prev=2: threshold slot 3, picks rank 3.
-        (2.0, 3, "pick_rank_3_after_2"),
+        # position_index=0: threshold slot 0, picks rank 0.
+        (0.0, 0, "position_0_picks_rank_0"),
+        # position_index=1: threshold slot 1, picks rank 1.
+        (1.0, 1, "position_1_picks_rank_1"),
+        # position_index=2: threshold slot 2, picks rank 2.
+        (2.0, 2, "position_2_picks_rank_2"),
+        # position_index=3: threshold slot 3, picks rank 3.
+        (3.0, 3, "position_3_picks_rank_3"),
     ],
 )
 def test_argmin_above_picks_strict_next_rank(
     sorted_module,
-    prev_bsp_rank,
+    position_index,
     expected_rank,
     label,
 ):
-    """attend_argmin_above_integer picks the smallest bsp_rank strictly
-    greater than prev_bsp_rank among renderable walls."""
+    """attend_argmin_above_integer picks the wall with the i-th smallest
+    bsp_rank among renderable walls, where i = position_index."""
     wall_rows = []
     for i in range(_MAX_WALLS):
         # Wall i has bsp_rank=i, is_renderable=True.  ax=wall index so
@@ -190,7 +190,7 @@ def test_argmin_above_picks_strict_next_rank(
                     onehot=_onehot(i, _MAX_WALLS),
                 ),
                 "indicators_above": _indicators(i, is_renderable=True),
-                "prev_bsp_rank": prev_bsp_rank,
+                "position_index": position_index,
                 "is_sorted": 0.0,
                 "is_wall": 1.0,
             }
@@ -199,7 +199,7 @@ def test_argmin_above_picks_strict_next_rank(
         "sort_score": 99.0,
         "sort_value": [0.0] * (13 + _MAX_WALLS),
         "indicators_above": [0.0] * _MAX_WALLS,
-        "prev_bsp_rank": prev_bsp_rank,
+        "position_index": position_index,
         "is_sorted": 1.0,
         "is_wall": 0.0,
     }
@@ -220,7 +220,7 @@ def test_non_renderable_walls_are_skipped(sorted_module):
     and pick the smallest-rank renderable wall.
 
     Scenario: wall 0 has rank 0 but is non-renderable.  Wall 1 has rank 1
-    and is renderable.  EOS seed (prev=-1, threshold=0) must pick wall 1.
+    and is renderable.  position_index=0 (threshold slot 0) must pick wall 1.
     """
     walls = [
         (0, False, 0.5),  # wall 0: non-renderable, rank 0, ax=0.5
@@ -251,7 +251,7 @@ def test_non_renderable_walls_are_skipped(sorted_module):
                     onehot=_onehot(i, _MAX_WALLS),
                 ),
                 "indicators_above": _indicators(rank, renderable),
-                "prev_bsp_rank": -1.0,
+                "position_index": 0.0,
                 "is_sorted": 0.0,
                 "is_wall": 1.0,
             }
@@ -260,7 +260,7 @@ def test_non_renderable_walls_are_skipped(sorted_module):
         "sort_score": 99.0,
         "sort_value": [0.0] * (13 + _MAX_WALLS),
         "indicators_above": [0.0] * _MAX_WALLS,
-        "prev_bsp_rank": -1.0,
+        "position_index": 0.0,
         "is_sorted": 1.0,
         "is_wall": 0.0,
     }
@@ -281,27 +281,27 @@ def test_non_renderable_walls_are_skipped(sorted_module):
 
 
 @pytest.mark.parametrize(
-    "prev_bsp_rank,expected_sel,expected_sort_done,label",
+    "position_index,expected_sel,expected_sort_done,label",
     [
-        # EOS seed: prev=-1, sel=0.  diff=-1 → sort_done=-1 (active).
-        (-1.0, 0, -1.0, "eos_seed_active"),
-        # prev=2, sel=3 (progress).  diff=-1 → sort_done=-1 (active).
-        (2.0, 3, -1.0, "progress_active"),
-        # Last progress step: prev=2, sel=3.  Covers the diff=-1 boundary.
-        (2.0, 3, -1.0, "adjacent_below_threshold"),
+        # position_index=0: sel=0.  diff=0 → sort_done=-1 (active).
+        (0.0, 0, -1.0, "position_0_active"),
+        # position_index=3: sel=3 (progress).  diff=0 → sort_done=-1 (active).
+        (3.0, 3, -1.0, "position_3_active"),
+        # position_index=2: sel=2.  Covers the diff=0 boundary.
+        (2.0, 2, -1.0, "adjacent_below_threshold"),
     ],
 )
 def test_sort_done_progress_signal(
     sorted_module,
-    prev_bsp_rank,
+    position_index,
     expected_sel,
     expected_sort_done,
     label,
 ):
-    """sort_done = sign(prev_bsp_rank - sel_bsp_rank + 0.5).
+    """sort_done = sign(position_index - sel_bsp_rank - 0.5).
 
-    During progress the attention picks sel > prev by at least one, so
-    diff = prev - sel <= -1 < -0.5 → sort_done = -1 (active).
+    During progress the attention picks sel >= position_index, so
+    diff = position_index - sel <= 0 < 0.5 → sort_done = -1 (active).
     """
     wall_rows = []
     for i in range(_MAX_WALLS):
@@ -323,7 +323,7 @@ def test_sort_done_progress_signal(
                     onehot=_onehot(i, _MAX_WALLS),
                 ),
                 "indicators_above": _indicators(i, is_renderable=True),
-                "prev_bsp_rank": prev_bsp_rank,
+                "position_index": position_index,
                 "is_sorted": 0.0,
                 "is_wall": 1.0,
             }
@@ -332,7 +332,7 @@ def test_sort_done_progress_signal(
         "sort_score": 99.0,
         "sort_value": [0.0] * (13 + _MAX_WALLS),
         "indicators_above": [0.0] * _MAX_WALLS,
-        "prev_bsp_rank": prev_bsp_rank,
+        "position_index": position_index,
         "is_sorted": 1.0,
         "is_wall": 0.0,
     }

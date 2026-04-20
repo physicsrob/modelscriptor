@@ -285,7 +285,6 @@ def test_probe_clean_on_v2_box_room(tiny_config):
     from torchwright.doom.game_graph import E8_INPUT
 
     d_render_fb = 2 * max_walls + 11
-    d_sort_out = 8 + 5 + 3 + max_walls
     tex_h = textures[0].shape[1]
     input_values = {
         "input_backward": torch.tensor([[0.0]]),
@@ -298,7 +297,7 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         "player_x": torch.tensor([[0.0]]),
         "player_y": torch.tensor([[0.0]]),
         "render_feedback": torch.zeros(1, d_render_fb),
-        "sort_feedback": torch.zeros(1, d_sort_out),
+        "sort_position_index": torch.tensor([[0.0]]),
         "tex_col_input": torch.tensor([[0.0]]),
         "tex_pixels": torch.zeros(1, tex_h * 3),
         "texture_id_e8": torch.zeros(1, 8),

@@ -2,20 +2,15 @@
 
 At each SORTED_WALL token the graph runs
 ``attend_argmin_above_integer`` over WALL positions.  The score is
-the per-wall BSP rank.  The threshold carried by each query is
-``prev_bsp_rank`` (a scalar fed back from the previous SORTED step),
-so the attention picks the smallest ``bsp_rank > prev_bsp_rank``
-among renderable walls.  ``indicators_above`` (computed at WALL
-time, gated by ``is_renderable``) is the key-side indicator basis:
-slot ``c`` is 1 iff the key's ``bsp_rank > c - 1`` AND the wall is
-renderable.
+the per-wall BSP rank.  Each SORTED token's threshold is derived
+from its ``position_index`` (host-fed, 0-indexed): the token at
+position i uses threshold slot i, picking the smallest
+``bsp_rank > i - 1`` among renderable walls.  No feedback from
+previous SORTED tokens is needed.
 
-**Why thresholds not masks.**  The V1-style above-threshold pattern
-carries one scalar (``prev_bsp_rank``) through the sort_feedback
-rather than a ``max_walls``-wide running mask.  That narrows the
-feedback, drops the mask/position-onehot rendezvous from the
-attention, and turns exhaustion into a clean integer threshold that
-goes out of range when all renderable walls are picked.
+``indicators_above`` (computed at WALL time, gated by
+``is_renderable``) is the key-side indicator basis: slot ``c`` is
+1 iff the key's ``bsp_rank > c - 1`` AND the wall is renderable.
 
 Visibility column computation (``vis_lo``, ``vis_hi``) lives in the
 WALL stage and travels through the payload — SORTED just unpacks it.
@@ -24,17 +19,12 @@ Downstream consumers:
 
 * **THINKING** uses ``sel_bsp_rank`` (from the payload) as score and
   ``sel_onehot`` (wall-index one-hot) as position key.
-* **Orchestrator output** packs ``[E8_SORTED_WALL, sel_wall_data,
-  sel_bsp_rank, vis_lo, vis_hi, sel_onehot]`` into the sort_feedback
-  field that closes the autoregressive sort loop.  No ``updated_mask``
-  — the threshold-based attention needs only the scalar
-  ``prev_bsp_rank``, extracted from the ``sel_bsp_rank`` slot.
 
 **Exhaustion.**  When the threshold exceeds every renderable wall's
 BSP rank (``N_renderable`` walls picked after ``N_renderable`` steps),
 ``attend_argmin_above_integer`` returns a softmax-averaged garbage
 value per its documented contract.  We detect the exhausted state
-cheaply via ``sort_done = compare(prev_bsp_rank - sel_bsp_rank, -0.5)``
+cheaply via ``sort_done = compare(position_index - sel_bsp_rank, 0.5)``
 so downstream stages can skip garbage picks.  The threshold slot is
 clamped to ``[0, max_walls - 1]`` so the attention always has a
 valid ``threshold_onehot`` column, avoiding the all-zero degeneracy.
@@ -84,10 +74,10 @@ class SortedInputs:
     sort_value: Node  # packed wall payload (fed as attention value)
     indicators_above: Node  # max_walls-wide thermometer key-side indicator
 
-    # BSP rank selected at the previous SORTED step (scalar, initialized
-    # to -1 at the EOS seed).  Threshold for the next pick = prev_bsp_rank,
-    # so we want keys with bsp_rank strictly greater than prev_bsp_rank.
-    prev_bsp_rank: Node
+    # Position index of this SORTED token in the sort sequence (0-indexed).
+    # Threshold for the pick = position_index, so we want keys with
+    # bsp_rank strictly greater than position_index - 1.
+    position_index: Node
 
     # Token-type flags used by the pre-attention score-distinctness
     # assertions.  ``is_wall`` restricts the valid-subset check to WALL
@@ -105,12 +95,11 @@ class SortedOutputs:
     sel_onehot: Node  # per-position wall-index one-hot of picked wall
 
     # BSP rank of the selected wall — used by THINKING as the score
-    # for its own argmin (picks walls in front-to-back order) and as the
-    # ``prev_bsp_rank`` for the next SORTED step's threshold.
+    # for its own argmin (picks walls in front-to-back order).
     sel_bsp_rank: Node
 
-    # Sort exhaustion flag: +1 when sel_bsp_rank <= prev_bsp_rank
-    # (no renderable wall strictly above the threshold — the attention
+    # Sort exhaustion flag: +1 when sel_bsp_rank < position_index
+    # (no renderable wall at or above the threshold — the attention
     # softmax-averaged garbage), -1 when the sort is still making progress.
     sort_done: Node
 
@@ -137,7 +126,7 @@ def build_sorted(
 ) -> SortedOutputs:
     with annotate("sort/threshold"):
         threshold_onehot = _compute_threshold_onehot(
-            inputs.prev_bsp_rank,
+            inputs.position_index,
             max_walls,
         )
 
@@ -168,33 +157,20 @@ def build_sorted(
 # ---------------------------------------------------------------------------
 
 
-def _compute_threshold_onehot(prev_bsp_rank: Node, max_walls: int) -> Node:
-    """Convert scalar ``prev_bsp_rank ∈ {-1, 0, …, max_walls - 1}`` to a
+def _compute_threshold_onehot(position_index: Node, max_walls: int) -> Node:
+    """Convert ``position_index ∈ {0, 1, …, max_walls - 1}`` to a
     width-``max_walls`` ``{0, 1}`` one-hot.
 
-    Slot ``c`` is 1 iff ``prev_bsp_rank + 1 == c`` (clamped to
+    Slot ``c`` is 1 iff ``position_index == c`` (clamped to
     ``[0, max_walls - 1]``).  The attention's rendezvous with
     ``indicators_above[c] = I(bsp_rank > c - 1 AND is_renderable)`` then
     picks the smallest ``bsp_rank`` strictly greater than
-    ``prev_bsp_rank`` among renderable walls.
+    ``position_index - 1`` among renderable walls.
 
-    **Why clamp.**  After all renderable walls are picked,
-    ``prev_bsp_rank`` reaches ``N_renderable - 1``, so the threshold
-    slot would be ``N_renderable``.  If ``N_renderable < max_walls``
-    the remaining slots are still valid one-hot positions, but if the
-    threshold drifts past ``max_walls - 1`` the one-hot becomes
-    all-zero and the attention degenerates (softmax over uniform
-    logits → garbage).  Clamping to ``max_walls - 1`` keeps the
-    attention in a well-defined state on exhausted steps — the pick
-    is still garbage (no valid keys above the clamped threshold) but
-    it's consistent-shape garbage that ``sort_done`` catches.
-
-    Mirrors ``examples.sort_digits_v1._threshold_onehot`` but with
-    a clamp for the exhaustion case.
+    SORTED token at position i uses threshold slot i, which picks the
+    wall with the i-th smallest BSP rank among renderable walls.
     """
-    # threshold = prev_bsp_rank + 1, clamped to [0, max_walls - 1].
-    raw = add_const(prev_bsp_rank, 1.0)
-    clamped = clamp(raw, 0.0, float(max_walls - 1))
+    clamped = clamp(position_index, 0.0, float(max_walls - 1))
     clamped_p1 = add_const(clamped, 1.0)
     onehot_bool = in_range(clamped, clamped_p1, max_walls)  # ±1
     ones = create_literal_value(
@@ -270,15 +246,15 @@ def _argmin_above_and_derive(
     vis_hi = extract_from(unpacked.vis_cols, VISIBILITY_WIDTH, 1, 1, "vis_hi")
 
     # Sort exhaustion: during normal progress the attention picks a
-    # wall with rank strictly greater than prev_bsp_rank, so
-    # prev - sel <= -1.  Once exhausted, the softmax averages values
-    # from below-threshold keys (column-0 domination by lowest-score
-    # wall), so prev - sel becomes non-negative.  The -0.5 threshold
-    # cleanly separates the cases.
+    # wall with rank >= position_index, so position_index - sel <= 0.
+    # Once exhausted, the softmax averages garbage and sel may be
+    # below position_index.  The 0.5 threshold cleanly separates:
+    # progress has position_index - sel <= 0 < 0.5, exhaustion has
+    # position_index - sel >= 1 > 0.5.
     raw_sel_bsp_rank = assert_integer(sel_bsp_rank)
     sort_done = compare(
-        subtract(inputs.prev_bsp_rank, raw_sel_bsp_rank),
-        -0.5,
+        subtract(inputs.position_index, raw_sel_bsp_rank),
+        0.5,
     )
 
     # Sentinel-ise sel_bsp_rank on exhausted steps so THINKING's
@@ -286,10 +262,7 @@ def _argmin_above_and_derive(
     # positions.  Without this, the softmax-averaged garbage rank on
     # exhausted steps is typically lower than real picks' ranks and
     # would win THINKING's argmin, pulling garbage wall data into
-    # RENDER.  The sentinel also flows into the next SORTED step's
-    # ``prev_bsp_rank`` feedback; the threshold clamp in
-    # ``_compute_threshold_onehot`` handles that cleanly (threshold
-    # pins at max_walls - 1 and successive steps stay exhausted).
+    # RENDER.
     sort_done_sentinel = create_literal_value(
         torch.tensor([99.0]),
         name="sort_done_sentinel",

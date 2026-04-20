@@ -8,7 +8,7 @@ Input schema (per position):
     token_type (8)   — E8 spherical code identifying the token role
     player_{x,y,angle}, input_* — player state and controls
     wall_{ax,ay,bx,by,tex_id}, wall_index — wall geometry (WALL tokens)
-    sort_feedback (8+5+2*max_walls) — previous sort output (SORTED_WALL tokens)
+    sort_position_index (1) — position index for SORTED_WALL tokens
     col_idx, patch_idx — screen coordinates (RENDER tokens)
 
 Output schema: token-type-dependent (see game_graph module docstring).

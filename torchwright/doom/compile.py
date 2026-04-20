@@ -4,13 +4,13 @@ Multi-phase autoregressive rollout:
 
     Phase -1 — Tex:     TEX_COL×(num_tex × tex_w)  (texture column prefill)
     Phase 0  — Prefill: INPUT + WALL×N + EOS        (host-driven)
-    Phase 1  — Sort:    SORTED_WALL×N               (pure autoregressive)
+    Phase 1  — Sort:    SORTED_WALL×N               (host-fed position index)
     Phase 2  — Render:  RENDER×(dynamic)             (autoregressive, pixels out)
 
 The host is a dumb token feeder and pixel bitblitter.  It feeds player
-state at every position, wall geometry at WALL positions, the
-accumulated mask at SORTED_WALL positions, and render feedback
-at RENDER positions.  The only host-side logic is copying feedback
+state at every position, wall geometry at WALL positions, a position
+index at SORTED_WALL positions, and render feedback at RENDER
+positions.  The only host-side logic is copying render feedback
 from each render output to the next input and bitblitting pixels
 to the framebuffer with skip-filled compositing.
 """
@@ -237,7 +237,7 @@ def _build_row(compiled, max_walls, **kwargs):
         "player_x": torch.zeros(1, device=device),
         "player_y": torch.zeros(1, device=device),
         "render_feedback": torch.zeros(d_render_fb, device=device),
-        "sort_feedback": torch.zeros(8 + 5 + 3 + max_walls_meta, device=device),
+        "sort_position_index": torch.zeros(1, device=device),
         "tex_col_input": torch.zeros(1, device=device),
         "tex_pixels": torch.zeros(tex_h * 3, device=device),
         "texture_id_e8": torch.zeros(8, device=device),
@@ -299,15 +299,11 @@ def step_frame(
         1. INPUT — feed player state + controls
         2. BSP_NODE×max_bsp_nodes — feed splitting plane coefficients
         3. WALL×N — feed wall geometry + BSP rank coefficients
-        4. EOS — feed player position → read resolved state from output
-        5. SORTED_WALL×N — pure autoregressive: output IS next input
+        4. EOS — feed player position → read resolved state from overflow
+        5. SORTED_WALL×N — host feeds position_index=k for each step
         6. THINKING/RENDER×(dynamic) — autoregressive: output IS next
            input.  THINKING selects wall, RENDER renders pixels.  Host
            reads pixels from overflow region, bitblits to framebuffer.
-
-    For autoregressive phases (sort + render), the output tensor's first
-    d_input values are laid out at input field offsets.  The host feeds
-    ``output[:d_input]`` directly as the next input — no remapping.
     """
     max_walls = int(module.metadata.get("max_walls", 8))
     cs = int(module.metadata.get("chunk_size", 20))
@@ -336,7 +332,6 @@ def step_frame(
 
     # Compute layout from compiled module
     d_input = max(s + w for _, s, w in module._input_specs)
-    d_sort_out = 8 + 5 + 3 + max_walls
     d_render_fb = 2 * max_walls + 11
     device = module._net.device
 
@@ -346,17 +341,18 @@ def step_frame(
 
     # Input-side offsets (overlaid fields' write targets on the next input)
     tt_off, _ = in_by_name["token_type"]
-    sf_off, _ = in_by_name["sort_feedback"]
     rf_off, _ = in_by_name["render_feedback"]
 
     # Output-side offsets in the gathered output tensor
-    sf_out_s, _ = out_by_name["sort_feedback"]
     rf_out_s, _ = out_by_name["render_feedback"]
     pix_out_s, _ = out_by_name["pixels"]
     col_out_s, _ = out_by_name["col"]
     start_out_s, _ = out_by_name["start"]
     length_out_s, _ = out_by_name["length"]
     done_out_s, _ = out_by_name["done"]
+    eos_rx_out_s, _ = out_by_name["eos_resolved_x"]
+    eos_ry_out_s, _ = out_by_name["eos_resolved_y"]
+    eos_angle_out_s, _ = out_by_name["eos_new_angle"]
 
     # Overlaid fields: any name appearing in both input and output specs.
     # The host copies these from output to input each step (delta transfer
@@ -481,12 +477,11 @@ def step_frame(
     t_prefill = time.perf_counter() - t0
     print(f"  prefill  {step} steps  kv={_kv_len(past)}  {t_prefill*1000:.0f}ms")
 
-    # Read collision-resolved state from EOS output (last row).
-    # sort_feedback begins with E8_SORTED_WALL(8), then resolved x, y, angle.
+    # Read collision-resolved state from EOS overflow outputs.
     eos_out = out[-1:]  # (1, d_output)
-    px = eos_out[0, sf_out_s + 8].item()
-    py = eos_out[0, sf_out_s + 9].item()
-    new_angle_raw = eos_out[0, sf_out_s + 10].item()
+    px = eos_out[0, eos_rx_out_s].item()
+    py = eos_out[0, eos_ry_out_s].item()
+    new_angle_raw = eos_out[0, eos_angle_out_s].item()
     angle = new_angle_raw
 
     def _out_to_input(raw_out):
@@ -504,23 +499,20 @@ def step_frame(
         return row
 
     # --- Phase 1: Sort ---
-    prev = _out_to_input(eos_out)
+    # Each SORTED token gets its position_index from the host (no feedback).
+    # Other input fields are zero (the SORTED computation only uses
+    # position_index + attention to WALL positions in the KV cache).
     t0 = time.perf_counter()
     for k in range(N):
-        out, past = _step(prev, past, step)
-        step += 1
-        prev = _out_to_input(out)
-        # Diagnostics: read sort_feedback from compact output
-        raw_sf = out[0, sf_out_s : sf_out_s + d_sort_out].cpu().numpy()
-        wall_data = raw_sf[8:13]
-        s_rank = raw_sf[13]
-        s_col_lo = raw_sf[14]
-        s_col_hi = raw_sf[15]
-        onehot = raw_sf[16 : 16 + max_walls]
-        print(
-            f"  sort[{k}]: wall=[{wall_data[0]:.2f},{wall_data[1]:.2f},{wall_data[2]:.2f},{wall_data[3]:.2f}] "
-            f"tex={wall_data[4]:.1f} rank={s_rank:.0f} cols=[{s_col_lo:.1f},{s_col_hi:.1f}) oh_max={np.argmax(onehot)}"
+        sort_row = _build_row(
+            module,
+            max_walls,
+            token_type=E8_SORTED_WALL,
+            sort_position_index=torch.tensor([float(k)]),
         )
+        out, past = _step(sort_row, past, step)
+        step += 1
+        print(f"  sort[{k}]")
 
     t_sort = time.perf_counter() - t0
     print(f"  sort     {N} steps  kv={_kv_len(past)}  {t_sort*1000:.0f}ms")

@@ -522,9 +522,9 @@ def _compute_indicators_above(
     so they never win SORTED's ``attend_argmin_above_integer`` search.
 
     Used by SORTED as ``key_in`` for the attention: the query-side
-    ``threshold_onehot[c] = I(prev_bsp_rank + 1 == c)`` selects which
+    ``threshold_onehot[c] = I(position_index == c)`` selects which
     threshold applies, and the bilinear rendezvous evaluates to
-    ``I(bsp_rank > prev_bsp_rank AND is_renderable)`` per key position.
+    ``I(bsp_rank > position_index - 1 AND is_renderable)`` per key.
 
     Mirrors ``examples.sort_digits_v1._build_indicators_above``.
     """

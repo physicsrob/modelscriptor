@@ -279,7 +279,7 @@ def doom_graph():
 
         # Known input-range mismatches (see module docstring).
         e8_names = {"token_type", "texture_id_e8"}
-        feedback_names = {"sort_feedback", "render_feedback"}
+        feedback_names = {"render_feedback"}
 
         tainted: Set[int] = set()
         for n in input_nodes:
