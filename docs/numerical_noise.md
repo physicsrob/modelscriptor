@@ -39,6 +39,28 @@ For commentary on the numbers — which are expected, which warrant investigatio
 | `square_signed` | `torchwright.ops.arithmetic_ops` | 0.25 | 276.7 | `square_signed_pm10` |
 | `thermometer_floor_div` | `torchwright.ops.arithmetic_ops` | 0 | 0 | `thermometer_integers_0_100_by10` |
 
+## How to read these numbers
+
+Each row reports output noise *at the op's design operating point* —
+i.e., with clean inputs drawn from the listed distribution. It does
+**not** bound output noise when upstream inputs are themselves noisy.
+
+Per-op bounds are **not additive** through a chain when any op has
+internal gain (a constant that multiplies an input). Gate ops
+(`cond_gate`, `select`, `attend_mean_where`) and threshold-output ops
+(`compare` in its ramp zone, `floor_int` near integer boundaries) all
+have structural gains > 1. An upstream deviation of magnitude `1/gain`
+can push the gated op outside its published bound, and the bias
+propagates multiplicatively downstream. See
+`docs/numerical_noise_findings.md` for the worked Phase E example and
+the list of known amplification hazards.
+
+To reason about a specific chain, don't try to compose per-op bounds.
+Probe the suspect node directly with
+`torchwright.debug.probe.probe_compiled`; the residual at the node is
+observable, the per-op bounds are an aid for spotting the op *class*
+most likely responsible.
+
 ## `abs`
 
 Exact decomposition: `ReLU(x) + ReLU(-x)`. Any non-zero measurement here would indicate a compiler or float32 bug.

@@ -57,6 +57,56 @@ designed to concentrate the softmax on a single key (e.g., `_QUERY_GAIN =
 property belongs in an attention-design reference, not an op noise
 reference; see plan 2 (compiler assertions) for a better home.
 
+### Input-amplification hazards (the Phase E trap, now partially mitigated)
+
+The per-op numbers in `numerical_noise.md` are measured on **clean input
+distributions**. They do **not** characterise what happens when the op
+receives noisy inputs. Gate ops — `cond_gate`, `select`,
+`attend_mean_where` — contain an internal constant that multiplies an
+input, so an upstream deviation of `ε` at that input produces ~`gain · ε`
+of output error. Per-op bounds are **not additive** through a chain
+containing any such op.
+
+**What main already fixed.** `cond_gate` (`torchwright/ops/logic_ops.py`)
+and `select` (`torchwright/ops/map_select.py`) now use
+`_GATE_OFFSET_SAFETY_FACTOR = 2.0` scaled against the gated input's
+declared `value_range` — so the gain is `~2·max|inp|` rather than the
+former hardcoded `big_offset = 1000`. For a typical boolean-domain `inp`
+(|inp| ≤ 1) this drops the amplification from 1000× to ~2×. The
+not-additive caveat still applies, but the hazard is proportional rather
+than catastrophic.
+
+**What remains.** `attend_mean_where`'s validity mask still uses
+`_VALIDITY_DIRECT = 1000` (`torchwright/ops/attention_ops.py:134`). Any
+leakage of noise onto the validity bit gets multiplied by 1000 inside the
+attention logit. This op is not yet wired into the measurement pipeline
+and is a reasonable follow-up.
+
+**Worked Phase E example (historical).** Before the safety-factor fix,
+on scene `(px=3, py=2, angle=20)`, a BSP-side `compare` at threshold 0.5
+produced outputs ~0.0017 inside its ramp zone — well within `compare`'s
+own design envelope. That 0.0017 became the input-noise to `cond_gate`,
+which multiplied by `big_offset = 1000` to yield a uniform 1.7-unit bias
+on every WALL position's `side_P_vec`. The bias propagated through the
+48-wide `bsp_rank` aggregation (coefficient magnitudes up to N/2) and
+materialised as a 1593-unit divergence at `Linear(id=989)`. Every op was
+inside its stated budget; the chain was not. The root-cause fix landed
+as `f0e6f86 feat: approximate flag on gate ops + remove big_offset`; see
+`docs/postmortems/phase_e_xfail.md` for the full trace.
+
+### Rel-error reporting: ramp-zone artefacts
+
+For `compare`, `floor_int`, `linear_bin_index`, and the boolean ops
+(`bool_any_true`, `bool_all_true`, `bool_not`, `equals_vector`), the
+reference is a discrete step function — the op is approximating a
+piecewise-constant target through a small continuous ramp. Samples that
+land inside the ramp legitimately report large absolute *and* relative
+error because the reference jumps while the approximation slopes. The
+numbers in `numerical_noise.md` at e.g. `compare_near_thresh_0` (abs
+≈ 2.0, rel ≈ 2.0) are diagnostic of ramp width, not a defect of the
+op. Read ramp-zone distribution rows as "here is how the ramp looks,"
+not as "here is an error budget."
+
 ## Production call-sites
 
 Which DOOM callsite each `doom_*` distribution covers. Callers editing any
