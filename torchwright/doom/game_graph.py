@@ -74,6 +74,7 @@ __all__ = [
     "TEX_E8_OFFSET",
 ]
 from torchwright.doom.graph_utils import extract_from
+from torchwright.doom.wall_payload import extract_geometry_field
 from torchwright.doom.stages.bsp import BspInputs, build_bsp
 from torchwright.doom.stages.eos import EosInputs, build_eos
 from torchwright.doom.stages.input import InputInputs, build_input
@@ -266,11 +267,10 @@ def build_game_graph(
             render_vis_lo=inputs["render_vis_lo"],
             render_vis_hi=inputs["render_vis_hi"],
             render_wall_j_onehot=inputs["render_wall_j_onehot"],
-            wall_ax=inputs["wall_ax"],
-            wall_ay=inputs["wall_ay"],
-            wall_bx=inputs["wall_bx"],
-            wall_by=inputs["wall_by"],
-            wall_position_onehot=wall_out.position_onehot,
+            render_wall_ax=inputs["render_wall_ax"],
+            render_wall_ay=inputs["render_wall_ay"],
+            render_wall_bx=inputs["render_wall_bx"],
+            render_wall_by=inputs["render_wall_by"],
             player_x=player_out.px,
             player_y=player_out.py,
             player_cos=player_out.cos_theta,
@@ -279,7 +279,6 @@ def build_game_graph(
             tex_pixels=inputs["tex_pixels"],
             tc_onehot_01=tex_col_out.tc_onehot_01,
             is_render=tf["is_render"],
-            is_wall=tf["is_wall"],
             is_tex_col=tf["is_tex_col"],
             pos_encoding=pos_encoding,
         ),
@@ -402,6 +401,8 @@ def _create_inputs(
     inputs["render_wall_j_onehot"] = create_input(
         "render_wall_j_onehot", max_walls, value_range=(0.0, 1.0)
     )
+    for k in ("render_wall_ax", "render_wall_ay", "render_wall_bx", "render_wall_by"):
+        inputs[k] = create_input(k, 1, value_range=(-max_coord, max_coord))
 
     return inputs
 
@@ -513,6 +514,19 @@ def _assemble_output(
             ),
         )
 
+        # render_wall_ax/ay/bx/by: SORTED sets from wall; RENDER forwards.
+        geom_outputs = {}
+        for geom_field in ("ax", "ay", "bx", "by"):
+            sorted_val = extract_geometry_field(
+                sorted_out.sel_wall_data, geom_field
+            )
+            render_next = getattr(render_out, f"next_wall_{geom_field}")
+            geom_outputs[f"render_wall_{geom_field}"] = select(
+                token_flags["is_sorted"],
+                sorted_val,
+                select(token_flags["is_render"], render_next, zero_1),
+            )
+
         # --- Token type ---
         out_token_type = select(
             token_flags["is_render"],
@@ -527,6 +541,9 @@ def _assemble_output(
         out_done = select(token_flags["is_render"], render_out.done_flag, neg_one)
 
         out_sort_done = select(token_flags["is_sorted"], sorted_out.sort_done, neg_one)
+        out_sort_bsp_rank = select(
+            token_flags["is_sorted"], sorted_out.sel_bsp_rank, zero_1
+        )
 
         out_eos_rx = select(token_flags["is_eos"], eos_out.resolved_x, zero_1)
         out_eos_ry = select(token_flags["is_eos"], eos_out.resolved_y, zero_1)
@@ -542,6 +559,7 @@ def _assemble_output(
         "render_vis_lo": out_render_vis_lo,
         "render_vis_hi": out_render_vis_hi,
         "render_wall_j_onehot": out_render_wall_j_onehot,
+        **geom_outputs,
     }
     overflow = {
         "pixels": out_pixels,
