@@ -230,3 +230,37 @@ class Assert(Node):
                 msg_parts.append(self.message)
             msg_parts.append(f"({detail})")
             raise AssertionError(": ".join(msg_parts[:-1]) + " " + msg_parts[-1])
+
+
+class DebugWatch(Node):
+    """Pass-through node that prints when a predicate fires.
+
+    Like Assert but observational: prints instead of raising.  Stripped
+    at compile time alongside Assert nodes.  Exercised during both
+    ``compute()`` (oracle path) and compiled debug forward when
+    ``debug=True``.
+    """
+
+    def __init__(self, inp: Node, predicate: Predicate, message: str = ""):
+        self.predicate = predicate
+        self.message = message
+        super().__init__(len(inp), [inp])
+
+    def compute_value_type(self) -> NodeValueType:
+        return self.inputs[0].value_type
+
+    def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
+        x = self.inputs[0].compute(n_pos, input_values)
+        self._check(x)
+        return x
+
+    def _check(self, x: torch.Tensor) -> None:
+        ok, detail = self.predicate(x)
+        if not ok:
+            site = self.annotation or f"node_{self.node_id}"
+            msg_parts = [f"DebugWatch at {site}"]
+            if self.message:
+                msg_parts.append(self.message)
+            if detail:
+                msg_parts.append(f"({detail})")
+            print(": ".join(msg_parts))

@@ -1083,6 +1083,8 @@ class CompiledHeadless:
         output_indices: torch.Tensor,
         metadata: Optional[dict] = None,
         output_specs: Optional[List[tuple]] = None,
+        asserts: Optional[List] = None,
+        watches: Optional[List] = None,
     ) -> None:
         self._net = net
         # input_specs: list of (name, start_col, width) in input-tensor column order.
@@ -1094,6 +1096,8 @@ class CompiledHeadless:
         self._output_specs = list(output_specs) if output_specs is not None else []
         self.input_names: List[str] = [name for name, _, _ in input_specs]
         self.metadata: dict = dict(metadata or {})
+        self._asserts = list(asserts) if asserts else []
+        self._watches = list(watches) if watches else []
 
         # KV cache shape metadata — discovered from the compiled transformer
         # so empty_past() can build zero-length tensors of the right shape.
@@ -1112,10 +1116,18 @@ class CompiledHeadless:
             n_new, input_values, past_len=past_len
         ).to(self._net.device)
 
-    def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Stateless per-query inference — uses the non-cached ``forward()``."""
+    def __call__(self, inputs: torch.Tensor, debug: bool = False) -> torch.Tensor:
+        """Stateless per-query inference — uses the non-cached ``forward()``.
+
+        When ``debug=True``, captures per-layer residual-stream snapshots
+        and checks all Assert nodes (raises on failure) and DebugWatch
+        nodes (prints on trigger).
+        """
         res_stream = self._build_res_stream(inputs, past_len=0)
-        res = self._net.forward(res_stream)
+        if debug and (self._asserts or self._watches):
+            res, _ = self._run_debug_checks(res_stream, past_kvs=None)
+        else:
+            res = self._net.forward(res_stream)
         return res[:, self._output_indices]
 
     def empty_past(
@@ -1138,6 +1150,7 @@ class CompiledHeadless:
         inputs: torch.Tensor,
         past: tuple,
         past_len: Optional[int] = None,
+        debug: bool = False,
     ) -> tuple:
         """Cached forward step.
 
@@ -1155,6 +1168,9 @@ class CompiledHeadless:
                 handing over a trimmed cache; the positional encoding
                 slice uses this value while the attention mask uses the
                 cache's actual shape.
+            debug: When True, capture residual-stream snapshots and
+                check all Assert nodes (raises) and DebugWatch nodes
+                (prints).
 
         Returns:
             ``(outputs, new_past)`` where ``outputs`` is
@@ -1169,7 +1185,10 @@ class CompiledHeadless:
 
         res_stream = self._build_res_stream(inputs, past_len=past_len)
         past_kvs = [(past_K[i], past_V[i]) for i in range(self._n_layers)]
-        res, new_kvs = self._net.forward_cached(res_stream, past_kvs=past_kvs)
+        if debug and (self._asserts or self._watches):
+            res, new_kvs = self._run_debug_checks(res_stream, past_kvs=past_kvs)
+        else:
+            res, new_kvs = self._net.forward_cached(res_stream, past_kvs=past_kvs)
 
         new_K = tuple(kv[0] for kv in new_kvs)
         new_V = tuple(kv[1] for kv in new_kvs)
@@ -1192,6 +1211,88 @@ class CompiledHeadless:
             if n == name:
                 return outputs[..., s : s + w]
         raise KeyError(f"output field {name!r} not found")
+
+    def _run_debug_checks(self, res_stream, past_kvs=None):
+        """Run forward with state capture, then check asserts and watches.
+
+        For prefill (past_kvs=None): uses net.forward(return_states=True).
+        For decode (past_kvs provided): manually walks layers to capture
+        per-layer residual-stream states.
+
+        Returns (res, new_kvs) where new_kvs is None for prefill or a
+        list of (K, V) tuples for decode.
+        """
+        from torchwright.debug.probe import (
+            _extract_compiled_value,
+            _first_state_with,
+            _ordered_mlp_states,
+        )
+        from torchwright.graph.misc import Assert, DebugWatch
+
+        net = self._net
+        ra = net.residual_assignment
+        assert ra is not None
+
+        state_tensor = {}
+        new_kvs = None
+
+        if past_kvs is None:
+            res, all_states = net.forward(res_stream, return_states=True)
+            for _key, (state, tensor) in all_states.items():
+                state_tensor[state] = (tensor, _key)
+        else:
+            res = res_stream
+            new_kvs_list = []
+            with torch.no_grad():
+                for i, layer in enumerate(net.layers):
+                    res, kv = layer.attn.forward_cached(res, past_kvs[i])
+                    new_kvs_list.append(kv)
+                    state_tensor[layer.attn.out_state] = (
+                        res,
+                        f"layer_{i}_attn_skip_out_state",
+                    )
+                    res = layer.mlp.forward(res)
+                    state_tensor[layer.mlp.out_state] = (
+                        res,
+                        f"layer_{i}_mlp_out_state",
+                    )
+            new_kvs = new_kvs_list
+
+        ordered_states = [s for _, _, s in _ordered_mlp_states(net, ra)]
+
+        for assert_node in self._asserts:
+            target = assert_node.inputs[0]
+            while isinstance(target, (Assert, DebugWatch)):
+                target = target.inputs[0]
+            state = _first_state_with(target, ra, ordered_states)
+            if state is None:
+                continue
+            tensor_pair = state_tensor.get(state)
+            if tensor_pair is None:
+                continue
+            res_tensor, _ = tensor_pair
+            compiled_val = _extract_compiled_value(target, ra, state, res_tensor)
+            if compiled_val is None:
+                continue
+            assert_node._check(compiled_val)
+
+        for watch_node in self._watches:
+            target = watch_node.inputs[0]
+            while isinstance(target, (Assert, DebugWatch)):
+                target = target.inputs[0]
+            state = _first_state_with(target, ra, ordered_states)
+            if state is None:
+                continue
+            tensor_pair = state_tensor.get(state)
+            if tensor_pair is None:
+                continue
+            res_tensor, _ = tensor_pair
+            compiled_val = _extract_compiled_value(target, ra, state, res_tensor)
+            if compiled_val is None:
+                continue
+            watch_node._check(compiled_val)
+
+        return res, new_kvs
 
 
 def compile_headless(
@@ -1300,6 +1401,26 @@ def compile_headless(
     else:
         combined_output = Concatenate(output_nodes)
 
+    # Collect Assert and DebugWatch nodes before forward_compile strips them.
+    from torchwright.graph.asserts import collect_debug_nodes
+
+    all_asserts = []
+    all_watches = []
+    _seen_ids: set = set()
+    for _name, (in_node, out_node) in io.items():
+        for root in (in_node, out_node):
+            if root is None:
+                continue
+            node_asserts, node_watches = collect_debug_nodes(root)
+            for a in node_asserts:
+                if a.node_id not in _seen_ids:
+                    _seen_ids.add(a.node_id)
+                    all_asserts.append(a)
+            for w in node_watches:
+                if w.node_id not in _seen_ids:
+                    _seen_ids.add(w.node_id)
+                    all_watches.append(w)
+
     # Map input nodes to their names for the residual assignment
     input_node_to_name = {spec[3]: spec[0] for spec in input_specs}
 
@@ -1341,6 +1462,8 @@ def compile_headless(
         output_indices_tensor,
         metadata=extra_metadata,
         output_specs=ch_output_specs,
+        asserts=all_asserts,
+        watches=all_watches,
     )
 
 
@@ -1362,9 +1485,13 @@ def _compile_headless_legacy(
     # reference may still point at one.  Downstream lookups
     # (residual-stream indices, etc.) must match the compiled graph's
     # effective terminal node.
-    from torchwright.graph.misc import Assert
+    from torchwright.graph.misc import Assert, DebugWatch
+    from torchwright.graph.asserts import collect_debug_nodes
 
-    while isinstance(output_node, Assert):
+    # Collect Assert and DebugWatch nodes before forward_compile strips them.
+    all_asserts, all_watches = collect_debug_nodes(output_node)
+
+    while isinstance(output_node, (Assert, DebugWatch)):
         output_node = output_node.inputs[0]
 
     net = forward_compile(
@@ -1408,4 +1535,6 @@ def _compile_headless_legacy(
         input_specs,
         output_indices,
         metadata=extra_metadata,
+        asserts=all_asserts,
+        watches=all_watches,
     )

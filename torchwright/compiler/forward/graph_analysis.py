@@ -7,6 +7,7 @@ from torchwright.graph import (
     Node,
     Assert,
     Concatenate,
+    DebugWatch,
     LiteralValue,
     InputNode,
     PosEncoding,
@@ -30,6 +31,8 @@ class GraphAnalyzer:
         # predicates as expected.
         self._stripped_asserts: List[Assert] = []
         self._assert_aliases: Dict[Assert, Node] = {}
+        self._stripped_watches: List[DebugWatch] = []
+        self._watch_aliases: Dict[DebugWatch, Node] = {}
         output_node = self._strip_asserts(output_node)
 
         self._output_node = output_node
@@ -60,11 +63,12 @@ class GraphAnalyzer:
         """
         pre_strip_nodes = get_ancestor_nodes({output_node})
         asserts = [n for n in pre_strip_nodes if isinstance(n, Assert)]
-        if not asserts:
+        watches = [n for n in pre_strip_nodes if isinstance(n, DebugWatch)]
+        if not asserts and not watches:
             return output_node
 
         def unwrap(node: Node) -> Node:
-            while isinstance(node, Assert):
+            while isinstance(node, (Assert, DebugWatch)):
                 node = node.inputs[0]
             return node
 
@@ -109,15 +113,18 @@ class GraphAnalyzer:
                 )
 
         for node in pre_strip_nodes:
-            if isinstance(node, Assert):
+            if isinstance(node, (Assert, DebugWatch)):
                 continue
             for i, inp in enumerate(node.inputs):
-                if isinstance(inp, Assert):
+                if isinstance(inp, (Assert, DebugWatch)):
                     node.inputs[i] = unwrap(inp)
 
         self._stripped_asserts.extend(asserts)
         for a in asserts:
             self._assert_aliases[a] = unwrap(a)
+        self._stripped_watches.extend(watches)
+        for w in watches:
+            self._watch_aliases[w] = unwrap(w)
         return unwrap(output_node)
 
     def get_stripped_asserts(self) -> List[Assert]:
@@ -127,6 +134,14 @@ class GraphAnalyzer:
     def get_assert_aliases(self) -> Dict[Assert, Node]:
         """Return mapping from stripped Assert nodes to their underlying targets."""
         return dict(self._assert_aliases)
+
+    def get_stripped_watches(self) -> List[DebugWatch]:
+        """Return the DebugWatch nodes removed during initialization."""
+        return list(self._stripped_watches)
+
+    def get_watch_aliases(self) -> Dict[DebugWatch, Node]:
+        """Return mapping from stripped DebugWatch nodes to their underlying targets."""
+        return dict(self._watch_aliases)
 
     def get_output_node(self) -> Node:
         """Return the effective output node after Assert stripping.
