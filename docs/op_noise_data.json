@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "commit": "a979f69",
-  "measured_at": "2026-04-16",
+  "commit": "e1b1b41",
+  "measured_at": "2026-04-20",
   "ops": [
     {
       "name": "abs",
@@ -185,16 +185,16 @@
           "name": "cond_gate_signed_bool_times_value",
           "description": "±1 conditions paired with scalar values in [-5, 5]. Expected output: `value` when cond=+1, `0` when cond=-1.",
           "n_samples": 4096,
-          "max_abs_error": 3.05176e-05,
-          "mean_abs_error": 7.84674e-06,
-          "p99_abs_error": 3.00407e-05,
-          "max_rel_error": 0.00399042,
-          "mean_rel_error": 2.55099e-05,
-          "p99_rel_error": 0.000359515,
+          "max_abs_error": 0.000976562,
+          "mean_abs_error": 0.000249378,
+          "p99_abs_error": 0.000959468,
+          "max_rel_error": 0.388475,
+          "mean_rel_error": 0.0010522,
+          "p99_rel_error": 0.0115953,
           "rel_valid_samples": 2089,
           "worst_input": {
             "cond": 1.0,
-            "inp": 1.57278
+            "inp": 3.05957
           }
         }
       ]
@@ -485,36 +485,21 @@
     {
       "name": "reciprocal",
       "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Geometric breakpoint spacing keeps relative interpolation error roughly constant across the range. Measurement op is built with `min_value=0.1, max_value=200.0, step=1.0` so a single compiled instance covers both production distributions.",
+      "notes": "Geometric breakpoint spacing keeps relative interpolation error roughly constant across the range. Measured against a reciprocal graph whose `(min_value, max_value, step)` matches its production callsite: `(0.3, 200.0, 1.0)` for `doom_reciprocal_wall` (`torchwright/doom/stages/wall.py:431`).",
       "distributions": [
-        {
-          "name": "doom_reciprocal_sorted",
-          "description": "1/x over [0.1, 50.0], step=0.1 — mirrors the `inv_denom_abs` callsite at `torchwright/doom/stages/sorted.py:439`.",
-          "n_samples": 4096,
-          "max_abs_error": 0.00250864,
-          "mean_abs_error": 0.000259315,
-          "p99_abs_error": 0.00131503,
-          "max_rel_error": 0.12228,
-          "mean_rel_error": 0.00838194,
-          "p99_rel_error": 0.0583375,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "x": 0.143451
-          }
-        },
         {
           "name": "doom_reciprocal_wall",
           "description": "1/x over [0.3, 200.0], step=1.0 — mirrors the `inv_abs_num_t` callsite at `torchwright/doom/stages/wall.py:339`.",
           "n_samples": 4096,
-          "max_abs_error": 0.00698127,
-          "mean_abs_error": 0.000981591,
-          "p99_abs_error": 0.00447691,
-          "max_rel_error": 1.38859,
-          "mean_rel_error": 0.127856,
-          "p99_rel_error": 0.80623,
+          "max_abs_error": 0.000824451,
+          "mean_abs_error": 0.000113957,
+          "p99_abs_error": 0.000477473,
+          "max_rel_error": 0.136051,
+          "mean_rel_error": 0.0144352,
+          "p99_rel_error": 0.078974,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "x": 198.88
+            "x": 0.315914
           }
         }
       ]
