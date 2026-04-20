@@ -193,26 +193,55 @@ def test_wall_height_scales_as_H_inv_times_den_over_cos(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "KNOWN ISSUE: the texture u-coordinate is computed as "
-        "piecewise_linear_2d(abs_nuc, abs_den, doc_bp, doc_bp, n/d lambda), "
-        "which bilinearly interpolates the division n/d over a 16x16 grid. "
-        "Division isn't bilinear, so the approximation drifts significantly "
-        "across the domain: at (abs_nuc=5, abs_den=10) u_raw=0.31 (expected 0.50); "
-        "at (abs_nuc=2.5, abs_den=10) u_raw=0.07 (expected 0.25). Needs a "
-        "different decomposition (e.g. reciprocal + signed_multiply) to fix."
-    ),
-    strict=False,
-)
 @pytest.mark.parametrize(
     "D,sort_den,expected_u_frac",
     [
-        (5.0, 10.0, 0.5),
-        (2.5, 10.0, 0.25),
-        (7.5, 10.0, 0.75),
-        (0.0, 1.0, 0.0),  # edge: abs_nuc=0
-        (0.9, 1.0, 0.9),  # edge: abs_nuc ≈ abs_den
+        pytest.param(
+            5.0,
+            10.0,
+            0.5,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "PL2D bilinear interpolation of n/d drifts: "
+                    "at (5, 10) u_raw=0.31 vs expected 0.50."
+                ),
+            ),
+        ),
+        pytest.param(
+            2.5,
+            10.0,
+            0.25,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "PL2D bilinear interpolation of n/d drifts: "
+                    "at (2.5, 10) u_raw=0.07 vs expected 0.25."
+                ),
+            ),
+        ),
+        pytest.param(
+            7.5,
+            10.0,
+            0.75,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "PL2D bilinear interpolation of n/d drifts: "
+                    "at (7.5, 10) u_raw drifts from expected 0.75."
+                ),
+            ),
+        ),
+        pytest.param(
+            0.0,
+            1.0,
+            0.0,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="PL2D drift at edge case abs_nuc=0.",
+            ),
+        ),
+        (0.9, 1.0, 0.9),  # edge: abs_nuc ≈ abs_den — passes
     ],
 )
 def test_texture_column_division_known_bug(
