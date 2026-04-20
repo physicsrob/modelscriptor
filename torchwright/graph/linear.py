@@ -1,10 +1,7 @@
 from typing import Optional
 
 from torchwright.graph import Node
-from torchwright.graph.value_type import (
-    NodeValueType,
-    is_integer_tensor,
-)
+from torchwright.graph.value_type import NodeValueType
 
 import torch
 
@@ -51,11 +48,7 @@ class Linear(Node):
         return torch.matmul(value_in, self.output_matrix) + self.output_bias
 
     def compute_value_type(self) -> NodeValueType:
-        inp_t = self.inputs[0].value_type
-        weights_int = is_integer_tensor(self.output_matrix)
-        bias_int = is_integer_tensor(self.output_bias)
-        is_int = inp_t.is_integer if (weights_int and bias_int) else False
-        return NodeValueType(is_integer=is_int)
+        return NodeValueType()
 
     def num_params(self):
         return self.d_input * self.d_output + self.d_output

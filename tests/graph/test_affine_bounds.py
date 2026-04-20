@@ -338,11 +338,10 @@ class TestDualRail:
             assert s.value_type.value_range.lo == pytest.approx(0.0)
             assert s.value_type.value_range.hi == pytest.approx(0.0)
 
-    def test_value_type_preserves_structural_flags(self):
+    def test_value_type_preserves_range(self):
         with fresh_graph_session():
             lit = LiteralValue(torch.tensor([0.0, 1.0]))
-            assert lit.value_type.is_binary is True
-            assert lit.value_type.is_integer is True
+            assert lit.value_type.value_range == Range(0.0, 1.0)
 
 
 class TestSoundness:
@@ -525,7 +524,10 @@ class TestSemanticBounds:
     """Semantic affine bounds for composite ops: cond_gate, select, compare."""
 
     def test_cond_gate_positive_input(self):
-        """cond_gate with positive input: upper = identity, lower = 0."""
+        """cond_gate with positive input: upper = identity, lower = 0.
+
+        c_tol=0.005 widens the semantic bound by M*c_tol per side.
+        """
         with fresh_graph_session():
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             inp = InputNode(2, name="inp", value_range=(1.0, 5.0))
@@ -534,8 +536,8 @@ class TestSemanticBounds:
             result = cond_gate(cond, inp)
             intervals = result.affine_bound.to_interval()
             for iv in intervals:
-                assert iv.lo == pytest.approx(0.0, abs=1e-5)
-                assert iv.hi == pytest.approx(5.0, abs=1e-5)
+                assert iv.lo == pytest.approx(0.0, abs=0.06)
+                assert iv.hi == pytest.approx(5.0, abs=0.06)
 
     def test_cond_gate_negative_input(self):
         """cond_gate with negative input: upper = 0, lower = identity."""
@@ -547,8 +549,8 @@ class TestSemanticBounds:
             result = cond_gate(cond, inp)
             intervals = result.affine_bound.to_interval()
             for iv in intervals:
-                assert iv.lo == pytest.approx(-5.0, abs=1e-5)
-                assert iv.hi == pytest.approx(0.0, abs=1e-5)
+                assert iv.lo == pytest.approx(-5.0, abs=0.06)
+                assert iv.hi == pytest.approx(0.0, abs=0.06)
 
     def test_cond_gate_straddling(self):
         """cond_gate with straddling input: bounded by [lo, hi]."""
@@ -559,8 +561,8 @@ class TestSemanticBounds:
 
             result = cond_gate(cond, inp)
             iv = result.affine_bound.to_interval()[0]
-            assert iv.lo >= -3.0 - 1e-5
-            assert iv.hi <= 5.0 + 1e-5
+            assert iv.lo >= -3.0 - 0.06
+            assert iv.hi <= 5.0 + 0.06
             assert iv.lo <= 0.0
             assert iv.hi >= 0.0
 
@@ -594,7 +596,7 @@ class TestSemanticBounds:
             assert width <= 6.0, f"Semantic bound width {width} should be <= 6 (0 to 5)"
 
     def test_select_hull(self):
-        """select bound is the hull of true/false intervals."""
+        """select bound is the hull of true/false intervals, widened by c_tol * M."""
         with fresh_graph_session():
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             a = InputNode(1, name="a", value_range=(2.0, 5.0))
@@ -603,8 +605,8 @@ class TestSemanticBounds:
 
             result = select(cond, a, b)
             iv = result.affine_bound.to_interval()[0]
-            assert iv.lo == pytest.approx(-1.0, abs=1e-5)
-            assert iv.hi == pytest.approx(5.0, abs=1e-5)
+            assert iv.lo == pytest.approx(-1.0, abs=0.06)
+            assert iv.hi == pytest.approx(5.0, abs=0.06)
 
     def test_select_soundness(self):
         """Randomized: actual select output within semantic bounds."""

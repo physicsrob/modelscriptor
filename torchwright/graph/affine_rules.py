@@ -372,9 +372,17 @@ def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -
 
 
 def _cond_gate_semantic_bound(
-    inp_ab: AffineBound, inp_node: Optional["Node"] = None
+    inp_ab: AffineBound,
+    inp_node: Optional["Node"] = None,
+    c_tol: float = 0.0,
+    M: float = 0.0,
 ) -> AffineBound:
-    """Per-component [min(0, inp), max(0, inp)] envelope for cond_gate."""
+    """Per-component [min(0, inp), max(0, inp)] envelope for cond_gate.
+
+    When ``c_tol > 0`` and ``M > 0``, widens the envelope by
+    ``c_tol * M`` per component to account for amplified condition noise
+    in the approximate gate path.
+    """
     intervals = inp_ab.to_interval()
     d = inp_ab.d_output
     n = inp_ab.n_cols
@@ -414,6 +422,10 @@ def _cond_gate_semantic_bound(
             A_lo[i] = s_lo * inp_ab.A_lo[i]
             b_lo[i] = s_lo * inp_ab.b_lo[i] + l * h / (h - l)
 
+    widen = c_tol * M
+    b_lo -= widen
+    b_hi += widen
+
     return AffineBound(
         A_lo=A_lo,
         A_hi=A_hi,
@@ -424,8 +436,16 @@ def _cond_gate_semantic_bound(
     )
 
 
-def _select_semantic_bound(a_ab: AffineBound, b_ab: AffineBound) -> AffineBound:
-    """Per-component hull of a and b intervals for select."""
+def _select_semantic_bound(
+    a_ab: AffineBound,
+    b_ab: AffineBound,
+    tolerance: float = 0.0,
+) -> AffineBound:
+    """Per-component hull of a and b intervals for select.
+
+    When ``tolerance > 0``, widens the hull by that amount per component
+    to account for amplified condition noise in the approximate gate path.
+    """
     import torch
 
     from torchwright.graph.affine_bound import _merge_layouts, _scatter
@@ -441,6 +461,9 @@ def _select_semantic_bound(a_ab: AffineBound, b_ab: AffineBound) -> AffineBound:
         b_lo[i] = min(a_intervals[i].lo, b_intervals[i].lo)
         b_hi[i] = max(a_intervals[i].hi, b_intervals[i].hi)
 
+    b_lo -= tolerance
+    b_hi += tolerance
+
     return AffineBound(
         A_lo=torch.zeros(d, a_ab.n_cols, dtype=torch.float64),
         A_hi=torch.zeros(d, a_ab.n_cols, dtype=torch.float64),
@@ -448,6 +471,60 @@ def _select_semantic_bound(a_ab: AffineBound, b_ab: AffineBound) -> AffineBound:
         b_hi=b_hi,
         columns=a_ab.columns,
         input_ranges=a_ab.input_ranges,
+    )
+
+
+def _broadcast_select_semantic_bound(
+    true_ab: AffineBound,
+    false_ab: AffineBound,
+    n_slots: int,
+    d_fill: int,
+    true_is_broadcast: bool,
+    false_is_broadcast: bool,
+    tolerance: float = 0.0,
+) -> AffineBound:
+    """Per-component hull across slots for broadcast_select.
+
+    Each output slot picks true or false, so the per-channel bound is
+    the hull of the corresponding true/false channel. When a branch is
+    broadcast, its single-slot interval applies to every slot.
+    """
+    import torch
+
+    true_intervals = true_ab.to_interval()
+    false_intervals = false_ab.to_interval()
+    d = n_slots * d_fill
+
+    b_lo = torch.zeros(d, dtype=torch.float64)
+    b_hi = torch.zeros(d, dtype=torch.float64)
+    for i in range(n_slots):
+        for j in range(d_fill):
+            out_idx = i * d_fill + j
+            t_idx = j if true_is_broadcast else out_idx
+            f_idx = j if false_is_broadcast else out_idx
+            t_iv = (
+                true_intervals[t_idx]
+                if t_idx < len(true_intervals)
+                else true_intervals[j]
+            )
+            f_iv = (
+                false_intervals[f_idx]
+                if f_idx < len(false_intervals)
+                else false_intervals[j]
+            )
+            b_lo[out_idx] = min(t_iv.lo, f_iv.lo)
+            b_hi[out_idx] = max(t_iv.hi, f_iv.hi)
+
+    b_lo -= tolerance
+    b_hi += tolerance
+
+    return AffineBound(
+        A_lo=torch.zeros(d, 0, dtype=torch.float64),
+        A_hi=torch.zeros(d, 0, dtype=torch.float64),
+        b_lo=b_lo,
+        b_hi=b_hi,
+        columns={},
+        input_ranges={},
     )
 
 

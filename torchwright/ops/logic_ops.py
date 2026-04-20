@@ -56,7 +56,7 @@ def bool_any_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit a979f69. See docs/numerical_noise.md.
+       measured at commit e1b1b41. See docs/numerical_noise.md.
     """
     # Strategy:
     # Convert all the values to 1.0 if they're > 0.0 and 0.0 otherwise
@@ -84,7 +84,7 @@ def bool_all_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit a979f69. See docs/numerical_noise.md.
+       measured at commit e1b1b41. See docs/numerical_noise.md.
     """
     return compare(
         sum_nodes(inp_list),
@@ -107,7 +107,7 @@ def bool_not(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit a979f69. See docs/numerical_noise.md.
+       measured at commit e1b1b41. See docs/numerical_noise.md.
     """
     return compare(inp, thresh=0.0, true_level=-1.0, false_level=1.0)
 
@@ -126,7 +126,7 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit a979f69. See docs/numerical_noise.md.
+       measured at commit e1b1b41. See docs/numerical_noise.md.
     """
     # If value1 == c, result is 1
     # else result is -1
@@ -145,7 +145,9 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
         output_proj=output_proj,
         output_bias=output_bias,
     )
-    return assert_matches_value_type(result, NodeValueType.sign())
+    return assert_matches_value_type(
+        result, NodeValueType(value_range=Range(-1.0, 1.0))
+    )
 
 
 def cond_add_vector(
@@ -200,25 +202,17 @@ def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
     vt = inp.value_type
     r = vt.value_range
     if not r.is_finite():
-        return NodeValueType.unknown()
-    out_range = Range(min(0.0, r.lo), max(0.0, r.hi))
-    if not cond.value_type.is_sign:
-        return NodeValueType(value_range=out_range)
-    if vt.is_binary:
-        return NodeValueType(
-            value_range=out_range,
-            is_integer=vt.is_integer,
-            is_binary=vt.is_binary,
-        )
-    if vt.is_integer:
-        return NodeValueType(
-            value_range=out_range,
-            is_integer=vt.is_integer,
-        )
-    return NodeValueType(value_range=out_range)
+        return NodeValueType()
+    return NodeValueType(value_range=Range(min(0.0, r.lo), max(0.0, r.hi)))
 
 
-def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
+def cond_gate(
+    cond: Node,
+    inp: Node,
+    *,
+    approximate: bool = True,
+    c_tol: float = 0.005,
+) -> Node:
     """
     Gates the value of a node based on a condition. If the condition is true,
     outputs the value. If false, outputs a zero tensor of the same shape as value.
@@ -235,20 +229,42 @@ def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
             noise on the on-side); the second gates ``inp`` via
             ``ReLU(±inp − M·c_off)``. The on-path is float-exact and immune to
             cond noise; costs one extra MLP sublayer.
+        c_tol: Maximum acceptable deviation of ``|cond|`` from 1. When
+            ``approximate=True``, an Assert checks ``||cond| - 1| <= c_tol``
+            and the output's semantic bound is widened by ``M * c_tol`` to
+            account for the amplified condition noise. Default 0.005
+            matches typical far-field compare noise.
 
     Returns:
         Node: Output node after applying the gate based on condition.
 
     .. noise-footer::
 
-       Max error: 3.052e-05 abs, 0.00399 rel over 4096 samples;
-       measured at commit a979f69. See docs/numerical_noise.md.
+       Max error: 0.0009766 abs, 0.3885 rel over 4096 samples;
+       measured at commit e1b1b41. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
     d = len(inp)
     M = _max_abs_or_raise(inp.value_type, "cond_gate")
 
     if approximate:
+        from torchwright.graph.misc import Assert
+
+        def _cond_check(x: torch.Tensor) -> tuple:
+            deviation = (x.abs() - 1.0).abs()
+            bad = deviation > c_tol
+            if not bad.any():
+                return True, ""
+            from torchwright.graph.asserts import _format_bad
+
+            return False, (f"expected ||cond| - 1| <= {c_tol}; {_format_bad(x, bad)}")
+
+        cond = Assert(
+            cond,
+            _cond_check,
+            message=f"cond near ±1 (c_tol={c_tol})",
+            claimed_type=NodeValueType(value_range=Range(-1.0 - c_tol, 1.0 + c_tol)),
+        )
         d_hidden = 2 * d
         input_proj = torch.zeros(d_hidden, 1 + d)
         input_bias = torch.zeros(d_hidden)
@@ -310,12 +326,17 @@ def cond_gate(cond: Node, inp: Node, *, approximate: bool = True) -> Node:
 
     vt = _cond_gate_output_type(cond, inp)
     if vt != NodeValueType.unknown():
-        gate_atol = max(1e-3, M / step_sharpness) if approximate else 1e-3
+        gate_atol = M * c_tol if approximate else 1e-3
         result = assert_matches_value_type(result, vt, atol=gate_atol)
     from torchwright.graph.affine_rules import (
         _apply_semantic_override,
         _cond_gate_semantic_bound,
     )
 
-    _apply_semantic_override(result, _cond_gate_semantic_bound(inp._affine_bound, inp))
+    _apply_semantic_override(
+        result,
+        _cond_gate_semantic_bound(
+            inp._affine_bound, inp, c_tol=c_tol if approximate else 0.0, M=M
+        ),
+    )
     return result

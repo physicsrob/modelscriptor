@@ -57,6 +57,90 @@ designed to concentrate the softmax on a single key (e.g., `_QUERY_GAIN =
 property belongs in an attention-design reference, not an op noise
 reference; see plan 2 (compiler assertions) for a better home.
 
+### Input-amplification hazards (the Phase E trap, now partially mitigated)
+
+The per-op numbers in `numerical_noise.md` are measured on **clean input
+distributions**. They do **not** characterise what happens when the op
+receives noisy inputs. Gate ops — `cond_gate`, `select`,
+`attend_mean_where` — contain an internal constant that multiplies an
+input, so an upstream deviation of `ε` at that input produces ~`gain · ε`
+of output error. Per-op bounds are **not additive** through a chain
+containing any such op.
+
+**What main already fixed.** `cond_gate` (`torchwright/ops/logic_ops.py`)
+and `select` (`torchwright/ops/map_select.py`) now use
+`_GATE_OFFSET_SAFETY_FACTOR = 2.0` scaled against the gated input's
+declared `value_range` — so the gain is `~2·max|inp|` rather than the
+former hardcoded `big_offset = 1000`. For a typical boolean-domain `inp`
+(|inp| ≤ 1) this drops the amplification from 1000× to ~2×. The
+not-additive caveat still applies, but the hazard is proportional rather
+than catastrophic.
+
+**What remains.** `attend_mean_where`'s validity mask still uses
+`_VALIDITY_DIRECT = 1000` (`torchwright/ops/attention_ops.py:134`). Any
+leakage of noise onto the validity bit gets multiplied by 1000 inside the
+attention logit. This op is not yet wired into the measurement pipeline
+and is a reasonable follow-up.
+
+**Worked Phase E example (historical).** Before the safety-factor fix,
+on scene `(px=3, py=2, angle=20)`, a BSP-side `compare` at threshold 0.5
+produced outputs ~0.0017 inside its ramp zone — well within `compare`'s
+own design envelope. That 0.0017 became the input-noise to `cond_gate`,
+which multiplied by `big_offset = 1000` to yield a uniform 1.7-unit bias
+on every WALL position's `side_P_vec`. The bias propagated through the
+48-wide `bsp_rank` aggregation (coefficient magnitudes up to N/2) and
+materialised as a 1593-unit divergence at `Linear(id=989)`. Every op was
+inside its stated budget; the chain was not. The root-cause fix landed
+as `f0e6f86 feat: approximate flag on gate ops + remove big_offset`; see
+`docs/postmortems/phase_e_xfail.md` for the full trace.
+
+### Rel-error reporting: ramp-zone artefacts
+
+For `compare`, `floor_int`, `linear_bin_index`, and the boolean ops
+(`bool_any_true`, `bool_all_true`, `bool_not`, `equals_vector`), the
+reference is a discrete step function — the op is approximating a
+piecewise-constant target through a small continuous ramp. Samples that
+land inside the ramp legitimately report large absolute *and* relative
+error because the reference jumps while the approximation slopes. The
+numbers in `numerical_noise.md` at e.g. `compare_near_thresh_0` (abs
+≈ 2.0, rel ≈ 2.0) are diagnostic of ramp width, not a defect of the
+op. Read ramp-zone distribution rows as "here is how the ramp looks,"
+not as "here is an error budget."
+
+### Known gap: reciprocal sorted callsite blocked on op-math
+
+`doom_reciprocal_sorted` is defined in `scripts/measure_op_noise.py` but
+temporarily **not** wired into the `reciprocal` `TargetOp`. The
+production callsite at `torchwright/doom/stages/wall.py:813` uses
+`reciprocal(denom_abs, min_value=0.1, max_value=max_denom, step=0.1)`,
+which creates ~500 geometric breakpoints. Summing that many ReLU terms
+in float32 accumulates ~2e-3 of error at the tail of the output range,
+exceeding `piecewise_linear(clamp=True)`'s declared `atol=1e-3` on its
+output `value_range`. The runtime assertion in
+`assert_matches_value_type` fires on the trailing samples, and the
+measurement pipeline can't complete.
+
+This is an **op-math precision-claim mismatch**, not a measurement
+issue. Two fixes are both op-math:
+- `piecewise_linear(clamp=True)` could pass a looser `atol` to
+  `assert_matches_value_type` proportional to breakpoint count (the
+  expected float32 accumulation).
+- The compiled implementation of `piecewise_linear` could be tightened
+  so its output genuinely honors the declared range to 1e-3.
+
+**Latent production implication.** The same assertion would fire at
+runtime in the DOOM game graph if `denom_abs` ever clamps up to
+`max_denom` during play — the measurement pipeline just surfaces it
+first because it probes the edge regime deliberately. A fix should be
+cross-referenced against `wall.py:813` to confirm both callsites
+benefit.
+
+Restore the measurement by (a) re-adding `doom_reciprocal_sorted` to
+`reciprocal`'s `distribution_names`, and (b) providing a
+`build_graphs_per_distribution` entry `reciprocal(nodes["x"],
+min_value=0.1, max_value=50.0, step=0.1)` — both are left as NOTEs in
+`scripts/measure_op_noise.py`.
+
 ## Production call-sites
 
 Which DOOM callsite each `doom_*` distribution covers. Callers editing any
@@ -65,12 +149,12 @@ changes.
 
 | Callsite | What it computes | Distribution | Op |
 | --- | --- | --- | --- |
-| `torchwright/doom/stages/wall.py:339` | `inv_abs_num_t = reciprocal(abs_num_t, min=0.3, max=…)` | `doom_reciprocal_wall` | `reciprocal` |
-| `torchwright/doom/stages/sorted.py:439` | `inv_denom_abs = reciprocal(denom_abs, min=0.1, max=…)` | `doom_reciprocal_sorted` | `reciprocal` |
-| `torchwright/doom/stages/wall.py:263` family | `sort_ey_cos`, `sort_ex_sin`, etc. via `piecewise_linear_2d` | `doom_diff_trig` | `piecewise_linear_2d` |
-| `torchwright/doom/stages/wall.py:205` family | `p_dx_ey`, `p_dy_ex`, etc. via `piecewise_linear_2d` | `doom_diff_vel` | `piecewise_linear_2d` |
-| `torchwright/doom/stages/sorted.py:549` | `atan_front_* = low_rank_2d(cross, dot, …, rank=3)` | `doom_atan_cross_dot` | `low_rank_2d` |
-| `torchwright/doom/stages/wall.py:386` | BSP side-bit compare (threshold 0.5) | `compare_near_thresh_05` | `compare` |
+| `torchwright/doom/stages/wall.py:431` | `inv_abs_num_t = reciprocal(abs_num_t, min=0.3, max=…)` | `doom_reciprocal_wall` | `reciprocal` |
+| `torchwright/doom/stages/wall.py:813` | `inv_denom_abs = reciprocal(denom_abs, min=0.1, max=…)` | `doom_reciprocal_sorted` (currently unwired, see "Known gap" above) | `reciprocal` |
+| `torchwright/doom/stages/wall.py` (family) | `sort_ey_cos`, `sort_ex_sin`, etc. via `piecewise_linear_2d` | `doom_diff_trig` | `piecewise_linear_2d` |
+| `torchwright/doom/stages/wall.py` (family) | `p_dx_ey`, `p_dy_ex`, etc. via `piecewise_linear_2d` | `doom_diff_vel` | `piecewise_linear_2d` |
+| `torchwright/doom/stages/sorted.py` | `atan_front_* = low_rank_2d(cross, dot, …, rank=3)` | `doom_atan_cross_dot` | `low_rank_2d` |
+| `torchwright/doom/stages/wall.py` | BSP side-bit compare (threshold 0.5) | `compare_near_thresh_05` | `compare` |
 
 Foundation ops (`piecewise_linear`, `square`, `square_signed`,
 `multiply_integers`, the exact negative controls, and the logic ops) are

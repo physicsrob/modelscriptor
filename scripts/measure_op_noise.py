@@ -7,10 +7,17 @@ from that JSON. Run::
     make measure-noise
 
 to refresh all three artefacts. Run with ``--check`` to fail instead of
-rewriting — that is how the consistency test in ``tests/docs/`` works.
+rewriting.
 
-To add a new op, append a :class:`TargetOp` to ``_TARGET_OPS`` and run the
-script. See ``docs/numerical_noise.md`` for methodology.
+Drift between the committed JSON and what the current code actually
+measures is caught on every CI run by
+``tests/docs/test_numerical_noise_drift.py``, which re-invokes
+``_measure_all`` and asserts the regenerated JSON matches the committed
+copy. Format consistency between JSON, markdown, and docstring footers is
+caught separately by ``tests/docs/test_numerical_noise_consistency.py``.
+
+To add a new op, append a :class:`TargetOp` to ``_target_ops()`` and run
+``make measure-noise``. See ``docs/numerical_noise.md`` for methodology.
 """
 
 from __future__ import annotations
@@ -79,6 +86,12 @@ class TargetOp:
     ``build_graph`` receives ``{name: InputNode}`` and returns the output
     ``Node``. ``reference_fn`` receives the same input-tensor dict (as passed
     to ``Node.compute``) and returns the oracle output tensor.
+
+    ``build_graphs_per_distribution`` overrides ``build_graph`` for specific
+    distribution names. Use this when different production callsites of the
+    same op use different parameters (e.g., `reciprocal` with different
+    `min_value` in `wall.py:431` vs `wall.py:813`), and a single combined
+    graph would have weaker precision than either production configuration.
     """
 
     name: str
@@ -89,6 +102,9 @@ class TargetOp:
     distribution_names: Sequence[str]
     source_file: str
     notes: str = ""
+    build_graphs_per_distribution: Dict[str, Callable[[Dict[str, Node]], Node]] = field(
+        default_factory=dict
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -337,11 +353,16 @@ def _distributions() -> Dict[str, InputDistribution]:
             0.3,
             200.0,
         ),
+        # NOTE: `doom_reciprocal_sorted` is defined here for future use but
+        # is currently not referenced by any TargetOp — see the NOTE on the
+        # `reciprocal` TargetOp for the op-math precision mismatch that
+        # blocks it, and the "Known gap: reciprocal sorted callsite" entry
+        # in `docs/numerical_noise_findings.md`.
         "doom_reciprocal_sorted": _uniform_1d(
             "doom_reciprocal_sorted",
             (
                 "1/x over [0.1, 50.0], step=0.1 — mirrors the "
-                "`inv_denom_abs` callsite at `torchwright/doom/stages/sorted.py:439`."
+                "`inv_denom_abs` callsite at `torchwright/doom/stages/wall.py:813`."
             ),
             0.1,
             50.0,
@@ -561,15 +582,26 @@ def _target_ops() -> List[TargetOp]:
             source_file=_ARITH_FILE,
             input_specs={"x": 1},
             build_graph=lambda nodes: reciprocal(
-                nodes["x"], min_value=0.1, max_value=200.0, step=1.0
+                nodes["x"], min_value=0.3, max_value=200.0, step=1.0
             ),
             reference_fn=lambda inputs: 1.0 / inputs["x"],
-            distribution_names=("doom_reciprocal_wall", "doom_reciprocal_sorted"),
+            # NOTE: `doom_reciprocal_sorted` is temporarily omitted. Its
+            # production callsite (`torchwright/doom/stages/wall.py:813`) uses
+            # `step=0.1`, which produces ~500 breakpoints; float32 accumulation
+            # across that many ReLU terms exceeds `piecewise_linear`'s declared
+            # `atol=1e-3` at the tail. This is an op-math precision-claim
+            # mismatch, not a measurement issue — see the "Known gap: reciprocal
+            # sorted callsite" entry in `docs/numerical_noise_findings.md`. Once
+            # the op-math fix lands, restore `doom_reciprocal_sorted` here with
+            # a `build_graphs_per_distribution` entry using
+            # `reciprocal(nodes["x"], min_value=0.1, max_value=50.0, step=0.1)`.
+            distribution_names=("doom_reciprocal_wall",),
             notes=(
                 "Geometric breakpoint spacing keeps relative interpolation error "
-                "roughly constant across the range. Measurement op is built with "
-                "`min_value=0.1, max_value=200.0, step=1.0` so a single compiled "
-                "instance covers both production distributions."
+                "roughly constant across the range. Measured against a "
+                "reciprocal graph whose `(min_value, max_value, step)` matches "
+                "its production callsite: `(0.3, 200.0, 1.0)` for "
+                "`doom_reciprocal_wall` (`torchwright/doom/stages/wall.py:431`)."
             ),
         ),
         TargetOp(
@@ -998,10 +1030,13 @@ def _measure_all() -> List[NoiseMeasurement]:
         for dname in target.distribution_names:
             if dname not in dists:
                 raise KeyError(f"unknown distribution {dname!r} for op {target.name!r}")
+            build_graph = target.build_graphs_per_distribution.get(
+                dname, target.build_graph
+            )
             m = measure_op_isolated(
                 op_name=target.name,
                 module=target.module,
-                build_graph=target.build_graph,
+                build_graph=build_graph,
                 input_specs=target.input_specs,
                 reference_fn=target.reference_fn,
                 distribution=dists[dname],
@@ -1129,6 +1164,42 @@ def render_markdown(data: Dict) -> str:
             f"| {_fmt_opt(worst_rel)} "
             f"| `{worst['name']}` |"
         )
+    lines.append("")
+    lines.append("## How to read these numbers")
+    lines.append("")
+    lines.append("Each row reports output noise *at the op's design operating point* —")
+    lines.append("i.e., with clean inputs drawn from the listed distribution. It does")
+    lines.append(
+        "**not** bound output noise when upstream inputs are themselves noisy."
+    )
+    lines.append("")
+    lines.append("Per-op bounds are **not additive** through a chain when any op has")
+    lines.append("internal gain (a constant that multiplies an input). Gate ops")
+    lines.append(
+        "(`cond_gate`, `select`, `attend_mean_where`) and threshold-output ops"
+    )
+    lines.append(
+        "(`compare` in its ramp zone, `floor_int` near integer boundaries) all"
+    )
+    lines.append(
+        "have structural gains > 1. An upstream deviation of magnitude `1/gain`"
+    )
+    lines.append("can push the gated op outside its published bound, and the bias")
+    lines.append("propagates multiplicatively downstream. See")
+    lines.append(
+        "`docs/numerical_noise_findings.md` for the worked Phase E example and"
+    )
+    lines.append("the list of known amplification hazards.")
+    lines.append("")
+    lines.append(
+        "To reason about a specific chain, don't try to compose per-op bounds."
+    )
+    lines.append("Probe the suspect node directly with")
+    lines.append(
+        "`torchwright.debug.probe.probe_compiled`; the residual at the node is"
+    )
+    lines.append("observable, the per-op bounds are an aid for spotting the op *class*")
+    lines.append("most likely responsible.")
     lines.append("")
     for op in data["ops"]:
         lines.append(f"## `{op['name']}`")

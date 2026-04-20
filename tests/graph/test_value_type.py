@@ -1,16 +1,11 @@
-"""Unit tests for ``Range`` arithmetic, ``NodeValueType`` factories, and
-their cross-field invariants.
-"""
+"""Unit tests for ``Range`` arithmetic and ``NodeValueType``."""
 
 import math
 
 import pytest
 
 from torchwright.graph import NodeValueType, Range
-from torchwright.graph.value_type import (
-    intersect_element_props,
-    tightened_with,
-)
+from torchwright.graph.value_type import tightened_with
 
 # --- Range ------------------------------------------------------------
 
@@ -62,146 +57,38 @@ def test_range_contains():
     assert not outer.contains(Range(-1.0, 5.0))
 
 
-# --- NodeValueType factories -----------------------------------------
+# --- NodeValueType ---------------------------------------------------
 
 
-def test_unknown_has_no_properties():
+def test_unknown_has_unbounded_range():
     t = NodeValueType.unknown()
     assert t.value_range == Range.unbounded()
-    assert not t.is_integer
-    assert not t.is_binary
-    assert not t.is_sign
-    assert not t.is_one_hot
 
 
-def test_integer_factory_defaults_to_unbounded():
-    t = NodeValueType.integer()
-    assert t.is_integer
-    assert t.value_range == Range.unbounded()
-
-
-def test_integer_factory_with_bounds():
-    t = NodeValueType.integer(0, 9)
-    assert t.is_integer
+def test_bounded_factory():
+    t = NodeValueType.bounded(0.0, 9.0)
     assert t.value_range == Range(0.0, 9.0)
-
-
-def test_binary_factory():
-    t = NodeValueType.binary()
-    assert t.is_binary and t.is_integer
-    assert t.value_range == Range(0.0, 1.0)
-
-
-def test_sign_factory():
-    t = NodeValueType.sign()
-    assert t.is_sign and t.is_integer
-    assert t.value_range == Range(-1.0, 1.0)
-
-
-def test_one_hot_factory_implies_binary():
-    t = NodeValueType.one_hot()
-    assert t.is_one_hot and t.is_binary and t.is_integer
-
-
-# --- Invariants -------------------------------------------------------
-
-
-def test_is_binary_requires_is_integer():
-    with pytest.raises(ValueError):
-        NodeValueType(value_range=Range(0.0, 1.0), is_binary=True, is_integer=False)
-
-
-def test_is_binary_allows_any_range():
-    t = NodeValueType(value_range=Range(0.0, 2.0), is_integer=True, is_binary=True)
-    assert t.is_binary
-
-
-def test_is_sign_allows_any_range():
-    t = NodeValueType(value_range=Range(-2.0, 1.0), is_integer=True, is_sign=True)
-    assert t.is_sign
-
-
-def test_is_one_hot_requires_is_binary():
-    with pytest.raises(ValueError):
-        NodeValueType(
-            value_range=Range(0.0, 1.0),
-            is_integer=True,
-            is_binary=False,
-            is_one_hot=True,
-        )
 
 
 # --- Combinators ------------------------------------------------------
 
 
-def test_intersect_element_props_keeps_common_properties():
-    a = NodeValueType.integer(0, 9)
-    b = NodeValueType.integer(-5, 3)
-    m = intersect_element_props(a, b)
-    assert m.is_integer
-    assert not m.is_binary
-    assert not m.is_one_hot
+def test_tightened_with_intersects_ranges():
+    a = NodeValueType.bounded(-5.0, 5.0)
+    b = NodeValueType.bounded(0.0, 3.0)
+    m = tightened_with(a, b)
+    assert m.value_range == Range(0.0, 3.0)
 
 
-def test_intersect_drops_mismatched_properties():
-    a = NodeValueType.binary()
-    b = NodeValueType.integer(0, 9)
-    m = intersect_element_props(a, b)
-    assert m.is_integer
-    assert not m.is_binary
-    assert not m.is_one_hot
-
-
-def test_drop_vector_props():
-    t = NodeValueType.one_hot().drop_vector_props()
-    assert t.is_binary
-    assert not t.is_one_hot
-
-
-# --- Bool structural flags -----------------------------------------------
-
-
-def test_true_is_truthy():
-    assert True
-
-
-def test_false_is_falsy():
-    assert not False
-
-
-def test_factory_defaults_to_true():
-    assert NodeValueType.integer().is_integer is True
-    assert NodeValueType.binary().is_binary is True
-    assert NodeValueType.sign().is_sign is True
-    assert NodeValueType.one_hot().is_one_hot is True
-
-
-# --- Combinators with bool flags -----------------------------------------
-
-
-def test_intersect_element_props_ands_flags():
-    a = NodeValueType.integer(0, 9)
-    b = NodeValueType.integer(-5, 3)
-    m = intersect_element_props(a, b)
-    assert m.is_integer is True
-
-
-def test_intersect_element_props_drops_when_one_missing():
-    a = NodeValueType.integer(0, 9)
-    b = NodeValueType.bounded(-5, 3)
-    m = intersect_element_props(a, b)
-    assert m.is_integer is False
-
-
-def test_tightened_with_or_semantics():
+def test_tightened_with_unbounded_and_bounded():
     a = NodeValueType.unknown()
-    b = NodeValueType.integer(0, 9)
+    b = NodeValueType.bounded(0.0, 9.0)
     m = tightened_with(a, b)
-    assert m.is_integer is True
+    assert m.value_range == Range(0.0, 9.0)
 
 
-def test_tightened_with_both_true():
-    a = NodeValueType.integer(0, 9)
-    b = NodeValueType.integer(0, 9)
+def test_tightened_with_both_same_range():
+    a = NodeValueType.bounded(0.0, 9.0)
+    b = NodeValueType.bounded(0.0, 9.0)
     m = tightened_with(a, b)
-    assert m.is_integer is True
+    assert m.value_range == Range(0.0, 9.0)

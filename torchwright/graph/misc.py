@@ -1,11 +1,6 @@
-from functools import reduce
 from typing import Callable, List, Dict, Optional, Tuple
 from torchwright.graph import Node
-from torchwright.graph.value_type import (
-    NodeValueType,
-    intersect_element_props,
-    is_integer_tensor,
-)
+from torchwright.graph.value_type import NodeValueType
 
 import torch
 
@@ -83,18 +78,7 @@ class Concatenate(Node):
         return torch.cat([x.compute(n_pos, input_values) for x in self.inputs], dim=-1)
 
     def compute_value_type(self) -> NodeValueType:
-        if not self.inputs:
-            return NodeValueType.unknown()
-        result = reduce(
-            intersect_element_props,
-            (inp.value_type for inp in self.inputs),
-        )
-        return NodeValueType(
-            is_integer=result.is_integer,
-            is_binary=result.is_binary,
-            is_sign=result.is_sign,
-            is_one_hot=result.is_one_hot,
-        )
+        return NodeValueType()
 
     def flatten_inputs(self: Node) -> List[Node]:
         # Flatten concatenation and return the list of nodes
@@ -116,10 +100,7 @@ class Add(Node):
         return input1.compute(n_pos, input_values) + input2.compute(n_pos, input_values)
 
     def compute_value_type(self) -> NodeValueType:
-        a, b = self.inputs[0].value_type, self.inputs[1].value_type
-        return NodeValueType(
-            is_integer=a.is_integer and b.is_integer,
-        )
+        return NodeValueType()
 
     def other_input(self, node: Node):
         if self.inputs[0] == node:
@@ -142,21 +123,14 @@ class LiteralValue(Node):
         return x
 
     def compute_value_type(self) -> NodeValueType:
+        from torchwright.graph.value_type import Range
+
         v = self.value
         if v.numel() == 0:
-            return NodeValueType.unknown()
+            return NodeValueType()
         lo = float(v.min().item())
         hi = float(v.max().item())
-        is_int = is_integer_tensor(v)
-        is_bin = is_int and lo >= 0.0 and hi <= 1.0
-        is_sgn = is_int and lo >= -1.0 and hi <= 1.0 and not is_bin
-        is_one_hot = is_bin and bool(v.sum().eq(1).item())
-        return NodeValueType(
-            is_integer=is_int,
-            is_binary=is_bin,
-            is_sign=is_sgn,
-            is_one_hot=is_one_hot,
-        )
+        return NodeValueType(value_range=Range(lo, hi))
 
     def is_zero(self):
         return self.value.eq(0).all()
@@ -233,13 +207,7 @@ class Assert(Node):
 
     def compute_value_type(self) -> NodeValueType:
         if self._claimed_type is not None:
-            ct = self._claimed_type
-            return NodeValueType(
-                is_integer=ct.is_integer,
-                is_binary=ct.is_binary,
-                is_sign=ct.is_sign,
-                is_one_hot=ct.is_one_hot,
-            )
+            return NodeValueType()
         return self.inputs[0].value_type
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:

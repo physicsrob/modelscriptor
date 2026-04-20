@@ -1,10 +1,10 @@
-"""Static value-property types attached to every Node.
+"""Static value-range types attached to every Node.
 
 Each Node has a ``value_type: NodeValueType`` that summarises what we
-statically know about its output tensor — element range, integer-ness,
-one-hot-ness, and so on. Propagation rules defined per-op populate this
-eagerly at graph-build time, and primitives can enforce contracts on
-their inputs via the helpers in ``torchwright.graph.asserts``.
+statically know about its output tensor's element range. Propagation
+rules defined per-op populate this eagerly at graph-build time, and
+primitives can enforce contracts on their inputs via the helpers in
+``torchwright.graph.asserts``.
 
 ``Range`` uses ±inf for unbounded sides so arithmetic is total; no
 ``Optional[Range]`` handling is needed at every rule site.
@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
-from typing import Optional
 
 _INF = math.inf
 
@@ -79,64 +78,17 @@ class Range:
 class NodeValueType:
     """Static properties of a node's output tensor.
 
-    Element properties hold for every scalar in the output; vector
-    properties describe the width-dim vector at each position.
-
-    Each structural property is a plain ``bool``: ``True`` means the
-    property is claimed, ``False`` means no claim.
+    Tracks the value_range: a closed interval bounding every scalar
+    element of the output.
     """
 
-    # --- Element properties ---
     value_range: Range = field(default_factory=Range.unbounded)
-    is_integer: bool = False
-    is_binary: bool = False
-    is_sign: bool = False
-
-    # --- Vector properties ---
-    is_one_hot: bool = False
-
-    def __post_init__(self):
-        if self.is_binary and not self.is_integer:
-            raise ValueError("is_binary implies is_integer")
-        if self.is_sign and not self.is_integer:
-            raise ValueError("is_sign implies is_integer")
-        if self.is_one_hot and not self.is_binary:
-            raise ValueError("is_one_hot implies is_binary")
 
     # --- Factory helpers ------------------------------------------------
 
     @staticmethod
     def unknown() -> "NodeValueType":
         return NodeValueType()
-
-    @staticmethod
-    def integer(
-        lo: Optional[float] = None,
-        hi: Optional[float] = None,
-    ) -> "NodeValueType":
-        r = Range(-_INF if lo is None else float(lo), _INF if hi is None else float(hi))
-        return NodeValueType(value_range=r, is_integer=True)
-
-    @staticmethod
-    def binary() -> "NodeValueType":
-        return NodeValueType(
-            value_range=Range(0.0, 1.0), is_integer=True, is_binary=True
-        )
-
-    @staticmethod
-    def sign() -> "NodeValueType":
-        return NodeValueType(
-            value_range=Range(-1.0, 1.0), is_integer=True, is_sign=True
-        )
-
-    @staticmethod
-    def one_hot() -> "NodeValueType":
-        return NodeValueType(
-            value_range=Range(0.0, 1.0),
-            is_integer=True,
-            is_binary=True,
-            is_one_hot=True,
-        )
 
     @staticmethod
     def bounded(lo: float, hi: float) -> "NodeValueType":
@@ -147,74 +99,15 @@ class NodeValueType:
     def with_range(self, r: Range) -> "NodeValueType":
         return replace(self, value_range=r)
 
-    def drop_vector_props(self) -> "NodeValueType":
-        """Return a copy with vector-level properties cleared.
-
-        Useful when an op preserves element-wise properties but cannot
-        preserve (e.g.) one-hot-ness.
-        """
-        return replace(self, is_one_hot=False)
-
-
-def is_integer_tensor(t) -> bool:
-    """True iff every element of ``t`` equals its rounded value.
-
-    Tolerates ``None`` by returning ``False`` (callers treat
-    missing biases as "unknown" and skip the integer claim).
-    """
-    import torch
-
-    if t is None:
-        return False
-    if not isinstance(t, torch.Tensor):
-        return False
-    if t.numel() == 0:
-        return True
-    return bool(torch.all(t == t.round()).item())
-
 
 def tightened_with(a: NodeValueType, b: NodeValueType) -> NodeValueType:
     """Combine two claims into the strictest type both admit.
 
-    Ranges are intersected; structural claims are OR-ed (either side's
-    claim survives).  Range is further tightened to the invariant
-    constraints implied by the OR-ed claims (e.g. ``is_binary`` forces
-    range ⊆ [0, 1]).
+    Ranges are intersected.
 
     Used by the compiler's Assert-strip pass to transfer an Assert's
     ``claimed_type`` onto the node it wrapped, so downstream analysis
     that runs after stripping still sees the strengthened type.
     """
     r = a.value_range.intersect(b.value_range)
-    is_int = a.is_integer or b.is_integer
-    is_bin = a.is_binary or b.is_binary
-    is_sgn = a.is_sign or b.is_sign
-    is_onehot = a.is_one_hot or b.is_one_hot
-    if is_bin:
-        r = r.intersect(Range(0.0, 1.0))
-    if is_sgn:
-        r = r.intersect(Range(-1.0, 1.0))
-    return NodeValueType(
-        value_range=r,
-        is_integer=is_int,
-        is_binary=is_bin,
-        is_sign=is_sgn,
-        is_one_hot=is_onehot,
-    )
-
-
-def intersect_element_props(a: NodeValueType, b: NodeValueType) -> NodeValueType:
-    """Meet of element-level properties: kept only if both sides have them.
-
-    Used by ops like ``Concatenate`` where the output's per-scalar
-    properties must hold across every contributing input. Vector
-    properties are dropped unconditionally — they rarely survive
-    concatenation. Ranges are not computed here — they come from
-    the affine bound system.
-    """
-    return NodeValueType(
-        is_integer=a.is_integer and b.is_integer,
-        is_binary=a.is_binary and b.is_binary,
-        is_sign=a.is_sign and b.is_sign,
-        is_one_hot=False,
-    )
+    return NodeValueType(value_range=r)

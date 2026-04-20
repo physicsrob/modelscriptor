@@ -73,17 +73,9 @@ def map_to_table(
         diff_abs_sum = diff_abs_sum + (value - default).abs()
     lo = float((default - diff_abs_sum).min().item())
     hi = float((default + diff_abs_sum).max().item())
-    # If all table values and the default are integer-valued tensors,
-    # the output is approximately integer (softmax-leakage on overlapping
-    # keys is the only source of non-integer drift, same reason compare
-    # declares APPROXIMATE).
-    from torchwright.graph.value_type import is_integer_tensor
-
-    all_values = list(key_to_value.values()) + [default]
-    is_int = all(is_integer_tensor(v) for v in all_values)
     return assert_matches_value_type(
         result,
-        NodeValueType(value_range=Range(lo, hi), is_integer=is_int),
+        NodeValueType(value_range=Range(lo, hi)),
     )
 
 
@@ -112,26 +104,7 @@ def _select_output_type(
     fv = false_node.value_type
     r = tv.value_range.union(fv.value_range)
     if not r.is_finite():
-        return NodeValueType.unknown()
-    if not cond.value_type.is_sign:
-        return NodeValueType(value_range=r)
-    is_int = tv.is_integer and fv.is_integer
-    is_bin = tv.is_binary and fv.is_binary
-    is_sgn = tv.is_sign and fv.is_sign
-    is_onehot = tv.is_one_hot and fv.is_one_hot
-    if is_onehot:
-        return NodeValueType(
-            value_range=r,
-            is_integer=is_int,
-            is_binary=is_bin,
-            is_one_hot=is_onehot,
-        )
-    if is_bin:
-        return NodeValueType(value_range=r, is_integer=is_int, is_binary=is_bin)
-    if is_sgn:
-        return NodeValueType(value_range=r, is_integer=is_int, is_sign=is_sgn)
-    if is_int:
-        return NodeValueType(value_range=r, is_integer=is_int)
+        return NodeValueType()
     return NodeValueType(value_range=r)
 
 
@@ -149,6 +122,7 @@ def select(
     false_node: Node,
     *,
     approximate: bool = True,
+    c_tol: float = 0.005,
 ) -> Node:
     """
     Outputs one of two nodes based on a boolean condition.
@@ -166,6 +140,11 @@ def select(
             the second gates each branch with ReLU clipping (no cancellation).
             The winning branch is float-exact and immune to cond noise; costs
             one extra MLP sublayer.
+        c_tol: Maximum acceptable deviation of ``|cond|`` from 1. When
+            ``approximate=True``, an Assert checks ``||cond| - 1| <= c_tol``
+            and the output's semantic bound is widened by ``c_tol * M`` to
+            account for the amplified condition noise. Default 0.005
+            matches typical far-field compare noise.
 
     Returns:
         Node: Either true_node or false_node based on the condition.
@@ -179,6 +158,23 @@ def select(
     M = _select_offset(true_node, false_node, "select")
 
     if approximate:
+        from torchwright.graph.misc import Assert
+
+        def _cond_check(x: torch.Tensor) -> tuple:
+            deviation = (x.abs() - 1.0).abs()
+            bad = deviation > c_tol
+            if not bad.any():
+                return True, ""
+            from torchwright.graph.asserts import _format_bad
+
+            return False, (f"expected ||cond| - 1| <= {c_tol}; {_format_bad(x, bad)}")
+
+        cond = Assert(
+            cond,
+            _cond_check,
+            message=f"cond near ±1 (c_tol={c_tol})",
+            claimed_type=NodeValueType(value_range=Range(-1.0 - c_tol, 1.0 + c_tol)),
+        )
         d_hidden = 2 * d
         input_proj = torch.zeros(d_hidden, 1 + 2 * d)
         input_bias = torch.zeros(d_hidden)
@@ -250,8 +246,9 @@ def select(
 
     vt = _select_output_type(cond, true_node, false_node)
     if vt != NodeValueType.unknown():
-        gate_atol = max(1e-3, M / step_sharpness) if approximate else 1e-3
+        gate_atol = M * c_tol if approximate else 1e-3
         result = assert_matches_value_type(result, vt, atol=gate_atol)
+    tolerance = c_tol * M if approximate else 0.0
     from torchwright.graph.affine_rules import (
         _apply_semantic_override,
         _select_semantic_bound,
@@ -259,7 +256,9 @@ def select(
 
     _apply_semantic_override(
         result,
-        _select_semantic_bound(true_node._affine_bound, false_node._affine_bound),
+        _select_semantic_bound(
+            true_node._affine_bound, false_node._affine_bound, tolerance=tolerance
+        ),
     )
     return result
 
@@ -333,7 +332,9 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
         output_bias=output_bias,
         name="in_range",
     )
-    return assert_matches_value_type(result, NodeValueType.sign())
+    return assert_matches_value_type(
+        result, NodeValueType(value_range=Range(-1.0, 1.0))
+    )
 
 
 def dynamic_extract(
@@ -447,6 +448,7 @@ def broadcast_select(
     d_fill: int,
     *,
     approximate: bool = True,
+    c_tol: float = 0.005,
 ) -> Node:
     """Select between two values at each of N slots, based on per-slot masks.
 
@@ -473,6 +475,10 @@ def broadcast_select(
             sublayer 2 gates each branch by ReLU clipping against
             ``M·c_on`` / ``M·c_off`` — no cancellation, winning branch
             is float-exact at mask=±1.
+        c_tol: Maximum acceptable deviation of ``|masks[i]|`` from 1.
+            When ``approximate=True``, an Assert checks
+            ``||masks| - 1| <= c_tol`` per element and the output's
+            semantic bound is widened by ``c_tol * M``. Default 0.005.
 
     Returns:
         Node of width n_slots * d_fill.
@@ -536,7 +542,7 @@ def broadcast_select(
                 output_proj[unit_neg_t, out_idx] = 1.0
                 output_proj[unit_neg_b, out_idx] = -1.0
 
-        return linear_relu_linear(
+        result = linear_relu_linear(
             input_node=inp,
             input_proj=input_proj,
             input_bias=input_bias,
@@ -544,6 +550,32 @@ def broadcast_select(
             output_bias=output_bias,
             name="broadcast_select",
         )
+        tv = true_value.value_type
+        fv = false_value.value_type
+        r = tv.value_range.union(fv.value_range)
+        if r.is_finite():
+            gate_atol = M * c_tol
+            result = assert_matches_value_type(
+                result, NodeValueType(value_range=r), atol=gate_atol
+            )
+        from torchwright.graph.affine_rules import (
+            _apply_semantic_override,
+            _broadcast_select_semantic_bound,
+        )
+
+        _apply_semantic_override(
+            result,
+            _broadcast_select_semantic_bound(
+                true_value._affine_bound,
+                false_value._affine_bound,
+                n_slots,
+                d_fill,
+                true_is_broadcast,
+                false_is_broadcast,
+                tolerance=c_tol * M,
+            ),
+        )
+        return result
 
     # approximate=False: two sublayers, cancellation-free.
     # Sublayer 1: c_off[i] = ReLU(-masks[i]), c_on[i] = ReLU(masks[i]).

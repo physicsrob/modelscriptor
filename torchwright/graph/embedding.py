@@ -4,7 +4,7 @@ from torchwright.graph import Node
 import torch
 
 from torchwright.graph.spherical_codes import get_spherical_codes
-from torchwright.graph.value_type import NodeValueType, is_integer_tensor
+from torchwright.graph.value_type import NodeValueType
 
 unk_token = "<unk>"
 special_tokens = [unk_token]
@@ -62,10 +62,7 @@ class Embedding(Node):
         return result
 
     def compute_value_type(self) -> NodeValueType:
-        t = self.table
-        if t.numel() == 0:
-            return NodeValueType.unknown()
-        return NodeValueType(is_integer=is_integer_tensor(t))
+        return NodeValueType()
 
     def num_params(self):
         return self.d_embed * self.max_vocab
