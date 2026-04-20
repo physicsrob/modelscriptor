@@ -279,13 +279,21 @@ def doom_graph():
 
         # Known input-range mismatches (see module docstring).
         e8_names = {"token_type", "texture_id_e8"}
-        feedback_names = {"render_feedback"}
+        # Render state inputs have over-declared ranges (0-255 for column
+        # indices that are really 0-W at runtime).  The full declared range
+        # causes spurious bound violations in the state machine.
+        render_state_names = {
+            "render_col",
+            "render_vis_lo",
+            "render_vis_hi",
+            "render_chunk_start",
+        }
 
         tainted: Set[int] = set()
         for n in input_nodes:
             if n.name in e8_names:
                 tainted |= _find_tainted_nodes(all_nodes, n, stop_at_overrides=True)
-            elif n.name in feedback_names:
+            elif n.name in render_state_names:
                 tainted |= _find_tainted_nodes(all_nodes, n, stop_at_overrides=False)
 
     return {

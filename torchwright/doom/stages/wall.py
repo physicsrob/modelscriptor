@@ -143,11 +143,6 @@ def build_wall(
     with annotate("wall/intersection"):
         sort_den, sort_num_t = _compute_central_ray_intersection(inputs)
 
-    with annotate("wall/precompute"):
-        precomp_C, precomp_D, precomp_E, precomp_H_inv = _compute_render_precomputation(
-            inputs, sort_num_t, H, max_coord
-        )
-
     with annotate("bsp/rank"):
         bsp_rank, is_renderable = _compute_bsp_rank(
             inputs,
@@ -187,11 +182,6 @@ def build_wall(
         inputs.wall_bx,
         inputs.wall_by,
         inputs.wall_tex_id,
-        sort_den,
-        precomp_C,
-        precomp_D,
-        precomp_E,
-        precomp_H_inv,
         bsp_rank,
         vis_lo,
         vis_hi,
@@ -349,94 +339,6 @@ def _compute_central_ray_intersection(inputs: WallInputs):
     sort_num_t = add(sort_ey_fx, sort_ex_gy)
 
     return sort_den, sort_num_t
-
-
-def _compute_render_precomputation(
-    inputs: WallInputs,
-    sort_num_t: Node,
-    H: int,
-    max_coord: float,
-):
-    """Rotate wall edge + player-to-A into the player's angular frame.
-
-    RENDER only needs per-column angle offsets (perp_cos, perp_sin) rather
-    than full ray angles.  The precomputed triple (C, D, E) captures the
-    column-independent part; H_inv is the wall-height scale factor.
-
-        C = ey*sin_p + ex*cos_p
-        D = fx*sin_p + gy*cos_p
-        E = fx*cos_p - gy*sin_p
-        H_inv = H / |num_t|
-    """
-    w_ex = subtract(inputs.wall_bx, inputs.wall_ax)
-    w_ey = subtract(inputs.wall_by, inputs.wall_ay)
-    w_fx = subtract(inputs.wall_ax, inputs.player_x)
-    w_gy = subtract(inputs.player_y, inputs.wall_ay)
-
-    sort_ey_sin = piecewise_linear_2d(
-        w_ey,
-        inputs.move_sin,
-        DIFF_BP,
-        TRIG_BP,
-        lambda a, b: a * b,
-        name="sort_ey_sin",
-    )
-    sort_ex_cos = piecewise_linear_2d(
-        w_ex,
-        inputs.move_cos,
-        DIFF_BP,
-        TRIG_BP,
-        lambda a, b: a * b,
-        name="sort_ex_cos",
-    )
-    precomp_C = add(sort_ey_sin, sort_ex_cos)
-
-    sort_fx_sin = piecewise_linear_2d(
-        w_fx,
-        inputs.move_sin,
-        DIFF_BP,
-        TRIG_BP,
-        lambda a, b: a * b,
-        name="sort_fx_sin",
-    )
-    sort_gy_cos = piecewise_linear_2d(
-        w_gy,
-        inputs.move_cos,
-        DIFF_BP,
-        TRIG_BP,
-        lambda a, b: a * b,
-        name="sort_gy_cos",
-    )
-    precomp_D = add(sort_fx_sin, sort_gy_cos)
-
-    sort_fx_cos = piecewise_linear_2d(
-        w_fx,
-        inputs.move_cos,
-        DIFF_BP,
-        TRIG_BP,
-        lambda a, b: a * b,
-        name="sort_fx_cos",
-    )
-    sort_gy_sin = piecewise_linear_2d(
-        w_gy,
-        inputs.move_sin,
-        DIFF_BP,
-        TRIG_BP,
-        lambda a, b: a * b,
-        name="sort_gy_sin",
-    )
-    precomp_E = subtract(sort_fx_cos, sort_gy_sin)
-
-    abs_num_t = abs(sort_num_t)
-    inv_abs_num_t = reciprocal(
-        abs_num_t,
-        min_value=0.3,
-        max_value=2.0 * max_coord * max_coord,
-        step=1.0,
-    )
-    precomp_H_inv = multiply_const(inv_abs_num_t, float(H))
-
-    return precomp_C, precomp_D, precomp_E, precomp_H_inv
 
 
 def _compute_bsp_rank(

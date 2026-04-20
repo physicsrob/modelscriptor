@@ -545,7 +545,7 @@ def _print_critical_path_analysis(all_nodes: Set[Node], output_nodes: Set[Node])
 _TOKEN_TYPE_PREFIXES = [
     ("RENDER", "render/"),
     ("SORTED", "sort/"),
-    ("THINKING", "thinking/"),
+    ("PLAYER", "player/"),
     ("WALL", "wall/"),
     ("BSP", "bsp/"),
     ("INPUT", "input/"),

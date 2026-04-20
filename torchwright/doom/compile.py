@@ -3,16 +3,17 @@
 Multi-phase autoregressive rollout:
 
     Phase -1 — Tex:     TEX_COL×(num_tex × tex_w)  (texture column prefill)
-    Phase 0  — Prefill: INPUT + WALL×N + EOS        (host-driven)
-    Phase 1  — Sort:    SORTED_WALL×N               (host-fed position index)
-    Phase 2  — Render:  RENDER×(dynamic)             (autoregressive, pixels out)
+    Phase 0  — Prefill: INPUT + BSP_NODE×M + WALL×N + EOS
+    Phase 0b — Player:  PLAYER_X + PLAYER_Y + PLAYER_ANGLE
+    Phase 1  — Sort:    SORTED_WALL×N  (host caches sorted wall data)
+    Phase 2  — Render:  RENDER×(dynamic)  (host-driven wall transitions)
 
 The host is a dumb token feeder and pixel bitblitter.  It feeds player
 state at every position, wall geometry at WALL positions, a position
-index at SORTED_WALL positions, and render feedback at RENDER
-positions.  The only host-side logic is copying render feedback
-from each render output to the next input and bitblitting pixels
-to the framebuffer with skip-filled compositing.
+index at SORTED_WALL positions, and discrete wall identity at RENDER
+positions.  The only host-side logic is copying overlaid fields from
+output to input, detecting wall transitions (render_is_new_wall > 0),
+and feeding the next sorted wall's identity on transitions.
 """
 
 import time
@@ -29,10 +30,12 @@ from torchwright.doom.game_graph import (
     E8_BSP_NODE,
     E8_EOS,
     E8_INPUT,
+    E8_PLAYER_ANGLE,
+    E8_PLAYER_X,
+    E8_PLAYER_Y,
     E8_RENDER,
     E8_SORTED_WALL,
     E8_TEX_COL,
-    E8_THINKING,
     E8_WALL,
     TEX_E8_OFFSET,
     build_game_graph,
@@ -96,16 +99,16 @@ def compute_min_d_head(max_walls: int, tex_w: int) -> int:
 
     Three attention patterns drive the requirement:
     - Sort (attend_argmin_above_integer):
-          1 + n_thresholds + d_value = 1 + max_walls + (13 + max_walls)
-    - Render (attend_argmin_unmasked):
-          1 + max_walls + (8 + max_walls)
+          1 + n_thresholds + d_value = 1 + max_walls + (8 + max_walls)
+    - Render wall geometry (attend_argmax_dot):
+          max_walls + 4  (query/key = one-hot, value = geometry)
     - TEX_COL (attend_argmax_dot): 8 + tex_w + 1
     """
-    d_sort_val = 13 + max_walls
+    d_sort_val = 8 + max_walls
     sort_d = 1 + max_walls + d_sort_val
-    render_d = 1 + max_walls + 8 + max_walls
+    render_geom_d = max_walls + 4
     tex_d = 8 + tex_w + 1
-    return max(sort_d, render_d, tex_d)
+    return max(sort_d, render_geom_d, tex_d)
 
 
 def compile_game(
@@ -216,7 +219,6 @@ def _build_row(compiled, max_walls, **kwargs):
         "player_angle": torch.zeros(1, device=device),
         "player_x": torch.zeros(1, device=device),
         "player_y": torch.zeros(1, device=device),
-        "render_feedback": torch.zeros(5, device=device),
         "render_mask": torch.zeros(max_walls_meta, device=device),
         "render_col": torch.zeros(1, device=device),
         "render_is_new_wall": torch.zeros(1, device=device),
@@ -288,10 +290,11 @@ def step_frame(
         2. BSP_NODE×max_bsp_nodes — feed splitting plane coefficients
         3. WALL×N — feed wall geometry + BSP rank coefficients
         4. EOS — feed player position → read resolved state from overflow
-        5. SORTED_WALL×N — host feeds position_index=k for each step
-        6. THINKING/RENDER×(dynamic) — autoregressive: output IS next
-           input.  THINKING selects wall, RENDER renders pixels.  Host
-           reads pixels from overflow region, bitblits to framebuffer.
+        5. PLAYER_X/Y/ANGLE — feed resolved state
+        6. SORTED_WALL×N — host feeds position_index, caches sorted wall data
+        7. RENDER×(dynamic) — host copies overlaid fields, detects wall
+           transitions, feeds next wall identity.  Reads pixels from
+           overflow and bitblits to framebuffer.
     """
     max_walls = int(module.metadata.get("max_walls", 8))
     cs = int(module.metadata.get("chunk_size", 20))
@@ -326,28 +329,21 @@ def step_frame(
     in_by_name = {n: (s, w) for n, s, w in module._input_specs}
     out_by_name = {n: (s, w) for n, s, w in module._output_specs}
 
-    # Input-side offsets (overlaid fields' write targets on the next input)
-    tt_off, _ = in_by_name["token_type"]
-
     # Output-side offsets in the gathered output tensor
     pix_out_s, _ = out_by_name["pixels"]
     col_out_s, _ = out_by_name["col"]
     start_out_s, _ = out_by_name["start"]
     length_out_s, _ = out_by_name["length"]
     done_out_s, _ = out_by_name["done"]
+    sort_done_out_s, _ = out_by_name["sort_done"]
     eos_rx_out_s, _ = out_by_name["eos_resolved_x"]
     eos_ry_out_s, _ = out_by_name["eos_resolved_y"]
     eos_angle_out_s, _ = out_by_name["eos_new_angle"]
 
     # Overlaid fields: any name appearing in both input and output specs.
-    # The host copies these from output to input each step (delta transfer
-    # places them at the same columns in the residual stream, but the
-    # gathered output tensor has its own running layout, so we copy
-    # explicitly).
     overlaid_names = [n for n, _s, _w in module._input_specs if n in out_by_name]
 
-    # Player input tensors (reused at START, WALL, and EOS positions
-    # so the graph computes velocity consistently at all three)
+    # Player input tensors
     input_kw = dict(
         input_forward=torch.tensor([float(inputs.forward)]),
         input_backward=torch.tensor([float(inputs.backward)]),
@@ -377,8 +373,6 @@ def step_frame(
     t_frame = time.perf_counter()
 
     # --- Batched prefill: TEX_COL + INPUT + BSP_NODE + WALL + EOS ---
-    # All prefill tokens are causally ordered and don't depend on each
-    # other's outputs, so we process them in a single batched call.
     t0 = time.perf_counter()
     rows = []
 
@@ -399,10 +393,7 @@ def step_frame(
     # INPUT (controls only here)
     rows.append(_common(token_type=E8_INPUT, **input_kw))
 
-    # BSP_NODE × max_bsp_nodes — real planes first, pad with null planes.
-    # The null plane (nx=0, ny=0, d=0) produces raw=0 at any player
-    # position, so side_P = compare(0,0) is BACK (cond_gate emits zero),
-    # and the padding contributes nothing to any wall's rank.
+    # BSP_NODE × max_bsp_nodes
     for i in range(max_bsp_nodes):
         onehot = torch.zeros(max_bsp_nodes)
         onehot[i] = 1.0
@@ -421,9 +412,7 @@ def step_frame(
             )
         )
 
-    # WALL × N — now each wall carries BSP rank coefficients precomputed
-    # by the host.  Rank = dot(coeffs, side_P_vec) + const is evaluated
-    # in the graph.
+    # WALL × N
     for i, w in enumerate(walls):
         if i < subset.seg_bsp_coeffs.shape[0]:
             coeffs = torch.tensor(
@@ -470,12 +459,7 @@ def step_frame(
     angle = new_angle_raw
 
     def _out_to_input(raw_out):
-        """Map overlaid output fields to a flat input row.
-
-        Every name present in both input and output specs is overlaid —
-        iterate the intersection rather than naming fields explicitly so
-        the host stays layout-agnostic.
-        """
+        """Map overlaid output fields to a flat input row."""
         row = torch.zeros(1, d_input, device=device)
         for name in overlaid_names:
             in_s, w = in_by_name[name]
@@ -483,11 +467,50 @@ def step_frame(
             row[0, in_s : in_s + w] = raw_out[0, out_s : out_s + w]
         return row
 
+    # --- Phase 0b: Player state tokens ---
+    t0 = time.perf_counter()
+    player_row_x = _build_row(
+        module,
+        max_walls,
+        token_type=E8_PLAYER_X,
+        player_x=torch.tensor([px]),
+    )
+    out, past = _step(player_row_x, past, step)
+    step += 1
+
+    player_row_y = _build_row(
+        module,
+        max_walls,
+        token_type=E8_PLAYER_Y,
+        player_y=torch.tensor([py]),
+    )
+    out, past = _step(player_row_y, past, step)
+    step += 1
+
+    player_row_angle = _build_row(
+        module,
+        max_walls,
+        token_type=E8_PLAYER_ANGLE,
+        player_angle=torch.tensor([angle]),
+    )
+    out, past = _step(player_row_angle, past, step)
+    step += 1
+
+    t_player = time.perf_counter() - t0
+    print(f"  player   3 steps  kv={_kv_len(past)}  {t_player*1000:.0f}ms")
+
     # --- Phase 1: Sort ---
     # Each SORTED token gets its position_index from the host (no feedback).
-    # Other input fields are zero (the SORTED computation only uses
-    # position_index + attention to WALL positions in the KV cache).
+    # Host caches sorted wall data from overlaid outputs.
     t0 = time.perf_counter()
+    sorted_walls = []  # list of (wall_j_onehot, vis_lo, vis_hi, tex_id)
+
+    # Output field offsets for sorted wall data
+    wj_out_s, wj_out_w = out_by_name["render_wall_j_onehot"]
+    vlo_out_s, _ = out_by_name["render_vis_lo"]
+    vhi_out_s, _ = out_by_name["render_vis_hi"]
+    tid_out_s, _ = out_by_name["render_tex_id"]
+
     for k in range(N):
         sort_row = _build_row(
             module,
@@ -497,68 +520,105 @@ def step_frame(
         )
         out, past = _step(sort_row, past, step)
         step += 1
-        if "_debug_grd" in out_by_name:
-            grd_s, grd_w = out_by_name["_debug_grd"]
-            grd = out[0, grd_s : grd_s + grd_w].cpu().numpy()
-            print(f"  sort[{k}] grd=[{','.join(f'{v:.3f}' for v in grd)}]")
-        else:
-            print(f"  sort[{k}]")
+
+        # Check sort exhaustion
+        sort_done_val = out[0, sort_done_out_s].item()
+        if sort_done_val > 0.0:
+            print(f"  sort[{k}] exhausted")
+            break
+
+        # Cache sorted wall data from overlaid outputs
+        wall_j_oh = out[0, wj_out_s : wj_out_s + wj_out_w].clone()
+        v_lo = out[0, vlo_out_s].item()
+        v_hi = out[0, vhi_out_s].item()
+        t_id = out[0, tid_out_s].item()
+        sorted_walls.append((wall_j_oh, v_lo, v_hi, t_id))
+        print(f"  sort[{k}] vis=[{v_lo:.0f},{v_hi:.0f}] tex={t_id:.0f}")
 
     t_sort = time.perf_counter() - t0
-    print(f"  sort     {N} steps  kv={_kv_len(past)}  {t_sort*1000:.0f}ms")
+    n_renderable = len(sorted_walls)
+    print(
+        f"  sort     {N} steps  kv={_kv_len(past)}  {t_sort*1000:.0f}ms  "
+        f"renderable={n_renderable}"
+    )
     print(f"  resolved state: px={px:.3f} py={py:.3f} angle={angle:.3f}")
 
-    # --- Phase 2: Render (THINKING + RENDER interleaved) ---
-    # THINKING tokens select a wall.  RENDER tokens render pixels.
-    # The graph decides the next token type in the output.
+    # --- Phase 2: Render (host-driven wall transitions) ---
     t0 = time.perf_counter()
     frame = np.full((H, W, 3), -1.0, dtype=np.float32)
     filled = np.zeros((H, W), dtype=bool)
 
-    # Seed: E8_THINKING with is_new_wall=+1, chunk_start=-1
-    prev = _build_row(
-        module,
-        max_walls,
-        token_type=E8_THINKING,
-        render_is_new_wall=torch.tensor([1.0]),
-        render_chunk_start=torch.tensor([-1.0]),
-    )
+    if n_renderable == 0:
+        render_steps = 0
+    else:
+        # Seed first wall
+        wall_j_oh, v_lo, v_hi, t_id = sorted_walls[0]
+        prev = _build_row(
+            module,
+            max_walls,
+            token_type=E8_RENDER,
+            render_wall_j_onehot=wall_j_oh,
+            render_vis_lo=torch.tensor([v_lo]),
+            render_vis_hi=torch.tensor([v_hi]),
+            render_tex_id=torch.tensor([t_id]),
+            render_is_new_wall=torch.tensor([1.0]),
+            render_chunk_start=torch.tensor([-1.0]),
+        )
 
-    max_render_steps = N * W * (H // cs + 1) + N + 10
-    render_steps = 0
+        wall_idx = 0
+        max_render_steps = n_renderable * W * (H // cs + 1) + n_renderable + 10
+        render_steps = 0
 
-    for k in range(max_render_steps):
-        out, past = _step(prev, past, step)
-        step += 1
-        render_steps += 1
-        raw = out[0].detach().cpu().numpy()
+        for k in range(max_render_steps):
+            out, past = _step(prev, past, step)
+            step += 1
+            render_steps += 1
+            raw = out[0].detach().cpu().numpy()
 
-        # Pixels and metadata from compact output
-        col = int(round(raw[col_out_s]))
-        start_y = int(round(raw[start_out_s]))
-        length = int(round(raw[length_out_s]))
-        done = raw[done_out_s]
-        pix = raw[pix_out_s : pix_out_s + cs * 3].reshape(cs, 3)
+            # Pixels and metadata from overflow output
+            col = int(round(raw[col_out_s]))
+            start_y = int(round(raw[start_out_s]))
+            length = int(round(raw[length_out_s]))
+            done = raw[done_out_s]
+            pix = raw[pix_out_s : pix_out_s + cs * 3].reshape(cs, 3)
 
-        # Bitblit with skip-filled (length=0 for THINKING tokens → no-op)
-        for row_idx in range(length):
-            y = start_y + row_idx
-            if 0 <= y < H and 0 <= col < W and not filled[y, col]:
-                frame[y, col] = pix[row_idx]
-                filled[y, col] = True
+            # Bitblit with skip-filled compositing
+            for row_idx in range(length):
+                y = start_y + row_idx
+                if 0 <= y < H and 0 <= col < W and not filled[y, col]:
+                    frame[y, col] = pix[row_idx]
+                    filled[y, col] = True
 
-        if done > 0.0:
-            break
+            if done > 0.0:
+                break
 
-        # Map compact output to input layout
-        prev = _out_to_input(out)
+            # Map overlaid output to next input
+            prev = _out_to_input(out)
 
-        # Host-side termination: check render_mask
-        rm_out_s, rm_out_w = out_by_name["render_mask"]
-        mask_vals = out[0, rm_out_s : rm_out_s + rm_out_w].cpu().numpy()
-        n_masked = int(np.sum(np.round(mask_vals).clip(0, 1)))
-        if n_masked >= N:
-            break
+            # Detect wall transition: render_is_new_wall > 0 in output
+            inw_in_s, _ = in_by_name["render_is_new_wall"]
+            is_new_wall = prev[0, inw_in_s].item()
+            if is_new_wall > 0.0:
+                wall_idx += 1
+                if wall_idx >= n_renderable:
+                    break
+                # Feed next sorted wall's identity
+                wall_j_oh, v_lo, v_hi, t_id = sorted_walls[wall_idx]
+                wj_in_s, wj_in_w = in_by_name["render_wall_j_onehot"]
+                vlo_in_s, _ = in_by_name["render_vis_lo"]
+                vhi_in_s, _ = in_by_name["render_vis_hi"]
+                tid_in_s, _ = in_by_name["render_tex_id"]
+                prev[0, wj_in_s : wj_in_s + wj_in_w] = wall_j_oh.to(device)
+                prev[0, vlo_in_s] = v_lo
+                prev[0, vhi_in_s] = v_hi
+                prev[0, tid_in_s] = t_id
+
+            # Host-side termination: check render_mask
+            rm_out_s, rm_out_w = out_by_name["render_mask"]
+            mask_vals = out[0, rm_out_s : rm_out_s + rm_out_w].cpu().numpy()
+            n_masked = int(np.sum(np.round(mask_vals).clip(0, 1)))
+            if n_masked >= n_renderable:
+                break
 
     # Fill unfilled pixels with ceiling/floor
     ceil = np.array(config.ceiling_color, dtype=np.float32)
@@ -571,11 +631,14 @@ def step_frame(
 
     t_render = time.perf_counter() - t0
     t_total = time.perf_counter() - t_frame
-    print(
-        f"  render   {render_steps} steps  kv={_kv_len(past)}  "
-        f"{t_render*1000:.0f}ms ({t_render/render_steps*1000:.1f}ms/step)  "
-        f"total={t_total*1000:.0f}ms"
-    )
+    if render_steps > 0:
+        print(
+            f"  render   {render_steps} steps  kv={_kv_len(past)}  "
+            f"{t_render*1000:.0f}ms ({t_render/render_steps*1000:.1f}ms/step)  "
+            f"total={t_total*1000:.0f}ms"
+        )
+    else:
+        print(f"  render   0 steps  total={t_total*1000:.0f}ms")
 
     new_state = GameState(
         x=px,

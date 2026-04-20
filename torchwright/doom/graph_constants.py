@@ -21,6 +21,9 @@ TOKEN_RENDER = 4
 TOKEN_TEX_COL = 5
 TOKEN_THINKING = 6
 TOKEN_BSP_NODE = 7
+TOKEN_PLAYER_X = 240
+TOKEN_PLAYER_Y = 241
+TOKEN_PLAYER_ANGLE = 242
 
 E8_INPUT = index_to_vector(TOKEN_INPUT)
 E8_WALL = index_to_vector(TOKEN_WALL)
@@ -30,6 +33,9 @@ E8_RENDER = index_to_vector(TOKEN_RENDER)
 E8_TEX_COL = index_to_vector(TOKEN_TEX_COL)
 E8_THINKING = index_to_vector(TOKEN_THINKING)
 E8_BSP_NODE = index_to_vector(TOKEN_BSP_NODE)
+E8_PLAYER_X = index_to_vector(TOKEN_PLAYER_X)
+E8_PLAYER_Y = index_to_vector(TOKEN_PLAYER_Y)
+E8_PLAYER_ANGLE = index_to_vector(TOKEN_PLAYER_ANGLE)
 
 # Texture E8 codes start at index 8 (after the 8 semantic token types),
 # so texture i maps to ``index_to_vector(8 + i)``.

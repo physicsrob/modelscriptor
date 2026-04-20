@@ -215,7 +215,7 @@ def _build_prefill(
 
 def _sort_argmin_attn(graph_io) -> Attn:
     """Return the SORTED argmin Attn node — the one under
-    ``sort/attention`` whose V-input width matches ``13 + max_walls``.
+    ``sort/attention`` whose V-input width matches ``8 + max_walls``.
     """
     roots = set(graph_io.overlaid_outputs.values()) | set(
         graph_io.overflow_outputs.values()
@@ -225,7 +225,7 @@ def _sort_argmin_attn(graph_io) -> Attn:
         for n in get_ancestor_nodes(roots)
         if isinstance(n, Attn) and (n.annotation or "").startswith("sort/attention")
     ]
-    expected_v_width = 13 + _MAX_WALLS
+    expected_v_width = 8 + _MAX_WALLS
     for attn in candidates:
         v_input = attn.inputs[2]
         if v_input is not None and len(v_input) == expected_v_width:

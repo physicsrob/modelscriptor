@@ -1,35 +1,36 @@
 """RENDER stage: chunked column fill + state machine for autoregressive loop.
 
 One RENDER token paints ``chunk_size`` vertical pixels of one screen
-column.  The wall being rendered is *not* picked here — it was chosen by
-the preceding THINKING token and its parameters arrive via the
-``render_feedback`` overlay (``fb_sort_den, fb_C, ...``).
+column.  The wall being rendered is identified by discrete values in
+the token type overlay: ``render_wall_j_onehot``, ``render_tex_id``,
+``render_vis_lo``, ``render_vis_hi``.
 
 Per-token flow:
 
-1. Derive the **active column**: if ``render_is_new_wall`` the column
-   resets to the wall's ``fb_col_lo``; otherwise it's ``render_col``.
-2. Compute wall height + texture u-coordinate using the feedback wall
-   data and the per-column angle offset.
-3. TEX_COL attention fetches the matching texture column pixels.
-4. Determine the **active chunk_start**: sentinel (-1) in the feedback
-   means "start at the wall's visible top"; otherwise continue from
+1. **Wall geometry attention**: attend to the WALL position matching
+   ``render_wall_j_onehot`` and read raw (ax, ay, bx, by).
+2. **Precompute**: from the raw geometry plus player state (position
+   and cos/sin from PLAYER broadcasts), compute the rotation products
+   (sort_den, C, D, E, sort_num_t) and derive H_inv.
+3. Derive the **active column**: if ``render_is_new_wall`` the column
+   resets to the wall's ``render_vis_lo``; otherwise it's ``render_col``.
+4. Compute wall height + texture u-coordinate.
+5. TEX_COL attention fetches the matching texture column pixels.
+6. Determine the **active chunk_start**: sentinel (-1) means
+   "start at the wall's visible top"; otherwise continue from
    ``render_chunk_start``.
-5. Fill ``chunk_size`` rows starting at ``active_start`` into the
-   column pixel strip.
-6. Compute state transitions — three exclusive cases:
+7. Fill ``chunk_size`` rows into the column pixel strip.
+8. Compute state transitions — three exclusive cases:
 
    * **more chunks**: ``active_start + cs < vis_bottom`` → stay on this
      column, advance chunk_start by ``cs``.
-   * **advance col**: no more chunks, ``active_col + 1 ≤ fb_col_hi`` →
+   * **advance col**: no more chunks, ``active_col + 1 ≤ vis_hi`` →
      move to the next column, reset chunk_start sentinel.
-   * **advance wall**: no more chunks, no more columns → update
-     ``render_mask`` with ``fb_onehot``.  If all walls are masked, emit
-     ``done``.
+   * **advance wall**: no more columns → update ``render_mask`` with
+     ``render_wall_j_onehot``.  If all walls are masked, emit ``done``.
+     On advance_wall the host feeds the next sorted wall's identity.
 
-Next-token-type logic (``E8_THINKING`` on advance_wall, else
-``E8_RENDER``) is exposed separately so the orchestrator can compose
-it with the type selects for the other stages.
+Next-token-type is always ``E8_RENDER`` (THINKING is eliminated).
 """
 
 import math
@@ -52,6 +53,7 @@ from torchwright.ops.arithmetic_ops import (
     multiply_const,
     piecewise_linear,
     piecewise_linear_2d,
+    reciprocal,
     subtract,
     sum_nodes,
     thermometer_floor_div,
@@ -65,9 +67,10 @@ from torchwright.reference_renderer.types import RenderConfig
 from torchwright.doom.graph_constants import (
     DIFF_BP,
     E8_RENDER,
-    E8_THINKING,
     TEX_E8_OFFSET,
+    TRIG_BP,
 )
+from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.renderer import _textured_column_fill
 
 # ---------------------------------------------------------------------------
@@ -79,9 +82,9 @@ from torchwright.doom.renderer import _textured_column_fill
 class RenderInputs:
     """Per-RENDER inputs.
 
-    Most fields come from ``render_feedback`` (an overlaid output).  The
-    orchestrator extracts each field from the packed feedback vector
-    before handing it here, so stage code stays flat.
+    Iteration state and wall identity come from overlaid outputs
+    (copied by the host).  Wall geometry is read from WALL positions
+    via attention.  Player state comes from PLAYER broadcasts.
     """
 
     # Iteration state (overlay).
@@ -90,16 +93,24 @@ class RenderInputs:
     render_is_new_wall: Node  # +1 if just transitioned to a new wall
     render_chunk_start: Node  # current chunk start row; sentinel -1 = "new col"
 
-    # Wall data (overlay; populated by THINKING, forwarded by prior RENDER).
-    fb_sort_den: Node
-    fb_C: Node
-    fb_D: Node
-    fb_E: Node
-    fb_H_inv: Node
-    fb_tex_id: Node
-    fb_col_lo: Node
-    fb_col_hi: Node
-    fb_onehot: Node  # max_walls-wide
+    # Wall identity (overlay; host-fed on transitions).
+    render_tex_id: Node
+    render_vis_lo: Node  # first visible column for this wall
+    render_vis_hi: Node  # last visible column for this wall
+    render_wall_j_onehot: Node  # max_walls-wide
+
+    # WALL geometry inputs (for wall geometry attention).
+    wall_ax: Node  # host-fed at WALL positions
+    wall_ay: Node
+    wall_bx: Node
+    wall_by: Node
+    wall_position_onehot: Node  # position one-hot at WALL positions
+
+    # Player state (from PLAYER broadcasts).
+    player_x: Node  # resolved x
+    player_y: Node  # resolved y
+    player_cos: Node  # cos(θ)
+    player_sin: Node  # sin(θ)
 
     # TEX_COL inputs (host-fed at TEX_COL positions).
     texture_id_e8: Node  # 8-wide
@@ -110,6 +121,7 @@ class RenderInputs:
 
     # Token-type flags.
     is_render: Node
+    is_wall: Node
     is_tex_col: Node
 
     pos_encoding: PosEncoding
@@ -121,12 +133,9 @@ class RenderOutputs:
 
     * ``pixels`` / ``active_col`` / ``active_start`` / ``chunk_length``
       land in overflow (host bitblits them to the framebuffer).
-    * ``next_render_feedback`` feeds back through the render_feedback
-      overlay (5-wide precomputes, forwarded unchanged).
     * Discrete state (mask, col, chunk, tex_id, vis bounds, onehot)
       are separate overlaid outputs copied by the host.
-    * ``render_next_type`` is the next token type at RENDER positions:
-      ``E8_THINKING`` on advance_wall, else ``E8_RENDER``.
+    * ``render_next_type`` is always ``E8_RENDER``.
     * ``done_flag`` signals to the host that all walls are fully
       rendered (it can stop feeding RENDER tokens).
     """
@@ -136,9 +145,8 @@ class RenderOutputs:
     active_start: Node
     chunk_length: Node
     done_flag: Node
-    next_render_feedback: Node  # 5-wide precomputes
-    render_next_type: Node  # 8-wide: E8_THINKING or E8_RENDER
-    # Discrete state outputs (overlaid separately from render_feedback).
+    render_next_type: Node  # 8-wide: always E8_RENDER
+    # Discrete state outputs (overlaid).
     next_render_mask: Node
     next_col: Node
     next_is_new_wall: Node
@@ -169,22 +177,51 @@ def build_render(
     tex_w, tex_h = textures[0].shape[0], textures[0].shape[1]
     cs = chunk_size
 
+    with annotate("render/wall_geom_attention"):
+        sel_ax, sel_ay, sel_bx, sel_by = _attend_wall_geometry(
+            inputs.pos_encoding,
+            is_render=inputs.is_render,
+            is_wall=inputs.is_wall,
+            wall_j_onehot=inputs.render_wall_j_onehot,
+            wall_position_onehot=inputs.wall_position_onehot,
+            wall_ax=inputs.wall_ax,
+            wall_ay=inputs.wall_ay,
+            wall_bx=inputs.wall_bx,
+            wall_by=inputs.wall_by,
+        )
+
+    with annotate("render/precompute"):
+        sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv = (
+            _compute_precomputes(
+                sel_ax,
+                sel_ay,
+                sel_bx,
+                sel_by,
+                inputs.player_x,
+                inputs.player_y,
+                inputs.player_cos,
+                inputs.player_sin,
+                H=H,
+                max_coord=max_coord,
+            )
+        )
+
     with annotate("render/state_machine"):
         active_col = select(
-            inputs.render_is_new_wall, inputs.fb_col_lo, inputs.render_col
+            inputs.render_is_new_wall, inputs.render_vis_lo, inputs.render_col
         )
         angle_offset = _compute_angle_offset(active_col, W=W, fov=fov)
 
     with annotate("render/wall_height"):
         tan_o, tan_val_bp = _compute_angle_offset_tan(angle_offset, fov=fov)
         den_over_cos, abs_den_over_cos = _compute_den_over_cos(
-            inputs.fb_sort_den,
-            inputs.fb_C,
+            sort_den,
+            precomp_C,
             tan_o,
             tan_val_bp,
         )
         wall_top, wall_bottom, wall_height = _compute_wall_height(
-            inputs.fb_H_inv,
+            precomp_H_inv,
             abs_den_over_cos,
             H=H,
             max_coord=max_coord,
@@ -192,8 +229,8 @@ def build_render(
 
     with annotate("render/tex_coord"):
         tex_col_idx = _compute_texture_column(
-            inputs.fb_D,
-            inputs.fb_E,
+            precomp_D,
+            precomp_E,
             tan_o,
             tan_val_bp,
             abs_den_over_cos,
@@ -206,7 +243,7 @@ def build_render(
             inputs.pos_encoding,
             is_render=inputs.is_render,
             is_tex_col=inputs.is_tex_col,
-            fb_tex_id=inputs.fb_tex_id,
+            fb_tex_id=inputs.render_tex_id,
             tex_col_idx=tex_col_idx,
             tc_onehot_01=inputs.tc_onehot_01,
             texture_id_e8=inputs.texture_id_e8,
@@ -231,7 +268,6 @@ def build_render(
 
     with annotate("render/state_transitions"):
         (
-            next_render_feedback,
             done_flag,
             render_next_type,
             next_render_mask,
@@ -247,15 +283,10 @@ def build_render(
             active_start=active_start,
             wall_bottom_clamped=clamp(wall_bottom, 0.0, float(H)),
             render_mask=inputs.render_mask,
-            fb_onehot=inputs.fb_onehot,
-            fb_col_hi=inputs.fb_col_hi,
-            fb_sort_den=inputs.fb_sort_den,
-            fb_C=inputs.fb_C,
-            fb_D=inputs.fb_D,
-            fb_E=inputs.fb_E,
-            fb_H_inv=inputs.fb_H_inv,
-            fb_tex_id=inputs.fb_tex_id,
-            fb_col_lo=inputs.fb_col_lo,
+            wall_j_onehot=inputs.render_wall_j_onehot,
+            vis_hi=inputs.render_vis_hi,
+            tex_id=inputs.render_tex_id,
+            vis_lo=inputs.render_vis_lo,
             chunk_size=cs,
             max_walls=max_walls,
         )
@@ -266,7 +297,6 @@ def build_render(
         active_start=active_start,
         chunk_length=chunk_length,
         done_flag=done_flag,
-        next_render_feedback=next_render_feedback,
         render_next_type=render_next_type,
         next_render_mask=next_render_mask,
         next_col=next_col,
@@ -277,6 +307,143 @@ def build_render(
         next_vis_hi=next_vis_hi,
         next_wall_j_onehot=next_wall_j_onehot,
     )
+
+
+# ---------------------------------------------------------------------------
+# Wall geometry attention
+# ---------------------------------------------------------------------------
+
+
+def _attend_wall_geometry(
+    pos_encoding: PosEncoding,
+    *,
+    is_render: Node,
+    is_wall: Node,
+    wall_j_onehot: Node,
+    wall_position_onehot: Node,
+    wall_ax: Node,
+    wall_ay: Node,
+    wall_bx: Node,
+    wall_by: Node,
+) -> tuple[Node, Node, Node, Node]:
+    """Read (ax, ay, bx, by) from the WALL position matching wall_j_onehot."""
+    GEOM_MATCH_GAIN = 1000.0
+    wall_geom = attend_argmax_dot(
+        pos_encoding,
+        query_vector=cond_gate(
+            is_render, wall_j_onehot
+        ),
+        key_vector=cond_gate(
+            is_wall, wall_position_onehot
+        ),
+        value=cond_gate(
+            is_wall,
+            Concatenate([wall_ax, wall_ay, wall_bx, wall_by]),
+        ),
+        match_gain=GEOM_MATCH_GAIN,
+        assert_hardness_gt=0.99,
+    )
+    sel_ax = extract_from(wall_geom, 4, 0, 1, "rsel_ax")
+    sel_ay = extract_from(wall_geom, 4, 1, 1, "rsel_ay")
+    sel_bx = extract_from(wall_geom, 4, 2, 1, "rsel_bx")
+    sel_by = extract_from(wall_geom, 4, 3, 1, "rsel_by")
+    return sel_ax, sel_ay, sel_bx, sel_by
+
+
+# ---------------------------------------------------------------------------
+# Precompute from raw geometry + player state
+# ---------------------------------------------------------------------------
+
+
+def _compute_precomputes(
+    sel_ax: Node,
+    sel_ay: Node,
+    sel_bx: Node,
+    sel_by: Node,
+    player_x: Node,
+    player_y: Node,
+    player_cos: Node,
+    player_sin: Node,
+    *,
+    H: int,
+    max_coord: float,
+) -> tuple[Node, Node, Node, Node, Node]:
+    """Compute (sort_den, C, D, E, H_inv) from raw wall geometry + player state.
+
+    Same math as the former WALL-stage ``_compute_render_precomputation``
+    and ``_compute_central_ray_intersection``, now computed at RENDER time.
+    """
+    w_ex = subtract(sel_bx, sel_ax)
+    w_ey = subtract(sel_by, sel_ay)
+    w_fx = subtract(sel_ax, player_x)
+    w_gy = subtract(player_y, sel_ay)
+
+    # sort_den = ey*cos - ex*sin
+    r_ey_cos = piecewise_linear_2d(
+        w_ey, player_cos, DIFF_BP, TRIG_BP,
+        lambda a, b: a * b, name="r_ey_cos",
+    )
+    r_ex_sin = piecewise_linear_2d(
+        w_ex, player_sin, DIFF_BP, TRIG_BP,
+        lambda a, b: a * b, name="r_ex_sin",
+    )
+    sort_den = subtract(r_ey_cos, r_ex_sin)
+
+    # C = ey*sin + ex*cos
+    r_ey_sin = piecewise_linear_2d(
+        w_ey, player_sin, DIFF_BP, TRIG_BP,
+        lambda a, b: a * b, name="r_ey_sin",
+    )
+    r_ex_cos = piecewise_linear_2d(
+        w_ex, player_cos, DIFF_BP, TRIG_BP,
+        lambda a, b: a * b, name="r_ex_cos",
+    )
+    precomp_C = add(r_ey_sin, r_ex_cos)
+
+    # D = fx*sin + gy*cos
+    r_fx_sin = piecewise_linear_2d(
+        w_fx, player_sin, DIFF_BP, TRIG_BP,
+        lambda a, b: a * b, name="r_fx_sin",
+    )
+    r_gy_cos = piecewise_linear_2d(
+        w_gy, player_cos, DIFF_BP, TRIG_BP,
+        lambda a, b: a * b, name="r_gy_cos",
+    )
+    precomp_D = add(r_fx_sin, r_gy_cos)
+
+    # E = fx*cos - gy*sin
+    r_fx_cos = piecewise_linear_2d(
+        w_fx, player_cos, DIFF_BP, TRIG_BP,
+        lambda a, b: a * b, name="r_fx_cos",
+    )
+    r_gy_sin = piecewise_linear_2d(
+        w_gy, player_sin, DIFF_BP, TRIG_BP,
+        lambda a, b: a * b, name="r_gy_sin",
+    )
+    precomp_E = subtract(r_fx_cos, r_gy_sin)
+
+    # sort_num_t = ey*fx + ex*gy
+    r_ey_fx = piecewise_linear_2d(
+        w_ey, w_fx, DIFF_BP, DIFF_BP,
+        lambda a, b: a * b, name="r_ey_fx",
+    )
+    r_ex_gy = piecewise_linear_2d(
+        w_ex, w_gy, DIFF_BP, DIFF_BP,
+        lambda a, b: a * b, name="r_ex_gy",
+    )
+    sort_num_t = add(r_ey_fx, r_ex_gy)
+
+    # H_inv = H / |sort_num_t|
+    abs_num_t = abs(sort_num_t)
+    inv_abs_num_t = reciprocal(
+        abs_num_t,
+        min_value=0.3,
+        max_value=2.0 * max_coord * max_coord,
+        step=1.0,
+    )
+    precomp_H_inv = multiply_const(inv_abs_num_t, float(H))
+
+    return sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv
 
 
 # ---------------------------------------------------------------------------
@@ -312,21 +479,21 @@ def _compute_angle_offset_tan(angle_offset: Node, *, fov: int):
 
 
 def _compute_den_over_cos(
-    fb_sort_den: Node,
-    fb_C: Node,
+    sort_den: Node,
+    precomp_C: Node,
     tan_o: Node,
     tan_val_bp,
 ):
     """``den/cos = sort_den - C*tan(offset)`` — per-column horizontal projection factor."""
     C_tan = piecewise_linear_2d(
-        fb_C,
+        precomp_C,
         tan_o,
         DIFF_BP,
         tan_val_bp,
         lambda a, b: a * b,
         name="C_tan_o",
     )
-    den_over_cos = subtract(fb_sort_den, C_tan)
+    den_over_cos = subtract(sort_den, C_tan)
     abs_den_over_cos = abs(den_over_cos)
     return den_over_cos, abs_den_over_cos
 
@@ -337,7 +504,7 @@ def _compute_den_over_cos(
 
 
 def _compute_wall_height(
-    fb_H_inv: Node,
+    precomp_H_inv: Node,
     abs_den_over_cos: Node,
     *,
     H: int,
@@ -360,7 +527,7 @@ def _compute_wall_height(
     doc_bp = [doc_max * i / 15 for i in range(16)]
 
     wall_height_raw = piecewise_linear_2d(
-        fb_H_inv,
+        precomp_H_inv,
         abs_den_over_cos,
         height_inv_bp,
         doc_bp,
@@ -387,8 +554,8 @@ def _compute_wall_height(
 
 
 def _compute_texture_column(
-    fb_D: Node,
-    fb_E: Node,
+    precomp_D: Node,
+    precomp_E: Node,
     tan_o: Node,
     tan_val_bp,
     abs_den_over_cos: Node,
@@ -416,14 +583,14 @@ def _compute_texture_column(
     far above the comparison transition half-width of 0.05.
     """
     E_tan = piecewise_linear_2d(
-        fb_E,
+        precomp_E,
         tan_o,
         DIFF_BP,
         tan_val_bp,
         lambda a, b: a * b,
         name="E_tan_o",
     )
-    num_u_over_cos = add(fb_D, E_tan)
+    num_u_over_cos = add(precomp_D, E_tan)
     abs_nuc = abs(num_u_over_cos)
 
     # Scale abs_nuc by tex_w once (exact).
@@ -502,8 +669,6 @@ def _chunk_fill(
     vis_top_render = clamp(wall_top, 0.0, float(H))
     vis_bottom_render = clamp(wall_bottom, 0.0, float(H))
 
-    # Chunk-start sentinel: host writes -1 on "new column", meaning
-    # "start at the wall's visible top".
     neg_half = create_literal_value(torch.tensor([-0.5]), name="neg_half")
     is_new_col = compare(subtract(neg_half, render_chunk_start), 0.0)
     active_start = select(is_new_col, vis_top_render, render_chunk_start)
@@ -535,22 +700,17 @@ def _compute_next_state(
     active_start: Node,
     wall_bottom_clamped: Node,
     render_mask: Node,
-    fb_onehot: Node,
-    fb_col_hi: Node,
-    fb_sort_den: Node,
-    fb_C: Node,
-    fb_D: Node,
-    fb_E: Node,
-    fb_H_inv: Node,
-    fb_tex_id: Node,
-    fb_col_lo: Node,
+    wall_j_onehot: Node,
+    vis_hi: Node,
+    tex_id: Node,
+    vis_lo: Node,
     chunk_size: int,
     max_walls: int,
 ):
     """Three-way state transition: more chunks / advance col / advance wall.
 
-    Returns the 5-wide precompute feedback (forwarded unchanged), the
-    discrete state outputs, ``done_flag``, and ``render_next_type``.
+    Returns discrete state outputs, ``done_flag``, and ``render_next_type``
+    (always E8_RENDER).
     """
     next_chunk_start_val = add_const(active_start, float(chunk_size))
     has_more_chunks = compare(
@@ -560,11 +720,11 @@ def _compute_next_state(
 
     col_p1 = add_const(active_col, 1.0)
     not_more_chunks = bool_not(has_more_chunks)
-    has_more_cols = compare(subtract(fb_col_hi, col_p1), 0.5)
+    has_more_cols = compare(subtract(vis_hi, col_p1), 0.5)
     advance_col = bool_all_true([not_more_chunks, has_more_cols])
     advance_wall = bool_all_true([not_more_chunks, bool_not(has_more_cols)])
 
-    mask_with_new = add(render_mask, fb_onehot)
+    mask_with_new = add(render_mask, wall_j_onehot)
     next_render_mask = select(advance_wall, mask_with_new, render_mask)
 
     mask_sum = Linear(
@@ -591,24 +751,17 @@ def _compute_next_state(
     neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one")
     next_is_new_wall = select(advance_wall, pos_one, neg_one)
 
-    render_next_type = select(
-        advance_wall,
-        create_literal_value(E8_THINKING, name="type_thinking"),
-        create_literal_value(E8_RENDER, name="type_render"),
-    )
-
-    next_render_feedback = Concatenate([fb_sort_den, fb_C, fb_D, fb_E, fb_H_inv])
+    render_next_type = create_literal_value(E8_RENDER, name="type_render")
 
     return (
-        next_render_feedback,
         done_flag,
         render_next_type,
         next_render_mask,
         next_col_output,
         next_is_new_wall,
         next_chunk,
-        fb_tex_id,
-        fb_col_lo,
-        fb_col_hi,
-        fb_onehot,
+        tex_id,
+        vis_lo,
+        vis_hi,
+        wall_j_onehot,
     )

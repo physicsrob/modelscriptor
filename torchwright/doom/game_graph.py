@@ -3,33 +3,21 @@
 Token sequence per frame:
 
     TEX_COL×(num_tex × tex_w) → INPUT → BSP_NODE×M → WALL×N →
-    EOS → SORTED_WALL×N → (THINKING → RENDER×k)×N
+    EOS → PLAYER_X → PLAYER_Y → PLAYER_ANGLE →
+    SORTED_WALL×N → RENDER×(dynamic)
 
-Eight token types (E8 spherical codes):
+Token types (E8 spherical codes):
 
-    TEX_COL (5)      Texture column pixel data.  Each token carries one
-                     column of one texture (tex_h × 3 floats).  RENDER
-                     tokens retrieve the right column via attention.
+    TEX_COL (5)      Texture column pixel data.
     INPUT (0)        Player state + movement inputs.
-    BSP_NODE (7)     One splitting plane of the BSP tree.  Each token
-                     classifies the player as FRONT/BACK of its plane;
-                     the result lands in a shared ``side_P_vec`` used
-                     by WALL tokens to derive BSP rank.
-    WALL (1)         Wall geometry + BSP rank precomputation + runtime
-                     collision against the player's velocity + per-wall
-                     render precompute.
-    EOS (2)          End of prefill.  Resolves collisions; emits
-                     resolved player state as overflow outputs.
-    SORTED_WALL (3)  Autoregressive sort output.  Each token's
-                     threshold is derived from a host-fed position
-                     index.  attend_argmin_above_integer finds the
-                     next-closest wall by BSP rank.
-    THINKING (6)     Wall selector hoisted out of RENDER — one per wall,
-                     populates the render_feedback overlay that feeds
-                     the next block of RENDER tokens.
-    RENDER (4)       Autoregressive column fill.  A state machine
-                     transitions through chunks, columns, and walls
-                     and emits ``done`` when finished.
+    BSP_NODE (7)     BSP splitting plane classification.
+    WALL (1)         Wall geometry + BSP rank + visibility.
+    EOS (2)          Collision resolution + state broadcast.
+    PLAYER_X (240)   Broadcast resolved x position.
+    PLAYER_Y (241)   Broadcast resolved y position.
+    PLAYER_ANGLE (242) Broadcast cos(θ)/sin(θ).
+    SORTED_WALL (3)  Autoregressive front-to-back sort.
+    RENDER (4)       Pixel generation (chunked column fill).
 
 Every cross-position data dependency flows through attention.  See each
 stage file for per-stage math.  This module does orchestration only.
@@ -56,10 +44,12 @@ from torchwright.doom.graph_constants import (
     E8_BSP_NODE,
     E8_EOS,
     E8_INPUT,
+    E8_PLAYER_ANGLE,
+    E8_PLAYER_X,
+    E8_PLAYER_Y,
     E8_RENDER,
     E8_SORTED_WALL,
     E8_TEX_COL,
-    E8_THINKING,
     E8_WALL,
     TEX_E8_OFFSET,
 )
@@ -77,18 +67,20 @@ __all__ = [
     "E8_SORTED_WALL",
     "E8_RENDER",
     "E8_TEX_COL",
-    "E8_THINKING",
     "E8_BSP_NODE",
+    "E8_PLAYER_X",
+    "E8_PLAYER_Y",
+    "E8_PLAYER_ANGLE",
     "TEX_E8_OFFSET",
 ]
 from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.stages.bsp import BspInputs, build_bsp
 from torchwright.doom.stages.eos import EosInputs, build_eos
 from torchwright.doom.stages.input import InputInputs, build_input
+from torchwright.doom.stages.player import PlayerInputs, build_player
 from torchwright.doom.stages.render import RenderInputs, build_render
 from torchwright.doom.stages.sorted import SortedInputs, build_sorted
 from torchwright.doom.stages.tex_col import TexColInputs, build_tex_col
-from torchwright.doom.stages.thinking import ThinkingInputs, build_thinking
 from torchwright.doom.stages.wall import WallInputs, build_wall
 
 # ---------------------------------------------------------------------------
@@ -148,7 +140,7 @@ def build_game_graph(
 
     pos_encoding = create_pos_encoding()
 
-    inputs, fb_fields = _create_inputs(
+    inputs = _create_inputs(
         max_walls=max_walls,
         tex_h=tex_h,
         max_bsp_nodes=max_bsp_nodes,
@@ -236,6 +228,19 @@ def build_game_graph(
         )
     )
 
+    # ---------- PLAYER ----------
+    player_out = build_player(
+        PlayerInputs(
+            player_x=inputs["player_x"],
+            player_y=inputs["player_y"],
+            player_angle=inputs["player_angle"],
+            is_player_x=tf["is_player_x"],
+            is_player_y=tf["is_player_y"],
+            is_player_angle=tf["is_player_angle"],
+            pos_encoding=pos_encoding,
+        ),
+    )
+
     # ---------- SORTED ----------
     sorted_out = build_sorted(
         SortedInputs(
@@ -250,41 +255,31 @@ def build_game_graph(
         max_walls=max_walls,
     )
 
-    # ---------- THINKING ----------
-    thinking_out = build_thinking(
-        ThinkingInputs(
-            sel_bsp_rank=sorted_out.sel_bsp_rank,
-            sel_onehot=sorted_out.sel_onehot,
-            gated_render_data=sorted_out.gated_render_data,
-            vis_lo=sorted_out.vis_lo,
-            vis_hi=sorted_out.vis_hi,
-            render_mask=fb_fields["render_mask"],
-            is_sorted=tf["is_sorted"],
-            pos_encoding=pos_encoding,
-        ),
-        max_walls=max_walls,
-    )
-
     # ---------- RENDER ----------
     render_out = build_render(
         RenderInputs(
-            render_mask=fb_fields["render_mask"],
-            render_col=fb_fields["render_col"],
-            render_is_new_wall=fb_fields["render_is_new_wall"],
-            render_chunk_start=fb_fields["render_chunk_start"],
-            fb_sort_den=fb_fields["fb_sort_den"],
-            fb_C=fb_fields["fb_C"],
-            fb_D=fb_fields["fb_D"],
-            fb_E=fb_fields["fb_E"],
-            fb_H_inv=fb_fields["fb_H_inv"],
-            fb_tex_id=fb_fields["fb_tex_id"],
-            fb_col_lo=fb_fields["fb_col_lo"],
-            fb_col_hi=fb_fields["fb_col_hi"],
-            fb_onehot=fb_fields["fb_onehot"],
+            render_mask=inputs["render_mask"],
+            render_col=inputs["render_col"],
+            render_is_new_wall=inputs["render_is_new_wall"],
+            render_chunk_start=inputs["render_chunk_start"],
+            render_tex_id=inputs["render_tex_id"],
+            render_vis_lo=inputs["render_vis_lo"],
+            render_vis_hi=inputs["render_vis_hi"],
+            render_wall_j_onehot=inputs["render_wall_j_onehot"],
+            wall_ax=inputs["wall_ax"],
+            wall_ay=inputs["wall_ay"],
+            wall_bx=inputs["wall_bx"],
+            wall_by=inputs["wall_by"],
+            wall_position_onehot=wall_out.position_onehot,
+            player_x=player_out.px,
+            player_y=player_out.py,
+            player_cos=player_out.cos_theta,
+            player_sin=player_out.sin_theta,
             texture_id_e8=inputs["texture_id_e8"],
             tex_pixels=inputs["tex_pixels"],
             tc_onehot_01=tex_col_out.tc_onehot_01,
             is_render=tf["is_render"],
+            is_wall=tf["is_wall"],
             is_tex_col=tf["is_tex_col"],
             pos_encoding=pos_encoding,
         ),
@@ -299,11 +294,9 @@ def build_game_graph(
     # ---------- Output assembly ----------
     overlaid, overflow = _assemble_output(
         token_flags=tf,
-        fb_fields=fb_fields,
         eos_out=eos_out,
         input_out=input_out,
         sorted_out=sorted_out,
-        thinking_out=thinking_out,
         render_out=render_out,
         max_walls=max_walls,
         chunk_size=cs,
@@ -330,27 +323,22 @@ def _create_inputs(
     tex_h: int,
     max_bsp_nodes: int,
     max_coord: float,
-) -> Tuple[Dict[str, Node], Dict[str, Node]]:
-    """Create host-fed input nodes + unpack the overlaid feedback vectors.
+) -> Dict[str, Node]:
+    """Create host-fed input nodes.
 
-    Feedback unpacking lives here because the layouts are shared with
-    ``_assemble_output`` — keeping the two in the same module prevents
-    silent drift.
+    No feedback vectors — all state is carried by discrete overlaid
+    fields that the host copies verbatim from output to input.
     """
     inputs: Dict[str, Node] = {}
 
-    # token_type is a spherical-code 8-vector with components in [-1, 1].
     inputs["token_type"] = create_input("token_type", 8, value_range=(-1.0, 1.0))
-    # Player/world coords are bounded by the configured max_coord.
     inputs["player_x"] = create_input(
         "player_x", 1, value_range=(-max_coord, max_coord)
     )
     inputs["player_y"] = create_input(
         "player_y", 1, value_range=(-max_coord, max_coord)
     )
-    # Angles are u8 (0..255).
     inputs["player_angle"] = create_input("player_angle", 1, value_range=(0.0, 255.0))
-    # Input flags are 0/1 (host sends integer booleans).
     for k in (
         "input_forward",
         "input_backward",
@@ -360,33 +348,24 @@ def _create_inputs(
         "input_strafe_right",
     ):
         inputs[k] = create_input(k, 1, value_range=(0.0, 1.0))
-    # Wall endpoint coords + ids.
     for k in ("wall_ax", "wall_ay", "wall_bx", "wall_by"):
         inputs[k] = create_input(k, 1, value_range=(-max_coord, max_coord))
-    # Integer IDs — u8 is plenty.
     for k in ("wall_tex_id", "wall_index"):
         inputs[k] = create_input(k, 1, value_range=(0.0, 255.0))
-    # Texture column index (u8).
     inputs["tex_col_input"] = create_input("tex_col_input", 1, value_range=(0.0, 255.0))
-    # Texture pixels are float RGB ∈ [0, 1].
     inputs["tex_pixels"] = create_input("tex_pixels", tex_h * 3, value_range=(0.0, 1.0))
-    # texture_id_e8 is a spherical-code 8-vector.
     inputs["texture_id_e8"] = create_input("texture_id_e8", 8, value_range=(-1.0, 1.0))
 
-    # BSP plane normal components are unit-normalised → [-1, 1].
     inputs["bsp_plane_nx"] = create_input("bsp_plane_nx", 1, value_range=(-1.0, 1.0))
     inputs["bsp_plane_ny"] = create_input("bsp_plane_ny", 1, value_range=(-1.0, 1.0))
-    # Plane offset d = n · point ≤ max_coord in magnitude.
     inputs["bsp_plane_d"] = create_input(
         "bsp_plane_d", 1, value_range=(-max_coord, max_coord)
     )
-    # Per-node onehot selector.
     inputs["bsp_node_id_onehot"] = create_input(
         "bsp_node_id_onehot",
         max_bsp_nodes,
         value_range=(0.0, 1.0),
     )
-    # Wall-BSP coefficients are signed integer weights; bound generously.
     inputs["wall_bsp_coeffs"] = create_input(
         "wall_bsp_coeffs",
         max_bsp_nodes,
@@ -398,23 +377,11 @@ def _create_inputs(
         value_range=(-max_coord, max_coord),
     )
 
-    # Position index for SORTED tokens (0-indexed, host-fed).
     inputs["sort_position_index"] = create_input(
         "sort_position_index", 1, value_range=(0.0, float(max_walls))
     )
 
-    # Render precompute feedback — 5-wide (sort_den, C, D, E, H_inv).
-    # Populated by THINKING, forwarded unchanged through RENDER tokens.
-    d_render_fb = 5
-    render_feedback = create_input(
-        "render_feedback",
-        d_render_fb,
-        value_range=(-max_coord, max_coord),
-    )
-    inputs["render_feedback"] = render_feedback
-
-    # Discrete render state — separate overlaid inputs so the host can
-    # copy them from output to input without interpreting them.
+    # Discrete render state — overlaid inputs copied by the host.
     inputs["render_mask"] = create_input(
         "render_mask", max_walls, value_range=(0.0, 1.0)
     )
@@ -436,22 +403,7 @@ def _create_inputs(
         "render_wall_j_onehot", max_walls, value_range=(0.0, 1.0)
     )
 
-    fields: Dict[str, Node] = {
-        "render_mask": inputs["render_mask"],
-        "render_col": inputs["render_col"],
-        "render_is_new_wall": inputs["render_is_new_wall"],
-        "render_chunk_start": inputs["render_chunk_start"],
-        "fb_sort_den": extract_from(render_feedback, d_render_fb, 0, 1, "fb_sort_den"),
-        "fb_C": extract_from(render_feedback, d_render_fb, 1, 1, "fb_C"),
-        "fb_D": extract_from(render_feedback, d_render_fb, 2, 1, "fb_D"),
-        "fb_E": extract_from(render_feedback, d_render_fb, 3, 1, "fb_E"),
-        "fb_H_inv": extract_from(render_feedback, d_render_fb, 4, 1, "fb_H_inv"),
-        "fb_tex_id": inputs["render_tex_id"],
-        "fb_col_lo": inputs["render_vis_lo"],
-        "fb_col_hi": inputs["render_vis_hi"],
-        "fb_onehot": inputs["render_wall_j_onehot"],
-    }
-    return inputs, fields
+    return inputs
 
 
 def _detect_token_types(token_type: Node) -> Dict[str, Node]:
@@ -463,20 +415,20 @@ def _detect_token_types(token_type: Node) -> Dict[str, Node]:
             "is_eos": equals_vector(token_type, E8_EOS),
             "is_sorted": equals_vector(token_type, E8_SORTED_WALL),
             "is_render": equals_vector(token_type, E8_RENDER),
-            "is_thinking": equals_vector(token_type, E8_THINKING),
             "is_tex_col": equals_vector(token_type, E8_TEX_COL),
             "is_bsp_node": equals_vector(token_type, E8_BSP_NODE),
+            "is_player_x": equals_vector(token_type, E8_PLAYER_X),
+            "is_player_y": equals_vector(token_type, E8_PLAYER_Y),
+            "is_player_angle": equals_vector(token_type, E8_PLAYER_ANGLE),
         }
 
 
 def _assemble_output(
     *,
     token_flags: Dict[str, Node],
-    fb_fields: Dict[str, Node],
     eos_out,
     input_out,
     sorted_out,
-    thinking_out,
     render_out,
     max_walls: int,
     chunk_size: int,
@@ -484,104 +436,76 @@ def _assemble_output(
     """Build the overlaid outputs + overflow outputs.
 
     Overlaid outputs fed back into the next step's input:
-        token_type, render_feedback (5-wide precomputes),
-        render_mask, render_col, render_is_new_wall,
+        token_type, render_mask, render_col, render_is_new_wall,
         render_chunk_start, render_tex_id, render_vis_lo,
         render_vis_hi, render_wall_j_onehot
-    Overflow outputs bitblitted by the host:
-        pixels, col, start, length, done, eos_resolved_x,
-        eos_resolved_y, eos_new_angle
-    """
-    d_render_fb = 5
 
+    At SORTED positions the render_* overlaid outputs carry the
+    sorted wall's identity so the host can cache the sorted order.
+
+    Overflow outputs bitblitted by the host:
+        pixels, col, start, length, done, sort_done,
+        eos_resolved_x, eos_resolved_y, eos_new_angle
+    """
     with annotate("output"):
         zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
         zero_8 = create_literal_value(torch.zeros(8), name="zero_8")
-        zero_rf = create_literal_value(torch.zeros(d_render_fb), name="zero_rf")
         zero_mw = create_literal_value(torch.zeros(max_walls), name="zero_mw")
         zero_pixels = create_literal_value(
             torch.zeros(chunk_size * 3),
             name="zero_pixels",
         )
-        pos_one = create_literal_value(torch.tensor([1.0]), name="pos_one_out")
         neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one_out")
-        chunk_sentinel = create_literal_value(
-            torch.tensor([-1.0]),
-            name="chunk_sentinel_out",
-        )
 
-        # --- render_feedback: 5-wide precomputes ---
-        # THINKING produces them from the selected wall; RENDER forwards.
-        thinking_precomputes = Concatenate(
-            [
-                thinking_out.t_sort_den,
-                thinking_out.t_C,
-                thinking_out.t_D,
-                thinking_out.t_E,
-                thinking_out.t_H_inv,
-            ]
-        )
-        out_render_fb = select(
-            token_flags["is_thinking"],
-            thinking_precomputes,
-            select(token_flags["is_render"], render_out.next_render_feedback, zero_rf),
-        )
+        # --- Discrete render state (overlaid outputs) ---
+        # SORTED populates them for host caching.
+        # RENDER advances them via state machine.
 
-        # --- Discrete render state (separate overlaid outputs) ---
-        # THINKING seeds the first RENDER with the picked wall's identity.
-        # RENDER's state machine advances col/chunk/wall.
-
-        # render_mask: THINKING forwards from input; RENDER advances.
+        # render_mask: RENDER advances on wall transitions.
         out_render_mask = select(
-            token_flags["is_thinking"],
-            fb_fields["render_mask"],
-            select(token_flags["is_render"], render_out.next_render_mask, zero_mw),
+            token_flags["is_render"], render_out.next_render_mask, zero_mw
         )
 
-        # render_col: THINKING sets to vis_lo; RENDER advances.
+        # render_col: SORTED sets to vis_lo; RENDER advances.
         out_render_col = select(
-            token_flags["is_thinking"],
-            thinking_out.t_col_lo,
+            token_flags["is_sorted"],
+            sorted_out.vis_lo,
             select(token_flags["is_render"], render_out.next_col, zero_1),
         )
 
-        # render_is_new_wall: THINKING sets +1; RENDER sets per state.
+        # render_is_new_wall: RENDER sets per state.
         out_render_is_new_wall = select(
-            token_flags["is_thinking"],
-            pos_one,
-            select(token_flags["is_render"], render_out.next_is_new_wall, neg_one),
+            token_flags["is_render"], render_out.next_is_new_wall, neg_one
         )
 
-        # render_chunk_start: THINKING sets sentinel -1; RENDER advances.
+        # render_chunk_start: RENDER advances.
         out_render_chunk_start = select(
-            token_flags["is_thinking"],
-            chunk_sentinel,
-            select(token_flags["is_render"], render_out.next_chunk, zero_1),
+            token_flags["is_render"], render_out.next_chunk, zero_1
         )
 
-        # render_tex_id: THINKING sets from wall; RENDER forwards.
+        # render_tex_id: SORTED sets from wall; RENDER forwards.
         out_render_tex_id = select(
-            token_flags["is_thinking"],
-            thinking_out.t_tex_id,
+            token_flags["is_sorted"],
+            sorted_out.sel_tex_id,
             select(token_flags["is_render"], render_out.next_tex_id, zero_1),
         )
 
-        # render_vis_lo/hi: THINKING sets from wall; RENDER forwards.
+        # render_vis_lo/hi: SORTED sets from wall; RENDER forwards.
         out_render_vis_lo = select(
-            token_flags["is_thinking"],
-            thinking_out.t_col_lo,
+            token_flags["is_sorted"],
+            sorted_out.vis_lo,
             select(token_flags["is_render"], render_out.next_vis_lo, zero_1),
         )
         out_render_vis_hi = select(
-            token_flags["is_thinking"],
-            thinking_out.t_col_hi,
+            token_flags["is_sorted"],
+            sorted_out.vis_hi,
             select(token_flags["is_render"], render_out.next_vis_hi, zero_1),
         )
 
-        # render_wall_j_onehot: THINKING sets from wall; RENDER forwards.
+        # render_wall_j_onehot: SORTED sets from wall; RENDER forwards.
         out_render_wall_j_onehot = select(
-            token_flags["is_thinking"],
-            thinking_out.t_onehot,
+            token_flags["is_sorted"],
+            sorted_out.sel_onehot,
             select(
                 token_flags["is_render"],
                 render_out.next_wall_j_onehot,
@@ -591,13 +515,9 @@ def _assemble_output(
 
         # --- Token type ---
         out_token_type = select(
-            token_flags["is_thinking"],
-            create_literal_value(E8_RENDER, name="thinking_next_type"),
-            select(
-                token_flags["is_render"],
-                render_out.render_next_type,
-                zero_8,
-            ),
+            token_flags["is_render"],
+            render_out.render_next_type,
+            zero_8,
         )
 
         out_pixels = select(token_flags["is_render"], render_out.pixels, zero_pixels)
@@ -606,13 +526,16 @@ def _assemble_output(
         out_length = select(token_flags["is_render"], render_out.chunk_length, zero_1)
         out_done = select(token_flags["is_render"], render_out.done_flag, neg_one)
 
+        out_sort_done = select(
+            token_flags["is_sorted"], sorted_out.sort_done, neg_one
+        )
+
         out_eos_rx = select(token_flags["is_eos"], eos_out.resolved_x, zero_1)
         out_eos_ry = select(token_flags["is_eos"], eos_out.resolved_y, zero_1)
         out_eos_angle = select(token_flags["is_eos"], input_out.new_angle, zero_1)
 
     overlaid = {
         "token_type": out_token_type,
-        "render_feedback": out_render_fb,
         "render_mask": out_render_mask,
         "render_col": out_render_col,
         "render_is_new_wall": out_render_is_new_wall,
@@ -628,6 +551,7 @@ def _assemble_output(
         "start": out_start,
         "length": out_length,
         "done": out_done,
+        "sort_done": out_sort_done,
         "eos_resolved_x": out_eos_rx,
         "eos_resolved_y": out_eos_ry,
         "eos_new_angle": out_eos_angle,

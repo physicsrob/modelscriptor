@@ -17,8 +17,9 @@ WALL stage and travels through the payload — SORTED just unpacks it.
 
 Downstream consumers:
 
-* **THINKING** uses ``sel_bsp_rank`` (from the payload) as score and
-  ``sel_onehot`` (wall-index one-hot) as position key.
+* The **host** caches ``sel_onehot``, ``vis_lo``, ``vis_hi``, and
+  ``sel_tex_id`` from the overlaid outputs at SORTED positions to
+  feed wall identity into RENDER on wall transitions.
 
 **Exhaustion.**  When the threshold exceeds every renderable wall's
 BSP rank (``N_renderable`` walls picked after ``N_renderable`` steps),
@@ -34,7 +35,7 @@ from dataclasses import dataclass
 
 import torch
 
-from torchwright.graph import Concatenate, Node, annotate
+from torchwright.graph import Node, annotate
 from torchwright.graph.asserts import (
     assert_distinct_across,
     assert_integer,
@@ -52,7 +53,6 @@ from torchwright.ops.arithmetic_ops import (
 )
 from torchwright.ops.attention_ops import attend_argmin_above_integer
 from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.logic_ops import cond_gate
 from torchwright.ops.map_select import in_range, select
 
 from torchwright.doom.graph_utils import extract_from
@@ -81,7 +81,7 @@ class SortedInputs:
 
     # Token-type flags used by the pre-attention score-distinctness
     # assertions.  ``is_wall`` restricts the valid-subset check to WALL
-    # positions.  ``is_sorted`` gates downstream THINKING-visible nodes.
+    # positions.  ``is_sorted`` gates downstream overlaid outputs.
     is_sorted: Node
     is_wall: Node
 
@@ -94,8 +94,7 @@ class SortedOutputs:
     sel_wall_data: Node  # ax, ay, bx, by, tex_id  (5-wide)
     sel_onehot: Node  # per-position wall-index one-hot of picked wall
 
-    # BSP rank of the selected wall — used by THINKING as the score
-    # for its own argmin (picks walls in front-to-back order).
+    # BSP rank of the selected wall — sentineled on exhausted steps.
     sel_bsp_rank: Node
 
     # Sort exhaustion flag: +1 when sel_bsp_rank < position_index
@@ -109,10 +108,8 @@ class SortedOutputs:
     vis_lo: Node
     vis_hi: Node
 
-    # Render data gated to zero at non-SORTED positions so THINKING's
-    # attention value sums cleanly.  6-wide:
-    # ``[sort_den, C, D, E, H_inv, tex_id]``.
-    gated_render_data: Node
+    # Texture ID extracted from geometry for host to cache.
+    sel_tex_id: Node
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +131,7 @@ def build_sorted(
         (
             sel_wall_data,
             sel_onehot,
-            gated_render_data,
+            sel_tex_id,
             sel_bsp_rank,
             sort_done,
             vis_lo,
@@ -148,7 +145,7 @@ def build_sorted(
         sort_done=sort_done,
         vis_lo=vis_lo,
         vis_hi=vis_hi,
-        gated_render_data=gated_render_data,
+        sel_tex_id=sel_tex_id,
     )
 
 
@@ -237,33 +234,21 @@ def _argmin_above_and_derive(
 
     unpacked = unpack_wall_payload(selected_sort, max_walls)
     sel_wall_data = unpacked.wall_data
-    sel_render = unpacked.render_data
     sel_bsp_rank = unpacked.bsp_rank
     sel_onehot = unpacked.onehot
     sel_tex_id = extract_geometry_field(sel_wall_data, "tex_id")
 
-    # Extract vis_lo/vis_hi from the payload (computed at WALL stage).
     vis_lo = extract_from(unpacked.vis_cols, VISIBILITY_WIDTH, 0, 1, "vis_lo")
     vis_hi = extract_from(unpacked.vis_cols, VISIBILITY_WIDTH, 1, 1, "vis_hi")
 
-    # Sort exhaustion: during normal progress the attention picks a
-    # wall with rank >= position_index, so position_index - sel <= 0.
-    # Once exhausted, the softmax averages garbage and sel may be
-    # below position_index.  The 0.5 threshold cleanly separates:
-    # progress has position_index - sel <= 0 < 0.5, exhaustion has
-    # position_index - sel >= 1 > 0.5.
     raw_sel_bsp_rank = assert_integer(sel_bsp_rank)
     sort_done = compare(
         subtract(inputs.position_index, raw_sel_bsp_rank),
         0.5,
     )
 
-    # Sentinel-ise sel_bsp_rank on exhausted steps so THINKING's
-    # argmin (which uses sel_bsp_rank as score) ignores these cached
-    # positions.  Without this, the softmax-averaged garbage rank on
-    # exhausted steps is typically lower than real picks' ranks and
-    # would win THINKING's argmin, pulling garbage wall data into
-    # RENDER.
+    # Sentinel-ise sel_bsp_rank on exhausted steps so any downstream
+    # consumer that reads it as a score ignores garbage positions.
     sort_done_sentinel = create_literal_value(
         torch.tensor([99.0]),
         name="sort_done_sentinel",
@@ -274,16 +259,10 @@ def _argmin_above_and_derive(
         raw_sel_bsp_rank,
     )
 
-    # Gate so non-SORTED positions contribute 0 to THINKING's attention.
-    gated_render_data = cond_gate(
-        inputs.is_sorted,
-        Concatenate([sel_render, sel_tex_id]),
-    )
-
     return (
         sel_wall_data,
         sel_onehot,
-        gated_render_data,
+        sel_tex_id,
         sel_bsp_rank_effective,
         sort_done,
         vis_lo,

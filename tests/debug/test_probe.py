@@ -284,7 +284,6 @@ def test_probe_clean_on_v2_box_room(tiny_config):
 
     from torchwright.doom.game_graph import E8_INPUT
 
-    d_render_fb = 2 * max_walls + 11
     tex_h = textures[0].shape[1]
     input_values = {
         "input_backward": torch.tensor([[0.0]]),
@@ -296,7 +295,6 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         "player_angle": torch.tensor([[0.0]]),
         "player_x": torch.tensor([[0.0]]),
         "player_y": torch.tensor([[0.0]]),
-        "render_feedback": torch.zeros(1, d_render_fb),
         "sort_position_index": torch.tensor([[0.0]]),
         "tex_col_input": torch.tensor([[0.0]]),
         "tex_pixels": torch.zeros(1, tex_h * 3),
@@ -314,6 +312,14 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         "bsp_node_id_onehot": torch.zeros(1, max_bsp_nodes),
         "wall_bsp_coeffs": torch.zeros(1, max_bsp_nodes),
         "wall_bsp_const": torch.tensor([[0.0]]),
+        "render_mask": torch.zeros(1, max_walls),
+        "render_col": torch.tensor([[0.0]]),
+        "render_is_new_wall": torch.tensor([[0.0]]),
+        "render_chunk_start": torch.tensor([[0.0]]),
+        "render_tex_id": torch.tensor([[0.0]]),
+        "render_vis_lo": torch.tensor([[0.0]]),
+        "render_vis_hi": torch.tensor([[0.0]]),
+        "render_wall_j_onehot": torch.zeros(1, max_walls),
     }
 
     # The v2 graph has large intermediate values in square_signed and
