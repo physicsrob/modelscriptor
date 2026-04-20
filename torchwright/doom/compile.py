@@ -538,11 +538,18 @@ def step_frame(
         w_ay = out[0, geom_out["render_wall_ay"]].item()
         w_bx = out[0, geom_out["render_wall_bx"]].item()
         w_by = out[0, geom_out["render_wall_by"]].item()
-        sorted_walls.append({
-            "onehot": wall_j_oh,
-            "vis_lo": v_lo, "vis_hi": v_hi, "tex_id": t_id,
-            "ax": w_ax, "ay": w_ay, "bx": w_bx, "by": w_by,
-        })
+        sorted_walls.append(
+            {
+                "onehot": wall_j_oh,
+                "vis_lo": v_lo,
+                "vis_hi": v_hi,
+                "tex_id": t_id,
+                "ax": w_ax,
+                "ay": w_ay,
+                "bx": w_bx,
+                "by": w_by,
+            }
+        )
         print(f"  sort[{k}] vis=[{v_lo:.0f},{v_hi:.0f}] tex={t_id:.0f}")
 
     t_sort = time.perf_counter() - t0

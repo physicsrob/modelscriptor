@@ -517,9 +517,7 @@ def _assemble_output(
         # render_wall_ax/ay/bx/by: SORTED sets from wall; RENDER forwards.
         geom_outputs = {}
         for geom_field in ("ax", "ay", "bx", "by"):
-            sorted_val = extract_geometry_field(
-                sorted_out.sel_wall_data, geom_field
-            )
+            sorted_val = extract_geometry_field(sorted_out.sel_wall_data, geom_field)
             render_next = getattr(render_out, f"next_wall_{geom_field}")
             geom_outputs[f"render_wall_{geom_field}"] = select(
                 token_flags["is_sorted"],
