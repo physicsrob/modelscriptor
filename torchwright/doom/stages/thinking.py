@@ -120,6 +120,25 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
         )
         render_value_gated = cond_gate(inputs.is_sorted, render_value)
 
+        # DebugWatch on attention value_in BEFORE it enters the attention.
+        from torchwright.graph.asserts import debug_watch
+
+        def _watch_value_in(t):
+            for pos in range(t.shape[0]):
+                vals = t[pos, :6].tolist()
+                if any(abs(v) > 0.01 for v in vals):
+                    print(
+                        f"  [watch:value_in] pos={pos}: "
+                        f"sort_den={vals[0]:.3f} C={vals[1]:.3f} "
+                        f"D={vals[2]:.3f} E={vals[3]:.3f} "
+                        f"H_inv={vals[4]:.3f} tex_id={vals[5]:.3f}"
+                    )
+            return True, ""
+
+        render_value_gated = debug_watch(
+            render_value_gated, _watch_value_in, message="thinking_value_in"
+        )
+
         selected_render = attend_argmin_unmasked(
             pos_encoding=inputs.pos_encoding,
             score=render_score,
@@ -129,58 +148,22 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
             assert_hardness_gt=0.99,
         )
 
-        # Debug: find the Attn node by BFS from selected_render.
-        from torchwright.graph.attn import Attn as _Attn
-
-        def _find_attn(node):
-            seen = set()
-            stack = [node]
-            while stack:
-                n = stack.pop()
-                if id(n) in seen:
-                    continue
-                seen.add(id(n))
-                if isinstance(n, _Attn):
-                    return n
-                for inp in getattr(n, "inputs", []):
-                    stack.append(inp)
-            return None
-
-        _inner = _find_attn(selected_render)
-        if isinstance(_inner, _Attn):
-            _a = _inner
-            print(f"\n[THINKING Attn debug]")
-            print(f"  query_in width: {len(_a.inputs[0])}")
-            print(f"  key_in width:   {len(_a.inputs[1])}")
-            print(f"  value_in width: {len(_a.inputs[2])}")
-            print(f"  d_head (d_qk):  {_a.query_matrix.shape[1]}")
-            print(f"  query_matrix shape: {_a.query_matrix.shape}")
-            print(f"  key_matrix shape:   {_a.key_matrix.shape}")
-            print(f"  value_matrix shape: {_a.value_matrix.shape}")
-            print(f"  output_matrix shape: {_a.output_matrix.shape}")
-            d_qk = _a.query_matrix.shape[1]
-            d_v = _a.value_matrix.shape[1]
-            print(f"  d_qk={d_qk}, d_v={d_v}")
-            # Show which value_matrix rows are non-zero
-            vm = _a.value_matrix
-            for row in range(vm.shape[0]):
-                nz = vm[row].nonzero(as_tuple=True)[0].tolist()
-                if nz:
+        # DebugWatch on attention output.
+        def _watch_attn_out(t):
+            for pos in range(t.shape[0]):
+                vals = t[pos, :6].tolist()
+                if any(abs(v) > 0.01 for v in vals):
                     print(
-                        f"  value_matrix[{row}] -> d_head cols {nz}, "
-                        f"vals={vm[row, nz].tolist()}"
+                        f"  [watch:attn_out] pos={pos}: "
+                        f"sort_den={vals[0]:.3f} C={vals[1]:.3f} "
+                        f"D={vals[2]:.3f} E={vals[3]:.3f} "
+                        f"H_inv={vals[4]:.3f} tex_id={vals[5]:.3f}"
                     )
-            # Show which output_matrix rows are non-zero
-            om = _a.output_matrix
-            for col in range(min(om.shape[1], 5)):
-                nz = om[:, col].nonzero(as_tuple=True)[0].tolist()
-                if nz:
-                    print(
-                        f"  output_matrix[:,{col}] <- d_head rows {nz}, "
-                        f"vals={om[nz, col].tolist()}"
-                    )
-        else:
-            print(f"[THINKING] could not find Attn node, got {type(_inner).__name__}")
+            return True, ""
+
+        selected_render = debug_watch(
+            selected_render, _watch_attn_out, message="thinking_attn_out"
+        )
 
         d_rv = 8 + max_walls
         t_sort_den = extract_from(selected_render, d_rv, 0, 1, "t_sort_den")
@@ -192,6 +175,18 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
         t_col_lo = extract_from(selected_render, d_rv, 6, 1, "t_col_lo")
         t_col_hi = extract_from(selected_render, d_rv, 7, 1, "t_col_hi")
         t_onehot = extract_from(selected_render, d_rv, 8, max_walls, "t_onehot")
+
+        # DebugWatch on extracted t_sort_den
+        def _watch_sort_den(t):
+            for pos in range(t.shape[0]):
+                v = t[pos, 0].item()
+                if abs(v) > 0.01:
+                    print(f"  [watch:t_sort_den] pos={pos}: {v:.4f}")
+            return True, ""
+
+        t_sort_den = debug_watch(
+            t_sort_den, _watch_sort_den, message="t_sort_den"
+        )
 
     return ThinkingOutputs(
         t_sort_den=t_sort_den,

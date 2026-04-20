@@ -339,12 +339,6 @@ def step_frame(
     eos_ry_out_s, _ = out_by_name["eos_resolved_y"]
     eos_angle_out_s, _ = out_by_name["eos_new_angle"]
 
-    # Debug: print overlaid mapping
-    print("  Output spec:")
-    for n, s, w in module._output_specs:
-        overlaid = "overlaid" if n in out_by_name and n in in_by_name else "overflow"
-        print(f"    {n}: out_offset={s} width={w} ({overlaid})")
-
     # Overlaid fields: any name appearing in both input and output specs.
     # The host copies these from output to input each step (delta transfer
     # places them at the same columns in the residual stream, but the
@@ -553,48 +547,15 @@ def step_frame(
                 frame[y, col] = pix[row_idx]
                 filled[y, col] = True
 
-        # Debug: show render state
-        tt_out_s, _ = out_by_name["token_type"]
-        tt_vec = out[0, tt_out_s : tt_out_s + 8].cpu()
-        rm_out_s, rm_out_w = out_by_name["render_mask"]
-        mask_vals = out[0, rm_out_s : rm_out_s + rm_out_w].cpu().numpy()
-        rc_out_s, _ = out_by_name["render_col"]
-        rc_val = out[0, rc_out_s].item()
-        vh_out_s, _ = out_by_name["render_vis_hi"]
-        vh_val = out[0, vh_out_s].item()
-        vl_out_s, _ = out_by_name["render_vis_lo"]
-        vl_val = out[0, vl_out_s].item()
-        is_thinking_next = (tt_vec - E8_THINKING.cpu()).abs().sum().item() < 1.0
-        n_masked = int(np.sum(np.round(mask_vals).clip(0, 1)))
-        if k == 0:
-            label = "T" if length == 0 else "R"
-            rf_out_s, rf_out_w = out_by_name["render_feedback"]
-            rf_vals = out[0, rf_out_s : rf_out_s + rf_out_w].cpu().numpy()
-            rf_in_s, rf_in_w = in_by_name["render_feedback"]
-            rf_in_vals = prev[0, rf_in_s : rf_in_s + rf_in_w].cpu().numpy()
-            print(
-                f"    [{k:3d}] {label} col={rc_val:.0f} vis=[{vl_val:.0f},{vh_val:.0f})"
-                f" len={length} mask={n_masked} done={done:.1f}"
-                f" next={'THINK' if is_thinking_next else 'RENDER'}"
-                f"\n           rf_in=[{','.join(f'{v:.3f}' for v in rf_in_vals)}]"
-                f" rf_out=[{','.join(f'{v:.3f}' for v in rf_vals)}]"
-            )
-            print("           All overlaid outputs at step 0:")
-            for oname in overlaid_names:
-                os, ow = out_by_name[oname]
-                ov = out[0, os : os + ow].cpu().numpy()
-                ins, iw = in_by_name[oname]
-                iv = prev[0, ins : ins + iw].cpu().numpy()
-                if ow <= 8:
-                    print(
-                        f"             {oname}: in=[{','.join(f'{v:.3f}' for v in iv)}] out=[{','.join(f'{v:.3f}' for v in ov)}]"
-                    )
-
         if done > 0.0:
             break
 
         # Map compact output to input layout
         prev = _out_to_input(out)
+
+        # Host-side termination: check render_mask
+        rm_out_s, rm_out_w = out_by_name["render_mask"]
+        mask_vals = out[0, rm_out_s : rm_out_s + rm_out_w].cpu().numpy()
         n_masked = int(np.sum(np.round(mask_vals).clip(0, 1)))
         if n_masked >= N:
             break

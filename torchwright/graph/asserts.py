@@ -701,8 +701,8 @@ def assert_softmax_hardness(
         ki = x[:, d_qi : d_qi + d_ki]
         n_pos = qi.shape[0]
 
-        Q = qi @ query_matrix
-        K = ki @ key_matrix
+        Q = qi @ query_matrix.to(x.device)
+        K = ki @ key_matrix.to(x.device)
         logits = Q @ K.t()
 
         mask = torch.triu(torch.ones(n_pos, n_pos, device=x.device), diagonal=1)
