@@ -191,19 +191,17 @@ def build_render(
         )
 
     with annotate("render/precompute"):
-        sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv = (
-            _compute_precomputes(
-                sel_ax,
-                sel_ay,
-                sel_bx,
-                sel_by,
-                inputs.player_x,
-                inputs.player_y,
-                inputs.player_cos,
-                inputs.player_sin,
-                H=H,
-                max_coord=max_coord,
-            )
+        sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv = _compute_precomputes(
+            sel_ax,
+            sel_ay,
+            sel_bx,
+            sel_by,
+            inputs.player_x,
+            inputs.player_y,
+            inputs.player_cos,
+            inputs.player_sin,
+            H=H,
+            max_coord=max_coord,
         )
 
     with annotate("render/state_machine"):
@@ -330,12 +328,8 @@ def _attend_wall_geometry(
     GEOM_MATCH_GAIN = 1000.0
     wall_geom = attend_argmax_dot(
         pos_encoding,
-        query_vector=cond_gate(
-            is_render, wall_j_onehot
-        ),
-        key_vector=cond_gate(
-            is_wall, wall_position_onehot
-        ),
+        query_vector=cond_gate(is_render, wall_j_onehot),
+        key_vector=cond_gate(is_wall, wall_position_onehot),
         value=cond_gate(
             is_wall,
             Concatenate([wall_ax, wall_ay, wall_bx, wall_by]),
@@ -380,56 +374,96 @@ def _compute_precomputes(
 
     # sort_den = ey*cos - ex*sin
     r_ey_cos = piecewise_linear_2d(
-        w_ey, player_cos, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="r_ey_cos",
+        w_ey,
+        player_cos,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="r_ey_cos",
     )
     r_ex_sin = piecewise_linear_2d(
-        w_ex, player_sin, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="r_ex_sin",
+        w_ex,
+        player_sin,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="r_ex_sin",
     )
     sort_den = subtract(r_ey_cos, r_ex_sin)
 
     # C = ey*sin + ex*cos
     r_ey_sin = piecewise_linear_2d(
-        w_ey, player_sin, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="r_ey_sin",
+        w_ey,
+        player_sin,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="r_ey_sin",
     )
     r_ex_cos = piecewise_linear_2d(
-        w_ex, player_cos, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="r_ex_cos",
+        w_ex,
+        player_cos,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="r_ex_cos",
     )
     precomp_C = add(r_ey_sin, r_ex_cos)
 
     # D = fx*sin + gy*cos
     r_fx_sin = piecewise_linear_2d(
-        w_fx, player_sin, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="r_fx_sin",
+        w_fx,
+        player_sin,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="r_fx_sin",
     )
     r_gy_cos = piecewise_linear_2d(
-        w_gy, player_cos, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="r_gy_cos",
+        w_gy,
+        player_cos,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="r_gy_cos",
     )
     precomp_D = add(r_fx_sin, r_gy_cos)
 
     # E = fx*cos - gy*sin
     r_fx_cos = piecewise_linear_2d(
-        w_fx, player_cos, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="r_fx_cos",
+        w_fx,
+        player_cos,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="r_fx_cos",
     )
     r_gy_sin = piecewise_linear_2d(
-        w_gy, player_sin, DIFF_BP, TRIG_BP,
-        lambda a, b: a * b, name="r_gy_sin",
+        w_gy,
+        player_sin,
+        DIFF_BP,
+        TRIG_BP,
+        lambda a, b: a * b,
+        name="r_gy_sin",
     )
     precomp_E = subtract(r_fx_cos, r_gy_sin)
 
     # sort_num_t = ey*fx + ex*gy
     r_ey_fx = piecewise_linear_2d(
-        w_ey, w_fx, DIFF_BP, DIFF_BP,
-        lambda a, b: a * b, name="r_ey_fx",
+        w_ey,
+        w_fx,
+        DIFF_BP,
+        DIFF_BP,
+        lambda a, b: a * b,
+        name="r_ey_fx",
     )
     r_ex_gy = piecewise_linear_2d(
-        w_ex, w_gy, DIFF_BP, DIFF_BP,
-        lambda a, b: a * b, name="r_ex_gy",
+        w_ex,
+        w_gy,
+        DIFF_BP,
+        DIFF_BP,
+        lambda a, b: a * b,
+        name="r_ex_gy",
     )
     sort_num_t = add(r_ey_fx, r_ex_gy)
 

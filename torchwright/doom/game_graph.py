@@ -526,9 +526,7 @@ def _assemble_output(
         out_length = select(token_flags["is_render"], render_out.chunk_length, zero_1)
         out_done = select(token_flags["is_render"], render_out.done_flag, neg_one)
 
-        out_sort_done = select(
-            token_flags["is_sorted"], sorted_out.sort_done, neg_one
-        )
+        out_sort_done = select(token_flags["is_sorted"], sorted_out.sort_done, neg_one)
 
         out_eos_rx = select(token_flags["is_eos"], eos_out.resolved_x, zero_1)
         out_eos_ry = select(token_flags["is_eos"], eos_out.resolved_y, zero_1)
