@@ -102,8 +102,8 @@ class TargetOp:
     distribution_names: Sequence[str]
     source_file: str
     notes: str = ""
-    build_graphs_per_distribution: Dict[str, Callable[[Dict[str, Node]], Node]] = (
-        field(default_factory=dict)
+    build_graphs_per_distribution: Dict[str, Callable[[Dict[str, Node]], Node]] = field(
+        default_factory=dict
     )
 
 
@@ -1167,22 +1167,14 @@ def render_markdown(data: Dict) -> str:
     lines.append("")
     lines.append("## How to read these numbers")
     lines.append("")
-    lines.append(
-        "Each row reports output noise *at the op's design operating point* —"
-    )
-    lines.append(
-        "i.e., with clean inputs drawn from the listed distribution. It does"
-    )
+    lines.append("Each row reports output noise *at the op's design operating point* —")
+    lines.append("i.e., with clean inputs drawn from the listed distribution. It does")
     lines.append(
         "**not** bound output noise when upstream inputs are themselves noisy."
     )
     lines.append("")
-    lines.append(
-        "Per-op bounds are **not additive** through a chain when any op has"
-    )
-    lines.append(
-        "internal gain (a constant that multiplies an input). Gate ops"
-    )
+    lines.append("Per-op bounds are **not additive** through a chain when any op has")
+    lines.append("internal gain (a constant that multiplies an input). Gate ops")
     lines.append(
         "(`cond_gate`, `select`, `attend_mean_where`) and threshold-output ops"
     )
@@ -1192,12 +1184,8 @@ def render_markdown(data: Dict) -> str:
     lines.append(
         "have structural gains > 1. An upstream deviation of magnitude `1/gain`"
     )
-    lines.append(
-        "can push the gated op outside its published bound, and the bias"
-    )
-    lines.append(
-        "propagates multiplicatively downstream. See"
-    )
+    lines.append("can push the gated op outside its published bound, and the bias")
+    lines.append("propagates multiplicatively downstream. See")
     lines.append(
         "`docs/numerical_noise_findings.md` for the worked Phase E example and"
     )
@@ -1206,15 +1194,11 @@ def render_markdown(data: Dict) -> str:
     lines.append(
         "To reason about a specific chain, don't try to compose per-op bounds."
     )
-    lines.append(
-        "Probe the suspect node directly with"
-    )
+    lines.append("Probe the suspect node directly with")
     lines.append(
         "`torchwright.debug.probe.probe_compiled`; the residual at the node is"
     )
-    lines.append(
-        "observable, the per-op bounds are an aid for spotting the op *class*"
-    )
+    lines.append("observable, the per-op bounds are an aid for spotting the op *class*")
     lines.append("most likely responsible.")
     lines.append("")
     for op in data["ops"]:
