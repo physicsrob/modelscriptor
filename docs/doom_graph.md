@@ -270,8 +270,9 @@ transitions.
    earlier designs — now they're computed fresh at each RENDER token
    from the raw wall coordinates and player state.
 
-3. **Active column.** If `render_is_new_wall`, reset to the wall's
-   `render_vis_lo`. Otherwise, continue from `render_col`.
+3. **Active column.** The active column is `render_col`. The host sets
+   this to `vis_lo` on wall transitions; the state machine advances it
+   on column transitions.
 
 4. **Angle offset.** `angle_offset = (col × fov / W) - fov/2` — the
    horizontal angle of this column relative to the screen center, in
@@ -314,14 +315,14 @@ transitions.
 
 9. **State transitions.** Three mutually exclusive cases:
    - **More chunks**: `active_start + chunk_size < wall_bottom` —
-     stay on this column, advance `chunk_start` by `chunk_size`.
+     stay on this column, advance `chunk_k` by 1.
    - **Advance column**: no more chunks, `active_col + 1 <= vis_hi`
-     — move to the next column, reset `chunk_start` to sentinel (-1).
+     — move to the next column, reset `chunk_k` to 0.
    - **Advance wall**: no more chunks, no more columns — add
      `render_wall_j_onehot` to `render_mask`. If all walls masked,
-     set `done = +1`. The host detects the wall transition
-     (`render_is_new_wall > 0` on the next token) and feeds the
-     next sorted wall's identity from its cached SORTED outputs.
+     set `done = +1`. The `advance_wall` overflow flag is +1; the
+     host reads it to feed the next sorted wall's identity and set
+     `render_col = vis_lo`.
 
    Next-token-type is always `E8_RENDER`.
 
@@ -346,12 +347,8 @@ The host copies each overlaid field verbatim from output to input.
 - **render_col** (1): Current screen column. SORTED seeds this to
   `vis_lo`; RENDER advances it via the state machine.
 
-- **render_is_new_wall** (1): +1 on wall transitions, -1 otherwise.
-  The host reads this to know when to feed the next sorted wall's
-  identity.
-
-- **render_chunk_start** (1): Current chunk start row. Sentinel -1
-  means "start at the wall's visible top."
+- **render_chunk_k** (1): Chunk index within the current column
+  (0, 1, 2, ...). Reset to 0 on column and wall transitions.
 
 - **render_tex_id** (1): Texture ID of the wall being rendered.
   SORTED seeds this from the wall payload; RENDER forwards it.
@@ -375,6 +372,9 @@ these directly:
 - **start** (1): Screen row where this chunk begins.
 - **length** (1): Number of rows painted (0 for non-RENDER tokens).
 - **done** (1): +1 when all walls are fully rendered, -1 otherwise.
+- **advance_wall** (1): +1 when transitioning to the next wall, -1
+  otherwise. The host reads this to feed the next sorted wall's
+  identity and set `render_col = vis_lo`.
 - **sort_done** (1): +1 when the sort has exhausted all renderable
   walls at this SORTED position, -1 otherwise.
 - **eos_resolved_x**, **eos_resolved_y** (1 each): Collision-resolved

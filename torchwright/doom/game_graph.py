@@ -260,8 +260,7 @@ def build_game_graph(
         RenderInputs(
             render_mask=inputs["render_mask"],
             render_col=inputs["render_col"],
-            render_is_new_wall=inputs["render_is_new_wall"],
-            render_chunk_start=inputs["render_chunk_start"],
+            render_chunk_k=inputs["render_chunk_k"],
             render_tex_id=inputs["render_tex_id"],
             render_vis_lo=inputs["render_vis_lo"],
             render_vis_hi=inputs["render_vis_hi"],
@@ -386,11 +385,8 @@ def _create_inputs(
         "render_mask", max_walls, value_range=(0.0, 1.0)
     )
     inputs["render_col"] = create_input("render_col", 1, value_range=(0.0, 255.0))
-    inputs["render_is_new_wall"] = create_input(
-        "render_is_new_wall", 1, value_range=(-1.0, 1.0)
-    )
-    inputs["render_chunk_start"] = create_input(
-        "render_chunk_start", 1, value_range=(-1.0, 255.0)
+    inputs["render_chunk_k"] = create_input(
+        "render_chunk_k", 1, value_range=(0.0, 20.0)
     )
     inputs["render_tex_id"] = create_input("render_tex_id", 1, value_range=(0.0, 255.0))
     inputs["render_vis_lo"] = create_input(
@@ -436,16 +432,16 @@ def _assemble_output(
     """Build the overlaid outputs + overflow outputs.
 
     Overlaid outputs fed back into the next step's input:
-        token_type, render_mask, render_col, render_is_new_wall,
-        render_chunk_start, render_tex_id, render_vis_lo,
-        render_vis_hi, render_wall_j_onehot
+        token_type, render_mask, render_col, render_chunk_k,
+        render_tex_id, render_vis_lo, render_vis_hi,
+        render_wall_j_onehot
 
     At SORTED positions the render_* overlaid outputs carry the
     sorted wall's identity so the host can cache the sorted order.
 
     Overflow outputs bitblitted by the host:
-        pixels, col, start, length, done, sort_done,
-        eos_resolved_x, eos_resolved_y, eos_new_angle
+        pixels, col, start, length, done, advance_wall,
+        sort_done, eos_resolved_x, eos_resolved_y, eos_new_angle
     """
     with annotate("output"):
         zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
@@ -473,14 +469,9 @@ def _assemble_output(
             select(token_flags["is_render"], render_out.next_col, zero_1),
         )
 
-        # render_is_new_wall: RENDER sets per state.
-        out_render_is_new_wall = select(
-            token_flags["is_render"], render_out.next_is_new_wall, neg_one
-        )
-
-        # render_chunk_start: RENDER advances.
-        out_render_chunk_start = select(
-            token_flags["is_render"], render_out.next_chunk, zero_1
+        # render_chunk_k: RENDER advances.
+        out_render_chunk_k = select(
+            token_flags["is_render"], render_out.next_chunk_k, zero_1
         )
 
         # render_tex_id: SORTED sets from wall; RENDER forwards.
@@ -525,6 +516,9 @@ def _assemble_output(
         out_start = select(token_flags["is_render"], render_out.active_start, zero_1)
         out_length = select(token_flags["is_render"], render_out.chunk_length, zero_1)
         out_done = select(token_flags["is_render"], render_out.done_flag, neg_one)
+        out_advance_wall = select(
+            token_flags["is_render"], render_out.advance_wall, neg_one
+        )
 
         out_sort_done = select(token_flags["is_sorted"], sorted_out.sort_done, neg_one)
 
@@ -536,8 +530,7 @@ def _assemble_output(
         "token_type": out_token_type,
         "render_mask": out_render_mask,
         "render_col": out_render_col,
-        "render_is_new_wall": out_render_is_new_wall,
-        "render_chunk_start": out_render_chunk_start,
+        "render_chunk_k": out_render_chunk_k,
         "render_tex_id": out_render_tex_id,
         "render_vis_lo": out_render_vis_lo,
         "render_vis_hi": out_render_vis_hi,
@@ -549,6 +542,7 @@ def _assemble_output(
         "start": out_start,
         "length": out_length,
         "done": out_done,
+        "advance_wall": out_advance_wall,
         "sort_done": out_sort_done,
         "eos_resolved_x": out_eos_rx,
         "eos_resolved_y": out_eos_ry,

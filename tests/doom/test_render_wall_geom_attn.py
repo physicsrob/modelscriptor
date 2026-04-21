@@ -187,8 +187,8 @@ def _compile_and_check_wall_geom(tex_size):
         render_vis_lo=torch.tensor([vlo]),
         render_vis_hi=torch.tensor([vhi]),
         render_tex_id=torch.tensor([tid]),
-        render_is_new_wall=torch.tensor([1.0]),
-        render_chunk_start=torch.tensor([-1.0]),
+        render_col=torch.tensor([vlo]),
+        render_chunk_k=torch.tensor([0.0]),
     )
     with torch.no_grad():
         rout, past = module.step(render_row, past, past_len=step)

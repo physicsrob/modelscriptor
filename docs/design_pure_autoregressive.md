@@ -5,6 +5,8 @@
 Design document. Supersedes
 [design_feedback_elimination.md](design_feedback_elimination.md).
 
+Steps 1, 2, 3, and 5 are implemented. Steps 4, 6, 7 remain.
+
 ## Motivation
 
 The current game graph carries two feedback vectors — `sort_feedback`

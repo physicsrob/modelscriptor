@@ -12,8 +12,9 @@ The host is a dumb token feeder and pixel bitblitter.  It feeds player
 state at every position, wall geometry at WALL positions, a position
 index at SORTED_WALL positions, and discrete wall identity at RENDER
 positions.  The only host-side logic is copying overlaid fields from
-output to input, detecting wall transitions (render_is_new_wall > 0),
-and feeding the next sorted wall's identity on transitions.
+output to input, detecting wall transitions (advance_wall > 0 in the
+overflow output), and feeding the next sorted wall's identity plus
+setting render_col to vis_lo on transitions.
 """
 
 import time
@@ -221,8 +222,7 @@ def _build_row(compiled, max_walls, **kwargs):
         "player_y": torch.zeros(1, device=device),
         "render_mask": torch.zeros(max_walls_meta, device=device),
         "render_col": torch.zeros(1, device=device),
-        "render_is_new_wall": torch.zeros(1, device=device),
-        "render_chunk_start": torch.zeros(1, device=device),
+        "render_chunk_k": torch.zeros(1, device=device),
         "render_tex_id": torch.zeros(1, device=device),
         "render_vis_lo": torch.zeros(1, device=device),
         "render_vis_hi": torch.zeros(1, device=device),
@@ -561,8 +561,8 @@ def step_frame(
             render_vis_lo=torch.tensor([v_lo]),
             render_vis_hi=torch.tensor([v_hi]),
             render_tex_id=torch.tensor([t_id]),
-            render_is_new_wall=torch.tensor([1.0]),
-            render_chunk_start=torch.tensor([-1.0]),
+            render_col=torch.tensor([v_lo]),
+            render_chunk_k=torch.tensor([0.0]),
         )
 
         wall_idx = 0
@@ -595,23 +595,25 @@ def step_frame(
             # Map overlaid output to next input
             prev = _out_to_input(out)
 
-            # Detect wall transition: render_is_new_wall > 0 in output
-            inw_in_s, _ = in_by_name["render_is_new_wall"]
-            is_new_wall = prev[0, inw_in_s].item()
-            if is_new_wall > 0.0:
+            # Detect wall transition: advance_wall > 0 in overflow output
+            aw_out_s, _ = out_by_name["advance_wall"]
+            is_advance_wall = out[0, aw_out_s].item()
+            if is_advance_wall > 0.0:
                 wall_idx += 1
                 if wall_idx >= n_renderable:
                     break
-                # Feed next sorted wall's identity
+                # Feed next sorted wall's identity + set render_col
                 wall_j_oh, v_lo, v_hi, t_id = sorted_walls[wall_idx]
                 wj_in_s, wj_in_w = in_by_name["render_wall_j_onehot"]
                 vlo_in_s, _ = in_by_name["render_vis_lo"]
                 vhi_in_s, _ = in_by_name["render_vis_hi"]
                 tid_in_s, _ = in_by_name["render_tex_id"]
+                col_in_s, _ = in_by_name["render_col"]
                 prev[0, wj_in_s : wj_in_s + wj_in_w] = wall_j_oh.to(device)
                 prev[0, vlo_in_s] = v_lo
                 prev[0, vhi_in_s] = v_hi
                 prev[0, tid_in_s] = t_id
+                prev[0, col_in_s] = v_lo
 
             # Host-side termination: check render_mask
             rm_out_s, rm_out_w = out_by_name["render_mask"]

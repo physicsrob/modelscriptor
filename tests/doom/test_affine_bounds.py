@@ -286,7 +286,7 @@ def doom_graph():
             "render_col",
             "render_vis_lo",
             "render_vis_hi",
-            "render_chunk_start",
+            "render_chunk_k",
         }
 
         tainted: Set[int] = set()

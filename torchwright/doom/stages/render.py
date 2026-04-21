@@ -12,23 +12,24 @@ Per-token flow:
 2. **Precompute**: from the raw geometry plus player state (position
    and cos/sin from PLAYER broadcasts), compute the rotation products
    (sort_den, C, D, E, sort_num_t) and derive H_inv.
-3. Derive the **active column**: if ``render_is_new_wall`` the column
-   resets to the wall's ``render_vis_lo``; otherwise it's ``render_col``.
+3. The **active column** is ``render_col`` (the host sets this to
+   ``render_vis_lo`` on wall transitions).
 4. Compute wall height + texture u-coordinate.
 5. TEX_COL attention fetches the matching texture column pixels.
-6. Determine the **active chunk_start**: sentinel (-1) means
-   "start at the wall's visible top"; otherwise continue from
-   ``render_chunk_start``.
+6. Compute **active_start** from ``render_chunk_k``:
+   ``vis_top + render_chunk_k × chunk_size``.
 7. Fill ``chunk_size`` rows into the column pixel strip.
 8. Compute state transitions — three exclusive cases:
 
    * **more chunks**: ``active_start + cs < vis_bottom`` → stay on this
-     column, advance chunk_start by ``cs``.
+     column, advance ``chunk_k`` by 1.
    * **advance col**: no more chunks, ``active_col + 1 ≤ vis_hi`` →
-     move to the next column, reset chunk_start sentinel.
+     move to the next column, reset ``chunk_k`` to 0.
    * **advance wall**: no more columns → update ``render_mask`` with
      ``render_wall_j_onehot``.  If all walls are masked, emit ``done``.
-     On advance_wall the host feeds the next sorted wall's identity.
+     ``advance_wall`` is emitted as an overflow flag; the host reads
+     it to feed the next sorted wall's identity and set
+     ``render_col = vis_lo``.
 
 Next-token-type is always ``E8_RENDER`` (THINKING is eliminated).
 """
@@ -89,9 +90,8 @@ class RenderInputs:
 
     # Iteration state (overlay).
     render_mask: Node  # max_walls-wide, walls fully rendered so far
-    render_col: Node  # current column
-    render_is_new_wall: Node  # +1 if just transitioned to a new wall
-    render_chunk_start: Node  # current chunk start row; sentinel -1 = "new col"
+    render_col: Node  # current screen column (overlay; host overrides to vis_lo on wall transitions)
+    render_chunk_k: Node  # chunk index within current column (0, 1, 2, ...)
 
     # Wall identity (overlay; host-fed on transitions).
     render_tex_id: Node
@@ -149,12 +149,13 @@ class RenderOutputs:
     # Discrete state outputs (overlaid).
     next_render_mask: Node
     next_col: Node
-    next_is_new_wall: Node
-    next_chunk: Node
+    next_chunk_k: Node
     next_tex_id: Node
     next_vis_lo: Node
     next_vis_hi: Node
     next_wall_j_onehot: Node
+    # Overflow flag: +1 when transitioning to the next wall.
+    advance_wall: Node
 
 
 # ---------------------------------------------------------------------------
@@ -205,9 +206,7 @@ def build_render(
         )
 
     with annotate("render/state_machine"):
-        active_col = select(
-            inputs.render_is_new_wall, inputs.render_vis_lo, inputs.render_col
-        )
+        active_col = inputs.render_col
         angle_offset = _compute_angle_offset(active_col, W=W, fov=fov)
 
     with annotate("render/wall_height"):
@@ -256,7 +255,7 @@ def build_render(
             wall_bottom,
             wall_height,
             tex_column_colors,
-            render_chunk_start=inputs.render_chunk_start,
+            render_chunk_k=inputs.render_chunk_k,
             config=config,
             tex_h=tex_h,
             chunk_size=cs,
@@ -270,12 +269,12 @@ def build_render(
             render_next_type,
             next_render_mask,
             next_col,
-            next_is_new_wall,
-            next_chunk,
+            next_chunk_k,
             next_tex_id,
             next_vis_lo,
             next_vis_hi,
             next_wall_j_onehot,
+            advance_wall,
         ) = _compute_next_state(
             active_col=active_col,
             active_start=active_start,
@@ -285,6 +284,7 @@ def build_render(
             vis_hi=inputs.render_vis_hi,
             tex_id=inputs.render_tex_id,
             vis_lo=inputs.render_vis_lo,
+            chunk_k=inputs.render_chunk_k,
             chunk_size=cs,
             max_walls=max_walls,
         )
@@ -298,12 +298,12 @@ def build_render(
         render_next_type=render_next_type,
         next_render_mask=next_render_mask,
         next_col=next_col,
-        next_is_new_wall=next_is_new_wall,
-        next_chunk=next_chunk,
+        next_chunk_k=next_chunk_k,
         next_tex_id=next_tex_id,
         next_vis_lo=next_vis_lo,
         next_vis_hi=next_vis_hi,
         next_wall_j_onehot=next_wall_j_onehot,
+        advance_wall=advance_wall,
     )
 
 
@@ -689,7 +689,7 @@ def _chunk_fill(
     wall_height: Node,
     tex_column_colors: Node,
     *,
-    render_chunk_start: Node,
+    render_chunk_k: Node,
     config: RenderConfig,
     tex_h: int,
     chunk_size: int,
@@ -701,9 +701,7 @@ def _chunk_fill(
     vis_top_render = clamp(wall_top, 0.0, float(H))
     vis_bottom_render = clamp(wall_bottom, 0.0, float(H))
 
-    neg_half = create_literal_value(torch.tensor([-0.5]), name="neg_half")
-    is_new_col = compare(subtract(neg_half, render_chunk_start), 0.0)
-    active_start = select(is_new_col, vis_top_render, render_chunk_start)
+    active_start = add(vis_top_render, multiply_const(render_chunk_k, float(chunk_size)))
 
     chunk_length = clamp(
         subtract(vis_bottom_render, active_start),
@@ -736,13 +734,14 @@ def _compute_next_state(
     vis_hi: Node,
     tex_id: Node,
     vis_lo: Node,
+    chunk_k: Node,
     chunk_size: int,
     max_walls: int,
 ):
     """Three-way state transition: more chunks / advance col / advance wall.
 
-    Returns discrete state outputs, ``done_flag``, and ``render_next_type``
-    (always E8_RENDER).
+    Returns discrete state outputs, ``advance_wall`` flag, ``done_flag``,
+    and ``render_next_type`` (always E8_RENDER).
     """
     next_chunk_start_val = add_const(active_start, float(chunk_size))
     has_more_chunks = compare(
@@ -771,17 +770,11 @@ def _compute_next_state(
     next_col_output = select(
         has_more_chunks,
         active_col,
-        select(advance_col, col_p1, zero_col),
+        select(advance_col, col_p1, zero_col),  # host overrides with vis_lo on advance_wall
     )
-    chunk_sentinel = create_literal_value(
-        torch.tensor([-1.0]),
-        name="chunk_sentinel",
-    )
-    next_chunk = select(has_more_chunks, next_chunk_start_val, chunk_sentinel)
-
-    pos_one = create_literal_value(torch.tensor([1.0]), name="pos_one")
-    neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one")
-    next_is_new_wall = select(advance_wall, pos_one, neg_one)
+    chunk_k_plus_1 = add_const(chunk_k, 1.0)
+    zero_chunk_k = create_literal_value(torch.tensor([0.0]), name="zero_chunk_k")
+    next_chunk_k = select(has_more_chunks, chunk_k_plus_1, zero_chunk_k)
 
     render_next_type = create_literal_value(E8_RENDER, name="type_render")
 
@@ -790,10 +783,10 @@ def _compute_next_state(
         render_next_type,
         next_render_mask,
         next_col_output,
-        next_is_new_wall,
-        next_chunk,
+        next_chunk_k,
         tex_id,
         vis_lo,
         vis_hi,
         wall_j_onehot,
+        advance_wall,
     )
