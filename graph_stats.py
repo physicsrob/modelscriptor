@@ -778,7 +778,12 @@ def main():
         help="Head dimension (default: auto from width/tex_size)",
     )
     parser.add_argument(
-        "--d-hidden", type=int, default=None, help="MLP hidden dimension (default: 4*d)"
+        "--d-hidden", type=int, default=None, help="MLP hidden dimension (default: d)"
+    )
+    parser.add_argument(
+        "--legacy-policy",
+        action="store_true",
+        help="Use legacy scheduling (standalone Linears in attention)",
     )
     args = parser.parse_args()
 
@@ -808,7 +813,7 @@ def main():
     else:
         d_head = args.d_head
 
-    d_hidden = args.d_hidden if args.d_hidden else 4 * d
+    d_hidden = args.d_hidden if args.d_hidden else d
 
     config = RenderConfig(
         screen_width=args.width,
@@ -847,16 +852,19 @@ def main():
     def _track(node, layer_idx):
         node_to_layer[node.node_id] = layer_idx
 
-    forward_compile(
+    from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY
+
+    net = forward_compile(
         d,
         d_head,
         output,
         pos,
         verbose=False,
         max_layers=400,
-        d_hidden=d_hidden if d_hidden != 4 * d else None,
+        d_hidden=d_hidden,
         device=None,
         on_node_scheduled=_track,
+        policy=LEGACY_POLICY if args.legacy_policy else None,
     )
     n_layers = max(node_to_layer.values()) + 1 if node_to_layer else 0
 
@@ -867,6 +875,25 @@ def main():
 
     layer_capacity = 4 * d * d + 2 * d * d_hidden + d_hidden + d
     _print_summary(total_graph, total_alloc, n_layers, layer_capacity)
+
+    # Head pruning summary
+    max_heads_per_layer = d // d_head
+    total_heads = sum(l.attn.attn.n_heads for l in net.layers)
+    total_heads_unpruned = max_heads_per_layer * n_layers
+    kv_per_pos = sum(l.attn.attn.n_heads * d_head * 2 for l in net.layers)
+    kv_unpruned = d * 2 * n_layers
+    attn_params = sum(l.attn.attn.num_params() for l in net.layers)
+    attn_unpruned = 4 * d * d_head * max_heads_per_layer * n_layers
+    print(
+        f"\n  Head pruning:"
+        f"\n    Heads:      {total_heads:>6} / {total_heads_unpruned} "
+        f"({100 * total_heads / total_heads_unpruned:.0f}%)"
+        f"\n    KV/pos:     {kv_per_pos:>6} / {kv_unpruned} floats "
+        f"({100 * kv_per_pos / kv_unpruned:.0f}%)"
+        f"\n    Attn params: {attn_params:>12,} / {attn_unpruned:,} "
+        f"({100 * attn_params / attn_unpruned:.0f}%)"
+    )
+    del net
 
     # Critical path analysis
     _print_critical_path_analysis(all_nodes, {output, pos})

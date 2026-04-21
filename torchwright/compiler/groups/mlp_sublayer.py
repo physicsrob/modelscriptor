@@ -44,6 +44,30 @@ class MLPSubLayer:
         else:
             return x
 
+    def trim_unused_slots(self):
+        """Remove trailing unused (all-zero) hidden slots after compilation.
+
+        Slots are allocated contiguously from index 0, so slicing
+        [:used] is safe.  Keeps at least 1 slot to avoid degenerate
+        empty-tensor shapes.
+        """
+        # linear1 output columns and linear2 input rows correspond to slots.
+        # A slot is unused if its linear1 column and linear2 row are both zero.
+        l1_used = (self.linear1.output_matrix != 0).any(dim=0)  # (d_hidden,)
+        l2_used = (self.linear2.output_matrix != 0).any(dim=1)  # (d_hidden,)
+        used = l1_used | l2_used
+        if used.any():
+            last_used = used.nonzero()[-1].item() + 1
+        else:
+            last_used = 1
+        n = max(last_used, 1)
+        if n < self.d_hidden:
+            self.linear1.output_matrix = self.linear1.output_matrix[:, :n].contiguous()
+            self.linear1.output_bias = self.linear1.output_bias[:n].contiguous()
+            self.linear2.output_matrix = self.linear2.output_matrix[:n, :].contiguous()
+            self.d_hidden = n
+            self.relu.d = n
+
     def num_params(self):
         return self.linear1.num_params() + self.linear2.num_params()
 

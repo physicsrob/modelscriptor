@@ -531,6 +531,18 @@ def forward_compile(
                     f"{kv_depth:>10}  {cp:>10}  {sa:>10}"
                 )
 
+    # Trim trailing unused MLP slots (same idea as head trimming).
+    for layer in net.layers:
+        layer.mlp.trim_unused_slots()
+    if verbose:
+        mlp_before = d_hidden * len(net.layers)
+        mlp_after = sum(layer.mlp.d_hidden for layer in net.layers)
+        mlp_saved = (mlp_before - mlp_after) * (2 * d + 2)
+        print(
+            f"\n  MLP trimming: {mlp_before - mlp_after}/{mlp_before} "
+            f"slots trimmed ({mlp_saved:,} params saved)"
+        )
+
     if device == "auto":
         net.to(get_device(verbose=verbose))
     elif device is not None:
