@@ -31,6 +31,7 @@ from torchwright.graph.asserts import (
     assert_matches_value_type,
     assert_onehot,
     assert_picked_from,
+    assert_score_gap_at_least,
     assert_strictly_less,
     assert_unique_values,
     collect_asserts,
@@ -618,6 +619,87 @@ def test_picked_from_returns_result_width():
 # above (accepts_clean_pick, rejects_blend, rejects_no_valid_keys,
 # accepts_duplicate_valid_values), and its production usage is
 # exercised by torchwright/doom/stages/sorted.py + tests/doom/.
+
+
+# ---------------------------------------------------------------------------
+# assert_score_gap_at_least — minimum pairwise gap among valid rows
+# ---------------------------------------------------------------------------
+
+
+def test_score_gap_fires_at_reference_eval():
+    """Two WALL scores within the softmax-resolvability margin should fire."""
+    sort_score = create_input("sort_score", 1, value_range=(0.0, 100.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
+    checked = assert_score_gap_at_least(sort_score, is_wall, margin=0.05)
+    with pytest.raises(AssertionError, match=r"min-gap"):
+        _eval(
+            checked,
+            {
+                "sort_score": torch.tensor([[1.0], [1.04], [99.0]]),
+                "is_wall": torch.tensor([[1.0], [1.0], [0.0]]),
+            },
+            n_pos=3,
+        )
+
+
+def test_score_gap_passes_with_comfortable_margin():
+    """Scores spaced well above the gap margin must pass reference eval."""
+    sort_score = create_input("sort_score", 1, value_range=(0.0, 100.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
+    checked = assert_score_gap_at_least(sort_score, is_wall, margin=0.05)
+    _eval(
+        checked,
+        {
+            "sort_score": torch.tensor([[1.0], [1.5], [99.0]]),
+            "is_wall": torch.tensor([[1.0], [1.0], [0.0]]),
+        },
+        n_pos=3,
+    )
+
+
+def test_score_gap_vacuous_zero_valid():
+    """Zero valid rows -> vacuous pass."""
+    sort_score = create_input("sort_score", 1, value_range=(0.0, 100.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
+    checked = assert_score_gap_at_least(sort_score, is_wall, margin=0.05)
+    _eval(
+        checked,
+        {
+            "sort_score": torch.tensor([[1.0], [1.0], [1.0]]),
+            "is_wall": torch.tensor([[0.0], [0.0], [0.0]]),
+        },
+        n_pos=3,
+    )
+
+
+def test_score_gap_vacuous_one_valid():
+    """Single valid row -> vacuous pass (no pair to check)."""
+    sort_score = create_input("sort_score", 1, value_range=(0.0, 100.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
+    checked = assert_score_gap_at_least(sort_score, is_wall, margin=0.05)
+    _eval(
+        checked,
+        {
+            "sort_score": torch.tensor([[1.0], [1.0], [1.0]]),
+            "is_wall": torch.tensor([[1.0], [0.0], [0.0]]),
+        },
+        n_pos=3,
+    )
+
+
+def test_score_gap_ignores_non_wall_ties():
+    """Ties between a valid and an invalid row are ignored."""
+    sort_score = create_input("sort_score", 1, value_range=(0.0, 100.0))
+    is_wall = create_input("is_wall", 1, value_range=(-1.0, 1.0))
+    checked = assert_score_gap_at_least(sort_score, is_wall, margin=0.05)
+    _eval(
+        checked,
+        {
+            "sort_score": torch.tensor([[1.0], [1.0], [99.0]]),
+            "is_wall": torch.tensor([[1.0], [0.0], [0.0]]),
+        },
+        n_pos=3,
+    )
 
 
 # --- All violations are hard errors now -----------------------------------
