@@ -86,6 +86,39 @@ def _verify_end_of_layer_liveness(
         )
 
 
+def _count_heads_by_type(
+    attn_ops: list[AttnHeadOp],
+    d_head: int,
+) -> dict[str, int]:
+    """Count attention heads consumed by each op type."""
+    counts: dict[str, int] = {}
+    for attn_op in attn_ops:
+        if attn_op.op_type == "compute_attn":
+            assert attn_op.node is not None
+            from torchwright.graph.attn import Attn as _Attn
+
+            assert isinstance(attn_op.node, _Attn)
+            n = (attn_op.node.d_v + d_head - 1) // d_head
+        elif attn_op.op_type == "compute_linear":
+            assert attn_op.node is not None
+            d_input = len(attn_op.node.inputs[0])
+            n = (d_input + d_head - 1) // d_head
+        elif attn_op.op_type == "compute_add":
+            assert attn_op.node is not None
+            n = 2 * ((len(attn_op.node) + d_head - 1) // d_head)
+        elif attn_op.op_type == "cancel":
+            n = (len(attn_op.target_cols) + d_head - 1) // d_head
+        elif attn_op.op_type == "add_into":
+            assert attn_op.node is not None
+            n = (len(attn_op.node) + d_head - 1) // d_head
+        elif attn_op.op_type == "delta_transfer":
+            n = (len(attn_op.target_cols) + d_head - 1) // d_head
+        else:
+            n = 0
+        counts[attn_op.op_type] = counts.get(attn_op.op_type, 0) + n
+    return counts
+
+
 def _count_layer_params(
     attn_ops: list[AttnHeadOp],
     mlp_ops: list[MLPOp],
@@ -295,6 +328,7 @@ def forward_compile(
     # 3. Layer loop — seed with input node params (Embedding, etc.)
     total_params = sum(n.num_params() for n in input_nodes)
     total_layer_time = 0.0
+    per_layer_head_counts: list[dict[str, int]] = []
     for i in range(max_layers):
         if output_node in computed:
             break
@@ -335,6 +369,7 @@ def forward_compile(
                 on_node_scheduled(node, i)
 
         layer_params = _count_layer_params(attn_ops, mlp_ops, d, d_head)
+        per_layer_head_counts.append(_count_heads_by_type(attn_ops, d_head))
         total_params += layer_params
         occupied_after = d - residual_map.get_free_count()
 
@@ -343,11 +378,13 @@ def forward_compile(
             pct_params = 100 * layer_params / layer_capacity if layer_capacity else 0
             pct_before = 100 * occupied_before // d
             pct_after = 100 * occupied_after // d
+            mlp_slots = sum(len(op.mlp_slots) for op in mlp_ops if op.mlp_slots)
             print(
                 f"  {i:<8} {n_ops:>5} ops  "
                 f"{layer_params:>9,}/{layer_capacity:,} ({pct_params:>4.1f}%)  "
                 f"{occupied_before:>6}/{d} ({pct_before:>2}%)  "
                 f"{occupied_after:>6}/{d} ({pct_after:>2}%)  "
+                f"MLP {mlp_slots:>4}/{d_hidden}  "
                 f"{layer_time*1000:>7.1f}ms "
                 f"(alloc {alloc_time*1000:.0f} sch {schedule_time*1000:.0f} "
                 f"attn {attn_time*1000:.0f} mlp {mlp_time*1000:.0f})",
@@ -406,6 +443,7 @@ def forward_compile(
                 )
             )
         write_attn_sublayer(delta_layer, delta_ops, residual_map, pos_encoding)
+        per_layer_head_counts.append(_count_heads_by_type(delta_ops, d_head))
         if verbose:
             print(f"  Delta transfer layer: {len(delta_ops)} overlays")
         if on_layer_compiled is not None:
@@ -446,8 +484,44 @@ def forward_compile(
     net.assert_aliases = graph.get_assert_aliases()
 
     if trim_heads:
+        max_heads = d // d_head
         for layer in net.layers:
             layer.attn.attn.trim_unused_heads()
+        if verbose:
+            heads_per_layer = [layer.attn.attn.n_heads for layer in net.layers]
+            total_before = max_heads * len(net.layers)
+            total_after = sum(heads_per_layer)
+            saved_params = (total_before - total_after) * 4 * d * d_head
+            print(
+                f"\n  Head pruning: {total_before - total_after}/{total_before} "
+                f"heads pruned ({saved_params:,} params saved)"
+            )
+            # Aggregate heads by op type across all layers
+            totals_by_type: dict[str, int] = {}
+            for counts in per_layer_head_counts:
+                for op_type, n in counts.items():
+                    totals_by_type[op_type] = totals_by_type.get(op_type, 0) + n
+            cross_pos = totals_by_type.get("compute_attn", 0)
+            self_attn = sum(
+                n for t, n in totals_by_type.items() if t != "compute_attn"
+            )
+            print(
+                f"  Heads by purpose: {cross_pos} cross-position (compute_attn), "
+                f"{self_attn} self-attending "
+                f"({', '.join(f'{n} {t}' for t, n in sorted(totals_by_type.items()) if t != 'compute_attn')})"
+            )
+            # Per-layer detail
+            print(f"\n  {'Layer':<8} {'Heads':>12}  {'KV depth':>10}  {'cross-pos':>10}  {'self-attn':>10}")
+            for i, layer in enumerate(net.layers):
+                attn = layer.attn.attn
+                kv_depth = attn.n_heads * d_head
+                counts = per_layer_head_counts[i] if i < len(per_layer_head_counts) else {}
+                cp = counts.get("compute_attn", 0)
+                sa = sum(n for t, n in counts.items() if t != "compute_attn")
+                print(
+                    f"  {i:<8} {attn.n_heads:>4}/{max_heads:<7} "
+                    f"{kv_depth:>10}  {cp:>10}  {sa:>10}"
+                )
 
     if device == "auto":
         net.to(get_device(verbose=verbose))

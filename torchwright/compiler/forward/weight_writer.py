@@ -55,6 +55,7 @@ class MLPOp:
         "compute_standalone_relu",
         "compute_literal_value",
         "compute_bias",
+        "compute_linear_bypass",
     ]
     node: Node
     target_cols: List[int]
@@ -108,6 +109,8 @@ def write_mlp_sublayer(
             _write_compute_bias(layer.mlp, op)
         elif op.op_type == "compute_standalone_relu":
             _write_compute_standalone_relu(layer.mlp, op, residual_map, biased_linears)
+        elif op.op_type == "compute_linear_bypass":
+            _write_compute_linear_bypass(layer.mlp, op, residual_map, biased_linears)
         else:
             raise ValueError(f"Unknown mlp op_type: {op.op_type}")
 
@@ -721,3 +724,78 @@ def _write_compute_standalone_relu(
 
     # linear2: MLP slots → output columns (identity, zero bias)
     mlp.linear2.output_matrix[slots_t, out_idx_t] = 1.0
+
+
+def _write_compute_linear_bypass(
+    mlp,
+    op: MLPOp,
+    rmap: ResidualStreamMap,
+    biased_linears: Optional[Set[Node]] = None,
+):
+    """Compile a standalone Linear via MLP using the ReLU bypass trick.
+
+    ReLU(z) - ReLU(-z) = z, so two MLP slots per output column recover
+    an arbitrary linear function without the ReLU nonlinearity.
+
+    Slot layout: mlp_slots[:d_output] are the positive slots,
+    mlp_slots[d_output:] are the negative slots.
+    """
+    node = op.node
+    assert isinstance(node, Linear)
+
+    assert op.source_cols is not None, "compute_linear_bypass requires source_cols"
+    in_idx = op.source_cols
+    out_idx = op.target_cols
+    mlp_slots = op.mlp_slots
+    d_output = node.d_output
+
+    assert len(mlp_slots) == 2 * d_output, (
+        f"compute_linear_bypass needs 2*d_output={2 * d_output} slots, "
+        f"got {len(mlp_slots)}"
+    )
+
+    pos_slots = mlp_slots[:d_output]
+    neg_slots = mlp_slots[d_output:]
+
+    in_idx_t = torch.as_tensor(in_idx, dtype=torch.long)
+    out_idx_t = torch.as_tensor(out_idx, dtype=torch.long)
+    pos_slots_t = torch.as_tensor(pos_slots, dtype=torch.long)
+    neg_slots_t = torch.as_tensor(neg_slots, dtype=torch.long)
+
+    target_dtype = mlp.linear1.output_matrix.dtype
+    W = node.output_matrix.to(target_dtype)  # (d_input, d_output)
+
+    # linear1: positive slots get +W columns, negative slots get -W columns.
+    # Each positive slot j computes W[:,j]^T @ x; after ReLU → max(0, W[:,j]^T @ x).
+    # Each negative slot j computes -W[:,j]^T @ x; after ReLU → max(0, -W[:,j]^T @ x).
+    mlp.linear1.output_matrix[in_idx_t.unsqueeze(1), pos_slots_t.unsqueeze(0)] = W
+    mlp.linear1.output_matrix[in_idx_t.unsqueeze(1), neg_slots_t.unsqueeze(0)] = -W
+
+    # Fold deferred biased-Linear inputs into linear1 slot biases.
+    if biased_linears:
+        input_node = node.inputs[0]
+        leaves = (
+            flatten_concat_nodes([input_node])
+            if isinstance(input_node, Concatenate)
+            else [input_node]
+        )
+        bias_dtype = mlp.linear1.output_bias.dtype
+        offset = 0
+        for leaf in leaves:
+            if leaf in biased_linears:
+                assert isinstance(leaf, Linear)
+                # contrib[j] = sum_i W[offset+i, j] * leaf.bias[i]
+                contrib = (
+                    leaf.output_bias @ W[offset : offset + len(leaf), :]
+                ).to(bias_dtype)
+                mlp.linear1.output_bias[pos_slots_t] += contrib
+                mlp.linear1.output_bias[neg_slots_t] -= contrib
+            offset += len(leaf)
+
+    # linear2: positive slots write +1 to output columns, negative write -1.
+    # Combined: max(0, W[:,j]^T @ x) - max(0, -W[:,j]^T @ x) = W[:,j]^T @ x.
+    mlp.linear2.output_matrix[pos_slots_t, out_idx_t] = 1.0
+    mlp.linear2.output_matrix[neg_slots_t, out_idx_t] = -1.0
+
+    # Output bias via linear2 output bias.
+    mlp.linear2.output_bias[out_idx_t] += node.output_bias.to(target_dtype)

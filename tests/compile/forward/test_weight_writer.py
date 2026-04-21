@@ -111,6 +111,8 @@ def _make_mlp_op(
         kwargs.setdefault("source_cols", rmap.resolve_indices(l1.inputs[0]))
     elif op_type == "compute_standalone_relu":
         kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
+    elif op_type == "compute_linear_bypass":
+        kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
     return MLPOp(
         op_type=cast(
             Literal[
@@ -118,6 +120,7 @@ def _make_mlp_op(
                 "compute_standalone_relu",
                 "compute_literal_value",
                 "compute_bias",
+                "compute_linear_bypass",
             ],
             op_type,
         ),
@@ -947,3 +950,233 @@ def test_mixed_layer():
     # Check MLP result
     expected_const = const.compute(N_POS, {})
     assert torch.allclose(out[:, const_cols].cpu(), expected_const, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# MLP — compute_linear_bypass
+# ---------------------------------------------------------------------------
+
+
+def test_mlp_linear_bypass_zero_bias():
+    """Zero-bias Linear compiled via MLP bypass: ReLU(Wx) - ReLU(-Wx) = Wx."""
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    W = torch.randn(4, 3)
+    linear_node = Linear(x, W, torch.zeros(3), name="lin")
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(linear_node)
+
+    mlp_slots = list(range(0, 2 * 3))  # 2 slots per output column
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = _make_mlp_op(
+        rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
+    )
+    write_mlp_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+    result = out[:, out_cols]
+
+    expected = linear_node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+def test_mlp_linear_bypass_with_bias():
+    """Linear with non-zero bias compiled via MLP bypass."""
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    W = torch.randn(4, 3)
+    b = torch.randn(3)
+    linear_node = Linear(x, W, b, name="biased_lin")
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(linear_node)
+
+    mlp_slots = list(range(0, 2 * 3))
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = _make_mlp_op(
+        rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
+    )
+    write_mlp_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+    result = out[:, out_cols]
+
+    expected = linear_node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+def test_mlp_linear_bypass_different_dims():
+    """Linear where d_input != d_output, compiled via MLP bypass."""
+    x = InputNode("x", 8, value_range=(-100.0, 100.0))
+    W = torch.randn(8, 3)
+    b = torch.randn(3)
+    linear_node = Linear(x, W, b, name="narrow")
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(linear_node)
+
+    mlp_slots = list(range(0, 2 * 3))
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = _make_mlp_op(
+        rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
+    )
+    write_mlp_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 8)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+    result = out[:, out_cols]
+
+    expected = linear_node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+def test_mlp_linear_bypass_preserves_input():
+    """MLP bypass doesn't corrupt the input node's columns."""
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    W = torch.randn(4, 3)
+    linear_node = Linear(x, W, torch.zeros(3), name="lin")
+
+    rmap = ResidualStreamMap(D)
+    x_cols = rmap.allocate(x)
+    out_cols = rmap.allocate(linear_node)
+
+    mlp_slots = list(range(0, 2 * 3))
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = _make_mlp_op(
+        rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
+    )
+    write_mlp_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+
+    assert torch.allclose(out[:, x_cols].cpu(), x_values, atol=1e-4)
+
+
+def test_mlp_linear_bypass_wide_output():
+    """Linear with output wider than input, compiled via MLP bypass."""
+    x = InputNode("x", 3, value_range=(-100.0, 100.0))
+    W = torch.randn(3, 8)
+    b = torch.randn(8)
+    linear_node = Linear(x, W, b, name="wide")
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(linear_node)
+
+    mlp_slots = list(range(0, 2 * 8))
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = _make_mlp_op(
+        rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
+    )
+    write_mlp_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 3)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+    result = out[:, out_cols]
+
+    expected = linear_node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+def test_mlp_linear_bypass_matches_attention():
+    """Same Linear produces identical result via MLP bypass vs attention path."""
+    pos = _make_pos_encoding()
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    W = torch.randn(4, 3)
+    linear_node = Linear(x, W, torch.zeros(3), name="lin")
+
+    x_values = torch.randn(N_POS, 4)
+    pe_values = pos.compute(N_POS, {})
+
+    # Attention path
+    rmap_attn = ResidualStreamMap(D)
+    rmap_attn.allocate(pos)
+    rmap_attn.allocate(x)
+    attn_out_cols = rmap_attn.allocate(linear_node)
+
+    layer_attn = TransformerLayer(D, D_HEAD, pos)
+    attn_op = _make_op(rmap_attn, "compute_linear", linear_node, attn_out_cols)
+    write_attn_sublayer(layer_attn, [attn_op], rmap_attn, pos)
+    layer_attn.to(device_mod.get_device(verbose=False))
+
+    res_attn = _build_residual_stream(rmap_attn, {pos: pe_values, x: x_values})
+    out_attn = layer_attn.attn.forward(res_attn)
+    result_attn = out_attn[:, attn_out_cols]
+
+    # MLP bypass path
+    rmap_mlp = ResidualStreamMap(D)
+    rmap_mlp.allocate(x)
+    mlp_out_cols = rmap_mlp.allocate(linear_node)
+
+    layer_mlp = TransformerLayer(D, D_HEAD)
+    mlp_slots = list(range(0, 2 * 3))
+    mlp_op = _make_mlp_op(
+        rmap_mlp, "compute_linear_bypass", linear_node, mlp_out_cols, mlp_slots=mlp_slots
+    )
+    write_mlp_sublayer(layer_mlp, [mlp_op], rmap_mlp)
+    layer_mlp.to(device_mod.get_device(verbose=False))
+
+    res_mlp = _build_residual_stream(rmap_mlp, {x: x_values})
+    out_mlp = layer_mlp.mlp.forward(res_mlp)
+    result_mlp = out_mlp[:, mlp_out_cols]
+
+    assert torch.allclose(result_attn.cpu(), result_mlp.cpu(), atol=1e-4)
+
+
+def test_mlp_linear_bypass_concatenated_input():
+    """Linear with Concatenate input compiled via MLP bypass."""
+    a = InputNode("a", 3, value_range=(-100.0, 100.0))
+    b = InputNode("b", 5, value_range=(-100.0, 100.0))
+    cat = Concatenate([a, b])
+    W = torch.randn(8, 4)
+    bias = torch.randn(4)
+    linear_node = Linear(cat, W, bias, name="cat_lin")
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(a)
+    rmap.allocate(b)
+    out_cols = rmap.allocate(linear_node)
+
+    mlp_slots = list(range(0, 2 * 4))
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = _make_mlp_op(
+        rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
+    )
+    write_mlp_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
+
+    a_values = torch.randn(N_POS, 3)
+    b_values = torch.randn(N_POS, 5)
+    res = _build_residual_stream(rmap, {a: a_values, b: b_values})
+
+    out = layer.mlp.forward(res)
+    result = out[:, out_cols]
+
+    expected = linear_node.compute(N_POS, {"a": a_values, "b": b_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
