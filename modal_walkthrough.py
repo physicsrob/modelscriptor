@@ -63,6 +63,7 @@ def generate_transformer(
     fps: int = 10,
     scale: int = 4,
     d: int = 3072,
+    d_hidden: int = 0,
 ) -> bytes:
     from torchwright.doom.compile import compile_game, step_frame
     from torchwright.doom.map_subset import build_scene_subset
@@ -82,6 +83,7 @@ def generate_transformer(
         d=d,
         chunk_size=chunk_size,
         device="cuda",
+        d_hidden=d_hidden if d_hidden > 0 else None,
     )
     subset = build_scene_subset(segments, textures)
 
@@ -171,6 +173,7 @@ def main(
     fps: int = 10,
     scale: int = 4,
     d: int = 3072,
+    d_hidden: int = 0,
 ):
     # Launch both in parallel
     transformer_call = generate_transformer.spawn(
@@ -183,6 +186,7 @@ def main(
         fps=fps,
         scale=scale,
         d=d,
+        d_hidden=d_hidden,
     )
     reference_call = generate_reference.spawn(
         scene=scene,
