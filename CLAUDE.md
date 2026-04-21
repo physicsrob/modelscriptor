@@ -91,6 +91,39 @@ discover existing code that violates this principle — host-side logic
 that does anything beyond token I/O and pixel blitting — flag it to
 the user immediately and stop other work until resolved.
 
+# What determines the size of the compiled DOOM graph
+
+The compiled transformer's layer count is set by the longest
+sequential chain of ops through the graph — but that chain weaves
+across token types through attention, not just through a single
+stage.
+
+Each token type (RENDER, WALL, BSP, SORTED, etc.) has its own
+subgraph with a **critical depth**: the longest chain of real ops
+(excluding Concatenate) within that subgraph. But a token type's
+ops don't all start at layer 0. When a stage attends to another
+token type's results, the dependent ops can't begin until the
+producing stage has written those results to the residual stream.
+
+This creates a cascading chain. For example: WALL computes
+visibility data (62 ops deep). BSP attends to WALL's results,
+which aren't available until layer 36 — so BSP's dependent ops
+start at layer 36, not layer 0. WALL then attends back to BSP at
+layer 47. SORTED attends to WALL at layer 49. Each attention hop
+serializes the stages: the consuming stage waits for the producing
+stage to finish.
+
+The total layer count (currently 70) is the length of the longest
+such cross-token-type chain, not the depth of any single stage.
+Adding a new attention hop between token types can increase the
+total depth even if neither stage's own subgraph gets deeper —
+because it adds another serialization point to the chain.
+
+`make graph-stats` shows both views: the per-stage "Own Depth"
+column (the stage's internal critical depth) and the "Bottleneck
+Input" column (which cross-position input arrives latest, forcing
+that stage's dependent ops to wait).
+
 # Testing
 
 ## Running Tests
