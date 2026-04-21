@@ -789,7 +789,7 @@ def test_attend_argmax_dot_selects_best_match():
     query_vector = InputNode("qv", 4, value_range=(-100.0, 100.0))
     key_vector = InputNode("kv", 4, value_range=(-100.0, 100.0))
     value = InputNode("value", 2, value_range=(-100.0, 100.0))
-    out = attend_argmax_dot(pe, query_vector, key_vector, value)
+    out = attend_argmax_dot(query_vector, key_vector, value)
 
     n_pos = 4
     # Query: one-hot selecting column 2 (0/1 convention)
@@ -828,9 +828,9 @@ def test_attend_argmax_dot_selects_best_match():
     # pos 1: pos 1 has col 2 = +1, pos 0 has -1 → picks pos 1
     assert torch.allclose(result[1], value_in[1], atol=1e-2)
     # pos 2: pos 1 and 2 both have col 2 = +1 (tied dot product);
-    # result is a soft average of value_in[1] and value_in[2] with
-    # slight tiebreak preference toward earliest.  Just verify it's
-    # between the two matching values and far from the non-matching one.
+    # result is a soft average of value_in[1] and value_in[2].
+    # Just verify it's between the two matching values and far from
+    # the non-matching one.
     assert result[2, 0].item() > 19.0  # well above value_in[0]=10
     assert result[2, 0].item() < 31.0  # bounded by value_in[2]=30
     # pos 3: pos 1 and 2 match (col 2 = +1), pos 3 doesn't → soft avg of 1,2
@@ -845,7 +845,7 @@ def test_attend_argmax_dot_zero_key_isolation():
     query_vector = InputNode("qv", 3, value_range=(-100.0, 100.0))
     key_vector = InputNode("kv", 3, value_range=(-100.0, 100.0))
     value = InputNode("value", 2, value_range=(-100.0, 100.0))
-    out = attend_argmax_dot(pe, query_vector, key_vector, value)
+    out = attend_argmax_dot(query_vector, key_vector, value)
 
     n_pos = 3
     # Query: one-hot column 0
@@ -884,7 +884,7 @@ def test_attend_argmax_dot_different_queries_per_position():
     query_vector = InputNode("qv", 3, value_range=(-100.0, 100.0))
     key_vector = InputNode("kv", 3, value_range=(-100.0, 100.0))
     value = InputNode("value", 1, value_range=(-100.0, 100.0))
-    out = attend_argmax_dot(pe, query_vector, key_vector, value)
+    out = attend_argmax_dot(query_vector, key_vector, value)
 
     n_pos = 4
     # Key positions 0-2 each have a different column set to +1.

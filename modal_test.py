@@ -46,7 +46,8 @@ SHARDS = [
 
 
 @app.function(gpu="a100-80gb", cpu=8, memory=32768, timeout=1800)
-def run_pytest(pytest_args: str, extra_args: str = "") -> int:
+def run_pytest(pytest_args: str, shard_id: int = 0, extra_args: str = "") -> int:
+    tag = f"[shard {shard_id}]"
     t0 = time.time()
     cmd = [
         sys.executable,
@@ -61,11 +62,17 @@ def run_pytest(pytest_args: str, extra_args: str = "") -> int:
     if extra_args:
         cmd.extend(shlex.split(extra_args))
 
-    print(f"[shard] {' '.join(cmd)}")
-    result = subprocess.run(cmd)
+    print(f"{tag} {' '.join(cmd)}")
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(f"{tag} {line}", end="")
+    proc.wait()
     elapsed = time.time() - t0
-    print(f"\n[shard] finished in {elapsed:.0f}s (exit {result.returncode})")
-    return result.returncode
+    print(f"\n{tag} finished in {elapsed:.0f}s (exit {proc.returncode})")
+    return proc.returncode
 
 
 # ── Entrypoint ────────────────────────────────────────────────────
@@ -74,7 +81,7 @@ def run_pytest(pytest_args: str, extra_args: str = "") -> int:
 @app.local_entrypoint()
 def main(file: str = "tests", args: str = ""):
     if file != "tests":
-        rc = run_pytest.remote(pytest_args=file, extra_args=args)
+        rc = run_pytest.remote(pytest_args=file, shard_id=0, extra_args=args)
         sys.exit(rc)
 
     shards = SHARDS
@@ -84,7 +91,9 @@ def main(file: str = "tests", args: str = ""):
         print(f"  shard {i}: {label}")
 
     t0 = time.time()
-    results = list(run_pytest.map(shards, kwargs={"extra_args": args}))
+    results = list(
+        run_pytest.map(shards, range(len(shards)), kwargs={"extra_args": args})
+    )
     elapsed = time.time() - t0
 
     failed = sum(1 for rc in results if rc != 0)

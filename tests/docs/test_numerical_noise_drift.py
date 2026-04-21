@@ -6,6 +6,13 @@ numbers have drifted from what's been committed — the canonical signal
 that an op's implementation, breakpoint grid, or measurement distribution
 has changed without `make measure-noise` being re-run.
 
+The comparison uses relative tolerance (not exact equality) for error
+magnitudes, because float32 arithmetic varies across CPU architectures
+(e.g. local dev machine vs Modal's AMD EPYC). Fields like ``worst_input``
+are ignored entirely since they're the most hardware-sensitive and carry
+no safety information. Structural fields (op names, distribution names,
+sample counts) are still exact-matched.
+
 Pairs with `test_numerical_noise_consistency.py`:
   - `test_numerical_noise_consistency.py` (~30ms): verifies JSON, markdown,
     and docstring footers agree with each other. Format/schema drift.
@@ -19,6 +26,7 @@ document as a manual obligation.
 from __future__ import annotations
 
 import json
+from typing import List
 
 from scripts.measure_op_noise import (
     DOCS_JSON,
@@ -26,13 +34,76 @@ from scripts.measure_op_noise import (
     render_json,
 )
 
+_ERROR_METRIC_KEYS = [
+    "max_abs_error",
+    "mean_abs_error",
+    "p99_abs_error",
+    "max_rel_error",
+    "mean_rel_error",
+    "p99_rel_error",
+]
+
+_RTOL = 0.30
+_ATOL = 1e-6
+
+
+def _close_enough(a: float, b: float) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    if a == b:
+        return True
+    return abs(a - b) <= _ATOL + _RTOL * max(abs(a), abs(b))
+
+
+def _compare_ops(committed: dict, regenerated: dict) -> List[str]:
+    """Compare two stripped JSON dicts and return a list of failure messages."""
+    c_ops = {op["name"]: op for op in committed["ops"]}
+    r_ops = {op["name"]: op for op in regenerated["ops"]}
+
+    failures: List[str] = []
+
+    missing = sorted(c_ops.keys() - r_ops.keys())
+    if missing:
+        failures.append(f"Ops in committed JSON but not in fresh measurement: {missing}")
+    extra = sorted(r_ops.keys() - c_ops.keys())
+    if extra:
+        failures.append(f"Ops in fresh measurement but not in committed JSON: {extra}")
+
+    for op_name in sorted(c_ops.keys() & r_ops.keys()):
+        c_dists = {d["name"]: d for d in c_ops[op_name]["distributions"]}
+        r_dists = {d["name"]: d for d in r_ops[op_name]["distributions"]}
+
+        d_missing = sorted(c_dists.keys() - r_dists.keys())
+        if d_missing:
+            failures.append(f"{op_name}: distributions removed: {d_missing}")
+        d_extra = sorted(r_dists.keys() - c_dists.keys())
+        if d_extra:
+            failures.append(f"{op_name}: distributions added: {d_extra}")
+
+        for dist_name in sorted(c_dists.keys() & r_dists.keys()):
+            cd = c_dists[dist_name]
+            rd = r_dists[dist_name]
+
+            if cd["n_samples"] != rd["n_samples"]:
+                failures.append(
+                    f"{op_name}/{dist_name}: n_samples "
+                    f"{cd['n_samples']} -> {rd['n_samples']}"
+                )
+
+            for key in _ERROR_METRIC_KEYS:
+                cv, rv = cd[key], rd[key]
+                if not _close_enough(cv, rv):
+                    failures.append(
+                        f"{op_name}/{dist_name}: {key} "
+                        f"{cv} -> {rv}"
+                    )
+
+    return failures
+
 
 def _strip_metadata(text: str) -> dict:
-    """Drop `commit` and `measured_at` from the JSON envelope.
-
-    These fields change on every re-run and are noise for drift detection;
-    the interesting content is the per-op measurement data.
-    """
     data = json.loads(text)
     data.pop("commit", None)
     data.pop("measured_at", None)
@@ -63,14 +134,15 @@ def test_committed_measurements_match_current_code() -> None:
         commit="<ignored>",
         measured_at="<ignored>",
     )
-    committed = DOCS_JSON.read_text()
 
     regenerated_data = _strip_metadata(regenerated)
-    committed_data = _strip_metadata(committed)
+    committed_data = _strip_metadata(DOCS_JSON.read_text())
 
-    assert regenerated_data == committed_data, (
+    failures = _compare_ops(committed_data, regenerated_data)
+    assert not failures, (
         "Per-op noise measurements have drifted from the committed values in "
-        f"{DOCS_JSON.name}. Run `make measure-noise` to regenerate the noise "
-        "artefacts (JSON, markdown, docstring footers), then commit the diff. "
-        "See CLAUDE.md section 'Numerical noise' for the full workflow."
+        f"{DOCS_JSON.name}.\n"
+        + "\n".join(f"  - {f}" for f in failures)
+        + "\nRun `make measure-noise` to regenerate, then commit the diff. "
+        "See CLAUDE.md § 'Numerical noise' for the full workflow."
     )

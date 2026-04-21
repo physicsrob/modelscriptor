@@ -33,7 +33,7 @@ basis** — at each key position, precompute the width-10 vector
 one-hot ``threshold_onehot`` selecting which threshold applies at this
 query position. Inside the attention, the bilinear product over those
 10 dimensions exactly computes ``I(score_i > prev_digit_j)``, while
-column 0 carries ``-score + tiebreak·pos`` — and the primitive
+column 0 carries ``-score`` — and the primitive
 ``attend_argmin_above_integer`` bakes all of this into one head.
 
 Per-slot unrolling. At iteration ``k`` the ``prev_digit`` is the digit

@@ -715,10 +715,12 @@ def assert_softmax_hardness(
         max_weights = weights.max(dim=1).values
 
         min_hw = max_weights.min().item()
+        argmax_positions = weights.argmax(dim=1).tolist()
         print(
             f"  [hardness] {attn_name}: "
             f"min={min_hw:.6f} mean={max_weights.mean().item():.6f} "
-            f"(threshold={threshold}, n_pos={n_pos})"
+            f"(threshold={threshold}, n_pos={n_pos}, "
+            f"selected_positions={argmax_positions})"
         )
 
         bad = max_weights < threshold

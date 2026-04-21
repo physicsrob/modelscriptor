@@ -103,12 +103,12 @@ def compute_min_d_head(max_walls: int, tex_w: int) -> int:
           1 + n_thresholds + d_value = 1 + max_walls + (8 + max_walls)
     - Render wall geometry (attend_argmax_dot):
           max_walls + 4  (query/key = one-hot, value = geometry)
-    - TEX_COL (attend_argmax_dot): 8 + tex_w + 1
+    - TEX_COL (attend_argmax_dot): 8 + tex_w
     """
     d_sort_val = 8 + max_walls
     sort_d = 1 + max_walls + d_sort_val
     render_geom_d = max_walls + 4
-    tex_d = 8 + tex_w + 1
+    tex_d = 8 + tex_w
     return max(sort_d, render_geom_d, tex_d)
 
 
