@@ -13,6 +13,7 @@ from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.sibling_clusters import SiblingClusters
+from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
@@ -45,6 +46,7 @@ class LayerScheduler:
         d_hidden: Optional[int] = None,
         clusters: Optional[SiblingClusters] = None,
         admission_budget_fraction: float = 0.4,
+        policy: Optional[SchedulingPolicy] = None,
     ):
         self.graph = graph
         self.d = d
@@ -52,6 +54,7 @@ class LayerScheduler:
         self.d_head = d_head
         self.n_heads = d // d_head
         self.pos_encoding = pos_encoding
+        self.policy = policy if policy is not None else SchedulingPolicy()
 
         # Admission control state (see _is_admissible).  When clusters
         # is None or empty, admission is disabled and the scheduler
@@ -138,6 +141,7 @@ class LayerScheduler:
 
         dead = self._find_dead_nodes(residual_map, computed_nodes)
         chains = self._detect_chains(ready)
+        claimed_relus = {relu for _, relu, _, _, _ in chains}
 
         # Remove chain-internal nodes from ready so they're not double-scheduled.
         # L1 with fanout stays in ready for standalone attention scheduling.
@@ -163,6 +167,7 @@ class LayerScheduler:
         (
             attn_ops,
             biased_linears,
+            bypass_linears,
             heads_used,
             cancel_cols,
             cancel_cols_set,
@@ -191,7 +196,7 @@ class LayerScheduler:
             if isinstance(node, (Linear, ReLU, LiteralValue)):
                 ready.add(node)
 
-        new_chains = self._detect_chains(ready)
+        new_chains = self._detect_chains(ready, claimed_relus)
         for l1, relu, l2, d_hidden, exclusive in new_chains:
             ready.discard(l2)
             ready.discard(relu)
@@ -207,6 +212,7 @@ class LayerScheduler:
             self._schedule_mlp_sublayer(
                 ready,
                 chains,
+                bypass_linears,
                 biased_linears,
                 residual_map,
                 computed_nodes,
@@ -327,8 +333,12 @@ class LayerScheduler:
             add_into_live_addends.add(live_addend)
             heads_used += n_heads
 
-        # Build compute candidates: Attn nodes, standalone Linears, deferred Adds
+        # Build compute candidates: Attn nodes, standalone Linears, deferred Adds.
+        # When policy routes position-local ops to MLP, standalone Linears
+        # are skipped here and scheduled via bypass in _schedule_mlp_sublayer.
+        local_policy = self.policy.local_in_attention
         compute_candidates = []
+        bypass_linears: list[Node] = []
         for node in ready:
             if isinstance(node, Attn):
                 n_heads = (node.d_v + self.d_head - 1) // self.d_head
@@ -342,6 +352,9 @@ class LayerScheduler:
                 # as a standalone Linear reading from the ReLU's residual slot.
                 if isinstance(inp, ReLU) and inp not in computed_nodes:
                     continue
+                if local_policy == "never":
+                    bypass_linears.append(node)
+                    continue
                 n_heads = self._heads_for_linear(node)
                 compute_candidates.append(("compute_linear", node, n_heads))
         # Deferred Adds: neither input is dead, so we can't use add_into.
@@ -352,7 +365,10 @@ class LayerScheduler:
 
         # Sort: Attn first; under column pressure prefer nodes that free columns,
         # otherwise maximize parallelism via critical path.
-        under_pressure = residual_map.get_free_count() < self.d // 4
+        under_pressure = (
+            residual_map.get_free_count()
+            < self.d * (1.0 - self.policy.pressure_threshold)
+        )
         if under_pressure:
             compute_candidates.sort(
                 key=lambda t: (
@@ -503,6 +519,7 @@ class LayerScheduler:
         return (
             attn_ops,
             biased_linears,
+            bypass_linears,
             heads_used,
             cancel_cols,
             cancel_cols_set,
@@ -517,6 +534,7 @@ class LayerScheduler:
         self,
         ready,
         chains,
+        bypass_linears,
         biased_linears,
         residual_map,
         computed_nodes,
@@ -562,7 +580,10 @@ class LayerScheduler:
             return True, additions, delta
 
         # 3a. L->R->L chains
-        under_pressure = residual_map.get_free_count() < self.d // 4
+        under_pressure = (
+            residual_map.get_free_count()
+            < self.d * (1.0 - self.policy.pressure_threshold)
+        )
         if under_pressure:
             chains.sort(
                 key=lambda c: (
@@ -675,6 +696,65 @@ class LayerScheduler:
             computed_nodes.add(node)
             self._mark_scheduled(node)
 
+        # 3b½. Standalone Linears via MLP bypass (ReLU bypass trick).
+        # These were skipped in the attention phase because the policy
+        # routes them to MLP.  Each output column needs 2 MLP slots.
+        if bypass_linears:
+            sorted_bypass = sorted(
+                bypass_linears,
+                key=(
+                    (
+                        lambda n: (
+                            self._net_column_cost(n, computed_nodes, residual_map),
+                            self._critical_path_key(n),
+                        )
+                    )
+                    if under_pressure
+                    else self._critical_path_key
+                ),
+            )
+            for node in sorted_bypass:
+                assert isinstance(node, Linear)
+                if node in computed_nodes:
+                    continue
+                n_slots = 2 * node.d_output
+                if next_slot + n_slots > self.d_hidden:
+                    continue
+                if not self._is_admissible(node):
+                    self._admission_deferred = True
+                    continue
+                target_cols = self._try_allocate(node, residual_map)
+                if target_cols is None:
+                    continue
+                ok, additions, delta = fits_cancel(target_cols)
+                if not ok:
+                    residual_map.free(node)
+                    continue
+                mlp_slots = list(range(next_slot, next_slot + n_slots))
+                next_slot += n_slots
+                self._require_live(
+                    node.inputs[0],
+                    residual_map,
+                    f"compute_linear_bypass input for {node!r}",
+                )
+                input_cols = residual_map.resolve_indices(node.inputs[0])
+                mlp_ops.append(
+                    MLPOp(
+                        "compute_linear_bypass",
+                        node,
+                        target_cols,
+                        mlp_slots,
+                        source_cols=input_cols,
+                    )
+                )
+                commit_cancel(additions, delta)
+                dirty = residual_map.dirty_subset(target_cols)
+                if dirty:
+                    residual_map.mark_clean(dirty)
+                computed_nodes.add(node)
+                ready.discard(node)
+                self._mark_scheduled(node)
+
         # 3c. LiteralValues (no slot cost)
         constants = sorted(
             [n for n in ready if isinstance(n, LiteralValue)],
@@ -717,14 +797,14 @@ class LayerScheduler:
     # Chain detection
     # ------------------------------------------------------------------
 
-    def _detect_chains(self, ready):
+    def _detect_chains(self, ready, exclude_relus=None):
         """Detect L1->ReLU->L2 chains by walking forward from ready Linears.
 
         Returns list of (l1, relu, l2, d_hidden, exclusive).
         exclusive means L1 has no effective consumers other than the ReLU.
         """
         chains = []
-        seen_relus = set()
+        seen_relus = set() if exclude_relus is None else set(exclude_relus)
 
         for node in ready:
             if not isinstance(node, Linear):

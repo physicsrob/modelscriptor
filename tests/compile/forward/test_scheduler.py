@@ -16,6 +16,7 @@ import torch
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.scheduler import LayerScheduler
+from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY, SchedulingPolicy
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
@@ -126,7 +127,28 @@ def test_schedule_constant():
 
 
 def test_schedule_zero_bias_linear():
-    """Zero-bias Linear (len <= d_head) produces AttnHeadOp('compute_linear')."""
+    """Zero-bias Linear: legacy policy uses attention, default uses MLP bypass."""
+    pos = _make_pos_encoding()
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    linear = _make_linear(x, 3, "lin")
+
+    graph = GraphAnalyzer(linear)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(x)
+    computed = {pos, x}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+
+    linear_ops = [op for op in attn_ops if op.op_type == "compute_linear"]
+    assert len(linear_ops) == 1
+    assert linear_ops[0].node is linear
+    assert linear in computed
+
+
+def test_schedule_zero_bias_linear_bypass():
+    """Zero-bias Linear with default policy produces MLPOp('compute_linear_bypass')."""
     pos = _make_pos_encoding()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     linear = _make_linear(x, 3, "lin")
@@ -140,18 +162,17 @@ def test_schedule_zero_bias_linear():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
-    linear_ops = [op for op in attn_ops if op.op_type == "compute_linear"]
-    assert len(linear_ops) == 1
-    assert linear_ops[0].node is linear
+    bypass_ops = [op for op in mlp_ops if op.op_type == "compute_linear_bypass"]
+    assert len(bypass_ops) == 1
+    assert bypass_ops[0].node is linear
+    assert len(bypass_ops[0].mlp_slots) == 2 * linear.d_output
+    attn_linears = [op for op in attn_ops if op.op_type == "compute_linear"]
+    assert len(attn_linears) == 0
     assert linear in computed
 
 
 def test_schedule_large_input_linear():
-    """Zero-bias Linear with input dim > d_head is still scheduled.
-
-    This is the sum_nodes pattern: Concatenate(4 × 8-dim) → Linear(32 → 8).
-    With d_input=32 and d_head=16, needs multiple attention heads.
-    """
+    """Zero-bias Linear with input dim > d_head: legacy uses attention, default uses bypass."""
     pos = _make_pos_encoding()
     inputs = [InputNode(f"x{i}", 8, value_range=(-100.0, 100.0)) for i in range(4)]
     cat = Concatenate(inputs)
@@ -168,7 +189,7 @@ def test_schedule_large_input_linear():
         rmap.allocate(inp)
     computed = {pos} | set(inputs)
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     linear_ops = [op for op in attn_ops if op.op_type == "compute_linear"]
@@ -177,7 +198,30 @@ def test_schedule_large_input_linear():
 
 
 def test_schedule_biased_linear():
-    """Biased Linear (len <= d_head) produces both AttnHeadOp and MLPOp in same layer."""
+    """Biased Linear: legacy uses attn Wx + MLP b, default uses bypass Wx+b."""
+    pos = _make_pos_encoding()
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    linear = _make_biased_linear(x, 3, "biased")
+
+    # Legacy: attention Wx + MLP bias
+    graph = GraphAnalyzer(linear)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(x)
+    computed = {pos, x}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+
+    linear_ops = [op for op in attn_ops if op.op_type == "compute_linear"]
+    assert any(op.node is linear for op in linear_ops)
+    bias_ops = [op for op in mlp_ops if op.op_type == "compute_bias"]
+    assert any(op.node is linear for op in bias_ops)
+    assert linear in computed
+
+
+def test_schedule_biased_linear_bypass():
+    """Biased Linear with default policy: bypass handles full Wx+b, no compute_bias."""
     pos = _make_pos_encoding()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     linear = _make_biased_linear(x, 3, "biased")
@@ -191,14 +235,11 @@ def test_schedule_biased_linear():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
-    # Wx via attention
-    linear_ops = [op for op in attn_ops if op.op_type == "compute_linear"]
-    assert any(op.node is linear for op in linear_ops)
-
-    # bias via MLP
+    bypass_ops = [op for op in mlp_ops if op.op_type == "compute_linear_bypass"]
+    assert len(bypass_ops) == 1
+    assert bypass_ops[0].node is linear
     bias_ops = [op for op in mlp_ops if op.op_type == "compute_bias"]
-    assert any(op.node is linear for op in bias_ops)
-
+    assert len(bias_ops) == 0
     assert linear in computed
 
 
@@ -384,7 +425,7 @@ def test_head_budget_exhaustion():
     rmap.allocate(x)
     computed = {pos, x}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     # Should not exceed head budget
@@ -662,11 +703,36 @@ def test_relu_chain_broken_by_fanout():
     rmap.allocate(x)
     computed = {pos, x}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    # Use legacy policy so L1 goes to attention (non-exclusive chain + attention L1)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
     before = len(computed)
     scheduler.schedule_layer(rmap, computed)
 
     # Must make progress — at least one new node computed
+    assert len(computed) > before
+
+
+def test_relu_chain_broken_by_fanout_bypass():
+    """Same as above but with default bypass policy — still makes progress."""
+    pos = _make_pos_encoding()
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
+    r = ReLU(l1, name="r")
+    l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
+    other = _make_linear(l1, 2, "other")
+    out_cat = Concatenate([l2, other])
+    out = _make_linear(out_cat, 1, "final")
+
+    graph = GraphAnalyzer(out)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(x)
+    computed = {pos, x}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    before = len(computed)
+    scheduler.schedule_layer(rmap, computed)
+
     assert len(computed) > before
 
 
@@ -676,9 +742,7 @@ def test_linear_with_computed_relu_input():
     After Linear fusion or certain scheduling patterns, L1 and ReLU may be
     computed in earlier layers while L2 is deferred. L2's input is a ReLU node
     that's already in the residual stream, so L2 should be schedulable as a
-    standalone Linear (via attention sublayer) rather than as part of a chain.
-
-    This tests the fix for scheduler deadlock after optimization passes.
+    standalone Linear rather than as part of a chain.
     """
     pos = _make_pos_encoding()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
@@ -692,16 +756,40 @@ def test_linear_with_computed_relu_input():
     rmap.allocate(x)
     rmap.allocate(l1)
     rmap.allocate(r)
-    # Pretend L1 and ReLU were already computed in earlier layers
+    computed = {pos, x, l1, r}
+
+    # Legacy: scheduled via attention
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
+    attn_ops, mlp_ops, biased = scheduler.schedule_layer(rmap, computed)
+
+    compute_linears = [op for op in attn_ops if op.op_type == "compute_linear"]
+    assert len(compute_linears) == 1
+    assert compute_linears[0].node is l2
+    assert l2 in computed
+
+
+def test_linear_with_computed_relu_input_bypass():
+    """Same scenario with default policy — scheduled via MLP bypass."""
+    pos = _make_pos_encoding()
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
+    r = ReLU(l1, name="r")
+    l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
+
+    graph = GraphAnalyzer(l2)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(x)
+    rmap.allocate(l1)
+    rmap.allocate(r)
     computed = {pos, x, l1, r}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, mlp_ops, biased = scheduler.schedule_layer(rmap, computed)
 
-    # L2 should be scheduled as a standalone Linear (compute_linear in attn sublayer)
-    compute_linears = [op for op in attn_ops if op.op_type == "compute_linear"]
-    assert len(compute_linears) == 1
-    assert compute_linears[0].node is l2
+    bypass_ops = [op for op in mlp_ops if op.op_type == "compute_linear_bypass"]
+    assert len(bypass_ops) == 1
+    assert bypass_ops[0].node is l2
     assert l2 in computed
 
     # Should NOT be scheduled via compute_relu (that's for full chains)

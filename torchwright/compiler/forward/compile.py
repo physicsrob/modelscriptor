@@ -16,6 +16,7 @@ from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.scheduler import LayerScheduler
+from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.forward.sibling_clusters import (
     SiblingClusterAnalyzer,
 )
@@ -185,6 +186,7 @@ def forward_compile(
     admission_budget_fraction: float = 0.4,
     admission_min_chains: int = 4,
     admission_min_peak_width: int = 32,
+    policy: Optional[SchedulingPolicy] = None,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -277,6 +279,9 @@ def forward_compile(
                 f"total chains"
             )
 
+    if policy is None:
+        policy = SchedulingPolicy()
+
     scheduler = LayerScheduler(
         graph,
         d,
@@ -285,6 +290,7 @@ def forward_compile(
         d_hidden=d_hidden,
         clusters=clusters,
         admission_budget_fraction=admission_budget_fraction,
+        policy=policy,
     )
 
     # Save input indices before scheduling (scheduling may free/reassign them)
