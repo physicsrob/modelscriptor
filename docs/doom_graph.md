@@ -332,8 +332,9 @@ unchanged by RENDER tokens within the same wall.
    - **Advance wall**: no more chunks, no more columns — add
      `render_wall_j_onehot` to `render_mask`.  If all walls masked,
      set `done = +1`.  Otherwise set next token type to
-     `E8_SORTED_WALL` and increment `sort_position_index` so the
-     transformer picks the next wall.
+     `E8_SORTED_WALL` so the transformer picks the next wall.
+     (`sort_position_index` is forwarded unchanged — SORTED
+     increments it on its own turn.)
 
 ## Outputs
 
