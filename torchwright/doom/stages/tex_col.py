@@ -14,17 +14,17 @@ from torchwright.ops.map_select import in_range
 
 
 @dataclass
-class TexColInputs:
+class TexColToken:
     tex_col_input: Node  # host-fed column index (meaningful at TEX_COL)
 
 
 @dataclass
-class TexColOutputs:
+class TexColKVOutput:
     tc_onehot_01: Node  # {0,1} one-hot over tex_w columns
 
 
-def build_tex_col(inputs: TexColInputs, tex_w: int) -> TexColOutputs:
+def build_tex_col(token: TexColToken, *, tex_w: int) -> TexColKVOutput:
     with annotate("tex_col"):
-        tc_p1 = add_const(inputs.tex_col_input, 1.0)
-        tc_onehot_01 = bool_to_01(in_range(inputs.tex_col_input, tc_p1, tex_w))
-    return TexColOutputs(tc_onehot_01=tc_onehot_01)
+        tc_p1 = add_const(token.tex_col_input, 1.0)
+        tc_onehot_01 = bool_to_01(in_range(token.tex_col_input, tc_p1, tex_w))
+    return TexColKVOutput(tc_onehot_01=tc_onehot_01)

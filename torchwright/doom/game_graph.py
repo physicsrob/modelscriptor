@@ -31,7 +31,6 @@ import torch
 
 from torchwright.graph import Concatenate, Node, annotate
 from torchwright.graph.pos_encoding import PosEncoding
-from torchwright.ops.arithmetic_ops import add_const
 from torchwright.ops.inout_nodes import (
     create_input,
     create_literal_value,
@@ -75,14 +74,14 @@ __all__ = [
     "TEX_E8_OFFSET",
 ]
 from torchwright.doom.graph_utils import extract_from
-from torchwright.doom.stages.bsp import BspInputs, build_bsp
-from torchwright.doom.stages.eos import EosInputs, build_eos
-from torchwright.doom.stages.input import InputInputs, build_input
-from torchwright.doom.stages.player import PlayerInputs, build_player
-from torchwright.doom.stages.render import RenderInputs, build_render
-from torchwright.doom.stages.sorted import SortedInputs, build_sorted
-from torchwright.doom.stages.tex_col import TexColInputs, build_tex_col
-from torchwright.doom.stages.wall import WallInputs, build_wall
+from torchwright.doom.stages.bsp import BspToken, build_bsp
+from torchwright.doom.stages.eos import EosKVInput, EosToken, build_eos
+from torchwright.doom.stages.input import InputToken, build_input
+from torchwright.doom.stages.player import PlayerToken, build_player
+from torchwright.doom.stages.render import RenderKVInput, RenderToken, build_render
+from torchwright.doom.stages.sorted import SortedKVInput, SortedToken, build_sorted
+from torchwright.doom.stages.tex_col import TexColToken, build_tex_col
+from torchwright.doom.stages.wall import WallKVInput, WallToken, build_wall
 
 # ---------------------------------------------------------------------------
 # I/O contract
@@ -151,7 +150,7 @@ def build_game_graph(
 
     # ---------- INPUT ----------
     input_out = build_input(
-        InputInputs(
+        InputToken(
             player_angle=inputs["player_angle"],
             input_turn_left=inputs["input_turn_left"],
             input_turn_right=inputs["input_turn_right"],
@@ -159,38 +158,38 @@ def build_game_graph(
             input_backward=inputs["input_backward"],
             input_strafe_left=inputs["input_strafe_left"],
             input_strafe_right=inputs["input_strafe_right"],
-            is_input=tf["is_input"],
-            pos_encoding=pos_encoding,
         ),
+        is_input=tf["is_input"],
+        pos_encoding=pos_encoding,
         turn_speed=turn_speed,
         move_speed=move_speed,
     )
 
     # ---------- TEX_COL ----------
     tex_col_out = build_tex_col(
-        TexColInputs(tex_col_input=inputs["tex_col_input"]),
+        TexColToken(tex_col_input=inputs["tex_col_input"]),
         tex_w=tex_w,
     )
 
     # ---------- BSP ----------
     bsp_out = build_bsp(
-        BspInputs(
+        BspToken(
             player_x=inputs["player_x"],
             player_y=inputs["player_y"],
             bsp_plane_nx=inputs["bsp_plane_nx"],
             bsp_plane_ny=inputs["bsp_plane_ny"],
             bsp_plane_d=inputs["bsp_plane_d"],
             bsp_node_id_onehot=inputs["bsp_node_id_onehot"],
-            is_bsp_node=tf["is_bsp_node"],
-            pos_encoding=pos_encoding,
         ),
+        is_bsp_node=tf["is_bsp_node"],
+        pos_encoding=pos_encoding,
         max_coord=max_coord,
         max_bsp_nodes=max_bsp_nodes,
     )
 
     # ---------- WALL ----------
     wall_out = build_wall(
-        WallInputs(
+        WallToken(
             wall_ax=inputs["wall_ax"],
             wall_ay=inputs["wall_ay"],
             wall_bx=inputs["wall_bx"],
@@ -199,15 +198,17 @@ def build_game_graph(
             wall_index=inputs["wall_index"],
             player_x=inputs["player_x"],
             player_y=inputs["player_y"],
-            is_wall=tf["is_wall"],
+            wall_bsp_coeffs=inputs["wall_bsp_coeffs"],
+            wall_bsp_const=inputs["wall_bsp_const"],
+        ),
+        WallKVInput(
             vel_dx=input_out.vel_dx,
             vel_dy=input_out.vel_dy,
             move_cos=input_out.move_cos,
             move_sin=input_out.move_sin,
-            wall_bsp_coeffs=inputs["wall_bsp_coeffs"],
-            wall_bsp_const=inputs["wall_bsp_const"],
             side_P_vec=bsp_out.side_P_vec,
         ),
+        is_wall=tf["is_wall"],
         config=config,
         max_walls=max_walls,
         max_coord=max_coord,
@@ -216,49 +217,51 @@ def build_game_graph(
 
     # ---------- EOS ----------
     eos_out = build_eos(
-        EosInputs(
-            is_wall=tf["is_wall"],
-            is_eos=tf["is_eos"],
-            collision=wall_out.collision,
+        EosToken(
             player_x=inputs["player_x"],
             player_y=inputs["player_y"],
+        ),
+        EosKVInput(
+            collision=wall_out.collision,
             vel_dx=input_out.vel_dx,
             vel_dy=input_out.vel_dy,
-            new_angle=input_out.new_angle,
-            pos_encoding=pos_encoding,
-        )
+        ),
+        is_wall=tf["is_wall"],
+        pos_encoding=pos_encoding,
     )
 
     # ---------- PLAYER ----------
     player_out = build_player(
-        PlayerInputs(
+        PlayerToken(
             player_x=inputs["player_x"],
             player_y=inputs["player_y"],
             player_angle=inputs["player_angle"],
-            is_player_x=tf["is_player_x"],
-            is_player_y=tf["is_player_y"],
-            is_player_angle=tf["is_player_angle"],
-            pos_encoding=pos_encoding,
         ),
+        is_player_x=tf["is_player_x"],
+        is_player_y=tf["is_player_y"],
+        is_player_angle=tf["is_player_angle"],
+        pos_encoding=pos_encoding,
     )
 
     # ---------- SORTED ----------
     sorted_out = build_sorted(
-        SortedInputs(
+        SortedToken(
+            position_index=inputs["sort_position_index"],
+        ),
+        SortedKVInput(
             sort_score=wall_out.sort_score,
             sort_value=wall_out.sort_value,
             indicators_above=wall_out.indicators_above,
-            position_index=inputs["sort_position_index"],
-            is_sorted=tf["is_sorted"],
-            is_wall=tf["is_wall"],
-            pos_encoding=pos_encoding,
         ),
+        is_sorted=tf["is_sorted"],
+        is_wall=tf["is_wall"],
+        pos_encoding=pos_encoding,
         max_walls=max_walls,
     )
 
     # ---------- RENDER ----------
     render_out = build_render(
-        RenderInputs(
+        RenderToken(
             render_mask=inputs["render_mask"],
             render_col=inputs["render_col"],
             render_chunk_k=inputs["render_chunk_k"],
@@ -267,6 +270,8 @@ def build_game_graph(
             render_vis_lo=inputs["render_vis_lo"],
             render_vis_hi=inputs["render_vis_hi"],
             render_wall_j_onehot=inputs["render_wall_j_onehot"],
+        ),
+        RenderKVInput(
             wall_ax=inputs["wall_ax"],
             wall_ay=inputs["wall_ay"],
             wall_bx=inputs["wall_bx"],
@@ -279,11 +284,11 @@ def build_game_graph(
             texture_id_e8=inputs["texture_id_e8"],
             tex_pixels=inputs["tex_pixels"],
             tc_onehot_01=tex_col_out.tc_onehot_01,
-            is_render=tf["is_render"],
-            is_wall=tf["is_wall"],
-            is_tex_col=tf["is_tex_col"],
-            pos_encoding=pos_encoding,
         ),
+        is_render=tf["is_render"],
+        is_wall=tf["is_wall"],
+        is_tex_col=tf["is_tex_col"],
+        pos_encoding=pos_encoding,
         config=config,
         textures=textures,
         chunk_size=cs,
@@ -515,7 +520,7 @@ def _assemble_output(
         # sort_position_index: SORTED increments; RENDER forwards.
         out_sort_position_index = select(
             token_flags["is_sorted"],
-            add_const(inputs["sort_position_index"], 1.0),
+            sorted_out.next_sort_position_index,
             select(
                 token_flags["is_render"],
                 render_out.next_sort_position_index,

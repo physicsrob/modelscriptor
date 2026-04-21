@@ -40,8 +40,8 @@ from torchwright.doom.renderer import trig_lookup
 
 
 @dataclass
-class InputInputs:
-    """Host-fed nodes and graph-level dependencies consumed by the INPUT stage."""
+class InputToken:
+    """Host-fed fields at the single INPUT position."""
 
     player_angle: Node
     input_turn_left: Node
@@ -50,12 +50,10 @@ class InputInputs:
     input_backward: Node
     input_strafe_left: Node
     input_strafe_right: Node
-    is_input: Node  # per-position flag (1.0 at INPUT positions)
-    pos_encoding: PosEncoding  # shared across all stages
 
 
 @dataclass
-class InputOutputs:
+class InputKVOutput:
     """Post-broadcast values available at every position for downstream stages."""
 
     vel_dx: Node
@@ -71,33 +69,36 @@ class InputOutputs:
 
 
 def build_input(
-    inputs: InputInputs,
+    token: InputToken,
+    *,
+    is_input: Node,
+    pos_encoding: PosEncoding,
     turn_speed: int,
     move_speed: float,
-) -> InputOutputs:
+) -> InputKVOutput:
     """Build the INPUT stage subgraph."""
     with annotate("input"):
         with annotate("game_logic"):
             new_angle = _compute_new_angle(
-                inputs.player_angle,
-                inputs.input_turn_left,
-                inputs.input_turn_right,
+                token.player_angle,
+                token.input_turn_left,
+                token.input_turn_right,
                 turn_speed,
             )
             vel_dx, vel_dy = _compute_velocity(
                 new_angle,
-                inputs.input_forward,
-                inputs.input_backward,
-                inputs.input_strafe_left,
-                inputs.input_strafe_right,
+                token.input_forward,
+                token.input_backward,
+                token.input_strafe_left,
+                token.input_strafe_right,
                 move_speed,
             )
             move_cos, move_sin = trig_lookup(new_angle)
 
         with annotate("attention"):
             return _broadcast_to_all_positions(
-                inputs.pos_encoding,
-                inputs.is_input,
+                pos_encoding,
+                is_input,
                 vel_dx,
                 vel_dy,
                 move_cos,
@@ -164,7 +165,7 @@ def _broadcast_to_all_positions(
     move_cos: Node,
     move_sin: Node,
     new_angle: Node,
-) -> InputOutputs:
+) -> InputKVOutput:
     """Use attend_mean_where over is_input to copy INPUT-position values everywhere.
 
     Since exactly one position has is_input=1, the "mean" is just that value.
@@ -174,7 +175,7 @@ def _broadcast_to_all_positions(
         validity=is_input,
         value=Concatenate([vel_dx, vel_dy, move_cos, move_sin, new_angle]),
     )
-    return InputOutputs(
+    return InputKVOutput(
         vel_dx=extract_from(ctrl_attn, 5, 0, 1, "a_vdx"),
         vel_dy=extract_from(ctrl_attn, 5, 1, 1, "a_vdy"),
         move_cos=extract_from(ctrl_attn, 5, 2, 1, "a_mcos"),

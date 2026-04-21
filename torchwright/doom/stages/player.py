@@ -28,18 +28,14 @@ from torchwright.doom.renderer import trig_lookup
 
 
 @dataclass
-class PlayerInputs:
-    player_x: Node
-    player_y: Node
-    player_angle: Node
-    is_player_x: Node
-    is_player_y: Node
-    is_player_angle: Node
-    pos_encoding: PosEncoding
+class PlayerToken:
+    player_x: Node      # host-fed at PLAYER_X position
+    player_y: Node      # host-fed at PLAYER_Y position
+    player_angle: Node   # host-fed at PLAYER_ANGLE position
 
 
 @dataclass
-class PlayerOutputs:
+class PlayerKVOutput:
     px: Node
     py: Node
     cos_theta: Node
@@ -51,30 +47,37 @@ class PlayerOutputs:
 # ---------------------------------------------------------------------------
 
 
-def build_player(inputs: PlayerInputs) -> PlayerOutputs:
+def build_player(
+    token: PlayerToken,
+    *,
+    is_player_x: Node,
+    is_player_y: Node,
+    is_player_angle: Node,
+    pos_encoding: PosEncoding,
+) -> PlayerKVOutput:
     with annotate("player/broadcast"):
         px = attend_mean_where(
-            inputs.pos_encoding,
-            validity=inputs.is_player_x,
-            value=inputs.player_x,
+            pos_encoding,
+            validity=is_player_x,
+            value=token.player_x,
         )
 
         py = attend_mean_where(
-            inputs.pos_encoding,
-            validity=inputs.is_player_y,
-            value=inputs.player_y,
+            pos_encoding,
+            validity=is_player_y,
+            value=token.player_y,
         )
 
-        cos_theta, sin_theta = trig_lookup(inputs.player_angle)
+        cos_theta, sin_theta = trig_lookup(token.player_angle)
         trig_attn = attend_mean_where(
-            inputs.pos_encoding,
-            validity=inputs.is_player_angle,
+            pos_encoding,
+            validity=is_player_angle,
             value=Concatenate([cos_theta, sin_theta]),
         )
         player_cos = extract_from(trig_attn, 2, 0, 1, "player_cos")
         player_sin = extract_from(trig_attn, 2, 1, 1, "player_sin")
 
-    return PlayerOutputs(
+    return PlayerKVOutput(
         px=px,
         py=py,
         cos_theta=player_cos,

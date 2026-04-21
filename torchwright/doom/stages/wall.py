@@ -78,43 +78,38 @@ class CollisionFlags:
 
 
 @dataclass
-class WallInputs:
-    # Host-fed wall geometry (meaningful only at WALL positions).
+class WallToken:
+    """Host-fed fields at each WALL position."""
+
     wall_ax: Node
     wall_ay: Node
     wall_bx: Node
     wall_by: Node
     wall_tex_id: Node
     wall_index: Node
-
-    # Host-fed player state (pre-collision-resolution).
-    player_x: Node
-    player_y: Node
-
-    # Token-type flag (1.0 at WALL positions).
-    is_wall: Node
-
-    # Broadcast values from the INPUT stage.
-    vel_dx: Node
-    vel_dy: Node
-    move_cos: Node
-    move_sin: Node
-
-    # BSP rank precomputation: ``rank = dot(coeffs, side_P_vec) + const``.
-    # Host precomputes coefficients from the BSP tree structure; side_P_vec
-    # comes from the BSP stage's broadcast.
-    wall_bsp_coeffs: Node  # max_bsp_nodes-wide (meaningful at WALL positions)
-    wall_bsp_const: Node  # 1-wide (meaningful at WALL positions)
-    side_P_vec: Node  # max_bsp_nodes-wide (broadcast from BSP stage)
+    player_x: Node  # pre-collision-resolution
+    player_y: Node  # pre-collision-resolution
+    wall_bsp_coeffs: Node  # max_bsp_nodes-wide
+    wall_bsp_const: Node  # 1-wide
 
 
 @dataclass
-class WallOutputs:
+class WallKVInput:
+    """Values arriving from other stages via attention broadcasts."""
+
+    vel_dx: Node    # from InputKVOutput
+    vel_dy: Node    # from InputKVOutput
+    move_cos: Node  # from InputKVOutput
+    move_sin: Node  # from InputKVOutput
+    side_P_vec: Node  # from BspKVOutput
+
+
+@dataclass
+class WallKVOutput:
     collision: CollisionFlags
     sort_score: Node  # per-position, fed as ``score`` to SORTED's argmin
     sort_value: Node  # packed payload, fed as ``value`` to SORTED's argmin
     position_onehot: Node  # per-wall one-hot + 0.5 bias, fed to SORTED argmin
-    is_renderable: Node  # ±1 validity signal fed to SORTED's argmin
     indicators_above: Node  # max_walls-wide thermometer I(bsp_rank >= c AND
     # is_renderable) — fed as key_in to SORTED's
     # attend_argmin_above_integer
@@ -126,23 +121,28 @@ class WallOutputs:
 
 
 def build_wall(
-    inputs: WallInputs,
+    token: WallToken,
+    kv: WallKVInput,
+    *,
+    is_wall: Node,
     config: RenderConfig,
     max_walls: int,
     max_coord: float,
     max_bsp_nodes: int,
-) -> WallOutputs:
+) -> WallKVOutput:
     H = config.screen_height
 
     with annotate("wall/collision"):
-        collision = _compute_collision_flags(inputs)
+        collision = _compute_collision_flags(token, kv, is_wall)
 
     with annotate("wall/intersection"):
-        sort_den, sort_num_t = _compute_central_ray_intersection(inputs)
+        sort_den, sort_num_t = _compute_central_ray_intersection(token, kv)
 
     with annotate("bsp/rank"):
         bsp_rank, is_renderable = _compute_bsp_rank(
-            inputs,
+            token,
+            kv,
+            is_wall,
             sort_den,
             sort_num_t,
             max_bsp_nodes,
@@ -150,21 +150,21 @@ def build_wall(
 
     with annotate("wall/visibility"):
         vis_lo, vis_hi = _compute_visibility_columns(
-            inputs.wall_ax,
-            inputs.wall_ay,
-            inputs.wall_bx,
-            inputs.wall_by,
-            inputs.player_x,
-            inputs.player_y,
-            inputs.move_cos,
-            inputs.move_sin,
+            token.wall_ax,
+            token.wall_ay,
+            token.wall_bx,
+            token.wall_by,
+            token.player_x,
+            token.player_y,
+            kv.move_cos,
+            kv.move_sin,
             is_renderable,
             config=config,
             max_coord=max_coord,
         )
 
     with annotate("wall/onehot"):
-        position_onehot = _compute_position_onehot(inputs.wall_index, max_walls)
+        position_onehot = _compute_position_onehot(token.wall_index, max_walls)
 
     with annotate("wall/indicators_above"):
         indicators_above = _compute_indicators_above(
@@ -174,23 +174,22 @@ def build_wall(
         )
 
     sort_value = pack_wall_payload(
-        inputs.wall_ax,
-        inputs.wall_ay,
-        inputs.wall_bx,
-        inputs.wall_by,
-        inputs.wall_tex_id,
+        token.wall_ax,
+        token.wall_ay,
+        token.wall_bx,
+        token.wall_by,
+        token.wall_tex_id,
         bsp_rank,
         vis_lo,
         vis_hi,
         position_onehot,
     )
 
-    return WallOutputs(
+    return WallKVOutput(
         collision=collision,
         sort_score=bsp_rank,
         sort_value=sort_value,
         position_onehot=position_onehot,
-        is_renderable=is_renderable,
         indicators_above=indicators_above,
     )
 
@@ -222,24 +221,26 @@ def _collision_validity(den: Node, num_t: Node, num_u: Node) -> Node:
     return bool_all_true([is_den_ok, is_t_pos, is_t_le_den, is_u_ge_0, is_u_le_den])
 
 
-def _compute_collision_flags(inputs: WallInputs) -> CollisionFlags:
+def _compute_collision_flags(
+    token: WallToken, kv: WallKVInput, is_wall: Node
+) -> CollisionFlags:
     """Per-wall hit flags for three movement rays.
 
     Six shared ``piecewise_linear_2d`` products drive three validity checks
     (full, x-only, y-only) via different (den, num_t, num_u) assignments.
     """
     # Wall edge vectors and player-to-wall-start vectors (cheap subtracts).
-    ex = subtract(inputs.wall_bx, inputs.wall_ax)
-    ey = subtract(inputs.wall_by, inputs.wall_ay)
-    dax = subtract(inputs.wall_ax, inputs.player_x)
-    day = subtract(inputs.wall_ay, inputs.player_y)
+    ex = subtract(token.wall_bx, token.wall_ax)
+    ey = subtract(token.wall_by, token.wall_ay)
+    dax = subtract(token.wall_ax, token.player_x)
+    day = subtract(token.wall_ay, token.player_y)
 
     # Shared products (6 MLP sublayers).
     p_dx_ey = piecewise_linear_2d(
-        inputs.vel_dx, ey, VEL_BP, DIFF_BP, lambda a, b: a * b, name="c_dx_ey"
+        kv.vel_dx, ey, VEL_BP, DIFF_BP, lambda a, b: a * b, name="c_dx_ey"
     )
     p_dy_ex = piecewise_linear_2d(
-        inputs.vel_dy, ex, VEL_BP, DIFF_BP, lambda a, b: a * b, name="c_dy_ex"
+        kv.vel_dy, ex, VEL_BP, DIFF_BP, lambda a, b: a * b, name="c_dy_ex"
     )
     p_dax_ey = piecewise_linear_2d(
         dax, ey, DIFF_BP, DIFF_BP, lambda a, b: a * b, name="c_dax_ey"
@@ -248,10 +249,10 @@ def _compute_collision_flags(inputs: WallInputs) -> CollisionFlags:
         day, ex, DIFF_BP, DIFF_BP, lambda a, b: a * b, name="c_day_ex"
     )
     p_dax_dy = piecewise_linear_2d(
-        dax, inputs.vel_dy, DIFF_BP, VEL_BP, lambda a, b: a * b, name="c_dax_dy"
+        dax, kv.vel_dy, DIFF_BP, VEL_BP, lambda a, b: a * b, name="c_dax_dy"
     )
     p_day_dx = piecewise_linear_2d(
-        day, inputs.vel_dx, DIFF_BP, VEL_BP, lambda a, b: a * b, name="c_day_dx"
+        day, kv.vel_dx, DIFF_BP, VEL_BP, lambda a, b: a * b, name="c_day_dx"
     )
 
     # Shared num_t (same for all three rays).
@@ -275,13 +276,13 @@ def _compute_collision_flags(inputs: WallInputs) -> CollisionFlags:
     # Gate to -1.0 at non-WALL positions.
     no_hit = create_literal_value(torch.tensor([-1.0]), name="no_hit")
     return CollisionFlags(
-        hit_full=select(inputs.is_wall, hit_full_raw, no_hit),
-        hit_x=select(inputs.is_wall, hit_x_raw, no_hit),
-        hit_y=select(inputs.is_wall, hit_y_raw, no_hit),
+        hit_full=select(is_wall, hit_full_raw, no_hit),
+        hit_x=select(is_wall, hit_x_raw, no_hit),
+        hit_y=select(is_wall, hit_y_raw, no_hit),
     )
 
 
-def _compute_central_ray_intersection(inputs: WallInputs):
+def _compute_central_ray_intersection(token: WallToken, kv: WallKVInput):
     """Intersect the player's central viewing ray with this wall's line.
 
     Shared with the RENDER phase's parametric-intersection math:
@@ -294,14 +295,14 @@ def _compute_central_ray_intersection(inputs: WallInputs):
     Returns ``(sort_den, sort_num_t)`` — downstream divides them to get the
     front-to-back distance used as the sort score.
     """
-    w_ex = subtract(inputs.wall_bx, inputs.wall_ax)
-    w_ey = subtract(inputs.wall_by, inputs.wall_ay)
-    w_fx = subtract(inputs.wall_ax, inputs.player_x)
-    w_gy = subtract(inputs.player_y, inputs.wall_ay)
+    w_ex = subtract(token.wall_bx, token.wall_ax)
+    w_ey = subtract(token.wall_by, token.wall_ay)
+    w_fx = subtract(token.wall_ax, token.player_x)
+    w_gy = subtract(token.player_y, token.wall_ay)
 
     sort_ey_cos = piecewise_linear_2d(
         w_ey,
-        inputs.move_cos,
+        kv.move_cos,
         DIFF_BP,
         TRIG_BP,
         lambda a, b: a * b,
@@ -309,7 +310,7 @@ def _compute_central_ray_intersection(inputs: WallInputs):
     )
     sort_ex_sin = piecewise_linear_2d(
         w_ex,
-        inputs.move_sin,
+        kv.move_sin,
         DIFF_BP,
         TRIG_BP,
         lambda a, b: a * b,
@@ -339,7 +340,9 @@ def _compute_central_ray_intersection(inputs: WallInputs):
 
 
 def _compute_bsp_rank(
-    inputs: WallInputs,
+    token: WallToken,
+    kv: WallKVInput,
+    is_wall: Node,
     sort_den: Node,
     sort_num_t: Node,
     max_bsp_nodes: int,
@@ -369,14 +372,14 @@ def _compute_bsp_rank(
     bsp_products = []
     for i in range(max_bsp_nodes):
         c_i = extract_from(
-            inputs.wall_bsp_coeffs,
+            token.wall_bsp_coeffs,
             max_bsp_nodes,
             i,
             1,
             f"bsp_c_{i}",
         )
         s_i = extract_from(
-            inputs.side_P_vec,
+            kv.side_P_vec,
             max_bsp_nodes,
             i,
             1,
@@ -387,7 +390,7 @@ def _compute_bsp_rank(
         s_bool = compare(s_i, 0.5)
         bsp_products.append(cond_gate(s_bool, c_i))
     bsp_dot = sum_nodes(bsp_products)
-    bsp_rank = assert_integer(add(bsp_dot, inputs.wall_bsp_const))
+    bsp_rank = assert_integer(add(bsp_dot, token.wall_bsp_const))
 
     # Renderability: is_wall AND |sort_den| > ε AND num_t × sign(den) > 0.
     abs_sort_den = abs(sort_den)
@@ -395,7 +398,7 @@ def _compute_bsp_rank(
     den_sign = compare(sort_den, 0.0)
     adj_num_t = select(den_sign, sort_num_t, negate(sort_num_t))
     is_t_pos = compare(adj_num_t, 0.0)
-    is_renderable = bool_all_true([inputs.is_wall, is_den_ok, is_t_pos])
+    is_renderable = bool_all_true([is_wall, is_den_ok, is_t_pos])
 
     return bsp_rank, is_renderable
 

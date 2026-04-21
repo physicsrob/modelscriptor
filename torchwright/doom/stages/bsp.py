@@ -33,8 +33,8 @@ from torchwright.ops.logic_ops import cond_gate
 
 
 @dataclass
-class BspInputs:
-    """Host-fed BSP values + token-type gate."""
+class BspToken:
+    """Host-fed fields at each BSP_NODE position."""
 
     player_x: Node
     player_y: Node
@@ -42,12 +42,10 @@ class BspInputs:
     bsp_plane_ny: Node
     bsp_plane_d: Node
     bsp_node_id_onehot: Node  # max_bsp_nodes-wide
-    is_bsp_node: Node
-    pos_encoding: PosEncoding
 
 
 @dataclass
-class BspOutputs:
+class BspKVOutput:
     """Per-position, per-slot BSP side decisions.
 
     ``side_P_vec`` is ``max_bsp_nodes``-wide with values in ``{0, 1}``
@@ -59,11 +57,13 @@ class BspOutputs:
 
 
 def build_bsp(
-    inputs: BspInputs,
+    token: BspToken,
     *,
+    is_bsp_node: Node,
+    pos_encoding: PosEncoding,
     max_coord: float,
     max_bsp_nodes: int,
-) -> BspOutputs:
+) -> BspKVOutput:
     """Compute the per-slot side_P vector broadcast.
 
     Parameters
@@ -76,8 +76,8 @@ def build_bsp(
     """
     with annotate("bsp/side_p"):
         bsp_nx_px = multiply_2d(
-            inputs.bsp_plane_nx,
-            inputs.player_x,
+            token.bsp_plane_nx,
+            token.player_x,
             max_abs1=1.0,
             max_abs2=max_coord,
             step1=0.1,
@@ -85,29 +85,29 @@ def build_bsp(
             name="bsp_nx_px",
         )
         bsp_ny_py = multiply_2d(
-            inputs.bsp_plane_ny,
-            inputs.player_y,
+            token.bsp_plane_ny,
+            token.player_y,
             max_abs1=1.0,
             max_abs2=max_coord,
             step1=0.1,
             step2=1.0,
             name="bsp_ny_py",
         )
-        bsp_raw = add(add(bsp_nx_px, bsp_ny_py), inputs.bsp_plane_d)
+        bsp_raw = add(add(bsp_nx_px, bsp_ny_py), token.bsp_plane_d)
         # ±1 bool: +1 if raw > 0 (FRONT), -1 if raw ≤ 0 (BACK).
         side_P_bool = compare(bsp_raw, 0.0)
         # At BSP_NODE[i]: emit onehot_i when side=FRONT, zero otherwise.
         # Other token types get a garbage value that attend_mean_where
         # will ignore (validity=is_bsp_node filters to BSP_NODE positions).
-        side_P_spread = cond_gate(side_P_bool, inputs.bsp_node_id_onehot)
+        side_P_spread = cond_gate(side_P_bool, token.bsp_node_id_onehot)
 
     with annotate("bsp/broadcast"):
         side_P_mean = attend_mean_where(
-            inputs.pos_encoding,
-            validity=inputs.is_bsp_node,
+            pos_encoding,
+            validity=is_bsp_node,
             value=side_P_spread,
         )
         # Undo the mean's division by M to recover per-slot 0/1 values.
         side_P_vec = multiply_const(side_P_mean, float(max_bsp_nodes))
 
-    return BspOutputs(side_P_vec=side_P_vec)
+    return BspKVOutput(side_P_vec=side_P_vec)

@@ -30,9 +30,12 @@ These compile into four phases:
 | 0b (Player) | PLAYER_X + PLAYER_Y + PLAYER_ANGLE | Autoregressive | 3 |
 | 1+2 (Sort+Render) | SORTED_WALL + RENDER (interleaved) | Autoregressive | N + dynamic (~258) |
 
-Prefill tokens are processed in a single batched call (they don't
-depend on each other's outputs). Autoregressive tokens are generated
-one at a time — each token's output determines the next token's input.
+Prefill tokens are processed in a single batched forward pass.
+Dependencies between them (WALL reads INPUT's broadcasts, WALL reads
+BSP's side decisions) are resolved internally through attention layers
+within that pass — no autoregressive stepping needed. Autoregressive
+tokens are generated one at a time — each token's output determines
+the next token's input.
 
 Sort and render are interleaved: a SORTED_WALL token picks the next
 closest wall and sets up its identity as feedback, then RENDER tokens
@@ -78,9 +81,10 @@ into a one-hot vector (`tc_onehot_01`) used as the attention key.
 
 ### INPUT — Player Controls (Phase 0)
 
-A single token. Receives the player's current position, angle, and
-six boolean movement flags (forward, backward, turn left, turn right,
-strafe left, strafe right).
+A single token. Receives the player's current angle and six boolean
+movement flags (forward, backward, turn left, turn right, strafe
+left, strafe right). Does not receive player position — that is
+consumed by BSP, WALL, and EOS directly.
 
 Computes:
 
@@ -97,7 +101,7 @@ All five derived values (vel_dx, vel_dy, move_cos, move_sin,
 new_angle) are **broadcast to every position** via
 `attend_mean_where`. Since exactly one position has `is_input=1`, the
 "mean" is just that position's value — every subsequent token can read
-the player's velocity and facing direction as plain node inputs.
+the player's velocity and facing direction via attention.
 
 ### BSP_NODE — Spatial Classification (Phase 0)
 
@@ -119,12 +123,12 @@ telling which side of every BSP plane the player is on.
 WALL tokens consume `side_P_vec` to compute their BSP rank (see
 below).
 
-### WALL — Geometry + Physics + Precomputation (Phase 0)
+### WALL — Geometry + Physics (Phase 0)
 
 N tokens (typically 8), one per wall segment. The workhorse of the
-prefill phase. Each WALL token performs three independent computations
-on its wall segment, then packs the results into a payload for the
-sort stage:
+prefill phase. Each WALL token performs several computations on its
+wall segment, then packs the results into a payload for the sort
+stage:
 
 **1. Collision detection.**
 Three ray-segment intersection tests: the player's full velocity
@@ -178,9 +182,8 @@ basis for the SORTED stage's threshold-based argmin attention.
 
 ### EOS — Collision Resolution (Phase 0)
 
-A single token marking the end of prefill. Two jobs:
+A single token marking the end of prefill.
 
-**Collision resolution.**
 Aggregates the per-WALL hit flags via `attend_mean_where` over WALL
 positions. If the averaged flag for any ray exceeds a threshold
 (0.05), at least one wall was hit. Applies axis-separated wall
@@ -195,10 +198,11 @@ into a wall, the full velocity ray hits, but the perpendicular
 axis's solo ray may miss, allowing the player to slide along the
 wall on that axis.
 
-**Resolved state output.**
-The resolved `(x, y, angle)` triple is emitted as overflow outputs
-(`eos_resolved_x`, `eos_resolved_y`, `eos_new_angle`). The host reads
-these and feeds them to the PLAYER tokens in Phase 0b.
+The resolved `(x, y)` is emitted as overflow outputs
+(`eos_resolved_x`, `eos_resolved_y`). The new angle (unchanged by
+collision — EOS only resolves position) is emitted separately as
+`eos_new_angle`. The host reads all three and feeds them to the
+PLAYER tokens in Phase 0b.
 
 ### PLAYER — State Broadcast (Phase 0b)
 
@@ -214,12 +218,6 @@ outputs) as the `player_x`, `player_y`, `player_angle` inputs at
 these three positions. The `attend_mean_where` broadcasts land in
 the KV cache, so all downstream tokens (SORTED, RENDER) can read the
 post-collision player position and trig values via attention.
-
-This replaces the earlier design where EOS broadcast state directly.
-Separating the broadcast into dedicated tokens means the RENDER stage
-reads player state from PLAYER positions (which carry only the
-resolved values) rather than from EOS (which also carries collision
-intermediates in its KV cache row).
 
 ### SORTED_WALL — Front-to-Back Sort
 
@@ -241,16 +239,16 @@ Each SORTED token:
    `[0, max_walls-1]` for exhaustion safety).
 2. Runs `attend_argmin_above_integer` over WALL positions, retrieving
    the packed payload of the winning wall.
-3. Unpacks the payload into geometry (ax, ay, bx, by, tex_id),
-   visibility columns, BSP rank, and wall identity one-hot.
+3. Unpacks the payload into visibility columns, wall identity one-hot,
+   texture ID, and BSP rank.
 4. Detects sort exhaustion: if `sort_position_index > sel_bsp_rank`,
    the attention averaged garbage (no valid keys above threshold).
-   Sentinels the BSP rank to 99 so downstream consumers ignore
-   exhausted picks.
+   Emits `sort_done = +1` so the host can stop early.
+5. Outputs `sort_position_index + 1` so the next SORTED token picks
+   the next wall in rank order.
 
-The threshold advances by 1 each step because `sort_position_index`
-is incremented via feedback: SORTED outputs `position_index + 1`,
-RENDER forwards it unchanged.
+The threshold advances by 1 each step: SORTED outputs
+`position_index + 1`, RENDER forwards it unchanged.
 
 **Feedback to RENDER.** At each SORTED position, the overlaid outputs
 carry the selected wall's identity (`sel_onehot`, `vis_lo`, `vis_hi`,
@@ -388,14 +386,15 @@ these directly:
 - **length** (1): Number of rows painted (0 for non-RENDER tokens).
 - **done** (1): +1 when all walls are fully rendered, -1 otherwise.
 - **advance_wall** (1): +1 when transitioning to the next wall, -1
-  otherwise.  The host does not read this — wall transitions are
-  handled by the transformer via the `token_type` overlaid output.
+  otherwise.  Informational only — the host does not need this because
+  wall transitions are driven by the `token_type` overlaid output.
 - **sort_done** (1): +1 when the sort has exhausted all renderable
   walls at this SORTED position, -1 otherwise.
 - **eos_resolved_x**, **eos_resolved_y** (1 each): Collision-resolved
   player position. The host reads these from the EOS token's output
   and feeds them to the PLAYER tokens.
-- **eos_new_angle** (1): Post-input new angle. Same flow as position.
+- **eos_new_angle** (1): Post-input new angle (from the INPUT stage,
+  not computed by EOS). The host feeds this to PLAYER_ANGLE.
 
 The host's rendering loop is trivial: step the transformer, read
 `(pixels, col, start, length)` from overflow output, bitblit the
@@ -470,14 +469,17 @@ one-hot-like selections. Distance-based sorting would require
 comparing floating-point distances with potential ties at wall
 intersections.
 
-**Why a position-index threshold instead of feedback?**
-Each SORTED token's threshold is its `position_index` (0, 1, 2, ...),
-fed by the host. The token at position `i` picks the wall with the
-`i`-th smallest BSP rank among renderable walls. This avoids any
-autoregressive feedback between SORTED tokens — the threshold sequence
-is determined by position alone. Exhaustion (fewer renderable walls
-than sort positions) is detected by comparing `position_index` against
-the selected wall's BSP rank.
+**Why a simple counter threshold instead of feeding back the selected rank?**
+Each SORTED token's threshold is `sort_position_index` (0, 1, 2, ...),
+incremented by 1 at each SORTED step. The token at step `i` picks the
+wall with the `i`-th smallest BSP rank among renderable walls. The
+alternative would be feeding back the selected wall's actual BSP rank
+as the next threshold — but that would require the attention to
+produce a clean integer rank under piecewise-linear approximation
+noise, then use that noisy value as the next threshold. The counter
+approach avoids compounding attention noise through the sort sequence.
+Exhaustion (fewer renderable walls than sort positions) is detected by
+comparing `sort_position_index` against the selected wall's BSP rank.
 
 **Why PLAYER tokens instead of EOS broadcasting state?**
 The EOS token resolves the collision and emits the new `(x, y, angle)`

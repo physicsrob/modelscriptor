@@ -1,4 +1,4 @@
-"""EOS stage: collision resolution + resolved-state broadcast.
+"""EOS stage: collision resolution.
 
 At the single EOS token the graph:
 
@@ -8,9 +8,10 @@ At the single EOS token the graph:
 2. Resolves the new player position using axis-separated wall sliding:
    the player moves on an axis only if neither the full ray nor that
    axis's lone ray hit anything.
-3. Broadcasts the resolved ``(x, y, angle)`` triple to every position
-   via another ``attend_mean_where``, so SORTED tokens can read the
-   post-collision player state without the host feeding it.
+
+The resolved ``(x, y)`` is emitted as overflow output.  The host reads
+it and feeds it to the PLAYER tokens, which broadcast the resolved
+state to all positions.
 """
 
 from dataclasses import dataclass
@@ -36,37 +37,28 @@ from torchwright.doom.stages.wall import CollisionFlags
 
 
 @dataclass
-class EosInputs:
-    # Token-type flags.
-    is_wall: Node  # 1.0 at WALL positions (for collision aggregation)
-    is_eos: Node  # 1.0 at the single EOS position (for state broadcast)
+class EosToken:
+    """Host-fed fields at the single EOS position."""
 
-    # Per-wall collision flags from the WALL stage.
-    collision: CollisionFlags
-
-    # Host-fed pre-update player position.
-    player_x: Node
-    player_y: Node
-
-    # Broadcast values from the INPUT stage.
-    vel_dx: Node
-    vel_dy: Node
-    new_angle: Node
-
-    pos_encoding: PosEncoding
+    player_x: Node  # pre-collision-resolution
+    player_y: Node  # pre-collision-resolution
 
 
 @dataclass
-class EosOutputs:
-    # Resolved position at the EOS token — emitted as part of the EOS output
-    # seed for the autoregressive sort loop.
+class EosKVInput:
+    """Values arriving from other stages via attention."""
+
+    collision: CollisionFlags  # from WallKVOutput
+    vel_dx: Node               # from InputKVOutput
+    vel_dy: Node               # from InputKVOutput
+
+
+@dataclass
+class EosTokenOutput:
+    """Overflow outputs the host reads from the EOS position."""
+
     resolved_x: Node
     resolved_y: Node
-
-    # Post-broadcast state available at every position for the SORTED stage.
-    px: Node
-    py: Node
-    angle: Node
 
 
 # ---------------------------------------------------------------------------
@@ -74,25 +66,19 @@ class EosOutputs:
 # ---------------------------------------------------------------------------
 
 
-def build_eos(inputs: EosInputs) -> EosOutputs:
+def build_eos(
+    token: EosToken,
+    kv: EosKVInput,
+    *,
+    is_wall: Node,
+    pos_encoding: PosEncoding,
+) -> EosTokenOutput:
     with annotate("eos/collision_resolve"):
-        resolved_x, resolved_y = _resolve_collision(inputs)
+        resolved_x, resolved_y = _resolve_collision(token, kv, is_wall, pos_encoding)
 
-    with annotate("eos/attention"):
-        px, py, angle = _broadcast_resolved_state(
-            inputs.pos_encoding,
-            inputs.is_eos,
-            resolved_x,
-            resolved_y,
-            inputs.new_angle,
-        )
-
-    return EosOutputs(
+    return EosTokenOutput(
         resolved_x=resolved_x,
         resolved_y=resolved_y,
-        px=px,
-        py=py,
-        angle=angle,
     )
 
 
@@ -101,7 +87,9 @@ def build_eos(inputs: EosInputs) -> EosOutputs:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_collision(inputs: EosInputs):
+def _resolve_collision(
+    token: EosToken, kv: EosKVInput, is_wall: Node, pos_encoding: PosEncoding
+):
     """Axis-separated wall sliding from per-WALL hit flags.
 
     Aggregates ``hit_*`` across WALL positions via a mean; any mean above
@@ -110,13 +98,13 @@ def _resolve_collision(inputs: EosInputs):
     that axis's lone ray hit a wall; otherwise the player stays put on
     that axis.
     """
-    hit_full_01 = bool_to_01(inputs.collision.hit_full)
-    hit_x_01 = bool_to_01(inputs.collision.hit_x)
-    hit_y_01 = bool_to_01(inputs.collision.hit_y)
+    hit_full_01 = bool_to_01(kv.collision.hit_full)
+    hit_x_01 = bool_to_01(kv.collision.hit_x)
+    hit_y_01 = bool_to_01(kv.collision.hit_y)
 
     resolve_attn = attend_mean_where(
-        inputs.pos_encoding,
-        validity=inputs.is_wall,
+        pos_encoding,
+        validity=is_wall,
         value=Concatenate([hit_full_01, hit_x_01, hit_y_01]),
     )
     avg_hf = extract_from(resolve_attn, 3, 0, 1, "avg_hf")
@@ -130,31 +118,8 @@ def _resolve_collision(inputs: EosInputs):
     use_new_x = bool_any_true([negate(any_hit_full), negate(any_hit_x)])
     use_new_y = bool_any_true([negate(any_hit_full), negate(any_hit_y)])
 
-    new_x = add(inputs.player_x, inputs.vel_dx)
-    new_y = add(inputs.player_y, inputs.vel_dy)
-    resolved_x = select(use_new_x, new_x, inputs.player_x)
-    resolved_y = select(use_new_y, new_y, inputs.player_y)
+    new_x = add(token.player_x, kv.vel_dx)
+    new_y = add(token.player_y, kv.vel_dy)
+    resolved_x = select(use_new_x, new_x, token.player_x)
+    resolved_y = select(use_new_y, new_y, token.player_y)
     return resolved_x, resolved_y
-
-
-def _broadcast_resolved_state(
-    pos_encoding: PosEncoding,
-    is_eos: Node,
-    resolved_x: Node,
-    resolved_y: Node,
-    new_angle: Node,
-):
-    """Copy the EOS-position resolved (x, y, angle) triple to all positions.
-
-    Since exactly one position has is_eos=1, the attention's mean is the
-    value at that single position.
-    """
-    eos_state_attn = attend_mean_where(
-        pos_encoding,
-        validity=is_eos,
-        value=Concatenate([resolved_x, resolved_y, new_angle]),
-    )
-    px = extract_from(eos_state_attn, 3, 0, 1, "eos_px")
-    py = extract_from(eos_state_attn, 3, 1, 1, "eos_py")
-    angle = extract_from(eos_state_attn, 3, 2, 1, "eos_angle")
-    return px, py, angle

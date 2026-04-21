@@ -81,75 +81,48 @@ from torchwright.doom.renderer import _textured_column_fill
 
 
 @dataclass
-class RenderInputs:
-    """Per-RENDER inputs.
+class RenderToken:
+    """Overlay fields at each RENDER position (copied by the host)."""
 
-    Iteration state and wall identity come from overlaid outputs
-    (copied by the host).  Wall geometry is read from WALL positions
-    via attention.  Player state comes from PLAYER broadcasts.
-    """
-
-    # Iteration state (overlay).
     render_mask: Node  # max_walls-wide, walls fully rendered so far
     render_col: Node  # current screen column (SORTED sets to vis_lo for each wall)
     render_chunk_k: Node  # chunk index within current column (0, 1, 2, ...)
     sort_position_index: Node  # which sorted wall we're on (0-indexed)
-
-    # Wall identity (overlay; set by SORTED, forwarded by RENDER).
     render_tex_id: Node
     render_vis_lo: Node  # first visible column for this wall
     render_vis_hi: Node  # last visible column for this wall
     render_wall_j_onehot: Node  # max_walls-wide
 
-    # WALL geometry inputs (for wall geometry attention).
-    wall_ax: Node  # host-fed at WALL positions
+
+@dataclass
+class RenderKVInput:
+    """Data at other positions read via attention."""
+
+    # From WALL positions (attend_argmax_dot on render_wall_j_onehot).
+    wall_ax: Node
     wall_ay: Node
     wall_bx: Node
     wall_by: Node
-    wall_position_onehot: Node  # position one-hot at WALL positions
+    wall_position_onehot: Node  # from WallKVOutput
 
-    # Player state (from PLAYER broadcasts).
+    # From PLAYER broadcasts.
     player_x: Node  # resolved x
     player_y: Node  # resolved y
     player_cos: Node  # cos(θ)
     player_sin: Node  # sin(θ)
 
-    # TEX_COL inputs (host-fed at TEX_COL positions).
-    texture_id_e8: Node  # 8-wide
-    tex_pixels: Node
-
-    # TEX_COL stage output (per-TEX_COL-position one-hot).
-    tc_onehot_01: Node
-
-    # Token-type flags.
-    is_render: Node
-    is_wall: Node
-    is_tex_col: Node
-
-    pos_encoding: PosEncoding
+    # From TEX_COL positions (attend_argmax_dot on tex_id + col).
+    texture_id_e8: Node  # host-fed at TEX_COL positions (8-wide)
+    tex_pixels: Node     # host-fed at TEX_COL positions
+    tc_onehot_01: Node   # from TexColKVOutput
 
 
 @dataclass
-class RenderOutputs:
-    """Outputs at RENDER positions.
+class RenderTokenOutput:
+    """Overlay + overflow outputs at RENDER positions."""
 
-    * ``pixels`` / ``active_col`` / ``active_start`` / ``chunk_length``
-      land in overflow (host bitblits them to the framebuffer).
-    * Discrete state (mask, col, chunk, tex_id, vis bounds, onehot)
-      are separate overlaid outputs copied by the host.
-    * ``render_next_type`` is ``E8_SORTED_WALL`` on wall transitions
-      (not done), ``E8_RENDER`` otherwise.
-    * ``done_flag`` signals to the host that all walls are fully
-      rendered (it can stop feeding tokens).
-    """
-
-    pixels: Node  # chunk_size * 3 floats
-    active_col: Node
-    active_start: Node
-    chunk_length: Node
-    done_flag: Node
+    # Overlaid (copied to next input).
     render_next_type: Node  # 8-wide: E8_SORTED_WALL on advance, E8_RENDER otherwise
-    # Discrete state outputs (overlaid).
     next_render_mask: Node
     next_col: Node
     next_chunk_k: Node
@@ -158,6 +131,13 @@ class RenderOutputs:
     next_vis_hi: Node
     next_wall_j_onehot: Node
     next_sort_position_index: Node
+
+    # Overflow (host reads).
+    pixels: Node  # chunk_size * 3 floats
+    active_col: Node
+    active_start: Node
+    chunk_length: Node
+    done_flag: Node
     advance_wall: Node
 
 
@@ -167,14 +147,20 @@ class RenderOutputs:
 
 
 def build_render(
-    inputs: RenderInputs,
+    token: RenderToken,
+    kv: RenderKVInput,
+    *,
+    is_render: Node,
+    is_wall: Node,
+    is_tex_col: Node,
+    pos_encoding: PosEncoding,
     config: RenderConfig,
     textures: List[np.ndarray],
     chunk_size: int,
     max_coord: float,
     max_walls: int,
     tex_sample_batch_size: int = 8,
-) -> RenderOutputs:
+) -> RenderTokenOutput:
     H = config.screen_height
     W = config.screen_width
     fov = config.fov_columns
@@ -183,15 +169,15 @@ def build_render(
 
     with annotate("render/wall_geom_attention"):
         sel_ax, sel_ay, sel_bx, sel_by = _attend_wall_geometry(
-            inputs.pos_encoding,
-            is_render=inputs.is_render,
-            is_wall=inputs.is_wall,
-            wall_j_onehot=inputs.render_wall_j_onehot,
-            wall_position_onehot=inputs.wall_position_onehot,
-            wall_ax=inputs.wall_ax,
-            wall_ay=inputs.wall_ay,
-            wall_bx=inputs.wall_bx,
-            wall_by=inputs.wall_by,
+            pos_encoding,
+            is_render=is_render,
+            is_wall=is_wall,
+            wall_j_onehot=token.render_wall_j_onehot,
+            wall_position_onehot=kv.wall_position_onehot,
+            wall_ax=kv.wall_ax,
+            wall_ay=kv.wall_ay,
+            wall_bx=kv.wall_bx,
+            wall_by=kv.wall_by,
         )
 
     with annotate("render/precompute"):
@@ -200,16 +186,16 @@ def build_render(
             sel_ay,
             sel_bx,
             sel_by,
-            inputs.player_x,
-            inputs.player_y,
-            inputs.player_cos,
-            inputs.player_sin,
+            kv.player_x,
+            kv.player_y,
+            kv.player_cos,
+            kv.player_sin,
             H=H,
             max_coord=max_coord,
         )
 
     with annotate("render/state_machine"):
-        active_col = inputs.render_col
+        active_col = token.render_col
         angle_offset = _compute_angle_offset(active_col, W=W, fov=fov)
 
     with annotate("render/wall_height"):
@@ -240,14 +226,14 @@ def build_render(
 
     with annotate("render/tex_attention"):
         tex_column_colors = _attend_to_texture_column(
-            inputs.pos_encoding,
-            is_render=inputs.is_render,
-            is_tex_col=inputs.is_tex_col,
-            fb_tex_id=inputs.render_tex_id,
+            pos_encoding,
+            is_render=is_render,
+            is_tex_col=is_tex_col,
+            fb_tex_id=token.render_tex_id,
             tex_col_idx=tex_col_idx,
-            tc_onehot_01=inputs.tc_onehot_01,
-            texture_id_e8=inputs.texture_id_e8,
-            tex_pixels=inputs.tex_pixels,
+            tc_onehot_01=kv.tc_onehot_01,
+            texture_id_e8=kv.texture_id_e8,
+            tex_pixels=kv.tex_pixels,
             num_tex=len(textures),
             tex_w=tex_w,
         )
@@ -258,7 +244,7 @@ def build_render(
             wall_bottom,
             wall_height,
             tex_column_colors,
-            render_chunk_k=inputs.render_chunk_k,
+            render_chunk_k=token.render_chunk_k,
             config=config,
             tex_h=tex_h,
             chunk_size=cs,
@@ -283,23 +269,18 @@ def build_render(
             active_col=active_col,
             active_start=active_start,
             wall_bottom_clamped=clamp(wall_bottom, 0.0, float(H)),
-            render_mask=inputs.render_mask,
-            wall_j_onehot=inputs.render_wall_j_onehot,
-            vis_hi=inputs.render_vis_hi,
-            tex_id=inputs.render_tex_id,
-            vis_lo=inputs.render_vis_lo,
-            chunk_k=inputs.render_chunk_k,
-            sort_position_index=inputs.sort_position_index,
+            render_mask=token.render_mask,
+            wall_j_onehot=token.render_wall_j_onehot,
+            vis_hi=token.render_vis_hi,
+            tex_id=token.render_tex_id,
+            vis_lo=token.render_vis_lo,
+            chunk_k=token.render_chunk_k,
+            sort_position_index=token.sort_position_index,
             chunk_size=cs,
             max_walls=max_walls,
         )
 
-    return RenderOutputs(
-        pixels=pixels,
-        active_col=active_col,
-        active_start=active_start,
-        chunk_length=chunk_length,
-        done_flag=done_flag,
+    return RenderTokenOutput(
         render_next_type=render_next_type,
         next_render_mask=next_render_mask,
         next_col=next_col,
@@ -309,6 +290,11 @@ def build_render(
         next_vis_hi=next_vis_hi,
         next_wall_j_onehot=next_wall_j_onehot,
         next_sort_position_index=next_sort_position_index,
+        pixels=pixels,
+        active_col=active_col,
+        active_start=active_start,
+        chunk_length=chunk_length,
+        done_flag=done_flag,
         advance_wall=advance_wall,
     )
 
