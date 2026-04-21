@@ -365,9 +365,8 @@ class LayerScheduler:
 
         # Sort: Attn first; under column pressure prefer nodes that free columns,
         # otherwise maximize parallelism via critical path.
-        under_pressure = (
-            residual_map.get_free_count()
-            < self.d * (1.0 - self.policy.pressure_threshold)
+        under_pressure = residual_map.get_free_count() < self.d * (
+            1.0 - self.policy.pressure_threshold
         )
         if under_pressure:
             compute_candidates.sort(
@@ -580,9 +579,8 @@ class LayerScheduler:
             return True, additions, delta
 
         # 3a. L->R->L chains
-        under_pressure = (
-            residual_map.get_free_count()
-            < self.d * (1.0 - self.policy.pressure_threshold)
+        under_pressure = residual_map.get_free_count() < self.d * (
+            1.0 - self.policy.pressure_threshold
         )
         if under_pressure:
             chains.sort(

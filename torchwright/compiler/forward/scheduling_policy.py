@@ -43,9 +43,9 @@ class SchedulingPolicy:
 
     # MLP slot priority when residual stream occupancy exceeds
     # pressure_threshold.  Freeing columns becomes more urgent.
-    mlp_priority_pressure: Literal[
-        "mandatory_first", "cleanup_first", "by_depth"
-    ] = "cleanup_first"
+    mlp_priority_pressure: Literal["mandatory_first", "cleanup_first", "by_depth"] = (
+        "cleanup_first"
+    )
 
     # Residual stream occupancy fraction above which the scheduler
     # switches from mlp_priority to mlp_priority_pressure.

@@ -16,7 +16,10 @@ import torch
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.scheduler import LayerScheduler
-from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY, SchedulingPolicy
+from torchwright.compiler.forward.scheduling_policy import (
+    LEGACY_POLICY,
+    SchedulingPolicy,
+)
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
