@@ -58,6 +58,43 @@ or `tests/doom/`, read `docs/doom_graph.md`. It documents the full pipeline:
 token sequence, phase structure, every stage's computation, feedback layouts,
 and how the graph compiles to a transformer.
 
+# Dumb host principle
+
+The DOOM renderer is an exercise in extreme constraints. The goal is
+not to render DOOM efficiently — it's to render DOOM in a way that is
+entirely analogous to autoregressive LLM inference. Each step has a
+discrete input token and predicts a discrete output token. The host
+copies the output token to the next input. This is normal LLM
+autoregression — the same loop that drives any chat model. The only
+addition is that output tokens include pixel information which the
+host copies to the screen, analogous to a mixed-modal model predicting
+image patches.
+
+That's it. The host feeds tokens and blits pixels. It does zero
+computation — no sorting, no geometry, no visibility culling, no
+arithmetic. The host may skip already-filled pixels when writing
+(front-to-back compositing), but that is a conditional write, not
+computation. All rendering logic — wall selection, visibility,
+distance, texture lookup, compositing decisions — lives inside the
+transformer.
+
+**Known violations** (as of 2026-04-20):
+
+- `doom/compile.py:658-666` — ceiling/floor fill. The host decides
+  pixel color based on `y < center_y`. This is rendering logic that
+  belongs in the transformer.
+- `doom/compile.py:652-656` — render_mask early termination. The host
+  rounds, clips, sums, and compares mask values to decide when to stop
+  rendering. The transformer should emit an explicit "done" signal
+  that the host reads without arithmetic.
+
+**Never violate this principle.** If a proposed design, optimization,
+or bug fix moves computation from the transformer to the host, it is
+wrong regardless of how much simpler it would make things. If you
+discover existing code that violates this principle — host-side logic
+that does anything beyond token I/O and pixel blitting — flag it to
+the user immediately and stop other work until resolved.
+
 # Testing
 
 ## Running Tests
