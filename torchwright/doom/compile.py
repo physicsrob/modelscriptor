@@ -41,6 +41,7 @@ from torchwright.doom.game_graph import (
     build_game_graph,
 )
 from torchwright.graph.spherical_codes import index_to_vector
+from torchwright.doom.trace import FrameTrace, RenderStepTrace, SortStepTrace
 from torchwright.reference_renderer.types import RenderConfig
 
 
@@ -266,6 +267,7 @@ def step_frame(
     subset,
     config: RenderConfig,
     textures: Optional[List[np.ndarray]] = None,
+    trace: Optional[FrameTrace] = None,
 ) -> Tuple[np.ndarray, GameState]:
     """Run one frame via the multi-phase rollout.
 
@@ -458,6 +460,11 @@ def step_frame(
     new_angle_raw = eos_out[0, eos_angle_out_s].item()
     angle = new_angle_raw
 
+    if trace is not None:
+        trace.eos_resolved_x = px
+        trace.eos_resolved_y = py
+        trace.eos_new_angle = new_angle_raw
+
     def _out_to_input(raw_out):
         """Map overlaid output fields to a flat input row."""
         row = torch.zeros(1, d_input, device=device)
@@ -535,8 +542,24 @@ def step_frame(
         sorted_walls.append((wall_j_oh, v_lo, v_hi, t_id))
         print(f"  sort[{k}] vis=[{v_lo:.0f},{v_hi:.0f}] tex={t_id:.0f}")
 
+        if trace is not None:
+            oh_np = wall_j_oh.cpu().numpy()
+            trace.sort_steps.append(
+                SortStepTrace(
+                    position_index=k,
+                    wall_j_onehot=oh_np,
+                    selected_wall_index=int(np.argmax(oh_np)),
+                    vis_lo=v_lo,
+                    vis_hi=v_hi,
+                    tex_id=t_id,
+                    sort_done=sort_done_val > 0.0,
+                )
+            )
+
     t_sort = time.perf_counter() - t0
     n_renderable = len(sorted_walls)
+    if trace is not None:
+        trace.n_renderable = n_renderable
     print(
         f"  sort     {N} steps  kv={_kv_len(past)}  {t_sort*1000:.0f}ms  "
         f"renderable={n_renderable}"
@@ -581,6 +604,18 @@ def step_frame(
             length = int(round(raw[length_out_s]))
             done = raw[done_out_s]
             pix = raw[pix_out_s : pix_out_s + cs * 3].reshape(cs, 3)
+
+            if trace is not None:
+                trace.render_steps.append(
+                    RenderStepTrace(
+                        col=col,
+                        start=start_y,
+                        length=length,
+                        pixels=pix.copy(),
+                        done=done > 0.0,
+                        wall_index=wall_idx,
+                    )
+                )
 
             # Bitblit with skip-filled compositing
             for row_idx in range(length):
