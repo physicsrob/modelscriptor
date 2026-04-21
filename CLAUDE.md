@@ -297,6 +297,219 @@ against.
   and `/tmp/torchwright-modal-run.log` symlinks to the latest run.
   Grep that file instead of spending another Modal round-trip.
 
+# Debugging compiled graphs
+
+When a compiled graph produces wrong output, the cause is almost
+always in the user graph (wrong op, wrong wiring, numerical noise
+accumulation) — not in the compiler.  The compiler has four
+runtime-enforced invariants (I1–I4, documented under *Compiler
+Invariants* below) that catch the structural bugs (column aliasing,
+truncated writes, wrong Q/K/V widths, premature frees) that would
+look like "the compiler broke my values."  If those invariants pass
+during compilation, the compiler produced a structurally correct
+transformer.  The remaining question is whether the user graph's
+math, when evaluated through piecewise-linear approximations, stays
+within its noise budget — and the tools below answer that question
+directly.
+
+Before suspecting a compiler bug, **run the tools in this section**.
+They are ordered from cheapest to most expensive.  If all of them
+come back clean, the problem is in the graph's numerical design
+(op choice, gain settings, breakpoint placement, tolerance budgets),
+not in the compiler.
+
+## debug=True forward pass
+
+The cheapest check.  Pass `debug=True` to `__call__` or `step`:
+
+    output = compiled(inputs, debug=True)
+    output, new_past = compiled.step(inputs, past, debug=True)
+
+This runs the full forward pass with per-sublayer residual-stream
+capture, then performs three checks:
+
+1. **Self-consistency**: for every graph node that appears in
+   multiple sublayer snapshots, verifies the value at its assigned
+   columns is identical across all of them.  A node's columns sit
+   in the residual stream untouched until freed; if they differ
+   between snapshots, something overwrote those columns while the
+   node was still live.  This is a compiler or scheduling bug (it
+   would mean I1 or I4 failed to catch an allocation error at
+   compile time).  Raises `RuntimeError` on failure.
+
+2. **Assert predicates**: every `Assert` node in the graph has its
+   predicate run against the compiled value.  Raises `AssertionError`
+   with annotation context on failure.
+
+3. **DebugWatch predicates**: every `DebugWatch` node in the graph
+   has its predicate run against the compiled value.  Prints on
+   trigger, does not raise.
+
+**If `debug=True` passes with no errors or warnings**, the compiled
+transformer's residual stream is internally self-consistent and
+every asserted invariant holds on compiled values.  That rules out
+the compiler as the source of the problem — whatever's wrong lives
+in the graph logic or numerical tolerances.
+
+## debug_value(node)
+
+After a `debug=True` forward, extract any graph node's compiled
+value:
+
+    compiled(inputs, debug=True)
+    val = compiled.debug_value(some_intermediate_node)
+
+Returns an `(n_pos, node.d_output)` tensor, or `None` if the node
+has no residual assignment.  Unwraps Assert/DebugWatch wrappers
+automatically.  Useful for spot-checking a specific node without
+setting up the full probe machinery.
+
+Raises `RuntimeError` if no `debug=True` forward has been run.
+
+## probe_compiled — full oracle comparison
+
+Runs the compiled transformer side-by-side with a recursive graph
+evaluation (the oracle — `node.compute` on every node) and reports
+every node whose compiled value disagrees beyond a tolerance:
+
+    from torchwright.debug.probe import probe_compiled
+
+    report = probe_compiled(compiled, output_node, input_values, n_pos, atol=1e-3)
+    print(report.format_short())
+
+`report.first_divergent` is the earliest node in topological order
+that exceeds `atol`.  `report.per_node` has the full error record
+for every checked node.  If `first_divergent is None`, the compiled
+transformer matches the oracle everywhere — the graph math is the
+math you designed, and the only error is the piecewise-linear
+approximation noise measured in `docs/op_noise_data.json`.
+
+`probe_graph` is a convenience wrapper that compiles and probes in
+one call:
+
+    from torchwright.debug.probe import probe_graph
+
+    report = probe_graph(output_node, pos_encoding, input_values, n_pos,
+                         d=2048, d_head=32, atol=500.0)
+
+**Interpreting `atol`.**  The tolerance must account for accumulated
+piecewise-linear approximation error through the graph.  For a
+shallow graph (few ops, small value range), `atol=1e-3` is
+appropriate.  For the DOOM renderer (deep op chains, values in the
+10^4 range), `atol=500` is the empirical floor — see the atol
+comment in `tests/debug/test_probe.py:test_probe_clean_on_v2_box_room`.
+
+## probe_residual — layer-by-layer node values
+
+Extract a specific node's compiled value at every post-MLP layer
+where it's materialized:
+
+    from torchwright.debug.probe import probe_residual
+
+    rp = probe_residual(compiled, prefill_tensor, node)
+    for layer_i in rp.layers:
+        print(f"layer {layer_i}: {rp.at(layer_i)}")
+
+Restrict to specific positions with `rp.positions([0, 3, 7])` or
+a single layer with `at_layer=5`.
+
+## probe_attention — softmax weight inspection
+
+Capture the explicit softmax weights and pre-softmax logits at a
+specific attention node and query position:
+
+    from torchwright.debug.probe import probe_attention
+
+    ap = probe_attention(compiled, prefill, attn_node, query_pos=2)
+    print(ap.top(k=5, head=0))  # top-5 keys by weight
+
+`ap.weights` is `(n_heads, n_keys)` and `ap.logits` is the same
+shape.  Useful for diagnosing softmax concentration failures
+(the attention isn't picking a single key) — the symptom behind
+the historical angle-192 rendering artifact.
+
+## probe_layer_diff — drift tracking
+
+Track how a node's value evolves across layers, compared to a
+known reference:
+
+    from torchwright.debug.probe import probe_layer_diff
+
+    report = probe_layer_diff(compiled, prefill, node,
+                              reference=oracle_value,
+                              positions=[0, 1, 2],
+                              drift_threshold=1e-3)
+    if report.first_drift_layer is not None:
+        print(f"drift starts at layer {report.first_drift_layer}")
+
+Can also detect sentinel values (e.g. `sentinel=-1000.0`) that
+should never appear in a healthy forward pass.
+
+## Assert and DebugWatch nodes
+
+Graph-level invariants are encoded as `Assert` and `DebugWatch`
+nodes that wrap intermediate values.  Both are stripped at compile
+time (the compiled transformer is identical with or without them)
+and re-checked during `debug=True` forward passes.
+
+Helpers in `torchwright/graph/asserts.py`:
+
+- `assert_in_range(node, lo, hi)` — value bounds
+- `assert_integer(node)` — near-integer values
+- `assert_bool(node)` — values near +1 or -1
+- `assert_01(node)` — values near 0 or 1
+- `assert_onehot(node)` — one-hot rows (pre-attention only)
+- `assert_unique_values(node)` — pairwise-distinct components
+- `assert_distinct_across(value, where)` — cross-position uniqueness
+- `assert_score_gap_at_least(score, where)` — softmax resolvability
+- `assert_picked_from(result, values, keys)` — attention picked
+  exactly one key
+- `assert_strictly_less(a, b)` — elementwise ordering
+- `debug_watch(node, predicate, message)` — observational (print,
+  not raise)
+
+These run on exact-math values during `reference_eval` and on
+compiled values during `debug=True`.  An assert that passes in
+reference eval but fails in the compiled forward pinpoints a node
+where piecewise-linear approximation error exceeds the tolerance —
+that's a noise-budget problem in the graph, not a compiler bug.
+
+## Triage sequence for wrong output
+
+1. **`compiled(inputs, debug=True)`** — does the self-consistency
+   check pass?  Do any asserts or watches fire?  If the consistency
+   check fails, that's a real compiler/scheduling bug (report per
+   D1).  If an assert fires, the failure message names the node
+   and the invariant that broke — investigate that node's inputs.
+
+2. **`probe_compiled`** — does the oracle agree with compiled?
+   If `first_divergent` is `None`, the compiled transformer matches
+   the graph's exact math within `atol`.  The problem is upstream
+   (graph logic, scene setup, input encoding).  If there is a
+   divergent node, it names the first place where compiled values
+   drift from exact math — investigate the op at that node and its
+   noise budget.
+
+3. **`debug_value(node)`** or **`probe_residual`** — spot-check
+   specific intermediate nodes.  Compare against hand-computed
+   expected values or oracle values from `reference_eval`.
+
+4. **`probe_attention`** — if the divergence is downstream of an
+   attention layer, check whether the softmax is concentrating
+   correctly.  A spread-out weight distribution (no single key
+   above 0.99) means the attention is blending values instead of
+   picking one — the gain or score gap is too small.
+
+5. **Per-op noise bounds** — check `docs/op_noise_data.json` for
+   the op producing the divergent node.  If the measured worst-case
+   error for that op (at the relevant input range) exceeds the
+   tolerance the graph needs, the fix is in the op's breakpoint
+   grid or the graph's tolerance budget, not the compiler.
+
+If all five come back clean, the compiled transformer is correct
+and the bug is in the test expectation, input setup, or reference
+implementation.
+
 # Doctrine
 
 The DOOM renderer project has a recurring failure mode: ship a
@@ -484,9 +697,11 @@ scripts in `/tmp/` are write-once, never indexed, never
 re-runnable, and don't accumulate institutional knowledge.
 
 - **Probing residual values / divergence:**
-  `torchwright/debug/probe.py`.  [TBD: extend the description
-  once Plan 1's generalized harness — residual inspection,
-  attention inspection, layer-wise diff — lands.]
+  `torchwright/debug/probe.py`.  Provides `probe_compiled` (full
+  oracle comparison), `probe_residual` (per-layer node value
+  extraction), `probe_attention` (softmax weight/logit capture),
+  and `probe_layer_diff` (layer-by-layer drift tracking).  See
+  the *Debugging compiled graphs* section above for usage.
 - **Compiler invariants:** assertions in
   `torchwright/compiler/`.  See the *Compiler Invariants* section
   below for the canonical list.

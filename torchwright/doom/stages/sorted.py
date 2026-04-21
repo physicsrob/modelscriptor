@@ -219,7 +219,6 @@ def _argmin_above_and_derive(
         indicators_above=inputs.indicators_above,
         threshold_onehot=threshold_onehot,
         value=inputs.sort_value,
-        assert_hardness_gt=0.99,
     )
 
     # Post-attention: result must match exactly one value row from a

@@ -309,3 +309,104 @@ def test_debug_watch_fires_on_correct_threshold():
     mod(inp, debug=True)
     assert len(fired_values) == 1
     assert abs(fired_values[0][0, 0].item() - 0.8) < 0.05
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency check
+# ---------------------------------------------------------------------------
+
+
+def test_debug_forward_runs_consistency_check():
+    """debug=True should not raise on a healthy graph (consistency passes)."""
+    pos, _, out = _build_graph(with_watch=True)
+    mod = _compile(pos, out)
+    inp = _make_input(mod, 0.5)
+    mod(inp, debug=True)
+
+
+def test_debug_step_runs_consistency_check():
+    """debug=True step should not raise on a healthy graph."""
+    pos, _, out = _build_graph(with_watch=True)
+    mod = _compile(pos, out)
+    inp = _make_input(mod, 0.5)
+    past = mod.empty_past()
+    mod.step(inp, past, debug=True)
+
+
+# ---------------------------------------------------------------------------
+# debug_value()
+# ---------------------------------------------------------------------------
+
+
+def test_debug_value_returns_compiled_value():
+    """debug_value(node) returns the node's compiled value after debug forward."""
+    pos = create_pos_encoding()
+    x = create_input("x", 1)
+    y = clamp(x, -1.0, 1.0)
+    mod = _compile(pos, y)
+
+    inp = _make_input(mod, 0.7)
+    output = mod(inp, debug=True)
+
+    val = mod.debug_value(y)
+    assert val is not None
+    assert val.shape[1] == 1
+    assert abs(val[0, 0].item() - output[0, 0].item()) < 1e-4
+
+
+def test_debug_value_on_intermediate():
+    """debug_value works on intermediate nodes, not just the output."""
+    pos = create_pos_encoding()
+    x = create_input("x", 1)
+    y = clamp(x, -1.0, 1.0)
+    from torchwright.ops.arithmetic_ops import add_const
+
+    z = add_const(y, 1.0)
+    mod = _compile(pos, z)
+
+    inp = _make_input(mod, 0.7)
+    mod(inp, debug=True)
+
+    val_y = mod.debug_value(y)
+    assert val_y is not None
+    assert abs(val_y[0, 0].item() - 0.7) < 0.05
+
+    val_z = mod.debug_value(z)
+    assert val_z is not None
+    assert abs(val_z[0, 0].item() - 1.7) < 0.05
+
+
+def test_debug_value_unwraps_assert():
+    """debug_value unwraps Assert/DebugWatch wrappers to find the target."""
+    pos, _, out = _build_graph(with_assert=True)
+    mod = _compile(pos, out)
+    inp = _make_input(mod, 0.5)
+    mod(inp, debug=True)
+
+    val = mod.debug_value(out)
+    assert val is not None
+    assert abs(val[0, 0].item() - 0.5) < 0.05
+
+
+def test_debug_value_raises_without_debug_forward():
+    """debug_value raises RuntimeError if no debug forward has been run."""
+    pos, _, out = _build_graph()
+    mod = _compile(pos, out)
+    with pytest.raises(RuntimeError, match="requires a prior debug=True"):
+        mod.debug_value(out)
+
+
+def test_debug_value_after_step():
+    """debug_value works after a debug=True step call."""
+    pos = create_pos_encoding()
+    x = create_input("x", 1)
+    y = clamp(x, -1.0, 1.0)
+    mod = _compile(pos, y)
+
+    inp = _make_input(mod, 0.4)
+    past = mod.empty_past()
+    output, _ = mod.step(inp, past, debug=True)
+
+    val = mod.debug_value(y)
+    assert val is not None
+    assert abs(val[0, 0].item() - output[0, 0].item()) < 1e-4

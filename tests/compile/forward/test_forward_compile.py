@@ -651,7 +651,7 @@ def test_compile_attend_argmax_dot():
     qv = create_input("qv", 4)
     kv = create_input("kv", 4)
     value = create_input("value", 3)
-    out = attend_argmax_dot(pos, qv, kv, value, match_gain=200.0)
+    out = attend_argmax_dot(qv, kv, value, match_gain=200.0)
 
     n_pos = 5
     _verify(

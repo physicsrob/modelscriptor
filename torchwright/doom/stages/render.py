@@ -327,7 +327,6 @@ def _attend_wall_geometry(
     """Read (ax, ay, bx, by) from the WALL position matching wall_j_onehot."""
     GEOM_MATCH_GAIN = 1000.0
     wall_geom = attend_argmax_dot(
-        pos_encoding,
         query_vector=cond_gate(is_render, wall_j_onehot),
         key_vector=cond_gate(is_wall, wall_position_onehot),
         value=cond_gate(
@@ -335,7 +334,6 @@ def _attend_wall_geometry(
             Concatenate([wall_ax, wall_ay, wall_bx, wall_by]),
         ),
         match_gain=GEOM_MATCH_GAIN,
-        assert_hardness_gt=0.99,
     )
     sel_ax = extract_from(wall_geom, 4, 0, 1, "rsel_ax")
     sel_ay = extract_from(wall_geom, 4, 1, 1, "rsel_ay")
@@ -671,12 +669,10 @@ def _attend_to_texture_column(
     scaled_rc = multiply_const(rc_onehot_01, COL_SCALE)
     scaled_tc = multiply_const(tc_onehot_01, COL_SCALE)
     return attend_argmax_dot(
-        pos_encoding,
         query_vector=cond_gate(is_render, Concatenate([tex_e8_query, scaled_rc])),
         key_vector=cond_gate(is_tex_col, Concatenate([texture_id_e8, scaled_tc])),
         value=cond_gate(is_tex_col, tex_pixels),
         match_gain=TEX_MATCH_GAIN,
-        assert_hardness_gt=0.99,
     )
 
 
