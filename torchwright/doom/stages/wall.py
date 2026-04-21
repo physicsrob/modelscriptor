@@ -1,4 +1,4 @@
-"""WALL stage: per-wall collision + BSP-rank sort score + render precomputation.
+"""WALL stage: per-wall collision + BSP-rank sort score + visibility.
 
 At every WALL token the graph computes, for one wall segment:
 
@@ -8,15 +8,12 @@ At every WALL token the graph computes, for one wall segment:
 * **BSP rank** ``rank(W) = dot(coeffs_W, side_P_vec) + const_W`` — a
   front-to-back sort key derived from the BSP tree's spatial structure.
   A clean integer permutation of ``0..N-1``; used as the score by
-  SORTED's ``attend_argmin_valid_unmasked``.
+  SORTED's ``attend_argmin_above_integer``.
 * **Renderability flag** ``is_renderable`` — ±1 boolean, true iff this
   is a real wall token whose central ray is not parallel to the wall
   and whose intersection is in front of the player.  SORTED's argmin
   treats non-renderable walls as *invalid keys* rather than folding the
   concern into the sort score.
-* **Render precomputations** ``sort_den, C, D, E, H_inv`` — the wall
-  geometry rotated into the player's angular frame so RENDER only
-  needs per-column angle offsets.
 * **Visibility column range** ``(vis_lo, vis_hi)`` — screen-column
   endpoints of the wall's visible arc, computed by rotating the wall
   segment into the player's frame and clipping against the FOV cone.

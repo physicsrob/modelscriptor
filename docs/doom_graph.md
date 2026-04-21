@@ -52,10 +52,6 @@ The E8 codes serve as position encoding. Texture IDs also map to E8
 vectors starting at index 8, so the same embedding space covers both
 token type and texture identity.
 
-(The constant `TOKEN_THINKING = 6` still exists in `graph_constants.py`
-but is unused — THINKING tokens were eliminated; see *Key Design
-Decisions* below.)
-
 ## Stages
 
 ### TEX_COL — Texture Data (Phase -1)
