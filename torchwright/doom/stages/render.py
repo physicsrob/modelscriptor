@@ -1,34 +1,36 @@
 """RENDER stage: chunked column fill + state machine for autoregressive loop.
 
 One RENDER token paints ``chunk_size`` vertical pixels of one screen
-column.  The wall being rendered is identified by discrete values in
-the token type overlay: ``render_wall_j_onehot``, ``render_tex_id``,
-``render_vis_lo``, ``render_vis_hi``.
+column.  The token carries four bounded integers: ``col`` (screen
+column), ``chunk_k`` (vertical chunk index), ``wall_counter`` (sort
+position), and ``wall_index`` (which wall).  Wall identity details
+(tex_id, vis_lo, vis_hi) are read from the WALL position via the
+geometry attention — not carried on the token.
 
 Per-token flow:
 
-1. **Wall geometry attention**: attend to the WALL position matching
-   ``render_wall_j_onehot`` and read raw (ax, ay, bx, by).
-2. **Precompute**: from the raw geometry plus player state (position
-   and cos/sin from PLAYER broadcasts), compute the rotation products
+1. **Wall geometry attention**: convert ``wall_index`` to a one-hot,
+   attend to the matching WALL position, read (ax, ay, bx, by,
+   tex_id, vis_lo, vis_hi).
+2. **Precompute**: from raw geometry plus player state (position and
+   cos/sin from PLAYER broadcasts), compute the rotation products
    (sort_den, C, D, E, sort_num_t) and derive H_inv.
-3. The **active column** is ``render_col`` (SORTED sets this to
-   ``vis_lo`` for each new wall).
+3. The **active column** is ``col`` (SORTED sets this to ``vis_lo``
+   for each new wall).
 4. Compute wall height + texture u-coordinate.
 5. TEX_COL attention fetches the matching texture column pixels.
-6. Compute **active_start** from ``render_chunk_k``:
-   ``vis_top + render_chunk_k × chunk_size``.
+6. Compute **active_start** from ``chunk_k``:
+   ``vis_top + chunk_k × chunk_size``.
 7. Fill ``chunk_size`` rows into the column pixel strip.
 8. Compute state transitions — three exclusive cases:
 
    * **more chunks**: ``active_start + cs < vis_bottom`` → stay on this
      column, advance ``chunk_k`` by 1.
-   * **advance col**: no more chunks, ``active_col + 1 ≤ vis_hi`` →
+   * **advance col**: no more chunks, ``col + 1 ≤ vis_hi`` →
      move to the next column, reset ``chunk_k`` to 0.
-   * **advance wall**: no more columns → update ``render_mask`` with
-     ``render_wall_j_onehot``.  If all walls are masked, emit ``done``.
-     Otherwise emit next-token-type = ``E8_SORTED_WALL`` so the
-     transformer picks the next wall.
+   * **advance wall**: no more columns → if ``wall_counter`` equals
+     ``max_walls``, emit ``done``.  Otherwise emit next-token-type =
+     ``E8_SORTED_WALL`` so the transformer picks the next wall.
 
 Next-token-type is ``E8_SORTED_WALL`` on wall transitions (not done),
 ``E8_RENDER`` otherwise.  The host just bitblits — no conditional logic.
@@ -82,27 +84,25 @@ from torchwright.doom.renderer import _textured_column_fill
 
 @dataclass
 class RenderToken:
-    """Overlay fields at each RENDER position (copied by the host)."""
+    """Four bounded integers — the minimal autoregressive state."""
 
-    render_mask: Node  # max_walls-wide, walls fully rendered so far
-    render_col: Node  # current screen column (SORTED sets to vis_lo for each wall)
-    render_chunk_k: Node  # chunk index within current column (0, 1, 2, ...)
-    sort_position_index: Node  # which sorted wall we're on (0-indexed)
-    render_tex_id: Node
-    render_vis_lo: Node  # first visible column for this wall
-    render_vis_hi: Node  # last visible column for this wall
-    render_wall_j_onehot: Node  # max_walls-wide
+    col: Node  # current screen column (0..W)
+    chunk_k: Node  # chunk index within current column (0..ceil(H/cs))
+    wall_counter: Node  # how many walls sorted so far (0..max_walls)
+    wall_index: Node  # which wall position being rendered (0..max_walls-1)
 
 
 @dataclass
 class RenderKVInput:
     """Data at other positions read via attention."""
 
-    # From WALL positions (attend_argmax_dot on render_wall_j_onehot).
+    # From WALL positions (attend_argmax_dot on wall_index one-hot).
     wall_ax: Node
     wall_ay: Node
     wall_bx: Node
     wall_by: Node
+    wall_tex_id: Node  # host-fed at WALL positions
+    wall_vis_hi: Node  # from WallKVOutput (late attention, off critical path)
     wall_position_onehot: Node  # from WallKVOutput
 
     # From PLAYER broadcasts.
@@ -113,8 +113,8 @@ class RenderKVInput:
 
     # From TEX_COL positions (attend_argmax_dot on tex_id + col).
     texture_id_e8: Node  # host-fed at TEX_COL positions (8-wide)
-    tex_pixels: Node     # host-fed at TEX_COL positions
-    tc_onehot_01: Node   # from TexColKVOutput
+    tex_pixels: Node  # host-fed at TEX_COL positions
+    tc_onehot_01: Node  # from TexColKVOutput
 
 
 @dataclass
@@ -123,14 +123,10 @@ class RenderTokenOutput:
 
     # Overlaid (copied to next input).
     render_next_type: Node  # 8-wide: E8_SORTED_WALL on advance, E8_RENDER otherwise
-    next_render_mask: Node
     next_col: Node
     next_chunk_k: Node
-    next_tex_id: Node
-    next_vis_lo: Node
-    next_vis_hi: Node
-    next_wall_j_onehot: Node
-    next_sort_position_index: Node
+    next_wall_counter: Node  # forwarded unchanged
+    next_wall_index: Node  # forwarded unchanged
 
     # Overflow (host reads).
     pixels: Node  # chunk_size * 3 floats
@@ -167,17 +163,31 @@ def build_render(
     tex_w, tex_h = textures[0].shape[0], textures[0].shape[1]
     cs = chunk_size
 
+    with annotate("render/wall_index_onehot"):
+        wall_index_p1 = add_const(token.wall_index, 1.0)
+        wall_j_onehot = bool_to_01(in_range(token.wall_index, wall_index_p1, max_walls))
+
     with annotate("render/wall_geom_attention"):
-        sel_ax, sel_ay, sel_bx, sel_by = _attend_wall_geometry(
+        sel_ax, sel_ay, sel_bx, sel_by, sel_tex_id = _attend_wall_geometry(
             pos_encoding,
             is_render=is_render,
             is_wall=is_wall,
-            wall_j_onehot=token.render_wall_j_onehot,
+            wall_j_onehot=wall_j_onehot,
             wall_position_onehot=kv.wall_position_onehot,
             wall_ax=kv.wall_ax,
             wall_ay=kv.wall_ay,
             wall_bx=kv.wall_bx,
             wall_by=kv.wall_by,
+            wall_tex_id=kv.wall_tex_id,
+        )
+
+    with annotate("render/wall_vis_attention"):
+        sel_vis_hi = _attend_wall_vis_hi(
+            is_render=is_render,
+            is_wall=is_wall,
+            wall_j_onehot=wall_j_onehot,
+            wall_position_onehot=kv.wall_position_onehot,
+            wall_vis_hi=kv.wall_vis_hi,
         )
 
     with annotate("render/precompute"):
@@ -195,7 +205,7 @@ def build_render(
         )
 
     with annotate("render/state_machine"):
-        active_col = token.render_col
+        active_col = token.col
         angle_offset = _compute_angle_offset(active_col, W=W, fov=fov)
 
     with annotate("render/wall_height"):
@@ -229,7 +239,7 @@ def build_render(
             pos_encoding,
             is_render=is_render,
             is_tex_col=is_tex_col,
-            fb_tex_id=token.render_tex_id,
+            fb_tex_id=sel_tex_id,
             tex_col_idx=tex_col_idx,
             tc_onehot_01=kv.tc_onehot_01,
             texture_id_e8=kv.texture_id_e8,
@@ -244,7 +254,7 @@ def build_render(
             wall_bottom,
             wall_height,
             tex_column_colors,
-            render_chunk_k=token.render_chunk_k,
+            render_chunk_k=token.chunk_k,
             config=config,
             tex_h=tex_h,
             chunk_size=cs,
@@ -256,40 +266,26 @@ def build_render(
         (
             done_flag,
             render_next_type,
-            next_render_mask,
             next_col,
             next_chunk_k,
-            next_tex_id,
-            next_vis_lo,
-            next_vis_hi,
-            next_wall_j_onehot,
-            next_sort_position_index,
             advance_wall,
         ) = _compute_next_state(
             active_col=active_col,
             active_start=active_start,
             wall_bottom_clamped=clamp(wall_bottom, 0.0, float(H)),
-            render_mask=token.render_mask,
-            wall_j_onehot=token.render_wall_j_onehot,
-            vis_hi=token.render_vis_hi,
-            tex_id=token.render_tex_id,
-            vis_lo=token.render_vis_lo,
-            chunk_k=token.render_chunk_k,
-            sort_position_index=token.sort_position_index,
+            vis_hi=sel_vis_hi,
+            wall_counter=token.wall_counter,
+            chunk_k=token.chunk_k,
             chunk_size=cs,
             max_walls=max_walls,
         )
 
     return RenderTokenOutput(
         render_next_type=render_next_type,
-        next_render_mask=next_render_mask,
         next_col=next_col,
         next_chunk_k=next_chunk_k,
-        next_tex_id=next_tex_id,
-        next_vis_lo=next_vis_lo,
-        next_vis_hi=next_vis_hi,
-        next_wall_j_onehot=next_wall_j_onehot,
-        next_sort_position_index=next_sort_position_index,
+        next_wall_counter=token.wall_counter,
+        next_wall_index=token.wall_index,
         pixels=pixels,
         active_col=active_col,
         active_start=active_start,
@@ -315,24 +311,56 @@ def _attend_wall_geometry(
     wall_ay: Node,
     wall_bx: Node,
     wall_by: Node,
-) -> tuple[Node, Node, Node, Node]:
-    """Read (ax, ay, bx, by) from the WALL position matching wall_j_onehot."""
+    wall_tex_id: Node,
+) -> tuple[Node, Node, Node, Node, Node]:
+    """Read (ax, ay, bx, by, tex_id) from the WALL position matching
+    wall_j_onehot.  All values are host-fed (available at layer 0), so this
+    attention can fire early — no dependency on WALL stage computation.
+    """
+    _GEOM_WIDTH = 5
     GEOM_MATCH_GAIN = 1000.0
     wall_geom = attend_argmax_dot(
         query_vector=cond_gate(is_render, wall_j_onehot),
         key_vector=cond_gate(is_wall, wall_position_onehot),
         value=cond_gate(
             is_wall,
-            Concatenate([wall_ax, wall_ay, wall_bx, wall_by]),
+            Concatenate([wall_ax, wall_ay, wall_bx, wall_by, wall_tex_id]),
         ),
         match_gain=GEOM_MATCH_GAIN,
         assert_hardness_gt=0.99,
     )
-    sel_ax = extract_from(wall_geom, 4, 0, 1, "rsel_ax")
-    sel_ay = extract_from(wall_geom, 4, 1, 1, "rsel_ay")
-    sel_bx = extract_from(wall_geom, 4, 2, 1, "rsel_bx")
-    sel_by = extract_from(wall_geom, 4, 3, 1, "rsel_by")
-    return sel_ax, sel_ay, sel_bx, sel_by
+    sel_ax = extract_from(wall_geom, _GEOM_WIDTH, 0, 1, "rsel_ax")
+    sel_ay = extract_from(wall_geom, _GEOM_WIDTH, 1, 1, "rsel_ay")
+    sel_bx = extract_from(wall_geom, _GEOM_WIDTH, 2, 1, "rsel_bx")
+    sel_by = extract_from(wall_geom, _GEOM_WIDTH, 3, 1, "rsel_by")
+    sel_tex_id = extract_from(wall_geom, _GEOM_WIDTH, 4, 1, "rsel_tex_id")
+    return sel_ax, sel_ay, sel_bx, sel_by, sel_tex_id
+
+
+def _attend_wall_vis_hi(
+    *,
+    is_render: Node,
+    is_wall: Node,
+    wall_j_onehot: Node,
+    wall_position_onehot: Node,
+    wall_vis_hi: Node,
+) -> Node:
+    """Read vis_hi from the WALL position matching wall_j_onehot.
+
+    Separate from the geometry attention because vis_hi is computed by the
+    WALL stage's FOV clipping (available at ~layer 40), while the geometry
+    fields are host-fed (layer 0).  The state machine doesn't need vis_hi
+    until after chunk fill (~layer 64), so this late attention has plenty
+    of slack and stays off the critical path.
+    """
+    GEOM_MATCH_GAIN = 1000.0
+    return attend_argmax_dot(
+        query_vector=cond_gate(is_render, wall_j_onehot),
+        key_vector=cond_gate(is_wall, wall_position_onehot),
+        value=cond_gate(is_wall, wall_vis_hi),
+        match_gain=GEOM_MATCH_GAIN,
+        assert_hardness_gt=0.99,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -723,13 +751,9 @@ def _compute_next_state(
     active_col: Node,
     active_start: Node,
     wall_bottom_clamped: Node,
-    render_mask: Node,
-    wall_j_onehot: Node,
     vis_hi: Node,
-    tex_id: Node,
-    vis_lo: Node,
+    wall_counter: Node,
     chunk_k: Node,
-    sort_position_index: Node,
     chunk_size: int,
     max_walls: int,
 ):
@@ -750,15 +774,7 @@ def _compute_next_state(
     advance_col = bool_all_true([not_more_chunks, has_more_cols])
     advance_wall = bool_all_true([not_more_chunks, bool_not(has_more_cols)])
 
-    mask_with_new = add(render_mask, wall_j_onehot)
-    next_render_mask = select(advance_wall, mask_with_new, render_mask)
-
-    mask_sum = Linear(
-        mask_with_new,
-        torch.ones(max_walls, 1),
-        name="render_mask_sum",
-    )
-    all_walls_done = compare(mask_sum, max_walls - 0.5)
+    all_walls_done = compare(wall_counter, float(max_walls) - 0.5)
     done_flag = bool_all_true([advance_wall, all_walls_done])
 
     zero_col = create_literal_value(torch.tensor([0.0]), name="zero_col")
@@ -779,13 +795,7 @@ def _compute_next_state(
     return (
         done_flag,
         render_next_type,
-        next_render_mask,
         next_col_output,
         next_chunk_k,
-        tex_id,
-        vis_lo,
-        vis_hi,
-        wall_j_onehot,
-        sort_position_index,
         advance_wall,
     )

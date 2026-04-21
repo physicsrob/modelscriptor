@@ -49,8 +49,8 @@ class EosKVInput:
     """Values arriving from other stages via attention."""
 
     collision: CollisionFlags  # from WallKVOutput
-    vel_dx: Node               # from InputKVOutput
-    vel_dy: Node               # from InputKVOutput
+    vel_dx: Node  # from InputKVOutput
+    vel_dy: Node  # from InputKVOutput
 
 
 @dataclass

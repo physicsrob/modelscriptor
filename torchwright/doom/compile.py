@@ -221,14 +221,10 @@ def _build_row(compiled, max_walls, **kwargs):
         "player_angle": torch.zeros(1, device=device),
         "player_x": torch.zeros(1, device=device),
         "player_y": torch.zeros(1, device=device),
-        "render_mask": torch.zeros(max_walls_meta, device=device),
         "render_col": torch.zeros(1, device=device),
         "render_chunk_k": torch.zeros(1, device=device),
-        "render_tex_id": torch.zeros(1, device=device),
-        "render_vis_lo": torch.zeros(1, device=device),
-        "render_vis_hi": torch.zeros(1, device=device),
-        "render_wall_j_onehot": torch.zeros(max_walls_meta, device=device),
-        "sort_position_index": torch.zeros(1, device=device),
+        "render_wall_index": torch.zeros(1, device=device),
+        "wall_counter": torch.zeros(1, device=device),
         "tex_col_input": torch.zeros(1, device=device),
         "tex_pixels": torch.zeros(tex_h * 3, device=device),
         "texture_id_e8": torch.zeros(8, device=device),
@@ -516,11 +512,10 @@ def step_frame(
     # detection, no wall-identity patching.
 
     # Output field offsets for trace recording.
-    wj_out_s, wj_out_w = out_by_name["render_wall_j_onehot"]
-    vlo_out_s, _ = out_by_name["render_vis_lo"]
-    vhi_out_s, _ = out_by_name["render_vis_hi"]
-    tid_out_s, _ = out_by_name["render_tex_id"]
-    spi_out_s, _ = out_by_name["sort_position_index"]
+    wi_out_s, _ = out_by_name["render_wall_index"]
+    wc_out_s, _ = out_by_name["wall_counter"]
+    col_overlay_s, _ = out_by_name["render_col"]
+    svhi_out_s, _ = out_by_name["sort_vis_hi"]
     t0 = time.perf_counter()
     frame = np.full((H, W, 3), -1.0, dtype=np.float32)
     filled = np.zeros((H, W), dtype=bool)
@@ -529,12 +524,12 @@ def step_frame(
         module,
         max_walls,
         token_type=E8_SORTED_WALL,
-        sort_position_index=torch.tensor([0.0]),
+        wall_counter=torch.tensor([0.0]),
     )
 
     max_steps = N * (W * (H // cs + 1) + 1) + 10
     total_steps = 0
-    prev_spi = 0.0
+    prev_wc = 0.0
 
     for k in range(max_steps):
         out, past = _step(prev, past, step)
@@ -550,27 +545,27 @@ def step_frame(
         sort_done = raw[sort_done_out_s]
         pix = raw[pix_out_s : pix_out_s + cs * 3].reshape(cs, 3)
 
-        # Trace: detect token type from sort_position_index changes.
-        # SORTED tokens increment spi; RENDER tokens forward it.
+        # Trace: detect token type from wall_counter changes.
+        # SORTED tokens increment wall_counter; RENDER tokens forward it.
         if trace is not None:
-            cur_spi = raw[spi_out_s]
-            if cur_spi > prev_spi + 0.5:
-                wall_j_oh = out[0, wj_out_s : wj_out_s + wj_out_w].cpu().numpy()
+            cur_wc = raw[wc_out_s]
+            if cur_wc > prev_wc + 0.5:
+                wall_idx = int(round(raw[wi_out_s]))
                 trace.sort_steps.append(
                     SortStepTrace(
                         position_index=len(trace.sort_steps),
-                        wall_j_onehot=wall_j_oh,
-                        selected_wall_index=int(np.argmax(wall_j_oh)),
-                        vis_lo=raw[vlo_out_s],
-                        vis_hi=raw[vhi_out_s],
-                        tex_id=raw[tid_out_s],
+                        wall_j_onehot=np.eye(max_walls)[wall_idx],
+                        selected_wall_index=wall_idx,
+                        vis_lo=raw[col_overlay_s],
+                        vis_hi=raw[svhi_out_s],
+                        tex_id=0.0,
                         sort_done=sort_done > 0.0,
                     )
                 )
                 if sort_done <= 0.0:
                     trace.n_renderable = len(trace.sort_steps)
             if length > 0:
-                wall_idx = max(0, int(round(cur_spi)) - 1)
+                sort_idx = max(0, int(round(cur_wc)) - 1)
                 trace.render_steps.append(
                     RenderStepTrace(
                         col=col,
@@ -578,10 +573,10 @@ def step_frame(
                         length=length,
                         pixels=pix.copy(),
                         done=done > 0.0,
-                        wall_index=wall_idx,
+                        wall_index=sort_idx,
                     )
                 )
-            prev_spi = cur_spi
+            prev_wc = cur_wc
 
         # Bitblit pixels (length=0 at SORTED positions → no-op).
         for row_idx in range(length):

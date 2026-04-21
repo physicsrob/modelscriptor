@@ -246,7 +246,7 @@ def build_game_graph(
     # ---------- SORTED ----------
     sorted_out = build_sorted(
         SortedToken(
-            position_index=inputs["sort_position_index"],
+            wall_counter=inputs["wall_counter"],
         ),
         SortedKVInput(
             sort_score=wall_out.sort_score,
@@ -262,20 +262,18 @@ def build_game_graph(
     # ---------- RENDER ----------
     render_out = build_render(
         RenderToken(
-            render_mask=inputs["render_mask"],
-            render_col=inputs["render_col"],
-            render_chunk_k=inputs["render_chunk_k"],
-            sort_position_index=inputs["sort_position_index"],
-            render_tex_id=inputs["render_tex_id"],
-            render_vis_lo=inputs["render_vis_lo"],
-            render_vis_hi=inputs["render_vis_hi"],
-            render_wall_j_onehot=inputs["render_wall_j_onehot"],
+            col=inputs["render_col"],
+            chunk_k=inputs["render_chunk_k"],
+            wall_counter=inputs["wall_counter"],
+            wall_index=inputs["render_wall_index"],
         ),
         RenderKVInput(
             wall_ax=inputs["wall_ax"],
             wall_ay=inputs["wall_ay"],
             wall_bx=inputs["wall_bx"],
             wall_by=inputs["wall_by"],
+            wall_tex_id=inputs["wall_tex_id"],
+            wall_vis_hi=wall_out.vis_hi,
             wall_position_onehot=wall_out.position_onehot,
             player_x=player_out.px,
             player_y=player_out.py,
@@ -305,7 +303,6 @@ def build_game_graph(
         input_out=input_out,
         sorted_out=sorted_out,
         render_out=render_out,
-        max_walls=max_walls,
         chunk_size=cs,
     )
 
@@ -384,27 +381,16 @@ def _create_inputs(
         value_range=(-max_coord, max_coord),
     )
 
-    inputs["sort_position_index"] = create_input(
-        "sort_position_index", 1, value_range=(0.0, float(max_walls))
-    )
-
-    # Discrete render state — overlaid inputs copied by the host.
-    inputs["render_mask"] = create_input(
-        "render_mask", max_walls, value_range=(0.0, 1.0)
+    # Autoregressive state — 4 bounded integers plus token_type.
+    inputs["wall_counter"] = create_input(
+        "wall_counter", 1, value_range=(0.0, float(max_walls))
     )
     inputs["render_col"] = create_input("render_col", 1, value_range=(0.0, 255.0))
     inputs["render_chunk_k"] = create_input(
         "render_chunk_k", 1, value_range=(0.0, 20.0)
     )
-    inputs["render_tex_id"] = create_input("render_tex_id", 1, value_range=(0.0, 255.0))
-    inputs["render_vis_lo"] = create_input(
-        "render_vis_lo", 1, value_range=(-2.0, 255.0)
-    )
-    inputs["render_vis_hi"] = create_input(
-        "render_vis_hi", 1, value_range=(-2.0, 255.0)
-    )
-    inputs["render_wall_j_onehot"] = create_input(
-        "render_wall_j_onehot", max_walls, value_range=(0.0, 1.0)
+    inputs["render_wall_index"] = create_input(
+        "render_wall_index", 1, value_range=(0.0, float(max_walls - 1))
     )
 
     return inputs
@@ -435,20 +421,17 @@ def _assemble_output(
     input_out,
     sorted_out,
     render_out,
-    max_walls: int,
     chunk_size: int,
 ) -> Tuple[Dict[str, Node], Dict[str, Node]]:
     """Build the overlaid outputs + overflow outputs.
 
     Overlaid outputs fed back into the next step's input:
-        token_type, render_mask, render_col, render_chunk_k,
-        render_tex_id, render_vis_lo, render_vis_hi,
-        render_wall_j_onehot, sort_position_index
+        token_type, render_col, render_chunk_k, wall_counter,
+        render_wall_index
 
-    SORTED tokens set wall identity + render_col for the first
-    RENDER token, then output token_type = E8_RENDER.  RENDER
-    tokens advance render state and output token_type =
-    E8_SORTED_WALL on wall transitions (not done).
+    SORTED sets col + wall_index for the first RENDER token, then
+    outputs token_type = E8_RENDER.  RENDER tokens advance col/chunk_k
+    and output token_type = E8_SORTED_WALL on wall transitions (not done).
 
     Overflow outputs bitblitted by the host:
         pixels, col, start, length, done, advance_wall,
@@ -457,28 +440,16 @@ def _assemble_output(
     with annotate("output"):
         zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
         zero_8 = create_literal_value(torch.zeros(8), name="zero_8")
-        zero_mw = create_literal_value(torch.zeros(max_walls), name="zero_mw")
         zero_pixels = create_literal_value(
             torch.zeros(chunk_size * 3),
             name="zero_pixels",
         )
         neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one_out")
 
-        # --- Discrete render state (overlaid outputs) ---
-        # SORTED sets wall identity + render_col for the first RENDER.
-        # RENDER advances state; on advance_wall emits SORTED_WALL type.
-
-        # render_mask: RENDER advances on wall transitions; SORTED forwards.
-        out_render_mask = select(
-            token_flags["is_sorted"],
-            inputs["render_mask"],
-            select(token_flags["is_render"], render_out.next_render_mask, zero_mw),
-        )
-
         # render_col: SORTED sets to vis_lo; RENDER advances.
         out_render_col = select(
             token_flags["is_sorted"],
-            sorted_out.vis_lo,
+            sorted_out.col,
             select(token_flags["is_render"], render_out.next_col, zero_1),
         )
 
@@ -487,43 +458,24 @@ def _assemble_output(
             token_flags["is_render"], render_out.next_chunk_k, zero_1
         )
 
-        # render_tex_id: SORTED sets from wall; RENDER forwards.
-        out_render_tex_id = select(
+        # wall_counter: SORTED increments; RENDER forwards.
+        out_wall_counter = select(
             token_flags["is_sorted"],
-            sorted_out.sel_tex_id,
-            select(token_flags["is_render"], render_out.next_tex_id, zero_1),
-        )
-
-        # render_vis_lo/hi: SORTED sets from wall; RENDER forwards.
-        out_render_vis_lo = select(
-            token_flags["is_sorted"],
-            sorted_out.vis_lo,
-            select(token_flags["is_render"], render_out.next_vis_lo, zero_1),
-        )
-        out_render_vis_hi = select(
-            token_flags["is_sorted"],
-            sorted_out.vis_hi,
-            select(token_flags["is_render"], render_out.next_vis_hi, zero_1),
-        )
-
-        # render_wall_j_onehot: SORTED sets from wall; RENDER forwards.
-        out_render_wall_j_onehot = select(
-            token_flags["is_sorted"],
-            sorted_out.sel_onehot,
+            sorted_out.next_wall_counter,
             select(
                 token_flags["is_render"],
-                render_out.next_wall_j_onehot,
-                zero_mw,
+                render_out.next_wall_counter,
+                zero_1,
             ),
         )
 
-        # sort_position_index: SORTED increments; RENDER forwards.
-        out_sort_position_index = select(
+        # render_wall_index: SORTED sets from sort result; RENDER forwards.
+        out_render_wall_index = select(
             token_flags["is_sorted"],
-            sorted_out.next_sort_position_index,
+            sorted_out.wall_index,
             select(
                 token_flags["is_render"],
-                render_out.next_sort_position_index,
+                render_out.next_wall_index,
                 zero_1,
             ),
         )
@@ -552,6 +504,7 @@ def _assemble_output(
         )
 
         out_sort_done = select(token_flags["is_sorted"], sorted_out.sort_done, neg_one)
+        out_sort_vis_hi = select(token_flags["is_sorted"], sorted_out.vis_hi, zero_1)
 
         out_eos_rx = select(token_flags["is_eos"], eos_out.resolved_x, zero_1)
         out_eos_ry = select(token_flags["is_eos"], eos_out.resolved_y, zero_1)
@@ -559,14 +512,10 @@ def _assemble_output(
 
     overlaid = {
         "token_type": out_token_type,
-        "render_mask": out_render_mask,
         "render_col": out_render_col,
         "render_chunk_k": out_render_chunk_k,
-        "render_tex_id": out_render_tex_id,
-        "render_vis_lo": out_render_vis_lo,
-        "render_vis_hi": out_render_vis_hi,
-        "render_wall_j_onehot": out_render_wall_j_onehot,
-        "sort_position_index": out_sort_position_index,
+        "wall_counter": out_wall_counter,
+        "render_wall_index": out_render_wall_index,
     }
     overflow = {
         "pixels": out_pixels,
@@ -576,6 +525,7 @@ def _assemble_output(
         "done": out_done,
         "advance_wall": out_advance_wall,
         "sort_done": out_sort_done,
+        "sort_vis_hi": out_sort_vis_hi,
         "eos_resolved_x": out_eos_rx,
         "eos_resolved_y": out_eos_ry,
         "eos_new_angle": out_eos_angle,

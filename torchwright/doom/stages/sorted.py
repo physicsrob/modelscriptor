@@ -35,7 +35,7 @@ from dataclasses import dataclass
 
 import torch
 
-from torchwright.graph import Node, annotate
+from torchwright.graph import Linear, Node, annotate
 from torchwright.graph.asserts import (
     assert_distinct_across,
     assert_integer,
@@ -58,7 +58,6 @@ from torchwright.ops.map_select import in_range
 from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.wall_payload import (
     VISIBILITY_WIDTH,
-    extract_geometry_field,
     unpack_wall_payload,
 )
 
@@ -71,7 +70,7 @@ from torchwright.doom.wall_payload import (
 class SortedToken:
     """Overlay fields at each SORTED_WALL position."""
 
-    position_index: Node  # sort_position_index (0-indexed, host copies from overlay)
+    wall_counter: Node  # how many walls sorted so far (0-indexed)
 
 
 @dataclass
@@ -87,12 +86,11 @@ class SortedKVInput:
 class SortedTokenOutput:
     """Overlay + overflow outputs at SORTED positions."""
 
-    sel_onehot: Node   # overlay → render_wall_j_onehot
-    vis_lo: Node       # overlay → render_vis_lo (also seeds render_col)
-    vis_hi: Node       # overlay → render_vis_hi
-    sel_tex_id: Node   # overlay → render_tex_id
-    sort_done: Node    # overflow — host reads
-    next_sort_position_index: Node  # overlay → sort_position_index
+    wall_index: Node  # scalar index of the selected wall (0..max_walls-1)
+    col: Node  # starting screen column (= vis_lo of the selected wall)
+    vis_hi: Node  # overflow — end of visible column range (for trace recording)
+    sort_done: Node  # overflow — host reads
+    next_wall_counter: Node  # overlay → wall_counter
 
 
 # ---------------------------------------------------------------------------
@@ -111,30 +109,27 @@ def build_sorted(
 ) -> SortedTokenOutput:
     with annotate("sort/threshold"):
         threshold_onehot = _compute_threshold_onehot(
-            token.position_index,
+            token.wall_counter,
             max_walls,
         )
 
     with annotate("sort/attention"):
-        (
-            sel_onehot,
-            sel_tex_id,
-            sort_done,
-            vis_lo,
-            vis_hi,
-        ) = _argmin_above_and_derive(
+        sel_onehot, sort_done, vis_lo, vis_hi = _argmin_above_and_derive(
             token, kv, is_wall, pos_encoding, threshold_onehot, max_walls
         )
 
-    next_sort_position_index = add_const(token.position_index, 1.0)
+    with annotate("sort/wall_index"):
+        indices_weight = torch.arange(max_walls, dtype=torch.float32).unsqueeze(1)
+        wall_index = Linear(sel_onehot, indices_weight, name="wall_index")
+
+    next_wall_counter = add_const(token.wall_counter, 1.0)
 
     return SortedTokenOutput(
-        sel_onehot=sel_onehot,
-        sort_done=sort_done,
-        vis_lo=vis_lo,
+        wall_index=wall_index,
+        col=vis_lo,
         vis_hi=vis_hi,
-        sel_tex_id=sel_tex_id,
-        next_sort_position_index=next_sort_position_index,
+        sort_done=sort_done,
+        next_wall_counter=next_wall_counter,
     )
 
 
@@ -227,20 +222,18 @@ def _argmin_above_and_derive(
     unpacked = unpack_wall_payload(selected_sort, max_walls)
     sel_bsp_rank = unpacked.bsp_rank
     sel_onehot = unpacked.onehot
-    sel_tex_id = extract_geometry_field(unpacked.wall_data, "tex_id")
 
     vis_lo = extract_from(unpacked.vis_cols, VISIBILITY_WIDTH, 0, 1, "vis_lo")
     vis_hi = extract_from(unpacked.vis_cols, VISIBILITY_WIDTH, 1, 1, "vis_hi")
 
     raw_sel_bsp_rank = assert_integer(sel_bsp_rank)
     sort_done = compare(
-        subtract(token.position_index, raw_sel_bsp_rank),
+        subtract(token.wall_counter, raw_sel_bsp_rank),
         0.5,
     )
 
     return (
         sel_onehot,
-        sel_tex_id,
         sort_done,
         vis_lo,
         vis_hi,

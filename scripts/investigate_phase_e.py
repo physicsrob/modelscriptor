@@ -365,7 +365,7 @@ def main():
         module,
         _MAX_WALLS,
         token_type=E8_SORTED_WALL,
-        sort_position_index=torch.tensor([0.0]),
+        wall_counter=torch.tensor([0.0]),
         player_x=torch.tensor([3.0]),
         player_y=torch.tensor([2.0]),
         player_angle=torch.tensor([20.0]),

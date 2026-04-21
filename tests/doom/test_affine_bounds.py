@@ -284,9 +284,8 @@ def doom_graph():
         # causes spurious bound violations in the state machine.
         render_state_names = {
             "render_col",
-            "render_vis_lo",
-            "render_vis_hi",
             "render_chunk_k",
+            "render_wall_index",
         }
 
         tainted: Set[int] = set()

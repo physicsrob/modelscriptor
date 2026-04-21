@@ -29,9 +29,9 @@ from torchwright.doom.renderer import trig_lookup
 
 @dataclass
 class PlayerToken:
-    player_x: Node      # host-fed at PLAYER_X position
-    player_y: Node      # host-fed at PLAYER_Y position
-    player_angle: Node   # host-fed at PLAYER_ANGLE position
+    player_x: Node  # host-fed at PLAYER_X position
+    player_y: Node  # host-fed at PLAYER_Y position
+    player_angle: Node  # host-fed at PLAYER_ANGLE position
 
 
 @dataclass

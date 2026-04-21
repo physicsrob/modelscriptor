@@ -295,7 +295,7 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         "player_angle": torch.tensor([[0.0]]),
         "player_x": torch.tensor([[0.0]]),
         "player_y": torch.tensor([[0.0]]),
-        "sort_position_index": torch.tensor([[0.0]]),
+        "wall_counter": torch.tensor([[0.0]]),
         "tex_col_input": torch.tensor([[0.0]]),
         "tex_pixels": torch.zeros(1, tex_h * 3),
         "texture_id_e8": torch.zeros(1, 8),
@@ -312,13 +312,9 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         "bsp_node_id_onehot": torch.zeros(1, max_bsp_nodes),
         "wall_bsp_coeffs": torch.zeros(1, max_bsp_nodes),
         "wall_bsp_const": torch.tensor([[0.0]]),
-        "render_mask": torch.zeros(1, max_walls),
         "render_col": torch.tensor([[0.0]]),
         "render_chunk_k": torch.tensor([[0.0]]),
-        "render_tex_id": torch.tensor([[0.0]]),
-        "render_vis_lo": torch.tensor([[0.0]]),
-        "render_vis_hi": torch.tensor([[0.0]]),
-        "render_wall_j_onehot": torch.zeros(1, max_walls),
+        "render_wall_index": torch.tensor([[0.0]]),
     }
 
     # The v2 graph has large intermediate values in square_signed and

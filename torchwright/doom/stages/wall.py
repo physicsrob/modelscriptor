@@ -97,8 +97,8 @@ class WallToken:
 class WallKVInput:
     """Values arriving from other stages via attention broadcasts."""
 
-    vel_dx: Node    # from InputKVOutput
-    vel_dy: Node    # from InputKVOutput
+    vel_dx: Node  # from InputKVOutput
+    vel_dy: Node  # from InputKVOutput
     move_cos: Node  # from InputKVOutput
     move_sin: Node  # from InputKVOutput
     side_P_vec: Node  # from BspKVOutput
@@ -113,6 +113,8 @@ class WallKVOutput:
     indicators_above: Node  # max_walls-wide thermometer I(bsp_rank >= c AND
     # is_renderable) — fed as key_in to SORTED's
     # attend_argmin_above_integer
+    vis_lo: Node  # screen-column visibility range start (RENDER reads via attention)
+    vis_hi: Node  # screen-column visibility range end (RENDER reads via attention)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +193,8 @@ def build_wall(
         sort_value=sort_value,
         position_onehot=position_onehot,
         indicators_above=indicators_above,
+        vis_lo=vis_lo,
+        vis_hi=vis_hi,
     )
 
 
