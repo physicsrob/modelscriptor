@@ -18,22 +18,28 @@ Each frame, the transformer processes this sequence:
 ```
 TEX_COL×(num_tex × tex_w) → INPUT → BSP_NODE×M → WALL×N →
 EOS → PLAYER_X → PLAYER_Y → PLAYER_ANGLE →
-SORTED_WALL×N → RENDER×(dynamic)
+[SORTED_WALL → RENDER×k]×N  (interleaved sort + render)
 ```
 
-These compile into five phases:
+These compile into four phases:
 
 | Phase | Tokens | Mode | Typical count |
 |-------|--------|------|---------------|
 | -1 (Tex) | TEX_COL | Prefill | num_tex × tex_w (e.g. 512) |
 | 0 (Prefill) | INPUT + BSP_NODE + WALL + EOS | Prefill | 1 + M + N + 1 (e.g. 58) |
 | 0b (Player) | PLAYER_X + PLAYER_Y + PLAYER_ANGLE | Autoregressive | 3 |
-| 1 (Sort) | SORTED_WALL | Autoregressive | N (e.g. 8) |
-| 2 (Render) | RENDER | Autoregressive | dynamic (~250) |
+| 1+2 (Sort+Render) | SORTED_WALL + RENDER (interleaved) | Autoregressive | N + dynamic (~258) |
 
 Prefill tokens are processed in a single batched call (they don't
 depend on each other's outputs). Autoregressive tokens are generated
 one at a time — each token's output determines the next token's input.
+
+Sort and render are interleaved: a SORTED_WALL token picks the next
+closest wall and sets up its identity as feedback, then RENDER tokens
+paint that wall's columns.  When a RENDER token finishes the last
+column, it emits ``token_type = E8_SORTED_WALL`` so the transformer
+picks the next wall.  The host just copies overlaid outputs to the
+next input — it never inspects token types or patches wall identity.
 
 ## Token Types
 
@@ -215,48 +221,51 @@ reads player state from PLAYER positions (which carry only the
 resolved values) rather than from EOS (which also carries collision
 intermediates in its KV cache row).
 
-### SORTED_WALL — Front-to-Back Sort (Phase 1)
+### SORTED_WALL — Front-to-Back Sort
 
-N tokens, autoregressive. Each picks the next-closest wall in BSP
-rank order.
+Interleaved with RENDER — one SORTED_WALL token runs before each
+wall's RENDER tokens. Each picks the next-closest wall in BSP rank
+order.
 
 The attention primitive is `attend_argmin_above_integer`: given a
-threshold one-hot (derived from the host-fed `position_index`), it
-finds the WALL position with the smallest BSP rank strictly exceeding
-that threshold. The key-side `indicators_above` thermometer encodes
-both the rank comparison and the renderability gate — non-renderable
-walls have all-zero indicators and are invisible to the attention.
+threshold one-hot (derived from the feedback-driven
+`sort_position_index`), it finds the WALL position with the smallest
+BSP rank strictly exceeding that threshold. The key-side
+`indicators_above` thermometer encodes both the rank comparison and
+the renderability gate — non-renderable walls have all-zero indicators
+and are invisible to the attention.
 
 Each SORTED token:
 
-1. Converts `position_index` to a threshold one-hot (clamped to
+1. Converts `sort_position_index` to a threshold one-hot (clamped to
    `[0, max_walls-1]` for exhaustion safety).
 2. Runs `attend_argmin_above_integer` over WALL positions, retrieving
    the packed payload of the winning wall.
 3. Unpacks the payload into geometry (ax, ay, bx, by, tex_id),
    visibility columns, BSP rank, and wall identity one-hot.
-4. Detects sort exhaustion: if `position_index > sel_bsp_rank`, the
-   attention averaged garbage (no valid keys above threshold).
+4. Detects sort exhaustion: if `sort_position_index > sel_bsp_rank`,
+   the attention averaged garbage (no valid keys above threshold).
    Sentinels the BSP rank to 99 so downstream consumers ignore
    exhausted picks.
 
-The threshold advances by 1 each step because `position_index` goes
-0, 1, 2, ... — no feedback from previous SORTED tokens is needed.
-After N steps, all renderable walls have been picked in front-to-back
-order.
+The threshold advances by 1 each step because `sort_position_index`
+is incremented via feedback: SORTED outputs `position_index + 1`,
+RENDER forwards it unchanged.
 
-**Host caching.** At each SORTED position, the overlaid outputs carry
-the selected wall's identity (`sel_onehot`, `vis_lo`, `vis_hi`,
-`sel_tex_id`). The host caches these so it can feed them to RENDER
-tokens on wall transitions.
+**Feedback to RENDER.** At each SORTED position, the overlaid outputs
+carry the selected wall's identity (`sel_onehot`, `vis_lo`, `vis_hi`,
+`sel_tex_id`) plus `render_col = vis_lo` and `render_chunk_k = 0`.
+The host copies these to the next token's input via standard feedback
+— no caching, no conditional logic.  The SORTED token also outputs
+`token_type = E8_RENDER` so the next token runs the RENDER stage.
 
-### RENDER — Pixel Generation (Phase 2)
+### RENDER — Pixel Generation
 
-The pixel-producing token. Each paints a vertical chunk of one screen
-column. Wall identity comes from discrete overlaid inputs
+The pixel-producing token.  Each paints a vertical chunk of one screen
+column.  Wall identity comes from discrete overlaid inputs
 (`render_wall_j_onehot`, `render_tex_id`, `render_vis_lo`,
-`render_vis_hi`) that the host copies from SORTED outputs on wall
-transitions.
+`render_vis_hi`) set by the preceding SORTED_WALL token and forwarded
+unchanged by RENDER tokens within the same wall.
 
 **Per-token computation:**
 
@@ -270,8 +279,8 @@ transitions.
    earlier designs — now they're computed fresh at each RENDER token
    from the raw wall coordinates and player state.
 
-3. **Active column.** The active column is `render_col`. The host sets
-   this to `vis_lo` on wall transitions; the state machine advances it
+3. **Active column.** The active column is `render_col`.  SORTED sets
+   this to `vis_lo` for each new wall; the state machine advances it
    on column transitions.
 
 4. **Angle offset.** `angle_offset = (col × fov / W) - fov/2` — the
@@ -316,15 +325,15 @@ transitions.
 9. **State transitions.** Three mutually exclusive cases:
    - **More chunks**: `active_start + chunk_size < wall_bottom` —
      stay on this column, advance `chunk_k` by 1.
+     Next token type: `E8_RENDER`.
    - **Advance column**: no more chunks, `active_col + 1 <= vis_hi`
      — move to the next column, reset `chunk_k` to 0.
+     Next token type: `E8_RENDER`.
    - **Advance wall**: no more chunks, no more columns — add
-     `render_wall_j_onehot` to `render_mask`. If all walls masked,
-     set `done = +1`. The `advance_wall` overflow flag is +1; the
-     host reads it to feed the next sorted wall's identity and set
-     `render_col = vis_lo`.
-
-   Next-token-type is always `E8_RENDER`.
+     `render_wall_j_onehot` to `render_mask`.  If all walls masked,
+     set `done = +1`.  Otherwise set next token type to
+     `E8_SORTED_WALL` and increment `sort_position_index` so the
+     transformer picks the next wall.
 
 ## Outputs
 
@@ -336,13 +345,18 @@ Fed back as the next token's input via delta transfer — the output
 lands at the same residual-stream columns as the corresponding input.
 The host copies each overlaid field verbatim from output to input.
 
-- **token_type** (8-wide): E8 code for the next token type. Only
-  RENDER tokens produce a meaningful value (`E8_RENDER`); other
-  transitions are driven by the host's phase state machine.
+- **token_type** (8-wide): E8 code for the next token type.  SORTED
+  outputs `E8_RENDER` (always followed by RENDER).  RENDER outputs
+  `E8_SORTED_WALL` on wall transitions (not done), `E8_RENDER`
+  otherwise.  The host copies this to the next input without
+  inspecting it.
 
-- **render_mask** (max_walls-wide): Walls fully rendered so far. RENDER
-  updates this on wall transitions by adding the current wall's
-  one-hot.
+- **render_mask** (max_walls-wide): Walls fully rendered so far.
+  RENDER updates this on wall transitions by adding the current
+  wall's one-hot.  SORTED forwards it unchanged.
+
+- **sort_position_index** (1): Which sorted wall we're on (0-indexed).
+  SORTED outputs `position_index + 1`; RENDER forwards it unchanged.
 
 - **render_col** (1): Current screen column. SORTED seeds this to
   `vis_lo`; RENDER advances it via the state machine.
@@ -373,8 +387,8 @@ these directly:
 - **length** (1): Number of rows painted (0 for non-RENDER tokens).
 - **done** (1): +1 when all walls are fully rendered, -1 otherwise.
 - **advance_wall** (1): +1 when transitioning to the next wall, -1
-  otherwise. The host reads this to feed the next sorted wall's
-  identity and set `render_col = vis_lo`.
+  otherwise.  The host does not read this — wall transitions are
+  handled by the transformer via the `token_type` overlaid output.
 - **sort_done** (1): +1 when the sort has exhausted all renderable
   walls at this SORTED position, -1 otherwise.
 - **eos_resolved_x**, **eos_resolved_y** (1 each): Collision-resolved
@@ -382,10 +396,13 @@ these directly:
   and feeds them to the PLAYER tokens.
 - **eos_new_angle** (1): Post-input new angle. Same flow as position.
 
-The host's rendering loop is trivial: read `(pixels, col, start,
-length)` from each RENDER token's output, bitblit the pixel strip to
-the framebuffer at `(col, start)` with skip-fill compositing (don't
-overwrite already-filled pixels), and stop when `done > 0`.
+The host's rendering loop is trivial: step the transformer, read
+`(pixels, col, start, length)` from overflow output, bitblit the
+pixel strip to the framebuffer at `(col, start)` with skip-fill
+compositing (don't overwrite already-filled pixels), copy overlaid
+outputs to the next input, and stop when `done > 0` or
+`sort_done > 0`.  The host never inspects token type, never caches
+wall data, never patches inputs.
 
 ## How the Graph Becomes a Transformer
 

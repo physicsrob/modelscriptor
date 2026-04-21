@@ -12,8 +12,8 @@ Per-token flow:
 2. **Precompute**: from the raw geometry plus player state (position
    and cos/sin from PLAYER broadcasts), compute the rotation products
    (sort_den, C, D, E, sort_num_t) and derive H_inv.
-3. The **active column** is ``render_col`` (the host sets this to
-   ``render_vis_lo`` on wall transitions).
+3. The **active column** is ``render_col`` (SORTED sets this to
+   ``vis_lo`` for each new wall).
 4. Compute wall height + texture u-coordinate.
 5. TEX_COL attention fetches the matching texture column pixels.
 6. Compute **active_start** from ``render_chunk_k``:
@@ -27,11 +27,11 @@ Per-token flow:
      move to the next column, reset ``chunk_k`` to 0.
    * **advance wall**: no more columns → update ``render_mask`` with
      ``render_wall_j_onehot``.  If all walls are masked, emit ``done``.
-     ``advance_wall`` is emitted as an overflow flag; the host reads
-     it to feed the next sorted wall's identity and set
-     ``render_col = vis_lo``.
+     Otherwise emit next-token-type = ``E8_SORTED_WALL`` so the
+     transformer picks the next wall.
 
-Next-token-type is always ``E8_RENDER`` (THINKING is eliminated).
+Next-token-type is ``E8_SORTED_WALL`` on wall transitions (not done),
+``E8_RENDER`` otherwise.  The host just bitblits — no conditional logic.
 """
 
 import math
@@ -68,6 +68,7 @@ from torchwright.reference_renderer.types import RenderConfig
 from torchwright.doom.graph_constants import (
     DIFF_BP,
     E8_RENDER,
+    E8_SORTED_WALL,
     TEX_E8_OFFSET,
     TRIG_BP,
 )
@@ -90,10 +91,11 @@ class RenderInputs:
 
     # Iteration state (overlay).
     render_mask: Node  # max_walls-wide, walls fully rendered so far
-    render_col: Node  # current screen column (overlay; host overrides to vis_lo on wall transitions)
+    render_col: Node  # current screen column (SORTED sets to vis_lo for each wall)
     render_chunk_k: Node  # chunk index within current column (0, 1, 2, ...)
+    sort_position_index: Node  # which sorted wall we're on (0-indexed)
 
-    # Wall identity (overlay; host-fed on transitions).
+    # Wall identity (overlay; set by SORTED, forwarded by RENDER).
     render_tex_id: Node
     render_vis_lo: Node  # first visible column for this wall
     render_vis_hi: Node  # last visible column for this wall
@@ -135,9 +137,10 @@ class RenderOutputs:
       land in overflow (host bitblits them to the framebuffer).
     * Discrete state (mask, col, chunk, tex_id, vis bounds, onehot)
       are separate overlaid outputs copied by the host.
-    * ``render_next_type`` is always ``E8_RENDER``.
+    * ``render_next_type`` is ``E8_SORTED_WALL`` on wall transitions
+      (not done), ``E8_RENDER`` otherwise.
     * ``done_flag`` signals to the host that all walls are fully
-      rendered (it can stop feeding RENDER tokens).
+      rendered (it can stop feeding tokens).
     """
 
     pixels: Node  # chunk_size * 3 floats
@@ -145,7 +148,7 @@ class RenderOutputs:
     active_start: Node
     chunk_length: Node
     done_flag: Node
-    render_next_type: Node  # 8-wide: always E8_RENDER
+    render_next_type: Node  # 8-wide: E8_SORTED_WALL on advance, E8_RENDER otherwise
     # Discrete state outputs (overlaid).
     next_render_mask: Node
     next_col: Node
@@ -154,7 +157,7 @@ class RenderOutputs:
     next_vis_lo: Node
     next_vis_hi: Node
     next_wall_j_onehot: Node
-    # Overflow flag: +1 when transitioning to the next wall.
+    next_sort_position_index: Node
     advance_wall: Node
 
 
@@ -274,6 +277,7 @@ def build_render(
             next_vis_lo,
             next_vis_hi,
             next_wall_j_onehot,
+            next_sort_position_index,
             advance_wall,
         ) = _compute_next_state(
             active_col=active_col,
@@ -285,6 +289,7 @@ def build_render(
             tex_id=inputs.render_tex_id,
             vis_lo=inputs.render_vis_lo,
             chunk_k=inputs.render_chunk_k,
+            sort_position_index=inputs.sort_position_index,
             chunk_size=cs,
             max_walls=max_walls,
         )
@@ -303,6 +308,7 @@ def build_render(
         next_vis_lo=next_vis_lo,
         next_vis_hi=next_vis_hi,
         next_wall_j_onehot=next_wall_j_onehot,
+        next_sort_position_index=next_sort_position_index,
         advance_wall=advance_wall,
     )
 
@@ -701,7 +707,9 @@ def _chunk_fill(
     vis_top_render = clamp(wall_top, 0.0, float(H))
     vis_bottom_render = clamp(wall_bottom, 0.0, float(H))
 
-    active_start = add(vis_top_render, multiply_const(render_chunk_k, float(chunk_size)))
+    active_start = add(
+        vis_top_render, multiply_const(render_chunk_k, float(chunk_size))
+    )
 
     chunk_length = clamp(
         subtract(vis_bottom_render, active_start),
@@ -735,13 +743,14 @@ def _compute_next_state(
     tex_id: Node,
     vis_lo: Node,
     chunk_k: Node,
+    sort_position_index: Node,
     chunk_size: int,
     max_walls: int,
 ):
     """Three-way state transition: more chunks / advance col / advance wall.
 
-    Returns discrete state outputs, ``advance_wall`` flag, ``done_flag``,
-    and ``render_next_type`` (always E8_RENDER).
+    On advance_wall (and not done), next token type is SORTED_WALL so the
+    transformer picks the next wall.  Otherwise next token is RENDER.
     """
     next_chunk_start_val = add_const(active_start, float(chunk_size))
     has_more_chunks = compare(
@@ -770,13 +779,16 @@ def _compute_next_state(
     next_col_output = select(
         has_more_chunks,
         active_col,
-        select(advance_col, col_p1, zero_col),  # host overrides with vis_lo on advance_wall
+        select(advance_col, col_p1, zero_col),
     )
     chunk_k_plus_1 = add_const(chunk_k, 1.0)
     zero_chunk_k = create_literal_value(torch.tensor([0.0]), name="zero_chunk_k")
     next_chunk_k = select(has_more_chunks, chunk_k_plus_1, zero_chunk_k)
 
-    render_next_type = create_literal_value(E8_RENDER, name="type_render")
+    type_render = create_literal_value(E8_RENDER, name="type_render")
+    type_sorted = create_literal_value(E8_SORTED_WALL, name="type_sorted_wall")
+    advance_not_done = bool_all_true([advance_wall, bool_not(all_walls_done)])
+    render_next_type = select(advance_not_done, type_sorted, type_render)
 
     return (
         done_flag,
@@ -788,5 +800,6 @@ def _compute_next_state(
         vis_lo,
         vis_hi,
         wall_j_onehot,
+        sort_position_index,
         advance_wall,
     )

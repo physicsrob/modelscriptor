@@ -4,7 +4,7 @@ Token sequence per frame:
 
     TEX_COL×(num_tex × tex_w) → INPUT → BSP_NODE×M → WALL×N →
     EOS → PLAYER_X → PLAYER_Y → PLAYER_ANGLE →
-    SORTED_WALL×N → RENDER×(dynamic)
+    [SORTED_WALL → RENDER×k]×N  (interleaved sort + render)
 
 Token types (E8 spherical codes):
 
@@ -31,6 +31,7 @@ import torch
 
 from torchwright.graph import Concatenate, Node, annotate
 from torchwright.graph.pos_encoding import PosEncoding
+from torchwright.ops.arithmetic_ops import add_const
 from torchwright.ops.inout_nodes import (
     create_input,
     create_literal_value,
@@ -261,6 +262,7 @@ def build_game_graph(
             render_mask=inputs["render_mask"],
             render_col=inputs["render_col"],
             render_chunk_k=inputs["render_chunk_k"],
+            sort_position_index=inputs["sort_position_index"],
             render_tex_id=inputs["render_tex_id"],
             render_vis_lo=inputs["render_vis_lo"],
             render_vis_hi=inputs["render_vis_hi"],
@@ -293,6 +295,7 @@ def build_game_graph(
     # ---------- Output assembly ----------
     overlaid, overflow = _assemble_output(
         token_flags=tf,
+        inputs=inputs,
         eos_out=eos_out,
         input_out=input_out,
         sorted_out=sorted_out,
@@ -422,6 +425,7 @@ def _detect_token_types(token_type: Node) -> Dict[str, Node]:
 def _assemble_output(
     *,
     token_flags: Dict[str, Node],
+    inputs: Dict[str, Node],
     eos_out,
     input_out,
     sorted_out,
@@ -434,10 +438,12 @@ def _assemble_output(
     Overlaid outputs fed back into the next step's input:
         token_type, render_mask, render_col, render_chunk_k,
         render_tex_id, render_vis_lo, render_vis_hi,
-        render_wall_j_onehot
+        render_wall_j_onehot, sort_position_index
 
-    At SORTED positions the render_* overlaid outputs carry the
-    sorted wall's identity so the host can cache the sorted order.
+    SORTED tokens set wall identity + render_col for the first
+    RENDER token, then output token_type = E8_RENDER.  RENDER
+    tokens advance render state and output token_type =
+    E8_SORTED_WALL on wall transitions (not done).
 
     Overflow outputs bitblitted by the host:
         pixels, col, start, length, done, advance_wall,
@@ -454,12 +460,14 @@ def _assemble_output(
         neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one_out")
 
         # --- Discrete render state (overlaid outputs) ---
-        # SORTED populates them for host caching.
-        # RENDER advances them via state machine.
+        # SORTED sets wall identity + render_col for the first RENDER.
+        # RENDER advances state; on advance_wall emits SORTED_WALL type.
 
-        # render_mask: RENDER advances on wall transitions.
+        # render_mask: RENDER advances on wall transitions; SORTED forwards.
         out_render_mask = select(
-            token_flags["is_render"], render_out.next_render_mask, zero_mw
+            token_flags["is_sorted"],
+            inputs["render_mask"],
+            select(token_flags["is_render"], render_out.next_render_mask, zero_mw),
         )
 
         # render_col: SORTED sets to vis_lo; RENDER advances.
@@ -469,7 +477,7 @@ def _assemble_output(
             select(token_flags["is_render"], render_out.next_col, zero_1),
         )
 
-        # render_chunk_k: RENDER advances.
+        # render_chunk_k: SORTED resets to 0; RENDER advances.
         out_render_chunk_k = select(
             token_flags["is_render"], render_out.next_chunk_k, zero_1
         )
@@ -504,11 +512,29 @@ def _assemble_output(
             ),
         )
 
+        # sort_position_index: SORTED increments; RENDER forwards.
+        out_sort_position_index = select(
+            token_flags["is_sorted"],
+            add_const(inputs["sort_position_index"], 1.0),
+            select(
+                token_flags["is_render"],
+                render_out.next_sort_position_index,
+                zero_1,
+            ),
+        )
+
         # --- Token type ---
+        # SORTED always followed by RENDER; RENDER emits SORTED_WALL
+        # on advance_wall (not done), RENDER otherwise.
+        type_render = create_literal_value(E8_RENDER, name="out_type_render")
         out_token_type = select(
-            token_flags["is_render"],
-            render_out.render_next_type,
-            zero_8,
+            token_flags["is_sorted"],
+            type_render,
+            select(
+                token_flags["is_render"],
+                render_out.render_next_type,
+                zero_8,
+            ),
         )
 
         out_pixels = select(token_flags["is_render"], render_out.pixels, zero_pixels)
@@ -535,6 +561,7 @@ def _assemble_output(
         "render_vis_lo": out_render_vis_lo,
         "render_vis_hi": out_render_vis_hi,
         "render_wall_j_onehot": out_render_wall_j_onehot,
+        "sort_position_index": out_sort_position_index,
     }
     overflow = {
         "pixels": out_pixels,

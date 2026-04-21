@@ -80,13 +80,9 @@ transformer.
 
 **Known violations** (as of 2026-04-20):
 
-- `doom/compile.py:658-666` — ceiling/floor fill. The host decides
-  pixel color based on `y < center_y`. This is rendering logic that
-  belongs in the transformer.
-- `doom/compile.py:652-656` — render_mask early termination. The host
-  rounds, clips, sums, and compares mask values to decide when to stop
-  rendering. The transformer should emit an explicit "done" signal
-  that the host reads without arithmetic.
+- `doom/compile.py` — ceiling/floor fill. The host decides pixel color
+  based on `y < center_y`. This is rendering logic that belongs in the
+  transformer.
 
 **Never violate this principle.** If a proposed design, optimization,
 or bug fix moves computation from the transformer to the host, it is

@@ -5,16 +5,16 @@ Multi-phase autoregressive rollout:
     Phase -1 — Tex:     TEX_COL×(num_tex × tex_w)  (texture column prefill)
     Phase 0  — Prefill: INPUT + BSP_NODE×M + WALL×N + EOS
     Phase 0b — Player:  PLAYER_X + PLAYER_Y + PLAYER_ANGLE
-    Phase 1  — Sort:    SORTED_WALL×N  (host caches sorted wall data)
-    Phase 2  — Render:  RENDER×(dynamic)  (host-driven wall transitions)
+    Phase 1+2 — Sort+Render (interleaved):
+        SORTED_WALL → RENDER×k → SORTED_WALL → RENDER×k → ...
 
-The host is a dumb token feeder and pixel bitblitter.  It feeds player
-state at every position, wall geometry at WALL positions, a position
-index at SORTED_WALL positions, and discrete wall identity at RENDER
-positions.  The only host-side logic is copying overlaid fields from
-output to input, detecting wall transitions (advance_wall > 0 in the
-overflow output), and feeding the next sorted wall's identity plus
-setting render_col to vis_lo on transitions.
+The host is a dumb token feeder and pixel bitblitter.  It seeds the
+first SORTED_WALL token, then loops: step the transformer, blit any
+pixels from overflow output, copy overlaid output to next input.  The
+transformer controls the token sequence via the ``token_type`` overlaid
+output — SORTED emits E8_RENDER, RENDER emits E8_SORTED_WALL on wall
+transitions.  The host never inspects token type, never caches wall
+data, never patches inputs.
 """
 
 import time
@@ -499,130 +499,59 @@ def step_frame(
     t_player = time.perf_counter() - t0
     print(f"  player   3 steps  kv={_kv_len(past)}  {t_player*1000:.0f}ms")
 
-    # --- Phase 1: Sort ---
-    # Each SORTED token gets its position_index from the host (no feedback).
-    # Host caches sorted wall data from overlaid outputs.
-    t0 = time.perf_counter()
-    sorted_walls = []  # list of (wall_j_onehot, vis_lo, vis_hi, tex_id)
-
-    # Output field offsets for sorted wall data
-    wj_out_s, wj_out_w = out_by_name["render_wall_j_onehot"]
-    vlo_out_s, _ = out_by_name["render_vis_lo"]
-    vhi_out_s, _ = out_by_name["render_vis_hi"]
-    tid_out_s, _ = out_by_name["render_tex_id"]
-
-    for k in range(N):
-        sort_row = _build_row(
-            module,
-            max_walls,
-            token_type=E8_SORTED_WALL,
-            sort_position_index=torch.tensor([float(k)]),
-        )
-        out, past = _step(sort_row, past, step)
-        step += 1
-
-        # Check sort exhaustion
-        sort_done_val = out[0, sort_done_out_s].item()
-        if sort_done_val > 0.0:
-            print(f"  sort[{k}] exhausted")
-            break
-
-        # Cache sorted wall data from overlaid outputs
-        wall_j_oh = out[0, wj_out_s : wj_out_s + wj_out_w].clone()
-        v_lo = out[0, vlo_out_s].item()
-        v_hi = out[0, vhi_out_s].item()
-        t_id = out[0, tid_out_s].item()
-        sorted_walls.append((wall_j_oh, v_lo, v_hi, t_id))
-        print(f"  sort[{k}] vis=[{v_lo:.0f},{v_hi:.0f}] tex={t_id:.0f}")
-
-    t_sort = time.perf_counter() - t0
-    n_renderable = len(sorted_walls)
-    print(
-        f"  sort     {N} steps  kv={_kv_len(past)}  {t_sort*1000:.0f}ms  "
-        f"renderable={n_renderable}"
-    )
-    print(f"  resolved state: px={px:.3f} py={py:.3f} angle={angle:.3f}")
-
-    # --- Phase 2: Render (host-driven wall transitions) ---
+    # --- Sort + Render (interleaved, pure bitblit) ---
+    #
+    # The transformer controls the token sequence: SORTED_WALL picks a
+    # wall and emits token_type=E8_RENDER; RENDER tokens paint pixels
+    # and emit token_type=E8_SORTED_WALL on wall transitions.  The host
+    # just copies overlaid outputs to the next input (_out_to_input) and
+    # blits pixels to the framebuffer.  No sorting cache, no advance_wall
+    # detection, no wall-identity patching.
     t0 = time.perf_counter()
     frame = np.full((H, W, 3), -1.0, dtype=np.float32)
     filled = np.zeros((H, W), dtype=bool)
 
-    if n_renderable == 0:
-        render_steps = 0
-    else:
-        # Seed first wall
-        wall_j_oh, v_lo, v_hi, t_id = sorted_walls[0]
-        prev = _build_row(
-            module,
-            max_walls,
-            token_type=E8_RENDER,
-            render_wall_j_onehot=wall_j_oh,
-            render_vis_lo=torch.tensor([v_lo]),
-            render_vis_hi=torch.tensor([v_hi]),
-            render_tex_id=torch.tensor([t_id]),
-            render_col=torch.tensor([v_lo]),
-            render_chunk_k=torch.tensor([0.0]),
-        )
+    prev = _build_row(
+        module,
+        max_walls,
+        token_type=E8_SORTED_WALL,
+        sort_position_index=torch.tensor([0.0]),
+    )
 
-        wall_idx = 0
-        max_render_steps = n_renderable * W * (H // cs + 1) + n_renderable + 10
-        render_steps = 0
+    max_steps = N * (W * (H // cs + 1) + 1) + 10
+    total_steps = 0
 
-        for k in range(max_render_steps):
-            out, past = _step(prev, past, step)
-            step += 1
-            render_steps += 1
-            raw = out[0].detach().cpu().numpy()
+    for k in range(max_steps):
+        out, past = _step(prev, past, step)
+        step += 1
+        total_steps += 1
+        raw = out[0].detach().cpu().numpy()
 
-            # Pixels and metadata from overflow output
-            col = int(round(raw[col_out_s]))
-            start_y = int(round(raw[start_out_s]))
-            length = int(round(raw[length_out_s]))
-            done = raw[done_out_s]
-            pix = raw[pix_out_s : pix_out_s + cs * 3].reshape(cs, 3)
+        # Read overflow outputs (zero/neg at non-RENDER positions).
+        col = int(round(raw[col_out_s]))
+        start_y = int(round(raw[start_out_s]))
+        length = int(round(raw[length_out_s]))
+        done = raw[done_out_s]
+        sort_done = raw[sort_done_out_s]
+        pix = raw[pix_out_s : pix_out_s + cs * 3].reshape(cs, 3)
 
-            # Bitblit with skip-filled compositing
-            for row_idx in range(length):
-                y = start_y + row_idx
-                if 0 <= y < H and 0 <= col < W and not filled[y, col]:
-                    frame[y, col] = pix[row_idx]
-                    filled[y, col] = True
+        # Bitblit pixels (length=0 at SORTED positions → no-op).
+        for row_idx in range(length):
+            y = start_y + row_idx
+            if 0 <= y < H and 0 <= col < W and not filled[y, col]:
+                frame[y, col] = pix[row_idx]
+                filled[y, col] = True
 
-            if done > 0.0:
-                break
+        if done > 0.0 or sort_done > 0.0:
+            break
 
-            # Map overlaid output to next input
-            prev = _out_to_input(out)
+        prev = _out_to_input(out)
 
-            # Detect wall transition: advance_wall > 0 in overflow output
-            aw_out_s, _ = out_by_name["advance_wall"]
-            is_advance_wall = out[0, aw_out_s].item()
-            if is_advance_wall > 0.0:
-                wall_idx += 1
-                if wall_idx >= n_renderable:
-                    break
-                # Feed next sorted wall's identity + set render_col
-                wall_j_oh, v_lo, v_hi, t_id = sorted_walls[wall_idx]
-                wj_in_s, wj_in_w = in_by_name["render_wall_j_onehot"]
-                vlo_in_s, _ = in_by_name["render_vis_lo"]
-                vhi_in_s, _ = in_by_name["render_vis_hi"]
-                tid_in_s, _ = in_by_name["render_tex_id"]
-                col_in_s, _ = in_by_name["render_col"]
-                prev[0, wj_in_s : wj_in_s + wj_in_w] = wall_j_oh.to(device)
-                prev[0, vlo_in_s] = v_lo
-                prev[0, vhi_in_s] = v_hi
-                prev[0, tid_in_s] = t_id
-                prev[0, col_in_s] = v_lo
-
-            # Host-side termination: check render_mask
-            rm_out_s, rm_out_w = out_by_name["render_mask"]
-            mask_vals = out[0, rm_out_s : rm_out_s + rm_out_w].cpu().numpy()
-            n_masked = int(np.sum(np.round(mask_vals).clip(0, 1)))
-            if n_masked >= n_renderable:
-                break
+    print(f"  resolved state: px={px:.3f} py={py:.3f} angle={angle:.3f}")
 
     # Fill unfilled pixels with ceiling/floor
+    # (Known violation of dumb-host principle — rendering logic that
+    # belongs in the transformer.  Tracked separately.)
     ceil = np.array(config.ceiling_color, dtype=np.float32)
     floor_c = np.array(config.floor_color, dtype=np.float32)
     center_y = H // 2
@@ -633,14 +562,14 @@ def step_frame(
 
     t_render = time.perf_counter() - t0
     t_total = time.perf_counter() - t_frame
-    if render_steps > 0:
+    if total_steps > 0:
         print(
-            f"  render   {render_steps} steps  kv={_kv_len(past)}  "
-            f"{t_render*1000:.0f}ms ({t_render/render_steps*1000:.1f}ms/step)  "
+            f"  sort+render {total_steps} steps  kv={_kv_len(past)}  "
+            f"{t_render*1000:.0f}ms ({t_render/total_steps*1000:.1f}ms/step)  "
             f"total={t_total*1000:.0f}ms"
         )
     else:
-        print(f"  render   0 steps  total={t_total*1000:.0f}ms")
+        print(f"  sort+render 0 steps  total={t_total*1000:.0f}ms")
 
     new_state = GameState(
         x=px,
