@@ -31,7 +31,11 @@ big graphs (e.g. the DOOM renderer) fit in realistic RAM.
 import json
 import os
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from torchwright.compiler.residual_assignment import ResidualAssignment
 
 import numpy as np
 import onnx
@@ -1061,6 +1065,15 @@ def _validate_io_spec(io: Dict[str, Tuple[Optional[Node], Optional[Node]]]) -> N
                 )
 
 
+@dataclass
+class _DebugState:
+    """Captured residual-stream snapshots from a debug=True forward pass."""
+
+    state_tensor: Dict  # ResidualStreamState -> (tensor, label)
+    ordered_states: List  # [ResidualStreamState, ...]
+    ra: "ResidualAssignment"
+
+
 class CompiledHeadless:
     """Callable wrapper around :class:`HeadlessTransformer`.
 
@@ -1098,6 +1111,7 @@ class CompiledHeadless:
         self.metadata: dict = dict(metadata or {})
         self._asserts = list(asserts) if asserts else []
         self._watches = list(watches) if watches else []
+        self._debug_state: Optional[_DebugState] = None
 
         # KV cache shape metadata — discovered from the compiled transformer
         # so empty_past() can build zero-length tensors of the right shape.
@@ -1212,12 +1226,55 @@ class CompiledHeadless:
                 return outputs[..., s : s + w]
         raise KeyError(f"output field {name!r} not found")
 
+    def debug_value(self, node: "Node") -> Optional[torch.Tensor]:
+        """Return the compiled value of ``node`` from the last debug=True forward.
+
+        Requires a prior call to ``__call__(inputs, debug=True)`` or
+        ``step(inputs, past, debug=True)``.  Returns ``None`` if the node
+        has no residual assignment in any captured state (e.g. it was
+        never materialized, or it's a Concatenate whose children aren't
+        all present at any single state).
+
+        Raises ``RuntimeError`` if no debug forward has been run yet.
+        """
+        if self._debug_state is None:
+            raise RuntimeError("debug_value() requires a prior debug=True forward pass")
+        from torchwright.debug.probe import (
+            _extract_compiled_value,
+            _first_state_with,
+        )
+        from torchwright.graph.misc import Assert, DebugWatch
+
+        while isinstance(node, (Assert, DebugWatch)):
+            node = node.inputs[0]
+
+        ds = self._debug_state
+        state = _first_state_with(node, ds.ra, ds.ordered_states)
+        if state is None:
+            return None
+        tensor_pair = ds.state_tensor.get(state)
+        if tensor_pair is None:
+            return None
+        res_tensor, _ = tensor_pair
+        return _extract_compiled_value(node, ds.ra, state, res_tensor)
+
     def _run_debug_checks(self, res_stream, past_kvs=None):
-        """Run forward with state capture, then check asserts and watches.
+        """Run forward with state capture, then check consistency, asserts, and watches.
 
         For prefill (past_kvs=None): uses net.forward(return_states=True).
         For decode (past_kvs provided): manually walks layers to capture
         per-layer residual-stream states.
+
+        After capturing states:
+        1. Stashes the captured state on ``self._debug_state`` so
+           :meth:`debug_value` can extract node values after the call.
+        2. Checks residual-stream self-consistency: for every node that
+           appears in multiple captured states, verifies the value at its
+           assigned columns is identical across all of them.  A mismatch
+           means something overwrote the node's columns before all
+           consumers read them — a compiler or scheduling bug.
+        3. Runs Assert predicates (raises on failure) and DebugWatch
+           predicates (prints on trigger).
 
         Returns (res, new_kvs) where new_kvs is None for prefill or a
         list of (K, V) tuples for decode.
@@ -1259,6 +1316,43 @@ class CompiledHeadless:
             new_kvs = new_kvs_list
 
         ordered_states = [s for _, _, s in _ordered_mlp_states(net, ra)]
+
+        self._debug_state = _DebugState(
+            state_tensor=state_tensor,
+            ordered_states=ordered_states,
+            ra=ra,
+        )
+
+        # Self-consistency: for each node present in multiple captured
+        # states, verify the value at its columns is the same everywhere.
+        # A mismatch means a column was overwritten while the node was
+        # still live — a scheduling or allocator bug.
+        captured_states = [s for s in ordered_states if s in state_tensor]
+        node_first_value: Dict[Node, Tuple[torch.Tensor, str]] = {}
+        for state in captured_states:
+            state_label = state.name or f"state_{state.state_id}"
+            for node in ra.get_nodes(state):
+                res_tensor, _ = state_tensor[state]
+                val = _extract_compiled_value(node, ra, state, res_tensor)
+                if val is None:
+                    continue
+                if node in node_first_value:
+                    first_val, first_label = node_first_value[node]
+                    if first_val.shape == val.shape:
+                        max_diff = (first_val - val).abs().max().item()
+                        if max_diff > 0.0:
+                            node_name = (
+                                node.annotation or node.name or f"node_{node.node_id}"
+                            )
+                            raise RuntimeError(
+                                f"Residual-stream self-consistency failure: "
+                                f"{node_name} (id={node.node_id}, "
+                                f"type={type(node).__name__}) has different "
+                                f"values at {first_label} vs {state_label} "
+                                f"(max_abs_diff={max_diff:.6g})"
+                            )
+                else:
+                    node_first_value[node] = (val.detach().clone(), state_label)
 
         for assert_node in self._asserts:
             target = assert_node.inputs[0]
