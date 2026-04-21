@@ -66,7 +66,9 @@ def _compare_ops(committed: dict, regenerated: dict) -> List[str]:
 
     missing = sorted(c_ops.keys() - r_ops.keys())
     if missing:
-        failures.append(f"Ops in committed JSON but not in fresh measurement: {missing}")
+        failures.append(
+            f"Ops in committed JSON but not in fresh measurement: {missing}"
+        )
     extra = sorted(r_ops.keys() - c_ops.keys())
     if extra:
         failures.append(f"Ops in fresh measurement but not in committed JSON: {extra}")
@@ -95,10 +97,7 @@ def _compare_ops(committed: dict, regenerated: dict) -> List[str]:
             for key in _ERROR_METRIC_KEYS:
                 cv, rv = cd[key], rd[key]
                 if not _close_enough(cv, rv):
-                    failures.append(
-                        f"{op_name}/{dist_name}: {key} "
-                        f"{cv} -> {rv}"
-                    )
+                    failures.append(f"{op_name}/{dist_name}: {key} " f"{cv} -> {rv}")
 
     return failures
 

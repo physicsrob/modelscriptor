@@ -107,9 +107,7 @@ class TestPipeline:
         def _run(px, py, angle, forward=False):
             key = (px, py, angle, forward)
             if key not in cache:
-                state = GameState(
-                    x=px, y=py, angle=angle, move_speed=0.3, turn_speed=4
-                )
+                state = GameState(x=px, y=py, angle=angle, move_speed=0.3, turn_speed=4)
                 inp = PlayerInput(forward=forward)
                 trace = FrameTrace()
                 frame, new_state = step_frame(
@@ -231,9 +229,7 @@ class TestPipeline:
         _, _, trace = run(0.0, 0.0, angle)
 
         ref_renderable = sum(
-            1
-            for seg in segs
-            if project_wall(0.0, 0.0, angle, seg, config) is not None
+            1 for seg in segs if project_wall(0.0, 0.0, angle, seg, config) is not None
         )
         assert (
             trace.n_renderable >= ref_renderable
