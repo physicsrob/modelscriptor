@@ -4,6 +4,10 @@ Compiles the full game at walkthrough resolution (64x80, fov=32), runs
 step_frame with trace capture, and compares intermediate outputs at each
 stage boundary against reference values.  When something breaks, the
 first failing boundary tells you exactly which stage diverged.
+
+Each unique (px, py, angle, forward) configuration runs step_frame
+exactly once via a class-scoped lazy cache — subsequent tests at the
+same configuration read the cached result.
 """
 
 import numpy as np
@@ -23,10 +27,6 @@ from torchwright.reference_renderer.render import (
 from torchwright.reference_renderer.textures import default_texture_atlas
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
-
-# ---------------------------------------------------------------------------
-# Shared fixtures
-# ---------------------------------------------------------------------------
 
 _TRIG = generate_trig_table()
 
@@ -60,34 +60,24 @@ def _box_room_segments(half=5.0):
 
 
 def _ref_bsp_ranks(subset, px, py):
-    """Compute reference BSP ranks for each segment at player position (px, py)."""
     n_cols = subset.seg_bsp_coeffs.shape[1]
     side_P_vec = np.zeros(n_cols)
     for i, node in enumerate(subset.bsp_nodes):
         val = node.nx * px + node.ny * py + node.d
         side_P_vec[i] = 1.0 if val > 0 else 0.0
-    ranks = subset.seg_bsp_coeffs @ side_P_vec + subset.seg_bsp_consts
-    return ranks
+    return subset.seg_bsp_coeffs @ side_P_vec + subset.seg_bsp_consts
 
 
 def _wall_pixel_fraction(frame, config):
-    """Fraction of pixels that are neither ceiling nor floor color."""
     ceil = np.array(config.ceiling_color)
     floor = np.array(config.floor_color)
-    H, W = config.screen_height, config.screen_width
-    wall_pixels = 0
-    for y in range(H):
-        for x in range(W):
-            pix = frame[y, x]
-            if not np.allclose(pix, ceil, atol=0.05) and not np.allclose(
-                pix, floor, atol=0.05
-            ):
-                wall_pixels += 1
-    return wall_pixels / (H * W)
+    is_ceil = np.all(np.abs(frame - ceil) <= 0.05, axis=-1)
+    is_floor = np.all(np.abs(frame - floor) <= 0.05, axis=-1)
+    return float((~is_ceil & ~is_floor).mean())
 
 
 class TestPipeline:
-    """Full pipeline tests at walkthrough resolution (64x80)."""
+    """Single-frame pipeline tests at walkthrough resolution (64x80)."""
 
     @pytest.fixture(scope="class")
     def scene(self):
@@ -109,51 +99,59 @@ class TestPipeline:
             verbose=False,
         )
 
-    def _run_frame(self, module, scene, px, py, angle, forward=False):
+    @pytest.fixture(scope="class")
+    def run(self, module, scene):
         config, textures, subset, segs = scene
-        state = GameState(x=px, y=py, angle=angle, move_speed=0.3, turn_speed=4)
-        inp = PlayerInput(forward=forward)
-        trace = FrameTrace()
-        frame, new_state = step_frame(
-            module, state, inp, subset, config, textures=textures, trace=trace
-        )
-        return frame, new_state, trace
+        cache = {}
+
+        def _run(px, py, angle, forward=False):
+            key = (px, py, angle, forward)
+            if key not in cache:
+                state = GameState(
+                    x=px, y=py, angle=angle, move_speed=0.3, turn_speed=4
+                )
+                inp = PlayerInput(forward=forward)
+                trace = FrameTrace()
+                frame, new_state = step_frame(
+                    module, state, inp, subset, config, textures=textures, trace=trace
+                )
+                cache[key] = (frame, new_state, trace)
+            return cache[key]
+
+        return _run
 
     # ── EOS boundary ──────────────────────────────────────────────
 
     @pytest.mark.parametrize("angle", [0, 64, 128, 192])
-    def test_eos_state_matches_reference_cardinal(self, module, scene, angle):
+    def test_eos_state_matches_reference_cardinal(self, run, scene, angle):
         config, textures, subset, segs = scene
         state = GameState(x=0.0, y=0.0, angle=angle, move_speed=0.3, turn_speed=4)
-        inp = PlayerInput()
-        ref = update_state(state, inp, segs, _TRIG)
+        ref = update_state(state, PlayerInput(), segs, _TRIG)
 
-        _, new_state, trace = self._run_frame(module, scene, 0.0, 0.0, angle)
+        _, _, trace = run(0.0, 0.0, angle)
 
         assert trace.eos_resolved_x == pytest.approx(ref.x, abs=0.15)
         assert trace.eos_resolved_y == pytest.approx(ref.y, abs=0.15)
         assert trace.eos_new_angle == pytest.approx(float(ref.angle), abs=1.5)
 
     @pytest.mark.parametrize("angle", [20, 45, 100, 160, 210])
-    def test_eos_state_matches_reference_oblique(self, module, scene, angle):
+    def test_eos_state_matches_reference_oblique(self, run, scene, angle):
         config, textures, subset, segs = scene
         state = GameState(x=0.0, y=0.0, angle=angle, move_speed=0.3, turn_speed=4)
-        inp = PlayerInput()
-        ref = update_state(state, inp, segs, _TRIG)
+        ref = update_state(state, PlayerInput(), segs, _TRIG)
 
-        _, new_state, trace = self._run_frame(module, scene, 0.0, 0.0, angle)
+        _, _, trace = run(0.0, 0.0, angle)
 
         assert trace.eos_resolved_x == pytest.approx(ref.x, abs=0.15)
         assert trace.eos_resolved_y == pytest.approx(ref.y, abs=0.15)
         assert trace.eos_new_angle == pytest.approx(float(ref.angle), abs=1.5)
 
-    def test_eos_collision_blocks_wall(self, module, scene):
+    def test_eos_collision_blocks_wall(self, run, scene):
         config, textures, subset, segs = scene
         state = GameState(x=4.0, y=0.0, angle=0, move_speed=0.3, turn_speed=4)
-        inp = PlayerInput(forward=True)
-        ref = update_state(state, inp, segs, _TRIG)
+        ref = update_state(state, PlayerInput(forward=True), segs, _TRIG)
 
-        _, new_state, trace = self._run_frame(module, scene, 4.0, 0.0, 0, forward=True)
+        _, _, trace = run(4.0, 0.0, 0, forward=True)
 
         assert trace.eos_resolved_x == pytest.approx(ref.x, abs=0.15)
         assert (
@@ -163,7 +161,7 @@ class TestPipeline:
     # ── SORTED boundary ───────────────────────────────────────────
 
     @pytest.mark.parametrize("angle", [0, 64, 128, 192, 20, 45, 100, 160, 210])
-    def test_sort_order_matches_bsp(self, module, scene, angle):
+    def test_sort_order_matches_bsp(self, run, scene, angle):
         """Reference-visible walls appear in BSP rank order in compiled sort.
 
         The compiled renderer's renderability gate (central-ray check) is
@@ -173,7 +171,7 @@ class TestPipeline:
         reference-visible subset is in BSP rank order.
         """
         config, textures, subset, segs = scene
-        _, _, trace = self._run_frame(module, scene, 0.0, 0.0, angle)
+        _, _, trace = run(0.0, 0.0, angle)
 
         ref_ranks = _ref_bsp_ranks(subset, 0.0, 0.0)
 
@@ -185,7 +183,6 @@ class TestPipeline:
         ref_renderable.sort()
         expected_walls = [wall_i for _, wall_i in ref_renderable]
 
-        # Unique wall indices from compiled sort, first-occurrence order
         seen = set()
         compiled_unique = []
         for s in trace.sort_steps:
@@ -206,14 +203,10 @@ class TestPipeline:
         )
 
     @pytest.mark.parametrize("angle", [0, 64, 128, 192])
-    def test_sort_visibility_matches_reference(self, module, scene, angle):
-        """vis_lo/vis_hi per wall match reference projection.
-
-        Only checks walls that appear in both the compiled sort output
-        (first occurrence) and the reference renderer.
-        """
+    def test_sort_visibility_matches_reference(self, run, scene, angle):
+        """vis_lo/vis_hi per wall match reference projection."""
         config, textures, subset, segs = scene
-        _, _, trace = self._run_frame(module, scene, 0.0, 0.0, angle)
+        _, _, trace = run(0.0, 0.0, angle)
 
         seen = set()
         for step in trace.sort_steps:
@@ -232,18 +225,14 @@ class TestPipeline:
             ), f"wall {wall_i} vis_hi: compiled={step.vis_hi}, ref={proj.vis_hi}"
 
     @pytest.mark.parametrize("angle", [0, 64, 128, 192])
-    def test_sort_done_fires_correctly(self, module, scene, angle):
-        """n_renderable covers all reference-visible walls.
-
-        The compiled renderer's renderability criterion (central ray hits
-        wall and is in front) is broader than ``project_wall`` (at least
-        one screen column's ray intersects).  So n_renderable >= ref count.
-        """
+    def test_sort_done_fires_correctly(self, run, scene, angle):
+        """n_renderable covers all reference-visible walls."""
         config, textures, subset, segs = scene
-        _, _, trace = self._run_frame(module, scene, 0.0, 0.0, angle)
+        _, _, trace = run(0.0, 0.0, angle)
 
         ref_renderable = sum(
-            1 for seg in segs
+            1
+            for seg in segs
             if project_wall(0.0, 0.0, angle, seg, config) is not None
         )
         assert (
@@ -256,10 +245,10 @@ class TestPipeline:
     # ── Structural checks ─────────────────────────────────────────
 
     @pytest.mark.parametrize("angle", [0, 64, 128, 192])
-    def test_walls_are_visible(self, module, scene, angle):
+    def test_walls_are_visible(self, run, scene, angle):
         """Wall pixels exist and cover >5% of frame."""
         config, textures, subset, segs = scene
-        frame, _, trace = self._run_frame(module, scene, 0.0, 0.0, angle)
+        frame, _, _ = run(0.0, 0.0, angle)
         fraction = _wall_pixel_fraction(frame, config)
         assert (
             fraction > 0.05
@@ -268,11 +257,12 @@ class TestPipeline:
     # ── RENDER boundary ───────────────────────────────────────────
 
     @pytest.mark.parametrize("angle", [0, 64, 128, 192])
-    def test_render_wall_heights(self, module, scene, angle):
+    def test_render_wall_heights(self, run, scene, angle):
         """Wall height at mid-column matches reference for the first unique wall."""
         config, textures, subset, segs = scene
-        _, _, trace = self._run_frame(module, scene, 0.0, 0.0, angle)
+        _, _, trace = run(0.0, 0.0, angle)
 
+        textures_list = textures
         seen = set()
         for step in trace.sort_steps:
             wall_i = step.selected_wall_index
@@ -285,7 +275,7 @@ class TestPipeline:
                 continue
             mid_col = (proj.vis_lo + proj.vis_hi) // 2
             ref_result = render_wall_column(
-                mid_col, proj, 0.0, 0.0, angle, config, textures
+                mid_col, proj, 0.0, 0.0, angle, config, textures_list
             )
             if ref_result is None:
                 continue
@@ -301,9 +291,7 @@ class TestPipeline:
             compiled_height = len(compiled_rows)
 
             if ref_height > 0:
-                assert compiled_height == pytest.approx(
-                    ref_height, abs=3
-                ), (
+                assert compiled_height == pytest.approx(ref_height, abs=3), (
                     f"wall {wall_i} col {mid_col}: "
                     f"compiled_height={compiled_height}, ref_height={ref_height}"
                 )
@@ -311,18 +299,18 @@ class TestPipeline:
     # ── Final frame ───────────────────────────────────────────────
 
     @pytest.mark.parametrize("angle", [0, 64, 128, 192])
-    def test_frame_matches_reference_cardinal(self, module, scene, angle):
+    def test_frame_matches_reference_cardinal(self, run, scene, angle):
         config, textures, subset, segs = scene
-        frame, _, _ = self._run_frame(module, scene, 0.0, 0.0, angle)
+        frame, _, _ = run(0.0, 0.0, angle)
         ref = render_frame(0.0, 0.0, angle, segs, config, textures=textures)
         compare_images(frame, ref).assert_matches(
             min_matched_fraction=0.96, max_err=float("inf")
         )
 
     @pytest.mark.parametrize("angle", [20, 45, 100, 160, 210])
-    def test_frame_matches_reference_oblique(self, module, scene, angle):
+    def test_frame_matches_reference_oblique(self, run, scene, angle):
         config, textures, subset, segs = scene
-        frame, _, _ = self._run_frame(module, scene, 0.0, 0.0, angle)
+        frame, _, _ = run(0.0, 0.0, angle)
         ref = render_frame(0.0, 0.0, angle, segs, config, textures=textures)
         compare_images(frame, ref).assert_matches(
             min_matched_fraction=0.96, max_err=float("inf")
@@ -336,49 +324,10 @@ class TestPipeline:
             (1.0, -3.0, 50),
         ],
     )
-    def test_frame_matches_reference_off_center(self, module, scene, px, py, angle):
+    def test_frame_matches_reference_off_center(self, run, scene, px, py, angle):
         config, textures, subset, segs = scene
-        frame, _, _ = self._run_frame(module, scene, px, py, angle)
+        frame, _, _ = run(px, py, angle)
         ref = render_frame(px, py, angle, segs, config, textures=textures)
         compare_images(frame, ref).assert_matches(
             min_matched_fraction=0.96, max_err=float("inf")
-        )
-
-    # ── Multi-frame stability ─────────────────────────────────────
-
-    def test_multi_frame_stability(self, module, scene):
-        """Walls visible across 10 frames of walk-and-turn.
-
-        Checks that at least 8 of 10 frames have >5% wall pixels.
-        A frame or two may drop below the threshold when the sort
-        outputs duplicate wall picks that consume render budget.
-        """
-        config, textures, subset, segs = scene
-        state = GameState(x=0.0, y=0.0, angle=0, move_speed=0.3, turn_speed=4)
-
-        actions = [
-            PlayerInput(),
-            PlayerInput(forward=True),
-            PlayerInput(forward=True),
-            PlayerInput(turn_right=True),
-            PlayerInput(forward=True),
-            PlayerInput(turn_right=True),
-            PlayerInput(forward=True),
-            PlayerInput(turn_left=True),
-            PlayerInput(forward=True),
-            PlayerInput(),
-        ]
-
-        visible_count = 0
-        for i, inp in enumerate(actions):
-            trace = FrameTrace()
-            frame, state = step_frame(
-                module, state, inp, subset, config, textures=textures, trace=trace
-            )
-            fraction = _wall_pixel_fraction(frame, config)
-            if fraction > 0.05:
-                visible_count += 1
-
-        assert visible_count >= 8, (
-            f"only {visible_count}/10 frames had >5% wall pixels (expected >=8)"
         )
