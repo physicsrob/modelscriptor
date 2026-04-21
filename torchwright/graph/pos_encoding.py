@@ -35,9 +35,9 @@ class PosEncoding(Node):
         For positions ``p`` with ``p · freq < π/2`` — i.e. roughly
         ``p < π/(2·freq)`` — the slow sin is monotonically increasing,
         and ``sin(p · freq) ≈ p · freq`` within a few percent. That makes
-        it a cheap linear-in-position proxy for tiebreak terms on the
-        key side of an attention head, without having to invert back
-        through :meth:`get_position_scalar`.
+        it a cheap linear-in-position proxy on the key side of an
+        attention head, without having to invert back through
+        :meth:`get_position_scalar`.
         """
         return math.exp((self.d_pos - 2) * -(math.log(10000.0) / self.d_pos))
 
