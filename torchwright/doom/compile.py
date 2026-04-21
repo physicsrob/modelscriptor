@@ -534,6 +534,7 @@ def step_frame(
 
     max_steps = N * (W * (H // cs + 1) + 1) + 10
     total_steps = 0
+    prev_spi = 0.0
 
     for k in range(max_steps):
         out, past = _step(prev, past, step)
@@ -549,12 +550,11 @@ def step_frame(
         sort_done = raw[sort_done_out_s]
         pix = raw[pix_out_s : pix_out_s + cs * 3].reshape(cs, 3)
 
-        # Trace: record sort/render steps from overflow outputs.
-        # sort_done > -0.5 means this was a SORTED_WALL token.
-        # length > 0 means this was a RENDER token with pixels.
+        # Trace: detect token type from sort_position_index changes.
+        # SORTED tokens increment spi; RENDER tokens forward it.
         if trace is not None:
-            sort_done_val = raw[sort_done_out_s]
-            if sort_done_val > -0.5:
+            cur_spi = raw[spi_out_s]
+            if cur_spi > prev_spi + 0.5:
                 wall_j_oh = out[0, wj_out_s : wj_out_s + wj_out_w].cpu().numpy()
                 trace.sort_steps.append(
                     SortStepTrace(
@@ -564,13 +564,13 @@ def step_frame(
                         vis_lo=raw[vlo_out_s],
                         vis_hi=raw[vhi_out_s],
                         tex_id=raw[tid_out_s],
-                        sort_done=sort_done_val > 0.0,
+                        sort_done=sort_done > 0.0,
                     )
                 )
-                if sort_done_val <= 0.0:
+                if sort_done <= 0.0:
                     trace.n_renderable = len(trace.sort_steps)
             if length > 0:
-                wall_idx = max(0, int(round(raw[spi_out_s])) - 1)
+                wall_idx = max(0, int(round(cur_spi)) - 1)
                 trace.render_steps.append(
                     RenderStepTrace(
                         col=col,
@@ -581,6 +581,7 @@ def step_frame(
                         wall_index=wall_idx,
                     )
                 )
+            prev_spi = cur_spi
 
         # Bitblit pixels (length=0 at SORTED positions → no-op).
         for row_idx in range(length):
