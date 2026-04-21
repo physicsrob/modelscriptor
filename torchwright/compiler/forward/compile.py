@@ -502,20 +502,22 @@ def forward_compile(
                 for op_type, n in counts.items():
                     totals_by_type[op_type] = totals_by_type.get(op_type, 0) + n
             cross_pos = totals_by_type.get("compute_attn", 0)
-            self_attn = sum(
-                n for t, n in totals_by_type.items() if t != "compute_attn"
-            )
+            self_attn = sum(n for t, n in totals_by_type.items() if t != "compute_attn")
             print(
                 f"  Heads by purpose: {cross_pos} cross-position (compute_attn), "
                 f"{self_attn} self-attending "
                 f"({', '.join(f'{n} {t}' for t, n in sorted(totals_by_type.items()) if t != 'compute_attn')})"
             )
             # Per-layer detail
-            print(f"\n  {'Layer':<8} {'Heads':>12}  {'KV depth':>10}  {'cross-pos':>10}  {'self-attn':>10}")
+            print(
+                f"\n  {'Layer':<8} {'Heads':>12}  {'KV depth':>10}  {'cross-pos':>10}  {'self-attn':>10}"
+            )
             for i, layer in enumerate(net.layers):
                 attn = layer.attn.attn
                 kv_depth = attn.n_heads * d_head
-                counts = per_layer_head_counts[i] if i < len(per_layer_head_counts) else {}
+                counts = (
+                    per_layer_head_counts[i] if i < len(per_layer_head_counts) else {}
+                )
                 cp = counts.get("compute_attn", 0)
                 sa = sum(n for t, n in counts.items() if t != "compute_attn")
                 print(

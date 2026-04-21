@@ -1136,7 +1136,11 @@ def test_mlp_linear_bypass_matches_attention():
     layer_mlp = TransformerLayer(D, D_HEAD)
     mlp_slots = list(range(0, 2 * 3))
     mlp_op = _make_mlp_op(
-        rmap_mlp, "compute_linear_bypass", linear_node, mlp_out_cols, mlp_slots=mlp_slots
+        rmap_mlp,
+        "compute_linear_bypass",
+        linear_node,
+        mlp_out_cols,
+        mlp_slots=mlp_slots,
     )
     write_mlp_sublayer(layer_mlp, [mlp_op], rmap_mlp)
     layer_mlp.to(device_mod.get_device(verbose=False))

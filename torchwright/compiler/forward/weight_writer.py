@@ -785,9 +785,9 @@ def _write_compute_linear_bypass(
             if leaf in biased_linears:
                 assert isinstance(leaf, Linear)
                 # contrib[j] = sum_i W[offset+i, j] * leaf.bias[i]
-                contrib = (
-                    leaf.output_bias @ W[offset : offset + len(leaf), :]
-                ).to(bias_dtype)
+                contrib = (leaf.output_bias @ W[offset : offset + len(leaf), :]).to(
+                    bias_dtype
+                )
                 mlp.linear1.output_bias[pos_slots_t] += contrib
                 mlp.linear1.output_bias[neg_slots_t] -= contrib
             offset += len(leaf)
