@@ -11,7 +11,7 @@ compile: $(ONNX_FILES)
 
 .PHONY: lint
 lint:
-	uv run black .
+	uv run black --check .
 	uv run mypy .
 
 .PHONY: test
