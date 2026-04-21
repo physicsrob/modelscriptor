@@ -124,6 +124,10 @@ column (the stage's internal critical depth) and the "Bottleneck
 Input" column (which cross-position input arrives latest, forcing
 that stage's dependent ops to wait).
 
+NEVER pipe `make graph-stats` through `tail`, `head`, or any other
+output-truncating filter.  The user always wants to see the full
+output.
+
 # Testing
 
 ## Running Tests
@@ -305,9 +309,9 @@ All flags (`--width`, `--height`, `--fps`, `--scale`, `--d`, `--d-head`,
 
 ## Critical Rules
 
-- NEVER pipe `make walkthrough` through `tail`, `head`, or any other
-  output-truncating filter.  The user always wants to see the full
-  output.
+- NEVER pipe `make walkthrough` or `make graph-stats` through `tail`,
+  `head`, or any other output-truncating filter.  The user always
+  wants to see the full output.
 - NEVER re-run `make walkthrough` just because you lost output (e.g.
   you piped through `| tail -10` and now want to grep).  If the code
   hasn't changed, the previous run's full output is in the log file —
