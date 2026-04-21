@@ -334,6 +334,7 @@ def _attend_wall_geometry(
             Concatenate([wall_ax, wall_ay, wall_bx, wall_by]),
         ),
         match_gain=GEOM_MATCH_GAIN,
+        assert_hardness_gt=0.99,
     )
     sel_ax = extract_from(wall_geom, 4, 0, 1, "rsel_ax")
     sel_ay = extract_from(wall_geom, 4, 1, 1, "rsel_ay")
@@ -673,6 +674,7 @@ def _attend_to_texture_column(
         key_vector=cond_gate(is_tex_col, Concatenate([texture_id_e8, scaled_tc])),
         value=cond_gate(is_tex_col, tex_pixels),
         match_gain=TEX_MATCH_GAIN,
+        assert_hardness_gt=0.99,
     )
 
 

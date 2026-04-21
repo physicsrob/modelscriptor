@@ -145,6 +145,7 @@ def build_thinking(inputs: ThinkingInputs, max_walls: int) -> ThinkingOutputs:
             mask_vector=assert_01(inputs.render_mask),
             position_onehot=render_position_onehot,
             value=render_value_gated,
+            assert_hardness_gt=0.99,
         )
 
         # DebugWatch on attention output.

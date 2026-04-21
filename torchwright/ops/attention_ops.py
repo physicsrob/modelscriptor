@@ -46,6 +46,7 @@ input rather than synthesising the step function inside the attention op.
 """
 
 import math
+from typing import Optional
 
 import torch
 
@@ -53,6 +54,7 @@ from torchwright.graph import Node, Concatenate, Attn
 from torchwright.graph.asserts import (
     assert_in_range,
     assert_matches_value_type,
+    assert_softmax_hardness,
 )
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.value_type import NodeValueType
@@ -68,7 +70,10 @@ _HARD_SELECTION_ATOL = 5e-3
 
 
 def _wrap_hard_selection_output(
-    attn: Attn, value: Node, atol: float = _HARD_SELECTION_ATOL
+    attn: Attn,
+    value: Node,
+    atol: float = _HARD_SELECTION_ATOL,
+    assert_hardness_gt: Optional[float] = None,
 ) -> Node:
     """Bake a value-type guarantee onto a hard-selection primitive's output.
 
@@ -86,11 +91,18 @@ def _wrap_hard_selection_output(
 
     If ``value.value_type`` is ``unknown``, skips wrapping (no claim to
     promote, no predicate to run).
+
+    When ``assert_hardness_gt`` is set, also wraps the output in a
+    softmax hardness assert that checks the maximum attention weight
+    per query exceeds the threshold.
     """
+    result: Node = attn
+    if assert_hardness_gt is not None:
+        result = assert_softmax_hardness(result, assert_hardness_gt)
     vt = value.value_type
     if vt == NodeValueType.unknown():
-        return attn
-    return assert_matches_value_type(attn, vt, atol=atol)
+        return result
+    return assert_matches_value_type(result, vt, atol=atol)
 
 
 # Coefficient applied to the slowest-cosine component of the positional
@@ -265,7 +277,12 @@ def _build_where_attn(
     )
 
 
-def attend_argmin(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
+def attend_argmin(
+    pos_encoding: PosEncoding,
+    score: Node,
+    value: Node,
+    assert_hardness_gt: Optional[float] = None,
+) -> Node:
     """Attend to the position with the *minimum* score.
 
     For each query position, this returns ``value`` at the position within
@@ -300,10 +317,17 @@ def attend_argmin(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
     key_matrix[0, 0] = -1.0  # smaller score → larger logit
 
     attn = _build_selection_attn(pos_encoding, score, key_matrix, value)
-    return _wrap_hard_selection_output(attn, value)
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )
 
 
-def attend_argmax(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
+def attend_argmax(
+    pos_encoding: PosEncoding,
+    score: Node,
+    value: Node,
+    assert_hardness_gt: Optional[float] = None,
+) -> Node:
     """Attend to the position with the *maximum* score.
 
     Sign-flipped twin of :func:`attend_argmin`.
@@ -324,7 +348,9 @@ def attend_argmax(pos_encoding: PosEncoding, score: Node, value: Node) -> Node:
     key_matrix[0, 0] = 1.0  # larger score → larger logit
 
     attn = _build_selection_attn(pos_encoding, score, key_matrix, value)
-    return _wrap_hard_selection_output(attn, value)
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )
 
 
 def attend_argmin_where(
@@ -332,6 +358,7 @@ def attend_argmin_where(
     score: Node,
     validity: Node,
     value: Node,
+    assert_hardness_gt: Optional[float] = None,
 ) -> Node:
     """Argmin of ``score`` restricted to positions where ``validity`` is true.
 
@@ -382,7 +409,9 @@ def attend_argmin_where(
         value,
         score_sign=-1.0,
     )
-    return _wrap_hard_selection_output(attn, value)
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )
 
 
 def attend_argmax_where(
@@ -390,6 +419,7 @@ def attend_argmax_where(
     score: Node,
     validity: Node,
     value: Node,
+    assert_hardness_gt: Optional[float] = None,
 ) -> Node:
     """Argmax of ``score`` restricted to positions where ``validity`` is true.
 
@@ -414,7 +444,9 @@ def attend_argmax_where(
         value,
         score_sign=+1.0,
     )
-    return _wrap_hard_selection_output(attn, value)
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )
 
 
 def attend_argmin_above_integer(
@@ -423,6 +455,7 @@ def attend_argmin_above_integer(
     indicators_above: Node,
     threshold_onehot: Node,
     value: Node,
+    assert_hardness_gt: Optional[float] = None,
 ) -> Node:
     """Argmin of ``score`` among positions strictly above a runtime threshold.
 
@@ -539,7 +572,9 @@ def attend_argmin_above_integer(
         value_matrix=value_matrix,
         output_matrix=output_matrix,
     )
-    return _wrap_hard_selection_output(attn, value)
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )
 
 
 def attend_argmin_unmasked(
@@ -548,6 +583,7 @@ def attend_argmin_unmasked(
     mask_vector: Node,
     position_onehot: Node,
     value: Node,
+    assert_hardness_gt: Optional[float] = None,
 ) -> Node:
     """Argmin of ``score`` over positions whose index isn't set in the mask.
 
@@ -671,7 +707,9 @@ def attend_argmin_unmasked(
         value_matrix=value_matrix,
         output_matrix=output_matrix,
     )
-    return _wrap_hard_selection_output(attn, value)
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )
 
 
 def attend_argmin_valid_unmasked(
@@ -681,6 +719,7 @@ def attend_argmin_valid_unmasked(
     mask_vector: Node,
     position_onehot: Node,
     value: Node,
+    assert_hardness_gt: Optional[float] = None,
 ) -> Node:
     """Argmin of ``score`` restricted to valid keys, with a per-query mask.
 
@@ -788,7 +827,9 @@ def attend_argmin_valid_unmasked(
         value_matrix=value_matrix,
         output_matrix=output_matrix,
     )
-    return _wrap_hard_selection_output(attn, value)
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )
 
 
 def attend_mean_where(
@@ -877,6 +918,7 @@ def attend_argmax_dot(
     key_vector: Node,
     value: Node,
     match_gain: float = 200.0,
+    assert_hardness_gt: Optional[float] = None,
 ) -> Node:
     """Argmax of a vector dot-product score.
 
@@ -957,4 +999,6 @@ def attend_argmax_dot(
         value_matrix=value_matrix,
         output_matrix=output_matrix,
     )
-    return _wrap_hard_selection_output(attn, value)
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )
