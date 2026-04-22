@@ -1,220 +1,122 @@
-# Overlay target-column reserve fix: root cause is elsewhere
+# Overlay target-column reserve fix: the right fix, wider-scope cause still open
 
 **Test:** `tests/doom/test_pipeline.py::TestPipeline::test_sort_order_matches_bsp[210]`
 **Fix landed:** commit `e404eec` ("reserve overlay target columns from reuse by intermediate allocations")
-**Status:** Fix resolves the symptom, but the stated root cause ("delta silently corrupted whatever lived there") does not match what actually happens end-to-end in the compiled forward pass. The underlying failure mode at runtime is identified (overlaid outputs drift by ~0.008 at step 92, E8 `token_type` degrades, subsequent positions collapse to zeros), but the specific op responsible for the drift is not yet pinned down.
+**Status:** Fix is correct and eliminates both the runtime failure and the `debug=True` self-consistency violation I traced. But the chain from the specific invariant violation I pinned down (the `advance_wall` overlay's delta overwriting column 160 while `Linear 2870` is still live there) to the observed runtime symptom (`wall_counter` output drifting `1.0000 → 1.0078 → 0` at step 92) is not closed — for every read path I could follow through layer 54, the per-overlay outputs still land correctly at their target_cols. Either a *second* aliasing that the first-failure-only check hid, or a render-position compute path I didn't probe, is doing the actual runtime damage. The fix happens to cure both because it prevents every overlay target_col from overlapping any live node's allocation.
 
-## Commit claim vs. what is actually going on
+## What I did pin down
 
-The commit explains the failure as:
+The compiler-invariant violation is real, and it's at the delta layer:
 
-> The delta-transfer layer at end of compile writes unconditionally to
-> each overlay's target columns. The allocator was free to reassign
-> those columns to intermediate nodes during the main compile loop
-> (once their original owner became dead), so the delta write silently
-> corrupted whatever lived there at end-of-compile.
+- Under the reverted fix, `Linear 2870` (60-wide `pixels` output) has `residual_map.get_indices(Linear 2870)` including **column 160** (as its slot 25).
+- The `advance_wall` overlay declares `target_cols = [160]`.
+- At layer 54 (the appended delta-transfer layer), head 0 emits the combined-form delta head for `advance_wall`: slot 0 writes `+residual[53]` (source), slot 1 writes `-residual[160]` (subtract), both at O column 160. Post-sublayer `residual[160] = Linear 2900`'s value (= `-1.0` at prefill positions, since `advance_wall = select(is_render, render_out.advance_wall, neg_one)` and `is_render=−1` off-render).
+- Through prefill, `Linear 2870`'s residual slot for index 25 lives at col 160 and held `0.0` end-to-end (prefill has no render frames). At layer 54 that `0.0` is overwritten to `-1.0`. Self-consistency catches it: Linear 2870's value at col 160 is different at layer 39 (when it was computed) vs. layer 54 (after the overwrite) — `max_abs_diff = 1.0`.
 
-Tracing the delta-transfer math against the actual allocations
-`compile_game` produced at angle=210 does not reproduce this story:
+Neither the delta math itself nor `Linear 2870`'s own delta-transfer reads produce wrong *outputs* from this overwrite alone: all reads in the sublayer are pre-sublayer, so they still see `Linear 2870[25]` at col 160 before the overwrite lands, and each overlay's declared target_cols end up with its own intended value. **The runtime bug must therefore be caused by something else I haven't traced**, most likely another overlay/node aliasing that the first-failure-only check never surfaced. Candidates for that investigation are listed in §4.
 
-- The delta op is `post[target] = pre[target] + source - subtract`,
-  and `subtract_cols == target_cols` unconditionally. The
-  pre-sublayer value at `target_cols` cancels out, leaving
-  `post[target] = pre[source]`. This holds regardless of what
-  intermediate happens to own `target_cols` going into the delta
-  sublayer.
-- All reads in the attention sublayer come from the pre-sublayer
-  residual, so parallel writes to `source_cols` by other overlays'
-  deltas do not corrupt this overlay's read.
-- Cross-overlay aliasing of source/target cols, and self-aliasing
-  (Linear 2870's residual cols overlapping its own target cols) were
-  both present in the failing compile. Every case still produces the
-  correct output at each target_col by that math.
+## Evidence
 
-Yet the test really does fail without the fix, and really does pass
-with it. The fix is doing something — just not what the commit says.
+### 1. debug=True self-consistency check pinpoints node + layer range
 
-## What actually happens at angle=210
-
-With the fix reverted and `TW_DEBUG_SORT=1` enabled (see
-`scripts/probe_sort_divergence.py`), the first four frames at
-`px=0, py=0, angle=210` produce:
-
-```
-[s] step=  90 wc=+1.0000 wi=+0.0010 rc=+56.0494 rck=-0.0000 aw=-1.00 sd=-1.00 ln= 0 done=-1.00 tt=[-10.00 +10.00 -10.00 -10.00 -10.00 -30.00 +10.00 -10.00]
-[s] step=  91 wc=+1.0000 wi=+0.0010 rc=+57.0494 rck=-0.0000 aw=-1.00 sd=-1.00 ln=12 done=-1.00 tt=[-10.00 +10.00 -10.00 -10.00 -10.00 -30.00 +10.00 -10.00]
-[s] step=  92 wc=+1.0078 wi=+0.0078 rc=+58.3044 rck=+0.0207 aw=-1.00 sd=-1.00 ln=12 done=-1.00 tt=[ -9.97 +10.03  -9.97  -9.97  -9.97 -29.97 +10.03  -9.97]
-[s] step=  93 wc=+0.0000 wi=+0.0000 rc=+0.0000  rck=-0.0000 aw=-1.00 sd=-1.00 ln= 0 done=-1.00 tt=[ +0.00  +0.00  +0.00  +0.00  +0.00  +0.00  +0.00  -0.00]
-```
-
-- Step 90 is the first SORTED token. `token_type` output is clean
-  E8_RENDER (`±10` with `-30` on the label component).
-- Step 91 is the first RENDER. Passthrough: every overlaid output
-  equals its input to machine precision.
-- **Step 92 is the second RENDER. All overlaid outputs have drifted
-  by ~0.0078, and the E8 `token_type` is off by 0.03 from the clean
-  encoding.**
-- **Step 93 reads Step 92's drifted output as its input. The drifted
-  E8 no longer matches any token_type constant exactly; the
-  transformer's attention heads degrade to all zeros. Every
-  subsequent position produces zeros, and the SORT never advances
-  past wall 0.**
-
-With the fix applied, the same trace is exact at every step: `wc`
-stays at `+1.0000`, `rc` increments by exactly 1.0 per render step,
-and the E8 `token_type` remains at exactly `±10/-30`. No drift at
-all.
-
-So: the failure is a single-shot numerical corruption at step 92,
-not a delta-transfer aliasing issue. The delta layer never
-misbehaves on either side of the fix — it sees clean values going
-in and writes clean values going out. The drift happens inside the
-main compile path.
-
-## Why the fix still works
-
-The fix's effective change is not "stop the delta from corrupting"
-but **"shift the allocator onto a different code path"**.
-
-Without the fix, Linear 2870 (the 60-wide `pixels` output) is
-allocated at a scattered set of columns that includes
-`[160..166, 167..170, 174, 175, 194, 198, 202, 206, 208..225]` —
-overlapping both its own overlay's target_cols (`[167..226]`) and
-seven other overlays' target_cols (`[160..166]`).
-
-Reserving `[160..229]` at compile start forces Linear 2870 onto
-`[38, 64..74, 235..421]` — no overlap with any overlay target_col.
-This in turn cascades through the scheduler's placement decisions
-for every other node, producing a numerically different compiled
-transformer.
-
-On that different compiled transformer, the second-RENDER
-passthrough is exact. That is the fix.
-
-## Why this matters
-
-1. **The commit's one-sentence reason is wrong.** Per D2/D3, the
-   stated explanation does not survive a close reading of the delta
-   math. Anyone who reads the commit and tries to reason about when
-   this class of bug could recur will reach incorrect conclusions.
-
-2. **The fix is a load-bearing coincidence.** It prevents this
-   specific allocator decision, but the underlying fragility — some
-   op whose compiled output drifts by ~0.03 under specific
-   allocation conditions — is still in the graph. A different scene,
-   angle, `d`, `chunk_size`, or any future scheduler tweak could
-   reintroduce the same failure mode under a different allocation
-   coincidence, and the pin/reserve would no longer be the thing
-   that "fixes" it.
-
-3. **The drift is too large for ordinary softmax leak.** With
-   `attention_hardness=100`, leakage on other positions is ~e^-100,
-   which cannot account for 0.03-scale drift on a pure passthrough
-   (`next_wall_counter = token.wall_counter` at RENDER). Something
-   more structural is going on — a missing cancel, an additive
-   write to a col that wasn't zeroed, a leak via a specific
-   attention head's V/O scatter, or similar.
-
-## What is still unknown
-
-- **Which op is introducing the 0.03 drift.** Candidates worth
-  probing first: the `select(is_render, …)` chain that computes
-  `out_token_type` and `out_wall_counter`; the `equals_vector`
-  op that derives `is_render`, `is_sorted` from `token_type`; any
-  `compute_linear` whose source_cols intersect Linear 2870's
-  residual cols at the relevant layer.
-- **Whether it is an allocator-bookkeeping bug** (a col that got
-  reused without cancel, so an additive write sums on top of a
-  stale value) or **a legitimate numerical-sensitivity issue**
-  (piecewise-linear op accumulating error beyond its declared
-  budget).
-- **How many other scene/angle/d combinations are silently riding
-  on the same coincidence.** The test only parametrises on angle;
-  the scheduler's allocation decisions depend on `d`, `d_head`,
-  `d_hidden`, `chunk_size`, etc., so the same fragility could
-  already be hiding behind other test configurations.
-
-## Direct evidence from `debug=True` self-consistency check
-
-Running the DOOM prefill through `module.step(..., debug=True, debug_atol=1e-7)`
-with the fix reverted fires the residual-stream self-consistency
-check immediately:
+Running prefill through `module.step(debug=True, debug_atol=1e-7)` with the fix reverted fires the check with a magnitude-1.0 diff, not fp noise:
 
 ```
 Residual-stream self-consistency failure (atol=1e-07):
-  node:   output (id=2870, type=Linear, width=60)
-  first:  layer_39_mlp_out_state
-  later:  layer_54_mlp_out_state
-  cols:   [41, 66, 118, 119, 120, 121, 122, 123, 124, 130, 133, 135,
-           140, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158,
-           159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170,
-           174, 175, 194, 198, 202, 206, 208, 209, 210, 211, 212, 213,
-           214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225]
+  node:      output (id=2870, type=Linear, width=60)
+  first:     layer_39_mlp_out_state
+  later:     layer_54_mlp_out_state
   worst col: residual[160] (node index 25)
   first val: [0.0, 0.0, …, 0.0]        # 86 positions, all 0.0
   later val: [-1.0, -1.0, …, -1.0]     # 86 positions, all -1.0
   max_abs_diff: 1.0
 ```
 
-With the fix applied, the self-consistency check passes cleanly; a
-different (pre-existing) `render/wall_vis_attention` softmax-hardness
-assert fires instead, but that is an independent issue and the
-consistency check has already run to completion by that point.
+Re-reading the `later val`: that's the value at **column 160** across 86 positions. Not all 60 of `Linear 2870`'s cols flip — only col 160 does.
 
-This is not fp noise. It is a magnitude-1.0 overwrite of every one of
-Linear 2870's 60 residual columns at every position, happening
-between layer 39 and layer 54 in a window where the node is still
-registered in `residual_assignment`. Some op in that window writes
-–1.0 additively into those columns. The 60-wide width, the –1.0
-constant value, and the per-position uniformity point at one of the
-`neg_one` / `zero_pixels` literals or `select(…, neg_one)` fallbacks
-in `torchwright/doom/game_graph.py::_assemble_output` — but the
-specific op producing the write has not been identified.
+### 2. Per-layer trajectory pinpoints the exact layer of the write
 
-Column 160 in particular is an overlay target column (overlay
-`Linear 2900`'s `target_cols = [160]`). Without the fix, that column
-is simultaneously owned by Linear 2870 in the allocator. That
-overlap is exactly the pattern the fix's reserve machinery prevents,
-and once reserved, Linear 2870 is forced onto a disjoint allocation
-(`[38, 64..74, 235..421]`) that the corrupting op does not reach.
+`scripts/probe_per_layer_trajectory.py` walks every captured sublayer state and prints residual[160]'s value at each one. The transition happens at `layer_54_attn_skip_out_state`:
 
-So the fix does address a real compiler-invariant violation — just
-not the one the commit message describes. The delta transfer layer
-was never where the value changed; the change happens 15 layers
-earlier, during normal compile scheduling, inside a cell the
-scheduler told the rest of the system was still live for Linear 2870.
+```
+layer_39_mlp_out_state    col[160]=+0.0000  …  <-- Linear 2870 computed here
+layer_40..53_*            col[160]=+0.0000
+layer_54_attn_skip_out_state  col[160]=-1.0000  <-- CHANGED
+layer_54_mlp_out_state    col[160]=-1.0000
+```
 
-## Follow-ups
+Layer 54 is the appended **delta-transfer layer** (`forward_compile.py` appends it after the main loop). So the write is emitted by the delta-transfer machinery itself.
 
-1. **Run `probe_compiled` at the angle=210 first-RENDER position
-   with the fix reverted.** The oracle is the recursive graph
-   evaluation; the first node whose compiled value diverges beyond
-   `atol` pins the drifting op.
+### 3. Layer 54 attention inspection identifies the exact head
 
-2. **Update the commit message / add a cross-reference here.** The
-   current xfail-grade reason on the commit ("delta silently
-   corrupted") is in the form flagged by D5 as unacceptable. This
-   postmortem stands in until the specific op is pinned down.
+`scripts/probe_layer_54.py` reads `net.layers[54].attn.attn` and finds every head whose O projection has a non-zero entry at residual column 160. Exactly one head contributes:
 
-3. **Keep the pin/reserve as defense-in-depth, but decouple it
-   from the correctness claim.** Reserving overlay target_cols is
-   cheap (~3.5% of the 2048-wide residual stream at DOOM settings)
-   and prevents one class of scheduler pathology. But the
-   downstream passthrough should produce integer wall_counter /
-   exact E8 encoding regardless of where Linear 2870 lands. That
-   is the real correctness property, and the real fix should
-   restore it.
+```
+head 0, slot 0: O coef = +1.000000
+  Q  [pos 0]: 100.0    (hardness=100 queries on pos_encoding col 0)
+  K  [pos 0]: 1.0
+  V  [col 53]: 1.0
+head 0, slot 1: O coef = -1.000000
+  Q  [pos 1]: 100.0
+  K  [pos 1]: 1.0
+  V  [col 160]: 1.0
+```
 
-4. **Once the drifting op is identified**, add a reproducer at the
-   smallest possible layer (op-level or a minimal 2–3-node graph)
-   per D6, not at the full-DOOM integration layer where it
-   currently lives.
+This is the exact signature of the combined-head form of `delta_transfer` in `_write_delta_transfer`: source (+1) on slot 0, subtract (-1) on slot 1, current-position attention via pos_encoding with hardness=100. For the `advance_wall` overlay:
 
-## Reproducer
+- `target_cols = [160]` (col 160 in the overflow region is the residual home of `advance_wall` output)
+- `source_cols = [53]` (where `Linear 2900` — the `advance_wall` `select(...)` leaf — was scheduled)
+- `subtract_cols = target_cols = [160]`
 
-`scripts/probe_sort_divergence.py` compiles the full game at
-`d=2048`, runs one frame at `(0, 0, 210)`, and with
-`TW_DEBUG_SORT=1` prints every overlaid output per position so the
-drift is visible frame-by-frame. The fix can be toggled by applying
-or reverting commit `e404eec`; each configuration's trace is
-deterministic on its own.
+So the write is exactly `residual[160] += residual[53] - residual[160]`, i.e. `residual[160] := Linear 2900` (the advance_wall output). At prefill positions (all non-render), `Linear 2900` evaluates `select(is_render, render_out.advance_wall, neg_one)` to `-1`, which matches the observed `-1.0` at 86 positions.
+
+### 4. The mechanism — confirmed for prefill, unconfirmed for the render-step drift
+
+`Linear 2870` is the `pixels` output (60 wide). Its own delta op has `source_cols = residual_map.get_indices(Linear 2870) = [41, 66, 118, …, 160, …, 225]`. Index 25 in that list is col 160. So `Linear 2870`'s delta head reads `residual[160]` pre-sublayer and writes it to `target_cols[25] = col 192` (pixel index 25 in the overflow `pixels` region).
+
+In the *same* attention sublayer, `Linear 2900`'s delta head also reads pre-sublayer, so it sees `Linear 2870`'s slot-25 value at col 160, not the post-sublayer `-1.0`. Both reads complete before any writes land. So within a single forward pass, each overlay's declared target_cols end up holding that overlay's intended value: `Linear 2870`'s delta copies the intended pixel value out to col 192; `Linear 2900`'s delta writes the intended `-1.0` to col 160. On paper both output slots look fine.
+
+The `residual[160]` post-sublayer value is simply `Linear 2900`'s output — the *overlay* being written uses its slot correctly. What's destroyed is `Linear 2870`'s slot 25 in the residual stream, which is *not* read by anything after layer 54 (it's already been copied to col 192 by `Linear 2870`'s own delta, and nothing else reads col 160 downstream of the delta layer).
+
+**This is where my understanding runs out.** The self-consistency check legitimately fires — the compiler said `Linear 2870` owns col 160 through layer 54 but col 160's value changed. That is a real invariant violation. But the runtime drift I originally captured (`wc` going `1.0000 → 1.0078 → 0` at step 92) has to be caused by *some* value inside the compile being wrong, and this specific col-160 overwrite on its own does not explain that — the chain from "col 160 held `-1.0` instead of `Linear 2870[25]` at the moment layer 54's delta wrote" to "step 92's `wall_counter` output drifts by 0.008" is not traced.
+
+Plausible routes worth investigating:
+
+- **More than one node suffers the same aliasing.** The self-consistency check raises on the first failure, so other nodes with overlapping cols are invisible. A version that collects every violation instead of raising on the first would say whether `Linear 2839` (`wall_counter` output, at col 45) or any of its select-chain intermediates also overlap an overlay target_col.
+- **An op during layers 40–53 writes to col 160 at RENDER positions.** At prefill my trajectory probe shows col 160 stable at 0 through layers 39–53. At a RENDER position, some conditional compute gated on `is_render=+1` might additively touch col 160, corrupting `Linear 2870[25]` *before* layer 54 runs. I did not run the trajectory probe at step 92 because the `render/wall_vis_attention` hardness Assert terminates prefill before I can reach it.
+- **KV-cache contamination at layer 54.** Reads at the delta layer are current-position via `pos_encoding` with hardness 100, so past-position weights are ~e^-100 — vanishingly small in theory, but if the O matrix has structural non-sparseness across head dimensions, a small fraction of a corrupted past col 160 could reach future positions' Q/K/V at layer 54. Non-obvious; wants a concrete weight-shape check.
+
+### 5. Where my earlier "delta math self-corrects" claim was wrong
+
+My claim: "`post[target] = pre[target] + source - subtract` with `subtract_cols == target_cols` gives `post[target] = source`, regardless of what intermediate owns target_cols." That arithmetic is correct. What's wrong is the conclusion I drew from it.
+
+Correct statement: the overlay *being written* gets its correct value at its target_cols. What I missed is that the live node sharing the target col has its residual-stream value there destroyed by the write. Whether that destruction propagates to wrong runtime output depends on whether anything downstream reads `residual[col]` assuming it still holds the live node's value. Every route I've traced so far in the delta-layer math does its read *before* the corresponding write, so per-overlay output values at their declared target_cols come out correct. The runtime drift at step 92 therefore points at a second layer of the problem I haven't yet characterised — see §4's list.
+
+## Why the fix works
+
+Reserving the overflow target cols `[160..229]` at compile start forces the allocator to pick a different home for `Linear 2870` — `[38, 64..74, 235..421]`, disjoint from all overlay target_cols. The delta at col 160 then only touches `Linear 2900`'s declared target, no collateral damage.
+
+The fix is load-bearing via the allocator, but for a good reason: the invariant "no live node's residual cols may overlap an overlay's target_cols" is a real compiler-invariant requirement that the scheduler wasn't previously enforcing. The reserve machinery is the mechanism that enforces it.
+
+## What this means for doctrine
+
+- **D1 (compiler-bug protocol):** honored correctly. The fix addresses a real compiler-invariant violation in the allocator/scheduler interaction, not a user-graph workaround.
+- **D2 (never defer numerical problems):** partially served. The violation at col 160 is bit-exact (a magnitude-1.0 write, not fp noise); no op noise budget is implicated *at the point the check fires*. The 0.008 runtime drift at step 92 is still a numerical-scale symptom whose mechanism I haven't traced from the identified violation, so D2's discipline of "the bit-level reason" isn't yet fully satisfied for the runtime symptom.
+- **D3 (understanding rule):** partial. One-sentence compression of the pinned violation: *layer 54's `advance_wall` delta head overwrites `residual[160]` while `Linear 2870` still claims col 160 as its slot 25*. One-sentence compression of the step-92 runtime drift: not available.
+- **D6 (reproducer):** `scripts/probe_debug_true.py` + `probe_per_layer_trajectory.py` + `probe_layer_54.py` form a complete reproducer chain for the invariant violation. `probe_sort_divergence.py` captures the downstream runtime symptom. The missing link between them — a unit-level probe that shows corrupted data *propagating* — is an open item.
+
+## Open follow-ups
+
+1. **Should the scheduler's `_get_effective_consumers` be tightened to never let output leaves become "dead" before the delta layer runs?** Today it treats a leaf of the terminal Concatenate as dead once the Concatenate is added to `computed_nodes`. That's what lets the overlap form. The reserve machinery shortcuts the problem by pre-reserving the offending columns; a longer-term fix might be to extend "live until delta" to every output leaf.
+
+2. **The `render/wall_vis_attention` softmax-hardness assert fires even with the fix applied.** The self-consistency check passes with the fix, but a downstream Assert surfaces at prefill position 1 with `max_weight=0.5`. That is independent of this postmortem and should be investigated separately; it shows the `debug=True` pipeline now has at least one unrelated latent issue visible.
+
+3. **Scope sweep.** The fix prevents this class of overlap across all overlays, not just `advance_wall`. But other allocation patterns at different `d`, `d_head`, `d_hidden`, or with different `SchedulingPolicy` choices could still expose analogous issues in completely different places (e.g., output leaves overlapping pinned inputs, or cross-position KV reads reaching into columns that got re-assigned mid-compile without the allocator realising). The reserve machinery only protects overlay target_cols.
+
+## Reproducers
+
+- `scripts/probe_sort_divergence.py` — per-position overlaid-output trace at angle=210, set `TW_DEBUG_SORT=1`. Shows the `~0.008` drift at step 92 and the subsequent collapse.
+- `scripts/probe_debug_true.py` — runs prefill with `debug=True, debug_atol=1e-7`. Self-consistency check fires with the fix reverted, passes with the fix applied.
+- `scripts/probe_per_layer_trajectory.py` — walks every captured sublayer state and prints residual values at a node's target cols. Identifies the exact layer (54) where `residual[160]` transitions from 0 → -1.
+- `scripts/probe_layer_54.py` — inspects `net.layers[54].attn.attn` and identifies the exact head (`head 0, slots 0/1`) and its Q/K/V/O footprint, matching it to `delta_transfer` for the `advance_wall` overlay.
+- `scripts/probe_step_92_debug.py` — attempts `debug=True` at step 92 specifically; currently short-circuited by the unrelated `render/wall_vis_attention` hardness Assert firing during prefill. Finishing this probe is the next step toward closing the gap between the pinned-down violation and the runtime symptom.
