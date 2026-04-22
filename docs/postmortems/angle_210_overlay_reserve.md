@@ -267,6 +267,119 @@ Verification:
    upstream node whose compiled value violates its declared
    value_type.
 
+## Session 4 addendum: Problem 2 resolved incidentally
+
+After Session 3 widened `texture_id_e8`'s declared range, the next
+`debug=True` assert to fire on angle=210 was at player step 87
+(`sort/attention: no valid key positions`), and then a cond-near-±1
+assert inside `wall/visibility` at player step 89.  Sessions 4
+addressed both and — as a happy side effect — also resolved the
+3 pre-existing full-suite `[210]` failures.
+
+### Commits landed this session
+
+1. **`ee3047c`** — `assert_picked_from` now skips inactive query
+   positions (queries whose per-row type boolean is 0) mirroring
+   the `1109ba6` relaxation for `assert_softmax_hardness`.  When
+   `keys` (per-row validity) is all-False, returns `True` with a
+   `[picked_from]` stdout note; in the main check, `bad` is also
+   AND-ed with `mask` so inactive queries are skipped individually.
+   Pure `debug=True`-path change; does not alter compiled behaviour.
+
+2. **`f569987`** — `_compute_visibility_columns` (and its helpers
+   `_plane_clip_contribs`, `_endpoint_to_column`) now pass a widened
+   `c_tol=0.01` to every `select()` and `cond_gate()` inside the
+   `wall/visibility` annotate scope.  Introduced `_VIS_C_TOL = 0.01`
+   as a module-level constant with a docstring on why.  The previous
+   default `0.005` was living right at the noise floor: GPU FP
+   nondeterminism (TF32 / cuBLAS algorithm selection / atomics
+   ordering) would sometimes swing one of these conds from
+   `|cond|=0.9951` (within tol) to `|cond|=0.9949` (just outside),
+   producing intermittent step-89 fires across runs of the same
+   code on the same inputs.
+
+### How we verified the intermittency
+
+`scripts/probe_wall_visibility_cond.py` compares multiple runs of
+the same `probe_debug_true` walkthrough.  Two distinct run-to-run
+prefill sort/attention `selected_positions` were observed:
+
+* `[...53,53,...,81,81,81,81,81]` — step 89 fires with cond=−0.9949.
+* `[...73,73,...,81,81,81,81,81]` — step 89 passes cleanly.
+
+Same code, same input tensors, same GPU, same hardware — only
+cuBLAS algorithm / atomic-order variation between runs.  That
+variation is below the `c_tol=0.005` absolute budget but enough to
+tip a borderline cond across the boundary, producing flaky asserts.
+
+### Why this resolves Problem 2
+
+**Hypothesis:** the step 91/92 `wall_counter` drift that was the
+mechanism behind the 3 `[210]` full-suite regressions was the
+same flavour of borderline-FP issue as the step 89 cond fire.
+Full-suite state (prior tests' allocator warmup, prior tensor
+allocations biasing cuBLAS algo selection) perturbs the FP
+trajectory enough to push some intermediate at step 91/92 onto
+the noisy side of its budget — manifesting as the `~0.008` drift
+that `scripts/probe_sort_divergence.py` caught.
+
+The wider `_VIS_C_TOL` budget and the widened `texture_id_e8`
+value range both propagate tighter / more accurate bounds into
+downstream ops' `claimed_type`s, giving the compiler more
+headroom in the bounds-aware parts of the pipeline.
+
+### Verification
+
+Full `tests/doom/` suite, run twice:
+
+* Run 1: `174 passed, 2 xfailed in 142.75s` — the 3 `[210]`
+  regressions (`test_eos_state_matches_reference_oblique[210]`,
+  `test_sort_order_matches_bsp[210]`,
+  `test_frame_matches_reference_oblique[210]`) all pass.
+* Run 2: `174 passed, 2 xfailed in 132.66s` — stable.
+
+The 2 remaining xfails are pre-existing and unrelated to
+angle=210 or Problem 2.
+
+Also:
+
+* `scripts.probe_debug_true`: walks through prefill (86 pos) +
+  3 player steps + 5 SORT/RENDER steps (94 total) with
+  `debug=True` cleanly — no asserts fire, no self-consistency
+  violations.
+* `scripts.probe_oracle_prefill_210`: `probe_compiled` at
+  `atol=500` reports CLEAN on the angle=210 prefill; top-5
+  `max_abs_error` caps at 128.0 (well under the 500-floor),
+  all inside the wall/visibility compare/select chain where
+  the cascading approximate-gate noise is documented.
+
+### Open items after this session
+
+1. **`token_type` belt-and-suspenders.**  Still mis-declared at
+   `game_graph.py:338` (`value_range=(-1.0, 1.0)` vs actual
+   10×-scaled E8 codes in `{-30, -10, 10, 30}`).  Latent because
+   no current consumer is `M`-sensitive.  Same class of bug as the
+   Session-3 `texture_id_e8` fix; should be tightened preemptively.
+
+2. **FP-nondeterminism hardening.**  The `wall/visibility` cond
+   budget was widened to 2× the default.  A more principled
+   long-term fix would be either (a) `torch.use_deterministic_algorithms`
+   mode in `_run_debug_checks`, or (b) lowering the per-op noise
+   measurement tooling's tolerances until the full graph has no
+   op living at its budget.  Both are scope-sweep work, not
+   angle-210-specific.
+
+3. **Whether `e404eec`'s overlay-reserve machinery is still
+   load-bearing.**  The original Phase E/F mechanism (`e404eec`)
+   fixed the `-k sort_order` scope failures; today's fixes
+   resolved the full-suite `[210]` failures.  Problem 1
+   (column aliasing via residual map) is still a real structural
+   bug and the reserve machinery is the right protection for it.
+   But the specific allocation pattern that triggered it at
+   `angle=210` may now compile differently enough that the
+   reserve isn't strictly required on the current compile.  Not
+   worth removing; documenting for future cleanup consideration.
+
 ## Reproducers
 
 - `scripts/probe_sort_divergence.py` — problem 2 at the runtime layer: per-position overlaid-output trace at angle=210 with `TW_DEBUG_SORT=1`. Shows the `~0.008` drift at step 92 and the subsequent collapse. With the fix reverted, drift appears; with the fix applied, outputs are exact.
@@ -275,3 +388,7 @@ Verification:
 - `scripts/probe_layer_54.py` — inspects `net.layers[54].attn.attn` and identifies the exact head (`head 0`, slots 0 and 1) plus its Q/K/V/O footprint. Matches the combined-form delta_transfer for the `advance_wall` overlay: target=[160], source=[53].
 - `scripts/probe_render_pos_trajectory.py` — walks `residual[160]` per layer during step 91's forward pass (first RENDER). Confirms col 160 is at `0.375` through layers 39–53 (pixels slot 25 value) and that no stray writes touch it before the delta layer. Combined with the pixels output landing correctly at col 192, rules out problem 1 as the direct cause of problem 2's drift.
 - `scripts/probe_step_92_debug.py` — stub for per-step `debug=True` at step 92. Currently short-circuited by an unrelated `render/wall_vis_attention` softmax-hardness Assert firing during the very first `debug=True` pass. Kept for future work on problem 2.
+- `scripts/probe_cond_gate_tex.py` — catches the `render/tex_attention` cond_gate assert (Session 3), walks upstream from the firing `Assert` node, and calls `compiled.debug_value(n)` on each ancestor to identify the first out-of-range node. Template for triaging future cond_gate postcondition fires.
+- `scripts/probe_texture_id_cols.py` — reads the raw prefill tensor at the `texture_id_e8` input-spec offset (Session 3), confirming bad values came from the prefill itself, not from residual aliasing.
+- `scripts/probe_wall_visibility_cond.py` — established the intermittency of the `wall/visibility` cond-near-±1 fire at step 89 (Session 4). Documents the two distinct run-to-run prefill sort modes and the correlation with whether step 89 fires.
+- `scripts/probe_oracle_prefill_210.py` — runs `probe_compiled(atol=500)` on the angle=210 prefill (Session 4). Reports CLEAN on the fix-applied compile; the top-5 errors all live in the `wall/visibility` compare/select chain and cap at 128.0.
