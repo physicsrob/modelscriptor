@@ -1343,6 +1343,13 @@ class CompiledHeadless:
         # states, verify the value at its columns is the same everywhere.
         # A mismatch means a column was overwritten while the node was
         # still live — a scheduling or allocator bug.
+        #
+        # We collect ALL violating nodes (one entry per node, the first
+        # state where its value diverged from the initial reading) and
+        # raise a single error listing every one.  Aborting on the first
+        # failure used to hide secondary aliasings behind the first, which
+        # made it easy to misdiagnose the compiler bug as a single isolated
+        # issue when in practice a whole class of nodes was affected.
         captured_states = [s for s in ordered_states if s in state_tensor]
         # Each entry: (value_tensor, label_from_state_tensor, cols_list).
         # The label comes from ``state_tensor[state][1]`` which embeds the
@@ -1350,9 +1357,13 @@ class CompiledHeadless:
         # ambiguous because every layer's MLP out state shares the same
         # name.
         node_first_value: Dict[Node, Tuple[torch.Tensor, str, list]] = {}
+        violations: List[tuple] = []
+        violated_nodes: set = set()
         for state in captured_states:
             state_label = state_tensor[state][1]
             for node in ra.get_nodes(state):
+                if node in violated_nodes:
+                    continue
                 res_tensor, _ = state_tensor[state]
                 val = _extract_compiled_value(node, ra, state, res_tensor)
                 if val is None:
@@ -1364,47 +1375,80 @@ class CompiledHeadless:
                         diff = (first_val - val).abs()
                         max_diff = diff.max().item()
                         if max_diff > atol:
-                            node_name = (
-                                node.annotation or node.name or f"node_{node.node_id}"
+                            violations.append(
+                                (
+                                    node,
+                                    first_label,
+                                    state_label,
+                                    cols,
+                                    first_val.detach().clone(),
+                                    val.detach().clone(),
+                                    max_diff,
+                                )
                             )
-                            # Locate the worst column and dump both values
-                            # there.  For multi-position tensors, diff is
-                            # (n_pos, n_cols); collapse to per-column max
-                            # so we can point at the single offender.
-                            if diff.ndim >= 2:
-                                per_col_max = diff.max(dim=0).values
-                            else:
-                                per_col_max = diff
-                            worst_col_idx = int(per_col_max.argmax().item())
-                            worst_col = (
-                                cols[worst_col_idx]
-                                if worst_col_idx < len(cols)
-                                else None
-                            )
-                            a_slice = first_val[..., worst_col_idx]
-                            b_slice = val[..., worst_col_idx]
-                            raise RuntimeError(
-                                f"Residual-stream self-consistency failure "
-                                f"(atol={atol:g}):\n"
-                                f"  node:   {node_name} "
-                                f"(id={node.node_id}, "
-                                f"type={type(node).__name__}, "
-                                f"width={len(cols)})\n"
-                                f"  first:  {first_label}\n"
-                                f"  later:  {state_label}\n"
-                                f"  cols:   {cols}\n"
-                                f"  worst col: residual[{worst_col}] "
-                                f"(node index {worst_col_idx})\n"
-                                f"  first val: {a_slice.tolist()}\n"
-                                f"  later val: {b_slice.tolist()}\n"
-                                f"  max_abs_diff: {max_diff:.6g}"
-                            )
+                            violated_nodes.add(node)
                 else:
                     node_first_value[node] = (
                         val.detach().clone(),
                         state_label,
                         cols,
                     )
+
+        if violations:
+            # Sort by max_abs_diff descending so the biggest offenders are
+            # at the top.
+            violations.sort(key=lambda v: v[6], reverse=True)
+            msg_lines = [
+                f"Residual-stream self-consistency failure (atol={atol:g}) — "
+                f"{len(violations)} node(s):"
+            ]
+            for i, (
+                node,
+                first_label,
+                later_label,
+                cols,
+                first_val,
+                val,
+                max_diff,
+            ) in enumerate(violations, 1):
+                diff = (first_val - val).abs()
+                if diff.ndim >= 2:
+                    per_col_max = diff.max(dim=0).values
+                else:
+                    per_col_max = diff
+                worst_col_idx = int(per_col_max.argmax().item())
+                worst_col = cols[worst_col_idx] if worst_col_idx < len(cols) else None
+                node_name = node.annotation or node.name or f"node_{node.node_id}"
+                # Summarise value tensors at the worst col if they span many
+                # positions: show min/max across positions rather than dumping
+                # the whole list so the error stays readable when the prefill
+                # is long.
+                a_slice = first_val[..., worst_col_idx]
+                b_slice = val[..., worst_col_idx]
+                if a_slice.ndim == 0 or a_slice.numel() <= 8:
+                    a_fmt = a_slice.tolist()
+                    b_fmt = b_slice.tolist()
+                else:
+                    a_fmt = (
+                        f"n={a_slice.numel()} min={float(a_slice.min()):g} "
+                        f"max={float(a_slice.max()):g}"
+                    )
+                    b_fmt = (
+                        f"n={b_slice.numel()} min={float(b_slice.min()):g} "
+                        f"max={float(b_slice.max()):g}"
+                    )
+                msg_lines.append(
+                    f"\n  [{i}] {node_name} (id={node.node_id}, "
+                    f"type={type(node).__name__}, width={len(cols)})\n"
+                    f"      first:     {first_label}\n"
+                    f"      later:     {later_label}\n"
+                    f"      cols:      {cols if len(cols) <= 16 else str(cols[:16]) + '...'}\n"
+                    f"      worst col: residual[{worst_col}] (node index {worst_col_idx})\n"
+                    f"      first val: {a_fmt}\n"
+                    f"      later val: {b_fmt}\n"
+                    f"      max_abs_diff: {max_diff:.6g}"
+                )
+            raise RuntimeError("".join(msg_lines))
 
         for assert_node in self._asserts:
             target = assert_node.inputs[0]
