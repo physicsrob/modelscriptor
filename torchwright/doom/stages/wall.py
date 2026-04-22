@@ -496,6 +496,16 @@ _COL_FOLD_BP_DOT_ABS = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
 # t-space — tight enough that real differences always saturate cleanly.
 _T_COMPARE_SCALE = 100.0
 
+# Widened cond tolerance for select() / cond_gate() inside the wall/visibility
+# chain.  The default 0.005 lives right at the noise floor of these compares:
+# FP-ordering differences in the compiled GPU kernel (observed via
+# TF32/atomics-driven variation across runs) can swing a cond from
+# |cond|=0.9951 (within 0.005 of 1) to |cond|=0.9949 (just outside),
+# producing intermittent debug=True assert fires on angle=210 at player
+# step 89.  The downstream consumer's numerical budget absorbs the widened
+# cond; the assert now flags drifts that genuinely indicate a problem.
+_VIS_C_TOL = 0.01
+
 
 def _compute_visibility_columns(
     wall_ax: Node,
@@ -645,11 +655,12 @@ def _compute_visibility_columns(
         multiply_const(subtract(t_lo_L, t_lo_R), _T_COMPARE_SCALE),
         0.0,
     )
-    col_A_boundary = select(a_clipped_on_L, W_lit, zero_lit)
+    col_A_boundary = select(a_clipped_on_L, W_lit, zero_lit, c_tol=_VIS_C_TOL)
     col_A = select(
         a_inside_L,
-        select(a_inside_R, col_A_interior, col_A_boundary),
+        select(a_inside_R, col_A_interior, col_A_boundary, c_tol=_VIS_C_TOL),
         col_A_boundary,
+        c_tol=_VIS_C_TOL,
     )
 
     # B is clipped by whichever plane it *exits* first (smaller t_hi).
@@ -659,11 +670,12 @@ def _compute_visibility_columns(
         multiply_const(subtract(t_hi_R, t_hi_L), _T_COMPARE_SCALE),
         0.0,
     )
-    col_B_boundary = select(b_clipped_on_L, W_lit, zero_lit)
+    col_B_boundary = select(b_clipped_on_L, W_lit, zero_lit, c_tol=_VIS_C_TOL)
     col_B = select(
         b_inside_L,
-        select(b_inside_R, col_B_interior, col_B_boundary),
+        select(b_inside_R, col_B_interior, col_B_boundary, c_tol=_VIS_C_TOL),
         col_B_boundary,
+        c_tol=_VIS_C_TOL,
     )
 
     vis_lo_visible = min_node(col_A, col_B)
@@ -675,13 +687,13 @@ def _compute_visibility_columns(
         torch.tensor([float(W + 2)]),
         name="vis_empty_sentinel",
     )
-    vis_lo_raw = select(is_empty, sentinel, vis_lo_visible)
-    vis_hi_raw = select(is_empty, sentinel, vis_hi_visible)
+    vis_lo_raw = select(is_empty, sentinel, vis_lo_visible, c_tol=_VIS_C_TOL)
+    vis_hi_raw = select(is_empty, sentinel, vis_hi_visible, c_tol=_VIS_C_TOL)
 
     # Gate by is_renderable so non-renderable walls contribute 0 (not
     # the W+2 sentinel) to any downstream softmax leakage.
-    vis_lo = cond_gate(is_renderable, vis_lo_raw)
-    vis_hi = cond_gate(is_renderable, vis_hi_raw)
+    vis_lo = cond_gate(is_renderable, vis_lo_raw, c_tol=_VIS_C_TOL)
+    vis_hi = cond_gate(is_renderable, vis_hi_raw, c_tol=_VIS_C_TOL)
 
     return vis_lo, vis_hi
 
@@ -737,15 +749,15 @@ def _plane_clip_contribs(
         name=f"t_star_pos_{suffix}",
     )
     t_star_neg = multiply_const(t_star_pos, -1.0)
-    t_star = select(denom_pos, t_star_pos, t_star_neg)
+    t_star = select(denom_pos, t_star_pos, t_star_neg, c_tol=_VIS_C_TOL)
 
     zero_lit = create_literal_value(torch.tensor([0.0]), name=f"t_zero_{suffix}")
     one_lit = create_literal_value(torch.tensor([1.0]), name=f"t_one_{suffix}")
     a_inside = compare(f_a, 0.0)
     b_inside = compare(f_b, 0.0)
 
-    t_lo_contrib = select(a_inside, zero_lit, t_star)
-    t_hi_contrib = select(b_inside, one_lit, t_star)
+    t_lo_contrib = select(a_inside, zero_lit, t_star, c_tol=_VIS_C_TOL)
+    t_hi_contrib = select(b_inside, one_lit, t_star, c_tol=_VIS_C_TOL)
     return t_lo_contrib, t_hi_contrib
 
 
@@ -856,6 +868,6 @@ def _endpoint_to_column(
         torch.tensor([float(W)]),
         name=f"col_{suffix}_back",
     )
-    col_final = select(dot_sign, col_front, col_back)
+    col_final = select(dot_sign, col_front, col_back, c_tol=_VIS_C_TOL)
 
     return clamp(col_final, col_lo, col_hi)
