@@ -20,6 +20,13 @@ class ResidualStreamMap:
         self.d = d
         self._free: Set[int] = set(range(d))
         self._node_to_indices: Dict[Node, List[int]] = {}
+        # Columns reserved for the end-of-compile delta-transfer layer.
+        # They must not be allocated to ordinary nodes during compile —
+        # the delta transfer writes to them unconditionally.  Used only
+        # for overflow-output target columns (overlaid-input columns are
+        # protected by pinning their input node in the scheduler
+        # instead; their columns stay allocated to the input node).
+        self._reserved: Set[int] = set()
         # Cols whose current value is unknown (may contain garbage from a
         # caller-provided residual stream).  A write op whose target lands on
         # a dirty col must first cancel the prior value, or the additive
@@ -104,6 +111,32 @@ class ResidualStreamMap:
     def get_allocated_nodes(self) -> Set[Node]:
         return set(self._node_to_indices.keys())
 
+    def reserve(self, cols) -> None:
+        """Remove ``cols`` from the free pool without assigning them to any node.
+
+        Used to protect end-of-compile delta-transfer target columns (overflow
+        outputs) from being reused by intermediate allocations.  Reserved
+        columns are disjoint from both ``_free`` and ``_node_to_indices`` and
+        stay that way for the rest of the compile.
+        """
+        cols = set(cols)
+        unowned = cols - self._free
+        if unowned:
+            owners = {
+                c: owner
+                for owner, indices in self._node_to_indices.items()
+                for c in indices
+                if c in unowned
+            }
+            raise AssertionError(
+                f"ResidualStreamMap.reserve({sorted(cols)[:8]}...): "
+                f"columns {sorted(unowned)[:8]} are already allocated "
+                f"(e.g. {{c: repr(o) for c, o in list(owners.items())[:3]}})."
+            )
+        self._free -= cols
+        self._reserved |= cols
+        self._check_invariants(f"reserve({sorted(cols)[:4]}...)")
+
     def _check_invariants(self, where: str) -> None:
         """Assert allocator state is self-consistent.
 
@@ -136,14 +169,30 @@ class ResidualStreamMap:
                 f"columns {ov[:8]} are both free and allocated (e.g. "
                 f"{ {c: repr(seen[c]) for c in ov[:3]} }). d={self.d}."
             )
-        total = self._free | seen.keys()
+        reserved_overlap_alloc = self._reserved & seen.keys()
+        if reserved_overlap_alloc:
+            ov = sorted(reserved_overlap_alloc)
+            raise AssertionError(
+                f"ResidualStreamMap invariant violated after {where}: "
+                f"reserved columns {ov[:8]} are also allocated "
+                f"(e.g. { {c: repr(seen[c]) for c in ov[:3]} }). d={self.d}."
+            )
+        reserved_overlap_free = self._reserved & self._free
+        if reserved_overlap_free:
+            ov = sorted(reserved_overlap_free)
+            raise AssertionError(
+                f"ResidualStreamMap invariant violated after {where}: "
+                f"reserved columns {ov[:8]} are also in the free pool. "
+                f"d={self.d}."
+            )
+        total = self._free | seen.keys() | self._reserved
         if total != set(range(self.d)):
             missing = sorted(set(range(self.d)) - total)
             raise AssertionError(
                 f"ResidualStreamMap invariant violated after {where}: "
-                f"columns {missing[:8]} are neither free nor allocated. "
-                f"d={self.d}, free={len(self._free)}, "
-                f"allocated={len(seen)}."
+                f"columns {missing[:8]} are neither free, allocated, "
+                f"nor reserved. d={self.d}, free={len(self._free)}, "
+                f"allocated={len(seen)}, reserved={len(self._reserved)}."
             )
 
     def build_residual_assignment(

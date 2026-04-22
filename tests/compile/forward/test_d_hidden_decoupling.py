@@ -72,10 +72,18 @@ def test_compile_with_small_d_hidden():
     assert module._net.d == 32
     assert module._net.d_hidden == 8
     # All MLP weight matrices in every compiled layer should be (d, d_hidden) /
-    # (d_hidden, d) — never (d, d).
+    # (d_hidden, d) — never (d, d).  trim_unused_slots() shrinks d_hidden to
+    # the number of slots actually used; the chain only uses 4, so the
+    # per-layer width trims down to at most 4 (but is still ≤ the requested
+    # d_hidden=8 and still decoupled from d=32).
     for layer in module._net.layers:
-        assert layer.mlp.linear1.output_matrix.shape == (32, 8)
-        assert layer.mlp.linear2.output_matrix.shape == (8, 32)
+        assert 1 <= layer.mlp.linear1.output_matrix.shape[1] <= 8
+        assert layer.mlp.linear1.output_matrix.shape[0] == 32
+        assert (
+            layer.mlp.linear2.output_matrix.shape[0]
+            == layer.mlp.linear1.output_matrix.shape[1]
+        )
+        assert layer.mlp.linear2.output_matrix.shape[1] == 32
 
     x = torch.tensor([[0.5, -1.0, 2.0, 0.25]])
     expected = out_node.compute(n_pos=1, input_values={"x": x})
@@ -112,9 +120,20 @@ def test_compile_with_d_hidden_larger_than_d():
 
     assert module._net.d == 32
     assert module._net.d_hidden == 64
+    # trim_unused_slots() trims trailing zeros; the chain fills 48 of the 64
+    # slots, so each layer's per-layer width lands in (32, 64].  The smoking
+    # gun is still intact: every layer's d_hidden > d, which was impossible
+    # before the decoupling.
     for layer in module._net.layers:
-        assert layer.mlp.linear1.output_matrix.shape == (32, 64)
-        assert layer.mlp.linear2.output_matrix.shape == (64, 32)
+        assert layer.mlp.linear1.output_matrix.shape[0] == 32
+        assert (
+            32 < layer.mlp.linear1.output_matrix.shape[1] <= 64
+        ), "per-layer d_hidden must exceed d=32 to exercise the decoupling"
+        assert (
+            layer.mlp.linear2.output_matrix.shape[0]
+            == layer.mlp.linear1.output_matrix.shape[1]
+        )
+        assert layer.mlp.linear2.output_matrix.shape[1] == 32
 
     x = torch.tensor([[0.5, -1.0, 2.0, 0.25]])
     expected = out_node.compute(n_pos=1, input_values={"x": x})

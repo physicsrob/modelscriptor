@@ -87,6 +87,45 @@ def _verify_end_of_layer_liveness(
         )
 
 
+def _verify_overlay_target_protection(
+    overlays,
+    residual_map,
+    pos_encoding: Node,
+    overlay_pinned_inputs: Set[Node],
+) -> None:
+    """Pre-delta-transfer guard: every target column must be safe from reuse.
+
+    A safe column is one of:
+      - ``pos_encoding``'s (never freed by the scheduler),
+      - owned by a node in ``overlay_pinned_inputs`` (pinned against freeing),
+      - reserved in the allocator (never handed out by ``allocate``).
+
+    Any other owner means the allocator reused an overlay target position
+    for an unrelated live node — the delta write about to happen would
+    silently corrupt that node.  Raising here turns the silent value
+    corruption into a loud compile-time error.
+    """
+    for _out_node, (_in_node, target_cols) in overlays.items():
+        for col in target_cols:
+            if col in residual_map._reserved:
+                continue
+            owner = None
+            for candidate, cols in residual_map._node_to_indices.items():
+                if col in cols:
+                    owner = candidate
+                    break
+            if owner is pos_encoding:
+                continue
+            if owner in overlay_pinned_inputs:
+                continue
+            raise AssertionError(
+                f"Overlay target column {col} is owned by {owner!r} at "
+                f"delta-transfer time — the allocator reused a reserved "
+                f"position.  Expected: pos_encoding, a pinned overlay "
+                f"input, or an allocator-reserved column."
+            )
+
+
 def _count_heads_by_type(
     attn_ops: list[AttnHeadOp],
     d_head: int,
@@ -282,6 +321,41 @@ def forward_compile(
     if policy is None:
         policy = SchedulingPolicy()
 
+    # Protect overlay target columns from reuse by intermediate allocations.
+    # The delta-transfer layer at end of compile writes to these columns
+    # unconditionally (via attention heads), so any intermediate node
+    # whose residual-stream columns intersect target_cols would be silently
+    # overwritten.  target_cols are *output-writeback* columns (the residual
+    # positions the output reader pulls from), not the overlay input node's
+    # allocated columns — they may land in pos_encoding's range, an input's
+    # range, or the initially-free overflow region.  Protection strategy per
+    # column:
+    #   - In pos_encoding's cols: no-op, pos_encoding is never freed.
+    #   - In some input node's cols: pin that input so the scheduler never
+    #     marks it dead.  Its columns stay allocated to it and can't be
+    #     reused by intermediates.
+    #   - In _free (overflow region): reserve the column directly so the
+    #     allocator never picks it.
+    overlay_pinned_inputs: set[Node] = set()
+    if overlays:
+        col_to_owner: dict[int, Node] = {}
+        for owner, cols in residual_map._node_to_indices.items():
+            for c in cols:
+                col_to_owner[c] = owner
+
+        cols_to_reserve: set[int] = set()
+        for _out_node, (_in_node, target_cols) in overlays.items():
+            for col in target_cols:
+                col_owner = col_to_owner.get(col)
+                if col_owner is None:
+                    cols_to_reserve.add(col)
+                elif col_owner is pos_encoding:
+                    pass
+                else:
+                    overlay_pinned_inputs.add(col_owner)
+        if cols_to_reserve:
+            residual_map.reserve(cols_to_reserve)
+
     scheduler = LayerScheduler(
         graph,
         d,
@@ -291,6 +365,7 @@ def forward_compile(
         clusters=clusters,
         admission_budget_fraction=admission_budget_fraction,
         policy=policy,
+        pinned_nodes=overlay_pinned_inputs,
     )
 
     # Save input indices before scheduling (scheduling may free/reassign them)
@@ -432,6 +507,9 @@ def forward_compile(
     # When overlays is provided, add a final layer that transfers each output
     # value to the input's columns via delta: target += (output - target).
     if overlays:
+        _verify_overlay_target_protection(
+            overlays, residual_map, pos_encoding, overlay_pinned_inputs
+        )
         delta_layer = net.add_layer(append=True)
         delta_ops = []
         for out_node, (in_node, target_cols) in overlays.items():
