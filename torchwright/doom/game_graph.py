@@ -358,7 +358,9 @@ def _create_inputs(
         inputs[k] = create_input(k, 1, value_range=(0.0, 255.0))
     inputs["tex_col_input"] = create_input("tex_col_input", 1, value_range=(0.0, 255.0))
     inputs["tex_pixels"] = create_input("tex_pixels", tex_h * 3, value_range=(0.0, 1.0))
-    inputs["texture_id_e8"] = create_input("texture_id_e8", 8, value_range=(-1.0, 1.0))
+    inputs["texture_id_e8"] = create_input(
+        "texture_id_e8", 8, value_range=(-30.0, 30.0)
+    )
 
     inputs["bsp_plane_nx"] = create_input("bsp_plane_nx", 1, value_range=(-1.0, 1.0))
     inputs["bsp_plane_ny"] = create_input("bsp_plane_ny", 1, value_range=(-1.0, 1.0))
