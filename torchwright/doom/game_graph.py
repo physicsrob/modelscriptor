@@ -24,7 +24,7 @@ stage file for per-stage math.  This module does orchestration only.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -36,13 +36,16 @@ from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_pos_encoding,
 )
-from torchwright.ops.logic_ops import equals_vector
+from torchwright.ops.logic_ops import bool_any_true, equals_vector
 from torchwright.ops.map_select import select
 from torchwright.reference_renderer.types import RenderConfig
 
 from torchwright.doom.graph_constants import (
     E8_BSP_NODE,
     E8_EOS,
+    E8_HIT_FULL_ID,
+    E8_HIT_X_ID,
+    E8_HIT_Y_ID,
     E8_INPUT,
     E8_PLAYER_ANGLE,
     E8_PLAYER_X,
@@ -50,6 +53,8 @@ from torchwright.doom.graph_constants import (
     E8_RENDER,
     E8_SORTED_WALL,
     E8_TEX_COL,
+    E8_THINKING_VALUE,
+    E8_THINKING_WALL,
     E8_WALL,
     TEX_E8_OFFSET,
 )
@@ -71,6 +76,11 @@ __all__ = [
     "E8_PLAYER_X",
     "E8_PLAYER_Y",
     "E8_PLAYER_ANGLE",
+    "E8_THINKING_WALL",
+    "E8_HIT_FULL_ID",
+    "E8_HIT_X_ID",
+    "E8_HIT_Y_ID",
+    "E8_THINKING_VALUE",
     "TEX_E8_OFFSET",
 ]
 from torchwright.doom.graph_utils import extract_from
@@ -81,6 +91,10 @@ from torchwright.doom.stages.player import PlayerToken, build_player
 from torchwright.doom.stages.render import RenderKVInput, RenderToken, build_render
 from torchwright.doom.stages.sorted import SortedKVInput, SortedToken, build_sorted
 from torchwright.doom.stages.tex_col import TexColToken, build_tex_col
+from torchwright.doom.stages.thinking_wall import (
+    ThinkingWallKVInput,
+    build_thinking_wall,
+)
 from torchwright.doom.stages.wall import WallKVInput, WallToken, build_wall
 
 # ---------------------------------------------------------------------------
@@ -243,6 +257,45 @@ def build_game_graph(
         pos_encoding=pos_encoding,
     )
 
+    # ---------- THINKING_WALL ----------
+    # Phase A M4: emits hit_full/hit_x/hit_y per wall as autoregressive
+    # value tokens.  Lives between PLAYER and SORTED in the token stream
+    # but participates in the per-position graph the same way every
+    # other stage does — token-type detectors gate which positions emit.
+    #
+    # Pre-collision player position note: PLAYER tokens currently carry
+    # the EOS-resolved (post-collision) player state, since RENDER needs
+    # post-collision to project the actual on-screen view.  HIT_*
+    # computation, however, needs pre-collision position (the question
+    # is whether this *intended* velocity ray hits anything before
+    # resolution).  We grab pre-collision via the raw ``inputs["player_x"]``
+    # / ``inputs["player_y"]`` slots — the host fills them with
+    # pre-collision values at thinking-token positions (see
+    # ``compile.step_frame``).
+    thinking_wall_out = build_thinking_wall(
+        ThinkingWallKVInput(
+            wall_ax=inputs["wall_ax"],
+            wall_ay=inputs["wall_ay"],
+            wall_bx=inputs["wall_bx"],
+            wall_by=inputs["wall_by"],
+            wall_position_onehot=wall_out.position_onehot,
+            vel_dx=input_out.vel_dx,
+            vel_dy=input_out.vel_dy,
+            player_x=inputs["player_x"],
+            player_y=inputs["player_y"],
+        ),
+        is_wall=tf["is_wall"],
+        is_thinking_wall_marker=tf["is_thinking_wall_marker"],
+        is_thinking_wall_n=tf["is_thinking_wall_n"],
+        is_any_identifier=tf["is_any_identifier"],
+        is_hit_full_id=tf["is_hit_full_id"],
+        is_hit_x_id=tf["is_hit_x_id"],
+        is_hit_y_id=tf["is_hit_y_id"],
+        is_thinking_value=tf["is_thinking_value"],
+        pos_encoding=pos_encoding,
+        max_walls=max_walls,
+    )
+
     # ---------- SORTED ----------
     sorted_out = build_sorted(
         SortedToken(
@@ -310,6 +363,7 @@ def build_game_graph(
         input_out=input_out,
         sorted_out=sorted_out,
         render_out=render_out,
+        thinking_wall_out=thinking_wall_out,
         chunk_size=cs,
     )
 
@@ -400,13 +454,27 @@ def _create_inputs(
         "render_chunk_k", 1, value_range=(0.0, 20.0)
     )
 
+    # Phase A M4: thinking-token value payload.  At THINKING_VALUE
+    # positions the host re-feeds the previous output's quantized
+    # integer here.  HIT_* values are 0/1, but we keep the wider range
+    # so the same slot can carry M5+ values (cross/dot in [-40, 40],
+    # vis_lo/hi in [-2, 122], etc.) without an IO-surface change.
+    inputs["thinking_value"] = create_input(
+        "thinking_value", 1, value_range=(-128.0, 65535.0)
+    )
+
     return inputs
 
 
-def _detect_token_types(token_type: Node) -> Dict[str, Node]:
-    """Derive per-type boolean flags from the 8-wide token_type vector."""
+def _detect_token_types(token_type: Node) -> Dict[str, Any]:
+    """Derive per-type boolean flags from the 8-wide token_type vector.
+
+    Most entries are ``Node`` booleans, but ``is_thinking_wall_n`` is a
+    ``list[Node]`` — one detector per marker — hence the wider ``Any``
+    value type.
+    """
     with annotate("token_type"):
-        return {
+        flags: Dict[str, Any] = {
             "is_input": equals_vector(token_type, E8_INPUT),
             "is_wall": equals_vector(token_type, E8_WALL),
             "is_eos": equals_vector(token_type, E8_EOS),
@@ -417,7 +485,28 @@ def _detect_token_types(token_type: Node) -> Dict[str, Node]:
             "is_player_x": equals_vector(token_type, E8_PLAYER_X),
             "is_player_y": equals_vector(token_type, E8_PLAYER_Y),
             "is_player_angle": equals_vector(token_type, E8_PLAYER_ANGLE),
+            # Phase A M4: thinking-token detectors.
+            "is_hit_full_id": equals_vector(token_type, E8_HIT_FULL_ID),
+            "is_hit_x_id": equals_vector(token_type, E8_HIT_X_ID),
+            "is_hit_y_id": equals_vector(token_type, E8_HIT_Y_ID),
+            "is_thinking_value": equals_vector(token_type, E8_THINKING_VALUE),
         }
+        # Per-marker detectors (8 walls).  is_thinking_wall_marker is the
+        # OR — used as the validity signal in the value step's "find
+        # current wall_index" attention.
+        is_thinking_wall_n = [
+            equals_vector(token_type, E8_THINKING_WALL[i]) for i in range(8)
+        ]
+        flags["is_thinking_wall_n"] = is_thinking_wall_n
+        flags["is_thinking_wall_marker"] = bool_any_true(is_thinking_wall_n)
+        flags["is_any_identifier"] = bool_any_true(
+            [
+                flags["is_hit_full_id"],
+                flags["is_hit_x_id"],
+                flags["is_hit_y_id"],
+            ]
+        )
+        return flags
 
 
 def _assemble_output(
@@ -428,6 +517,7 @@ def _assemble_output(
     input_out,
     sorted_out,
     render_out,
+    thinking_wall_out,
     chunk_size: int,
 ) -> Tuple[Dict[str, Node], Dict[str, Node]]:
     """Build the overlaid outputs + overflow outputs.
@@ -496,17 +586,32 @@ def _assemble_output(
         )
 
         # --- Token type ---
-        # SORTED always followed by RENDER; RENDER emits SORTED_WALL
-        # on advance_wall (not done), RENDER otherwise.
+        # Phase A M4: thinking-token positions emit their own next type
+        # (marker → HIT_FULL_ID, identifier → THINKING_VALUE, value →
+        # next identifier or marker or SORTED).  Outside thinking,
+        # SORTED→RENDER and RENDER→SORTED_WALL/RENDER as before.
         type_render = create_literal_value(E8_RENDER, name="out_type_render")
         out_token_type = select(
-            token_flags["is_sorted"],
-            type_render,
+            thinking_wall_out.is_thinking_active,
+            thinking_wall_out.next_token_type,
             select(
-                token_flags["is_render"],
-                render_out.render_next_type,
-                zero_8,
+                token_flags["is_sorted"],
+                type_render,
+                select(
+                    token_flags["is_render"],
+                    render_out.render_next_type,
+                    zero_8,
+                ),
             ),
+        )
+
+        # Phase A M4: thinking_value overlaid output.  Carries the
+        # quantized integer the host re-feeds at the next THINKING_VALUE
+        # input.  Zero at non-VALUE positions.
+        out_thinking_value = select(
+            token_flags["is_thinking_value"],
+            thinking_wall_out.thinking_value,
+            zero_1,
         )
 
         out_pixels = select(token_flags["is_render"], render_out.pixels, zero_pixels)
@@ -530,6 +635,7 @@ def _assemble_output(
         "render_col": out_render_col,
         "render_chunk_k": out_render_chunk_k,
         "wall_counter": out_wall_counter,
+        "thinking_value": out_thinking_value,
     }
     overflow = {
         "pixels": out_pixels,

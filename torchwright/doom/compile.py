@@ -30,6 +30,9 @@ from torchwright.doom.input import PlayerInput
 from torchwright.doom.game_graph import (
     E8_BSP_NODE,
     E8_EOS,
+    E8_HIT_FULL_ID,
+    E8_HIT_X_ID,
+    E8_HIT_Y_ID,
     E8_INPUT,
     E8_PLAYER_ANGLE,
     E8_PLAYER_X,
@@ -37,6 +40,8 @@ from torchwright.doom.game_graph import (
     E8_RENDER,
     E8_SORTED_WALL,
     E8_TEX_COL,
+    E8_THINKING_VALUE,
+    E8_THINKING_WALL,
     E8_WALL,
     TEX_E8_OFFSET,
     build_game_graph,
@@ -241,6 +246,9 @@ def _build_row(compiled, max_walls, **kwargs):
         "bsp_node_id_onehot": torch.zeros(max_bsp_nodes, device=device),
         "wall_bsp_coeffs": torch.zeros(max_bsp_nodes, device=device),
         "wall_bsp_const": torch.zeros(1, device=device),
+        # Phase A M4: thinking-token value payload.  Carried autoregressively
+        # via overlaid copy from the previous output's thinking_value slot.
+        "thinking_value": torch.zeros(1, device=device),
     }
     defaults.update(kwargs)
     d_input = max(s + w for _, s, w in compiled._input_specs)
@@ -317,6 +325,11 @@ def step_frame(
     past = module.empty_past()
     step = 0
     px, py, angle = float(state.x), float(state.y), float(state.angle)
+    # Phase A M4: keep pre-collision player position around so the host
+    # can feed it to the raw player_x/y slots at thinking-token positions.
+    # PLAYER's broadcast goes post-collision (see step_frame docstring),
+    # but HIT_* computation needs pre-collision.
+    pre_px, pre_py = px, py
 
     # Compute layout from compiled module
     d_input = max(s + w for _, s, w in module._input_specs)
@@ -461,12 +474,24 @@ def step_frame(
         trace.eos_new_angle = new_angle_raw
 
     def _out_to_input(raw_out):
-        """Map overlaid output fields to a flat input row."""
+        """Map overlaid output fields to a flat input row.
+
+        Also fills pre-collision player_x/y in the raw input slots at
+        every autoregressive position.  Thinking-wall reads these at
+        THINKING_VALUE positions for HIT_* computation; SORTED/RENDER
+        ignore them (they read post-collision via the PLAYER broadcast).
+        """
         row = torch.zeros(1, d_input, device=device)
         for name in overlaid_names:
             in_s, w = in_by_name[name]
             out_s, _ = out_by_name[name]
             row[0, in_s : in_s + w] = raw_out[0, out_s : out_s + w]
+        if "player_x" in in_by_name:
+            ix_s, ix_w = in_by_name["player_x"]
+            row[0, ix_s : ix_s + ix_w] = pre_px
+        if "player_y" in in_by_name:
+            iy_s, iy_w = in_by_name["player_y"]
+            row[0, iy_s : iy_s + iy_w] = pre_py
         return row
 
     # --- Phase 0b: Player state tokens ---
@@ -501,14 +526,17 @@ def step_frame(
     t_player = time.perf_counter() - t0
     print(f"  player   3 steps  kv={_kv_len(past)}  {t_player*1000:.0f}ms")
 
-    # --- Sort + Render (interleaved, pure bitblit) ---
+    # --- Thinking + Sort + Render (single autoregressive loop) ---
     #
-    # The transformer controls the token sequence: SORTED_WALL picks a
-    # wall and emits token_type=E8_RENDER; RENDER tokens paint pixels
-    # and emit token_type=E8_SORTED_WALL on wall transitions.  The host
-    # just copies overlaid outputs to the next input (_out_to_input) and
-    # blits pixels to the framebuffer.  No sorting cache, no advance_wall
-    # detection, no wall-identity patching.
+    # Phase A M4: the host injects THINKING_WALL_0 as the first
+    # autoregressive token.  The transformer then drives the full
+    # sequence: thinking tokens (markers, identifiers, values), then
+    # SORTED, then RENDER, until done.  The host loop is identical
+    # across all three phases — copy overlaid outputs (_out_to_input),
+    # blit pixels for any RENDER positions, terminate on done/sort_done.
+    #
+    # The transformer controls the token sequence by emitting
+    # next_token_type at every step; the host doesn't introspect.
 
     # Output field offsets for trace recording.
     # Phase A M3: wall identity is no longer an overlaid input; RENDER
@@ -520,26 +548,45 @@ def step_frame(
     wc_out_s, _ = out_by_name["wall_counter"]
     col_overlay_s, _ = out_by_name["render_col"]
     svhi_out_s, _ = out_by_name["sort_vis_hi"]
+    tv_out_s, _ = out_by_name["thinking_value"]
+    tt_out_s, _ = out_by_name["token_type"]
     t0 = time.perf_counter()
     frame = np.full((H, W, 3), -1.0, dtype=np.float32)
     filled = np.zeros((H, W), dtype=bool)
 
+    # Phase A M4: first autoregressive token is THINKING_WALL_0.
+    # Pre-collision player position is fed via the raw player_x/y slots
+    # (host-side helper feeds pre_px/pre_py).
     prev = _build_row(
         module,
         max_walls,
-        token_type=E8_SORTED_WALL,
+        token_type=E8_THINKING_WALL[0],
         wall_counter=torch.tensor([0.0]),
+        player_x=torch.tensor([pre_px]),
+        player_y=torch.tensor([pre_py]),
     )
 
-    max_steps = N * (W * (H // cs + 1) + 1) + 10
+    # Thinking phase budget: 8 markers + 8 walls × (3 IDs + 3 values) = 56.
+    # Add a small safety margin.
+    n_thinking = 8 + max_walls * 6 + 4
+    max_steps = n_thinking + N * (W * (H // cs + 1) + 1) + 10
     total_steps = 0
     prev_wc = 0.0
+    # Capture thinking-value outputs by step index for the dual-path
+    # regression test.  Keyed by autoregressive step number; the test
+    # walks the sequence to map values back to (wall_index, hit_field).
+    thinking_value_log = []
 
     for k in range(max_steps):
         out, past = _step(prev, past, step)
         step += 1
         total_steps += 1
         raw = out[0].detach().cpu().numpy()
+
+        # Capture thinking_value at every step (zero except at
+        # THINKING_VALUE positions).  Test harness walks the log to map
+        # values back to (wall_index, hit_field) by step index.
+        thinking_value_log.append(float(raw[tv_out_s]))
 
         # Read overflow outputs (zero/neg at non-RENDER positions).
         col = int(round(raw[col_out_s]))
@@ -554,7 +601,16 @@ def step_frame(
         if trace is not None:
             cur_wc = raw[wc_out_s]
             if cur_wc > prev_wc + 0.5:
-                wall_idx = int(round(raw[wi_out_s]))
+                # Garbage picks (after sort exhaustion) can produce
+                # nonsensical wall_idx values from soft-averaged
+                # attention; clamp to keep the trace harness from
+                # crashing on np.eye() out-of-bounds.  The next
+                # iteration's done/sort_done check will break the loop.
+                raw_wi = raw[wi_out_s]
+                if 0.0 <= raw_wi < max_walls:
+                    wall_idx = int(round(raw_wi))
+                else:
+                    wall_idx = max(0, min(max_walls - 1, 0))
                 trace.sort_steps.append(
                     SortStepTrace(
                         position_index=len(trace.sort_steps),
@@ -593,6 +649,9 @@ def step_frame(
             break
 
         prev = _out_to_input(out)
+
+    if trace is not None:
+        trace.thinking_value_log = thinking_value_log
 
     print(f"  resolved state: px={px:.3f} py={py:.3f} angle={angle:.3f}")
 
