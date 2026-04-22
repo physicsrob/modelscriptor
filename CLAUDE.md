@@ -237,6 +237,19 @@ Tests calling `compile_game()` are expensive (~17s to compile, ~2s per
    The default is `"auto"` which uses GPU when available.  Forcing CPU will
    make inference ~8x slower.
 
+## When full-suite tests fail but `-k` passes
+
+A test that passes under `make test FILE=... ARGS="-k foo"` but fails when
+the full `tests/doom/` suite runs is almost always cross-test GPU state —
+cuBLAS algorithm cache biased by prior allocations, tensor-cache warmup,
+or scheduler nondeterminism — not a logic bug in the failing test. The
+diagnostic signature is an allocator-sensitive compute path or a
+tolerance-boundary flake (see *FP nondeterminism at tolerance boundaries*
+under *Debugging compiled graphs*). Investigate the ops on the failing
+codepath, not the test.
+
+Worked example: `docs/postmortems/angle_210_overlay_reserve.md` §2.
+
 # Numerical noise
 
 Every approximate op in `torchwright/ops/` is measured against its exact-math
@@ -555,6 +568,35 @@ reference eval but fails in the compiled forward pinpoints a node
 where piecewise-linear approximation error exceeds the tolerance —
 that's a noise-budget problem in the graph, not a compiler bug.
 
+## FP nondeterminism at tolerance boundaries
+
+GPU matmul is non-deterministic across runs — cuBLAS algorithm
+selection, TF32, and atomics ordering produce run-to-run variation
+on the order of `1e-5` to `1e-6` on float32 accumulation.  Same
+code, same inputs, same GPU.  This is below every per-op mean-error
+budget in `docs/op_noise_data.json`, but it can flip a borderline
+cond across a `c_tol` boundary: a cond landing at `|cond|=0.995`
+under a `c_tol=0.005` budget fires the postcondition assert on
+some runs and passes on others.
+
+**Symptom.** `debug=True` asserts fire intermittently on identical
+inputs; re-running `step` sometimes passes, sometimes fails.  Not a
+bug in the op, not a scheduling issue — a tolerance sitting too
+close to the actual cond magnitude.
+
+**Rule.** `c_tol` and assertion tolerances need margin above *both*
+the op's measured noise and GPU FP variation.  If a cond lives at
+its budget, that's brittle — either widen the tolerance (cheap,
+biases the cond "on") or tighten the upstream compute so the cond
+lands further from zero (principled, often requires graph-level
+changes).  Full-suite-only test regressions (passes under `-k`,
+fails in the full suite) are the most common way this bites; see
+*When full-suite tests fail but `-k` passes* under *Testing*.
+
+Worked example: `_VIS_C_TOL = 0.01` in
+`torchwright/doom/stages/wall.py`, widened from the default
+`0.005`.  See `docs/postmortems/angle_210_overlay_reserve.md` §2.
+
 ## Triage sequence for wrong output
 
 1. **`compiled(inputs, debug=True)`** — does the self-consistency
@@ -562,6 +604,9 @@ that's a noise-budget problem in the graph, not a compiler bug.
    check fails, that's a real compiler/scheduling bug (report per
    D1).  If an assert fires, the failure message names the node
    and the invariant that broke — investigate that node's inputs.
+   If the same `debug=True` call passes on some runs and fails on
+   others with identical inputs, see *FP nondeterminism at tolerance
+   boundaries* above before investigating the op.
 
 2. **`probe_compiled`** — does the oracle agree with compiled?
    If `first_divergent` is `None`, the compiled transformer matches

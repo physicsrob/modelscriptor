@@ -1130,16 +1130,24 @@ class CompiledHeadless:
             n_new, input_values, past_len=past_len
         ).to(self._net.device)
 
-    def __call__(self, inputs: torch.Tensor, debug: bool = False) -> torch.Tensor:
+    def __call__(
+        self,
+        inputs: torch.Tensor,
+        debug: bool = False,
+        debug_atol: float = 1e-7,
+    ) -> torch.Tensor:
         """Stateless per-query inference — uses the non-cached ``forward()``.
 
         When ``debug=True``, captures per-layer residual-stream snapshots
         and checks all Assert nodes (raises on failure) and DebugWatch
-        nodes (prints on trigger).
+        nodes (prints on trigger).  ``debug_atol`` is the maximum
+        per-column drift tolerated by the residual-stream self-consistency
+        check; diffs at or below ``debug_atol`` are treated as fp-rounding
+        noise.
         """
         res_stream = self._build_res_stream(inputs, past_len=0)
         if debug and (self._asserts or self._watches):
-            res, _ = self._run_debug_checks(res_stream, past_kvs=None)
+            res, _ = self._run_debug_checks(res_stream, past_kvs=None, atol=debug_atol)
         else:
             res = self._net.forward(res_stream)
         return res[:, self._output_indices]
@@ -1165,6 +1173,7 @@ class CompiledHeadless:
         past: tuple,
         past_len: Optional[int] = None,
         debug: bool = False,
+        debug_atol: float = 1e-7,
     ) -> tuple:
         """Cached forward step.
 
@@ -1185,6 +1194,9 @@ class CompiledHeadless:
             debug: When True, capture residual-stream snapshots and
                 check all Assert nodes (raises) and DebugWatch nodes
                 (prints).
+            debug_atol: Maximum per-column drift tolerated by the
+                residual-stream self-consistency check.  Diffs at or
+                below ``debug_atol`` are treated as fp-rounding noise.
 
         Returns:
             ``(outputs, new_past)`` where ``outputs`` is
@@ -1200,7 +1212,9 @@ class CompiledHeadless:
         res_stream = self._build_res_stream(inputs, past_len=past_len)
         past_kvs = [(past_K[i], past_V[i]) for i in range(self._n_layers)]
         if debug and (self._asserts or self._watches):
-            res, new_kvs = self._run_debug_checks(res_stream, past_kvs=past_kvs)
+            res, new_kvs = self._run_debug_checks(
+                res_stream, past_kvs=past_kvs, atol=debug_atol
+            )
         else:
             res, new_kvs = self._net.forward_cached(res_stream, past_kvs=past_kvs)
 
@@ -1258,7 +1272,7 @@ class CompiledHeadless:
         res_tensor, _ = tensor_pair
         return _extract_compiled_value(node, ds.ra, state, res_tensor)
 
-    def _run_debug_checks(self, res_stream, past_kvs=None):
+    def _run_debug_checks(self, res_stream, past_kvs=None, atol: float = 1e-7):
         """Run forward with state capture, then check consistency, asserts, and watches.
 
         For prefill (past_kvs=None): uses net.forward(return_states=True).
@@ -1270,9 +1284,11 @@ class CompiledHeadless:
            :meth:`debug_value` can extract node values after the call.
         2. Checks residual-stream self-consistency: for every node that
            appears in multiple captured states, verifies the value at its
-           assigned columns is identical across all of them.  A mismatch
-           means something overwrote the node's columns before all
-           consumers read them — a compiler or scheduling bug.
+           assigned columns is identical across all of them (up to
+           ``atol`` per column, to tolerate fp-rounding noise).  A diff
+           exceeding ``atol`` means something overwrote the node's
+           columns before all consumers read them — a compiler or
+           scheduling bug.
         3. Runs Assert predicates (raises on failure) and DebugWatch
            predicates (prints on trigger).
 
@@ -1327,32 +1343,112 @@ class CompiledHeadless:
         # states, verify the value at its columns is the same everywhere.
         # A mismatch means a column was overwritten while the node was
         # still live — a scheduling or allocator bug.
+        #
+        # We collect ALL violating nodes (one entry per node, the first
+        # state where its value diverged from the initial reading) and
+        # raise a single error listing every one.  Aborting on the first
+        # failure used to hide secondary aliasings behind the first, which
+        # made it easy to misdiagnose the compiler bug as a single isolated
+        # issue when in practice a whole class of nodes was affected.
         captured_states = [s for s in ordered_states if s in state_tensor]
-        node_first_value: Dict[Node, Tuple[torch.Tensor, str]] = {}
+        # Each entry: (value_tensor, label_from_state_tensor, cols_list).
+        # The label comes from ``state_tensor[state][1]`` which embeds the
+        # layer index ("layer_5_mlp_out_state") — ``state.name`` alone is
+        # ambiguous because every layer's MLP out state shares the same
+        # name.
+        node_first_value: Dict[Node, Tuple[torch.Tensor, str, list]] = {}
+        violations: List[tuple] = []
+        violated_nodes: set = set()
         for state in captured_states:
-            state_label = state.name or f"state_{state.state_id}"
+            state_label = state_tensor[state][1]
             for node in ra.get_nodes(state):
+                if node in violated_nodes:
+                    continue
                 res_tensor, _ = state_tensor[state]
                 val = _extract_compiled_value(node, ra, state, res_tensor)
                 if val is None:
                     continue
+                cols = list(ra.get_node_indices(state, node))
                 if node in node_first_value:
-                    first_val, first_label = node_first_value[node]
+                    first_val, first_label, first_cols = node_first_value[node]
                     if first_val.shape == val.shape:
-                        max_diff = (first_val - val).abs().max().item()
-                        if max_diff > 0.0:
-                            node_name = (
-                                node.annotation or node.name or f"node_{node.node_id}"
+                        diff = (first_val - val).abs()
+                        max_diff = diff.max().item()
+                        if max_diff > atol:
+                            violations.append(
+                                (
+                                    node,
+                                    first_label,
+                                    state_label,
+                                    cols,
+                                    first_val.detach().clone(),
+                                    val.detach().clone(),
+                                    max_diff,
+                                )
                             )
-                            raise RuntimeError(
-                                f"Residual-stream self-consistency failure: "
-                                f"{node_name} (id={node.node_id}, "
-                                f"type={type(node).__name__}) has different "
-                                f"values at {first_label} vs {state_label} "
-                                f"(max_abs_diff={max_diff:.6g})"
-                            )
+                            violated_nodes.add(node)
                 else:
-                    node_first_value[node] = (val.detach().clone(), state_label)
+                    node_first_value[node] = (
+                        val.detach().clone(),
+                        state_label,
+                        cols,
+                    )
+
+        if violations:
+            # Sort by max_abs_diff descending so the biggest offenders are
+            # at the top.
+            violations.sort(key=lambda v: v[6], reverse=True)
+            msg_lines = [
+                f"Residual-stream self-consistency failure (atol={atol:g}) — "
+                f"{len(violations)} node(s):"
+            ]
+            for i, (
+                node,
+                first_label,
+                later_label,
+                cols,
+                first_val,
+                val,
+                max_diff,
+            ) in enumerate(violations, 1):
+                diff = (first_val - val).abs()
+                if diff.ndim >= 2:
+                    per_col_max = diff.max(dim=0).values
+                else:
+                    per_col_max = diff
+                worst_col_idx = int(per_col_max.argmax().item())
+                worst_col = cols[worst_col_idx] if worst_col_idx < len(cols) else None
+                node_name = node.annotation or node.name or f"node_{node.node_id}"
+                # Summarise value tensors at the worst col if they span many
+                # positions: show min/max across positions rather than dumping
+                # the whole list so the error stays readable when the prefill
+                # is long.
+                a_slice = first_val[..., worst_col_idx]
+                b_slice = val[..., worst_col_idx]
+                if a_slice.ndim == 0 or a_slice.numel() <= 8:
+                    a_fmt = a_slice.tolist()
+                    b_fmt = b_slice.tolist()
+                else:
+                    a_fmt = (
+                        f"n={a_slice.numel()} min={float(a_slice.min()):g} "
+                        f"max={float(a_slice.max()):g}"
+                    )
+                    b_fmt = (
+                        f"n={b_slice.numel()} min={float(b_slice.min()):g} "
+                        f"max={float(b_slice.max()):g}"
+                    )
+                msg_lines.append(
+                    f"\n  [{i}] {node_name} (id={node.node_id}, "
+                    f"type={type(node).__name__}, width={len(cols)})\n"
+                    f"      first:     {first_label}\n"
+                    f"      later:     {later_label}\n"
+                    f"      cols:      {cols if len(cols) <= 16 else str(cols[:16]) + '...'}\n"
+                    f"      worst col: residual[{worst_col}] (node index {worst_col_idx})\n"
+                    f"      first val: {a_fmt}\n"
+                    f"      later val: {b_fmt}\n"
+                    f"      max_abs_diff: {max_diff:.6g}"
+                )
+            raise RuntimeError("".join(msg_lines))
 
         for assert_node in self._asserts:
             target = assert_node.inputs[0]
