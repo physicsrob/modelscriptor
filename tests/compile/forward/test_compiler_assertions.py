@@ -66,7 +66,7 @@ def test_D_check_invariants_catches_missing_column():
     orphan = next(iter(rmap._free))
     rmap._free.discard(orphan)
 
-    with pytest.raises(AssertionError, match=r"neither free nor allocated"):
+    with pytest.raises(AssertionError, match=r"neither free, allocated"):
         rmap._check_invariants("poisoned")
 
 
@@ -239,3 +239,94 @@ def test_A_require_live_raises_for_unallocated_input():
 
     with pytest.raises(AssertionError, match=r"Live-column invariant violated"):
         scheduler._require_live(x, rmap, f"compute_linear input for {l!r}")
+
+
+# ---------------------------------------------------------------------------
+# Overlay target-column reservation
+# ---------------------------------------------------------------------------
+
+
+def test_reserve_rejects_allocated_col():
+    """reserve() must fail if any requested column is already allocated —
+    the caller would otherwise silently lose that column from the free pool
+    without any effect (it was already not free)."""
+    rmap = ResidualStreamMap(16)
+    a = InputNode("a", 4, value_range=(-1.0, 1.0))
+    rmap.allocate(a)  # takes [0,1,2,3]
+
+    with pytest.raises(AssertionError, match=r"already allocated"):
+        rmap.reserve([0, 1])
+
+
+def test_reserve_blocks_subsequent_allocation():
+    """Reserved columns cannot be handed out by allocate() — this is the
+    bedrock of overlay-target protection."""
+    rmap = ResidualStreamMap(8)
+    rmap.reserve([0, 1, 2, 3])
+
+    a = InputNode("a", 4, value_range=(-1.0, 1.0))
+    rmap.allocate(a)
+    # a must get the unreserved columns [4,5,6,7], not the reserved ones.
+    assert rmap.get_indices(a) == [4, 5, 6, 7]
+
+
+def test_scheduler_pins_never_marks_pinned_dead():
+    """A node listed in pinned_nodes must never appear in the dead list,
+    even when its effective consumers have all been computed."""
+    from torchwright.compiler.forward.scheduler import LayerScheduler
+
+    pos = PosEncoding(d_pos=D_HEAD)
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    weight = torch.eye(4, 4)
+    bias = torch.zeros(4)
+    l = Linear(x, weight, bias)
+
+    graph = GraphAnalyzer(l)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(x)
+
+    scheduler_unpinned = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler_pinned = LayerScheduler(graph, D, D_HEAD, pos, pinned_nodes={x})
+
+    # Once l is computed, x has no remaining consumers: unpinned scheduler
+    # lists x as dead, pinned scheduler does not.
+    computed = {x, l}
+    assert x in scheduler_unpinned._find_dead_nodes(rmap, computed)
+    assert x not in scheduler_pinned._find_dead_nodes(rmap, computed)
+
+
+def test_delta_transfer_guard_catches_reallocation():
+    """If an overlay target column is owned by an unrelated live node at
+    delta-transfer time, the guard must fire and name that node.  This is
+    the last-line assertion that protects against the allocator reusing
+    an overlay target position for an intermediate — exactly the bug that
+    the pin/reserve machinery exists to prevent."""
+    from torchwright.compiler.forward.compile import (
+        _verify_overlay_target_protection,
+    )
+
+    pos = PosEncoding(d_pos=D_HEAD)
+    x = InputNode("x", 4, value_range=(-1.0, 1.0))
+    bait = InputNode("bait", 1, value_range=(-1.0, 1.0))
+    weight = torch.eye(4, 4)
+    bias = torch.zeros(4)
+    y = Linear(x, weight, bias)
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)  # [0..15]
+    rmap.allocate(x)  # [16..19]
+    rmap.allocate(bait)  # [20]
+
+    # Poison: overlay's target col 20 is owned by `bait`, which is neither
+    # pos_encoding nor a pinned input.  The guard must fire.
+    overlays = {y: (x, [20])}
+    with pytest.raises(AssertionError, match=r"Overlay target column 20 is owned by"):
+        _verify_overlay_target_protection(
+            overlays, rmap, pos_encoding=pos, overlay_pinned_inputs=set()
+        )
+
+    # Control: if we pin `bait`, the guard accepts it.
+    _verify_overlay_target_protection(
+        overlays, rmap, pos_encoding=pos, overlay_pinned_inputs={bait}
+    )

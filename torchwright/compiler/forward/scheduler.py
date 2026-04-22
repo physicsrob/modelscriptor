@@ -47,6 +47,7 @@ class LayerScheduler:
         clusters: Optional[SiblingClusters] = None,
         admission_budget_fraction: float = 0.4,
         policy: Optional[SchedulingPolicy] = None,
+        pinned_nodes: Optional[Set[Node]] = None,
     ):
         self.graph = graph
         self.d = d
@@ -55,6 +56,13 @@ class LayerScheduler:
         self.n_heads = d // d_head
         self.pos_encoding = pos_encoding
         self.policy = policy if policy is not None else SchedulingPolicy()
+        # Nodes whose residual-stream columns must stay allocated for the
+        # entire compile.  Used for overlay inputs: the delta-transfer
+        # layer at end of compile writes to those columns, so the
+        # allocator must not reuse them for other live-to-end nodes.
+        self._pinned_nodes: Set[Node] = (
+            set(pinned_nodes) if pinned_nodes is not None else set()
+        )
 
         # Admission control state (see _is_admissible).  When clusters
         # is None or empty, admission is disabled and the scheduler
@@ -913,6 +921,8 @@ class LayerScheduler:
     def _is_dead(self, node: Node, computed_nodes: Set[Node]) -> bool:
         if node is self.pos_encoding:
             return False
+        if node in self._pinned_nodes:
+            return False
         if node not in self.graph.get_all_nodes():
             return False
         return self._get_effective_consumers(node).issubset(computed_nodes)
@@ -926,6 +936,8 @@ class LayerScheduler:
         residual stream, so their columns can't be reused for add_into.
         """
         if addend is self.pos_encoding:
+            return False
+        if addend in self._pinned_nodes:
             return False
         if isinstance(addend, Concatenate):
             return False
