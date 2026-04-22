@@ -618,7 +618,20 @@ def assert_picked_from(
         n_pos = res.shape[0]
         valid_idxs = mask.nonzero(as_tuple=False).squeeze(-1)
         if valid_idxs.numel() == 0:
-            return False, "no valid key positions"
+            # No position in this batch is a valid key — which in the
+            # caller's convention (``keys`` is the per-row is_wall /
+            # is_render / is_tex_col boolean, same flag as query-row
+            # activity) means every query row is itself inactive.  The
+            # downstream consumer gates the result away (e.g. via
+            # ``select(is_sorted, ...)``), so there's nothing to check.
+            # This branch hits in decode mode at step positions whose
+            # type boolean is 0 (e.g. a PLAYER_X step for a sort-stage
+            # assert keyed on is_wall).
+            print(
+                f"  [picked_from] skip: no valid key positions in batch "
+                f"of {n_pos} — every query inactive"
+            )
+            return True, ""
         valid_vals = vals[valid_idxs]
         # (n_pos, 1, d) - (1, n_keys, d) → (n_pos, n_keys, d); max over d = L∞.
         dists = (res.unsqueeze(1) - valid_vals.unsqueeze(0)).abs().max(dim=-1).values
@@ -631,7 +644,11 @@ def assert_picked_from(
         first_valid_idx = int(valid_idxs.min().item())
         query_rows = torch.arange(n_pos, device=x.device)
         has_visible_valid = query_rows >= first_valid_idx
-        bad = (min_dists > atol) & has_visible_valid
+        # Also skip query rows that are themselves inactive (``mask[q]``
+        # is False).  The caller's convention is that ``keys`` doubles
+        # as the per-row type flag; an inactive query is the type-
+        # isolation pattern and its attention output is meaningless.
+        bad = (min_dists > atol) & has_visible_valid & mask
         if not bad.any():
             return True, ""
         q = int(bad.nonzero(as_tuple=False)[0].item())
