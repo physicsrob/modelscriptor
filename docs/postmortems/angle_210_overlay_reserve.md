@@ -122,9 +122,150 @@ The fix is load-bearing via the allocator, but for a good reason: the invariant 
 
 1. **Should the scheduler's `_get_effective_consumers` be tightened to never let output leaves become "dead" before the delta layer runs?** Today it treats a leaf of the terminal Concatenate as dead once the Concatenate is added to `computed_nodes`. That's what lets the overlap form. The reserve machinery shortcuts the problem by pre-reserving the offending columns; a longer-term fix might be to extend "live until delta" to every output leaf.
 
-2. **The `render/wall_vis_attention` softmax-hardness assert fires even with the fix applied.** The self-consistency check passes with the fix, but a downstream Assert surfaces at prefill position 1 with `max_weight=0.5`. That is independent of this postmortem and should be investigated separately; it shows the `debug=True` pipeline now has at least one unrelated latent issue visible.
+2. ~~**The `render/wall_vis_attention` softmax-hardness assert fires even with the fix applied.**~~ **Resolved in `1109ba6`** — these softmax-hardness asserts were firing on inactive query positions (queries where the documented "type isolation by zero query/key" pattern leaves attention uniform). `assert_softmax_hardness` and `assert_picked_from` now skip those queries.
 
 3. **Scope sweep.** The fix prevents this class of overlap across all overlays, not just `advance_wall`. But other allocation patterns at different `d`, `d_head`, `d_hidden`, or with different `SchedulingPolicy` choices could still expose analogous issues in completely different places (e.g., output leaves overlapping pinned inputs, or cross-position KV reads reaching into columns that got re-assigned mid-compile without the allocator realising). The reserve machinery only protects overlay target_cols.
+
+## Session 3 addendum: the `render/tex_attention` cond_gate assert
+
+After `1109ba6` relaxed the inactive-query softmax-hardness asserts,
+`module.step(prefill, debug=True)` surfaces a different assert further
+down the pipeline:
+
+```
+Assert failed at render/tex_attention: matches NodeValueType(value_range=Range(lo=-1.0, hi=10.0))
+  (atol=0.1; bad at [0]=-20.0000 (+349 more))
+```
+
+### One-sentence root cause
+
+The `texture_id_e8` InputNode is declared with `value_range=(-1.0, 1.0)`
+at `torchwright/doom/game_graph.py:361`, but
+`torchwright/graph/spherical_codes.py:18` multiplies the raw E8
+codebook by 10× (`spherical_codes = 10.0 * load_spherical_codes(...)`)
+so the actual `index_to_vector(...)` values have components in
+`{-30, -10, 10, 30}`; when that mis-declared node feeds the key-side
+`cond_gate` (via `Concatenate([texture_id_e8, scaled_tc])`),
+`cond_gate` computes `M = 2·max_abs_range = 2·10 = 20` from the (wrong)
+declared range and — at the 32 TEX_COL prefill positions where
+`is_tex_col=+1` and the actual `inp[j]` equals `-30` — the on-path
+`ReLU(M·c + inp[j])` saturates to `0` so the output is
+`0 + ReLU(−M) − M = 0 + 20 − 20 = −20`, which then fails the
+`assert_matches_value_type(Range(-1, 10), atol=0.1)` postcondition.
+
+### Classification
+
+**Real value-type declaration bug.** Not PL noise, not inactive-position
+garbage. The declaration is 30× too narrow for `texture_id_e8` and
+symmetrically for `token_type` (also `value_range=(-1.0, 1.0)` at
+`game_graph.py:338`). The bug was latent until `1109ba6` removed the
+inactive-query softmax-hardness asserts that had been firing first on
+the same `debug=True` prefill.
+
+### Why the test passes anyway
+
+`test_sort_order_matches_bsp[210]` doesn't turn on `debug=True`, so the
+cond_gate postcondition assert never runs at test time. The functional
+behaviour of the texture attention is unaffected: the saturated `-20`
+at key slots doesn't prevent `attend_argmax_dot(match_gain=1000.0)` from
+picking the right TEX_COL — the `-20` appears only on slots whose
+correct (in-range) value would have been ≤ `-1`, and the massive
+`match_gain` dwarfs the ≤ `19` dot-product error that introduces.
+
+### Why `token_type` isn't currently firing an assert
+
+`token_type` is only consumed by `equals_vector(token_type, E8_X)` calls
+and by output-overlay write-back. `equals_vector` is a dot-product
+against the E8 codebook constant, producing a bounded `±1` output whose
+value-type is independent of the input range; the overlay write-back
+just shuttles the residual cols. Neither path passes `token_type`
+through `cond_gate`, so its mis-declared range doesn't reach any
+`M`-sensitive downstream op.
+
+### Chosen fix path
+
+**Real-bug-fix.** The minimal change is to widen the declared range of
+`texture_id_e8` (and, for consistency and correctness of any future
+consumer, `token_type`) to `(-30.0, 30.0)` to match the actual
+post-scaling E8 code range. Empirical verification:
+
+- `E8.8.1024.txt` contains only components `{-3, -1, 1, 3}` (checked by
+  `awk '{for(i=1;i<=NF;i++)print $i}' | sort -u`).
+- `spherical_codes.py:18` scales by 10×, so the post-scaled range is
+  exactly `{-30, -10, 10, 30}`; `(-30, 30)` is the tightest declaration
+  that contains all codes.
+
+The change propagates: `cond_gate`'s `M` becomes `2·max(30, 10) = 60`;
+the cond_gate output's declared `value_type` widens from `Range(-1, 10)`
+to `Range(-30, 30)`; the `assert_matches_value_type` at `render/
+tex_attention` then checks the compiled output against a range that the
+saturated `-20` comfortably satisfies.
+
+### Reproducer + probe trail
+
+- `scripts/probe_cond_gate_tex.py` — catches the cond_gate assert,
+  walks from the firing `Assert` node upstream, and prints
+  `compiled.debug_value(node)` for every ancestor. Identifies id=19
+  `InputNode('texture_id_e8')` as the first upstream node whose
+  compiled value (`min=-30 max=10`) violates its declared range
+  (`[-1, 1]`).
+- `scripts/probe_texture_id_cols.py` — reads the raw prefill tensor at
+  the `texture_id_e8` input-spec offset and confirms the bad values
+  come from the prefill itself, not from residual-column aliasing.
+  Also dumps `ra.get_node_indices` at every captured post-sublayer
+  state to show the residual cols are stable across layers 0-3.
+
+### Fix landed + verification
+
+Applied the minimal fix: widened `texture_id_e8`'s declared range at
+`torchwright/doom/game_graph.py:361` from `(-1.0, 1.0)` to
+`(-30.0, 30.0)` to match the actual post-scaling E8 code range
+`{-30, -10, 10, 30}`.
+
+Verification:
+
+- `scripts/probe_debug_true.py`: prefill now passes `debug=True`
+  cleanly on all 86 positions. The next assert fires further
+  downstream at player step 87
+  (`sort/attention: attention picked one — no valid key positions`),
+  which is a separate concern for follow-up.
+- `make test FILE=tests/doom/test_pipeline.py ARGS="-k sort_order"`:
+  9/9 pass (including `[210]`).
+- `make test FILE=tests/doom/test_pipeline.py`: 47/47 pass.
+- `make test FILE=tests/doom/`: **3 pre-existing failures at
+  `[210]`** (`test_eos_state_matches_reference_oblique[210]`,
+  `test_sort_order_matches_bsp[210]`,
+  `test_frame_matches_reference_oblique[210]`). **These are not
+  introduced by this fix** — the same 3 failures occur at
+  commit `1109ba6` (pre-fix) when the full doom suite runs. They
+  are the cross-file manifestation of Problem 2: earlier tests in
+  the suite perturb some torch/CUDA/scheduler state that shifts
+  the compile onto a drifting path at angle=210 on (0.0, 0.0). The
+  overlay-reserve fix `e404eec` resolves the `-k sort_order` and
+  `-k test_pipeline` scopes but does not extend to the full-suite
+  state.
+
+### Notes for the next-next session
+
+1. `token_type` (same site, line 338) has the same mis-declaration
+   `value_range=(-1.0, 1.0)` against 10×-scaled E8 codes, but is
+   only consumed by `equals_vector(...)` and overlay write-back, so
+   it doesn't currently feed any `M`-sensitive op. Consider widening
+   for belt-and-suspenders correctness.
+2. With the cond_gate assert resolved, `probe_compiled` at
+   angle=210 step 91 on the fix-reverted compile is now unblocked —
+   no need for a `skip_asserts=True` bypass. Expected outcome:
+   either a specific divergent op is identified (actionable), or the
+   report shows distributed fp drift (meaning the overlay-reserve
+   fix is a coincidental numerical remedy, not a structural one).
+   Either way, the 3 full-suite failures above are the runtime
+   signal to investigate.
+3. The next assert to fire (player step 87 `sort/attention: no
+   valid key positions`) should be triaged with the same
+   `scripts/probe_cond_gate_tex.py` template: catch the assert,
+   walk upstream from the firing `Assert` node, identify the first
+   upstream node whose compiled value violates its declared
+   value_type.
 
 ## Reproducers
 
