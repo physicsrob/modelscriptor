@@ -335,7 +335,7 @@ def _create_inputs(
     """
     inputs: Dict[str, Node] = {}
 
-    inputs["token_type"] = create_input("token_type", 8, value_range=(-1.0, 1.0))
+    inputs["token_type"] = create_input("token_type", 8, value_range=(-30.0, 30.0))
     inputs["player_x"] = create_input(
         "player_x", 1, value_range=(-max_coord, max_coord)
     )

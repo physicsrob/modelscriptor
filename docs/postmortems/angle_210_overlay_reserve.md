@@ -117,12 +117,12 @@ large `match_gain` dominates the `≤ 19` dot-product error.
 `game_graph.py:361`. `M` becomes 60; the cond_gate output type widens
 to `Range(-30, 30)`; the assert passes.
 
-**Open: `token_type` has the identical mis-declaration.** Line 338
-declares `value_range=(-1.0, 1.0)` for the same 10×-scaled E8 codes.
-Currently latent — `token_type` is only consumed by
+**`token_type` had the identical mis-declaration** (line 338,
+`value_range=(-1.0, 1.0)` for the same 10×-scaled E8 codes) and was
+widened to `(-30.0, 30.0)` preemptively while the context was loaded,
+even though it was latent — `token_type` is only consumed by
 `equals_vector(...)` (dot-product producing `±1` regardless of input
 range) and overlay write-back (which doesn't pass through `cond_gate`).
-Should be widened preemptively.
 
 ## Debug infrastructure added while investigating
 
