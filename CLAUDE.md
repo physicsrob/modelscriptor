@@ -51,6 +51,17 @@ changing Basis. Which do you prefer?" Don't commit to elaborate
 machinery without explicit agreement. If the user says "that feels
 gross," trust that instinct and look for the direct path.
 
+## State constraints alongside proposals
+
+When proposing a mechanism, state all its constraints and assumptions
+upfront. Don't wait for the user to discover them through follow-up
+questions. "This requires X and constrains Y" is always better than
+explaining X only when asked. If a design requires a fixed layout,
+say so. If it introduces a dependency, name it. If it limits future
+flexibility, flag it. Minimizing complexity in the explanation doesn't
+reduce the complexity of the mechanism — it just hides it, and the
+user will find it later in a more frustrating way.
+
 # DOOM game graph
 
 Before working on anything under `torchwright/doom/`, `torchwright/doom/stages/`,
