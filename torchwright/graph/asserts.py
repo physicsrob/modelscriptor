@@ -615,16 +615,26 @@ def assert_picked_from(
             mask = keys_t.squeeze(-1) > 0.5
         else:
             mask = (keys_t > 0.5).any(dim=-1)
-        valid_vals = vals[mask]
-        if valid_vals.shape[0] == 0:
+        n_pos = res.shape[0]
+        valid_idxs = mask.nonzero(as_tuple=False).squeeze(-1)
+        if valid_idxs.numel() == 0:
             return False, "no valid key positions"
+        valid_vals = vals[valid_idxs]
         # (n_pos, 1, d) - (1, n_keys, d) → (n_pos, n_keys, d); max over d = L∞.
         dists = (res.unsqueeze(1) - valid_vals.unsqueeze(0)).abs().max(dim=-1).values
         min_dists, argmin_k = dists.min(dim=-1)
-        bad = min_dists > atol
+        # Skip query rows that have no valid key in their causal window —
+        # the softmax has nothing legitimate to pick from there, the
+        # downstream consumer is expected to gate the result away (e.g.
+        # via ``select(is_sorted, ...)``), and asserting against the
+        # valid-key set fires on a value the consumer never reads.
+        first_valid_idx = int(valid_idxs.min().item())
+        query_rows = torch.arange(n_pos, device=x.device)
+        has_visible_valid = query_rows >= first_valid_idx
+        bad = (min_dists > atol) & has_visible_valid
         if not bad.any():
             return True, ""
-        q = bad.nonzero(as_tuple=False)[0].item()
+        q = int(bad.nonzero(as_tuple=False)[0].item())
         return False, (
             f"query row {q}: result doesn't match any value row "
             f"within atol={atol}; closest valid key #{argmin_k[int(q)].item()} "
@@ -714,16 +724,46 @@ def assert_softmax_hardness(
         weights = torch.softmax(logits, dim=1)
         max_weights = weights.max(dim=1).values
 
+        # Skip query positions where the attention has nothing meaningful
+        # to concentrate on.  Two cases that both produce a uniform
+        # softmax over the causal window — neither indicates a real
+        # blending bug because the downstream consumer gates the output
+        # away (e.g. ``select(is_render, ...)``):
+        #
+        #   (a) The query input itself has near-zero norm.  The
+        #       documented "type isolation by zero query/key" pattern
+        #       (see ``attend_argmax_dot``'s docstring): callers
+        #       ``cond_gate`` the query at non-participating positions.
+        #       Residual noise from ``cond_gate``'s additive cancellation
+        #       is on the order of 1e-6, so ``qi.norm > 1e-3`` cleanly
+        #       separates noise from a real query (one-hots, scores, and
+        #       ±1-encoded gates are all order-1).
+        #
+        #   (b) The query input is non-zero but every causally-visible
+        #       key row has near-zero K norm (e.g. the SORTED-stage
+        #       argmin-above-integer attention at a query that precedes
+        #       any WALL token).  Without a non-trivial K, Q · K is
+        #       dominated by noise and the softmax is forced uniform.
+        query_active = qi.norm(dim=1) > 1e-3
+        if query_active.any():
+            k_norms = K.norm(dim=1)  # shape (n_pos,)
+            # Cumulative max over causally-visible keys [0..q] inclusive.
+            cumulative_max_k = torch.cummax(k_norms, dim=0).values
+            keys_meaningful = cumulative_max_k > 1e-3
+            query_active = query_active & keys_meaningful
+
         min_hw = max_weights.min().item()
         argmax_positions = weights.argmax(dim=1).tolist()
+        active_count = int(query_active.sum().item())
         print(
             f"  [hardness] {attn_name}: "
             f"min={min_hw:.6f} mean={max_weights.mean().item():.6f} "
             f"(threshold={threshold}, n_pos={n_pos}, "
+            f"active_queries={active_count}, "
             f"selected_positions={argmax_positions})"
         )
 
-        bad = max_weights < threshold
+        bad = (max_weights < threshold) & query_active
         if not bad.any():
             return True, ""
         q = int(bad.nonzero(as_tuple=False)[0].item())
