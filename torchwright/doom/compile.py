@@ -223,7 +223,6 @@ def _build_row(compiled, max_walls, **kwargs):
         "player_y": torch.zeros(1, device=device),
         "render_col": torch.zeros(1, device=device),
         "render_chunk_k": torch.zeros(1, device=device),
-        "render_wall_index": torch.zeros(1, device=device),
         "wall_counter": torch.zeros(1, device=device),
         "tex_col_input": torch.zeros(1, device=device),
         "tex_pixels": torch.zeros(tex_h * 3, device=device),
@@ -512,7 +511,12 @@ def step_frame(
     # detection, no wall-identity patching.
 
     # Output field offsets for trace recording.
-    wi_out_s, _ = out_by_name["render_wall_index"]
+    # Phase A M3: wall identity is no longer an overlaid input; RENDER
+    # reads it from the KV cache via attention.  The SORTED stage still
+    # emits its picked wall index as an overflow field ("sort_wall_index")
+    # so the trace harness can record which wall the transformer chose
+    # at each sort step — this field is host-visible but not fed back.
+    wi_out_s, _ = out_by_name["sort_wall_index"]
     wc_out_s, _ = out_by_name["wall_counter"]
     col_overlay_s, _ = out_by_name["render_col"]
     svhi_out_s, _ = out_by_name["sort_vis_hi"]

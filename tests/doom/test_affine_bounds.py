@@ -285,7 +285,6 @@ def doom_graph():
         render_state_names = {
             "render_col",
             "render_chunk_k",
-            "render_wall_index",
         }
 
         tainted: Set[int] = set()

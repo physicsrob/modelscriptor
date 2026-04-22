@@ -265,7 +265,6 @@ def build_game_graph(
             col=inputs["render_col"],
             chunk_k=inputs["render_chunk_k"],
             wall_counter=inputs["wall_counter"],
-            wall_index=inputs["render_wall_index"],
         ),
         RenderKVInput(
             wall_ax=inputs["wall_ax"],
@@ -282,6 +281,14 @@ def build_game_graph(
             texture_id_e8=inputs["texture_id_e8"],
             tex_pixels=inputs["tex_pixels"],
             tc_onehot_01=tex_col_out.tc_onehot_01,
+            # Phase A M3: wall identity reaches RENDER via attention to
+            # the most recent SORTED position.  No more overlaid
+            # render_wall_index feedback.  Score is the host-fed
+            # ``wall_counter`` (monotonically increasing at SORTED);
+            # validity is is_sorted.
+            wall_counter=inputs["wall_counter"],
+            sorted_wall_index=sorted_out.wall_index,
+            is_sorted=tf["is_sorted"],
         ),
         is_render=tf["is_render"],
         is_wall=tf["is_wall"],
@@ -381,16 +388,16 @@ def _create_inputs(
         value_range=(-max_coord, max_coord),
     )
 
-    # Autoregressive state — 4 bounded integers plus token_type.
+    # Autoregressive state — 3 bounded integers plus token_type.
+    # Phase A M3: render_wall_index is no longer an overlaid input;
+    # RENDER reads the current wall index via attention to the most
+    # recent SORTED position.
     inputs["wall_counter"] = create_input(
         "wall_counter", 1, value_range=(0.0, float(max_walls))
     )
     inputs["render_col"] = create_input("render_col", 1, value_range=(0.0, 255.0))
     inputs["render_chunk_k"] = create_input(
         "render_chunk_k", 1, value_range=(0.0, 20.0)
-    )
-    inputs["render_wall_index"] = create_input(
-        "render_wall_index", 1, value_range=(0.0, float(max_walls - 1))
     )
 
     return inputs
@@ -426,16 +433,24 @@ def _assemble_output(
     """Build the overlaid outputs + overflow outputs.
 
     Overlaid outputs fed back into the next step's input:
-        token_type, render_col, render_chunk_k, wall_counter,
-        render_wall_index
+        token_type, render_col, render_chunk_k, wall_counter
 
-    SORTED sets col + wall_index for the first RENDER token, then
-    outputs token_type = E8_RENDER.  RENDER tokens advance col/chunk_k
-    and output token_type = E8_SORTED_WALL on wall transitions (not done).
+    SORTED sets col for the first RENDER token, then outputs
+    token_type = E8_RENDER.  RENDER tokens advance col/chunk_k and
+    output token_type = E8_SORTED_WALL on wall transitions (not done).
+    Wall identity travels through the KV cache now (Phase A M3): RENDER
+    reads ``sorted_out.wall_index`` from the most-recent SORTED position
+    via ``attend_most_recent_matching``.
 
-    Overflow outputs bitblitted by the host:
+    Overflow outputs bitblitted/inspected by the host:
         pixels, col, start, length, done, advance_wall,
-        sort_done, eos_resolved_x, eos_resolved_y, eos_new_angle
+        sort_done, sort_vis_hi, sort_wall_index,
+        eos_resolved_x, eos_resolved_y, eos_new_angle
+
+    ``sort_wall_index`` is host-visible but not fed back — the trace
+    harness reads it for walkthrough recording and the autoregressive
+    loop doesn't need it as input (RENDER gets its wall identity via
+    attention, not via this field).
     """
     with annotate("output"):
         zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
@@ -469,15 +484,15 @@ def _assemble_output(
             ),
         )
 
-        # render_wall_index: SORTED sets from sort result; RENDER forwards.
-        out_render_wall_index = select(
+        # sort_wall_index: SORTED emits the picked wall index as an
+        # overflow field.  RENDER doesn't forward it (it reads wall
+        # identity from the KV cache via attention).  Only populated at
+        # SORTED positions; zero elsewhere.  Host-visible for the trace
+        # harness, not fed back as input.
+        out_sort_wall_index = select(
             token_flags["is_sorted"],
             sorted_out.wall_index,
-            select(
-                token_flags["is_render"],
-                render_out.next_wall_index,
-                zero_1,
-            ),
+            zero_1,
         )
 
         # --- Token type ---
@@ -515,7 +530,6 @@ def _assemble_output(
         "render_col": out_render_col,
         "render_chunk_k": out_render_chunk_k,
         "wall_counter": out_wall_counter,
-        "render_wall_index": out_render_wall_index,
     }
     overflow = {
         "pixels": out_pixels,
@@ -526,6 +540,7 @@ def _assemble_output(
         "advance_wall": out_advance_wall,
         "sort_done": out_sort_done,
         "sort_vis_hi": out_sort_vis_hi,
+        "sort_wall_index": out_sort_wall_index,
         "eos_resolved_x": out_eos_rx,
         "eos_resolved_y": out_eos_ry,
         "eos_new_angle": out_eos_angle,

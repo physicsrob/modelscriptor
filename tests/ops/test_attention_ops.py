@@ -36,6 +36,7 @@ from torchwright.ops.attention_ops import (
     attend_argmin_unmasked,
     attend_argmin_valid_unmasked,
     attend_mean_where,
+    attend_most_recent_matching,
 )
 
 
@@ -917,3 +918,181 @@ def test_attend_argmax_dot_different_queries_per_position():
     assert abs(result[2].item() - 30.0) < 0.5
     # pos 3 queries col 0 → pos 0 (col 0 = +1, among {0,1,2,3})
     assert abs(result[3].item() - 10.0) < 0.5
+
+
+# ---------------------------------------------------------------------------
+# attend_most_recent_matching
+# ---------------------------------------------------------------------------
+
+
+def test_most_recent_matching_single_match():
+    """When only one causal-window position matches, the output equals
+    that position's value."""
+    pe = _pe()
+    query = InputNode("query", 4, value_range=(-1.0, 1.0))
+    key = InputNode("key", 4, value_range=(-1.0, 1.0))
+    value = InputNode("value", 1, value_range=(-100.0, 100.0))
+    out = attend_most_recent_matching(pe, query, key, value)
+
+    n_pos = 5
+    # One-hot types, only position 2 has type 0.
+    key_in = torch.eye(4)[torch.tensor([1, 2, 0, 3, 1])]
+    # All queries look for type 0.
+    query_in = torch.eye(4)[torch.tensor([0, 0, 0, 0, 0])]
+    value_in = torch.tensor([[10.0], [20.0], [30.0], [40.0], [50.0]])
+
+    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    # From pos 2 onwards, position 2 is the only match → value 30.
+    for p in range(2, n_pos):
+        assert abs(result[p].item() - 30.0) < 1e-2, f"pos {p}: {result[p]}"
+
+
+def test_most_recent_matching_picks_most_recent_of_ties():
+    """With multiple matches, recency breaks the tie."""
+    pe = _pe()
+    query = InputNode("query", 4, value_range=(-1.0, 1.0))
+    key = InputNode("key", 4, value_range=(-1.0, 1.0))
+    value = InputNode("value", 1, value_range=(-100.0, 100.0))
+    out = attend_most_recent_matching(pe, query, key, value)
+
+    n_pos = 6
+    # pos 0,3 = type 0; pos 1,4 = type 1; pos 2,5 = type 2.
+    key_in = torch.eye(4)[torch.tensor([0, 1, 2, 0, 1, 2])]
+    # Each query asks for its own type — so recency matters.
+    query_in = torch.eye(4)[torch.tensor([0, 1, 2, 0, 1, 2])]
+    # Distinct values so tied matches are distinguishable.
+    value_in = torch.tensor([[10.0], [20.0], [30.0], [40.0], [50.0], [60.0]])
+
+    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    # Each position is the most recent match for its own query.
+    expected = torch.tensor([[10.0], [20.0], [30.0], [40.0], [50.0], [60.0]])
+    assert torch.allclose(
+        result, expected, atol=1e-2
+    ), f"got {result.squeeze().tolist()}"
+
+
+def test_most_recent_matching_recency_advances_with_time():
+    """As new matches appear, the attended position advances."""
+    pe = _pe()
+    query = InputNode("query", 4, value_range=(-1.0, 1.0))
+    key = InputNode("key", 4, value_range=(-1.0, 1.0))
+    value = InputNode("value", 1, value_range=(-100.0, 100.0))
+    out = attend_most_recent_matching(pe, query, key, value)
+
+    n_pos = 6
+    # All positions have type 0 — every position matches every query.
+    key_in = torch.eye(4)[torch.tensor([0, 0, 0, 0, 0, 0])]
+    query_in = torch.eye(4)[torch.tensor([0, 0, 0, 0, 0, 0])]
+    value_in = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]])
+
+    # Every query's "most recent match" is the query's own position.
+    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    for p in range(n_pos):
+        assert abs(result[p].item() - float(p + 1)) < 1e-2, f"pos {p}: {result[p]}"
+
+
+def test_most_recent_matching_e8_type_lookup():
+    """Realistic DOOM-style usage: query and key are 10×-scaled E8 codes
+    (from ``index_to_vector``), matching SORTED positions among a mix.
+
+    This is the shape M3 will use: RENDER attends to 'most recent
+    SORTED_WALL' by feeding token_type as key and a literal E8 code as
+    query.  10×-scaled codes have self-dot 1600 and worst off-diagonal
+    ~800; default ``match_gain = 200`` gives a 200·800 = 160000 logit
+    gap between match and worst no-match, plenty to dominate the
+    ~``8·n_pos`` recency swing.
+    """
+    from torchwright.graph.spherical_codes import index_to_vector
+
+    pe = _pe()
+    # Use a few DOOM-used E8 indices.  Only index 3 is treated as "match".
+    TYPES = [1, 3, 5, 7, 3, 4, 3]  # positions 1, 4, 6 are type 3
+    target_e8 = index_to_vector(3)
+
+    query = InputNode("query", 8, value_range=(-20.0, 20.0))
+    key = InputNode("key", 8, value_range=(-20.0, 20.0))
+    value = InputNode("value", 1, value_range=(-100.0, 100.0))
+    out = attend_most_recent_matching(pe, query, key, value)
+
+    n_pos = 7
+    key_in = torch.stack([index_to_vector(t) for t in TYPES])
+    # Every query carries the same target E8 code.
+    query_in = target_e8.unsqueeze(0).expand(n_pos, -1).contiguous()
+    value_in = torch.arange(10.0, 10.0 + n_pos).unsqueeze(1)  # 10, 11, ..., 16
+
+    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    # Type-3 positions: 1, 4, 6.  Their values: 11, 14, 16.
+    # From pos 1→3: most recent match is pos 1 → value 11.
+    # From pos 4→5: most recent match is pos 4 → value 14.
+    # At pos 6: most recent match is pos 6 → value 16.
+    expected_vals = [11.0, 11.0, 11.0, 11.0, 14.0, 14.0, 16.0]
+    # Positions 0 has no match in the causal prefix → soft-average
+    # biased by recency; we don't assert on it.
+    for p in range(1, n_pos):
+        assert (
+            abs(result[p].item() - expected_vals[p]) < 1e-2
+        ), f"pos {p}: got {result[p].item()}, expected {expected_vals[p]}"
+
+
+def test_most_recent_matching_scale_1500_tokens():
+    """Phase A scale derisking: with a ~1500-token causal window and
+    sparse matches (every ~30 positions), the softmax concentrates
+    cleanly on the most recent match.
+
+    This exercises the sizing claim in the docstring — that the
+    ``_QUERY_GAIN · n_pos`` recency swing stays well below the match
+    gap at the default ``match_gain`` with E8-scaled vectors.
+    """
+    from torchwright.graph.spherical_codes import index_to_vector
+
+    pe = _pe()
+    n_pos = 1500
+    match_every = 30  # one match every 30 positions
+    target_e8 = index_to_vector(3)
+    non_target_e8 = index_to_vector(0)
+
+    query = InputNode("query", 8, value_range=(-20.0, 20.0))
+    key = InputNode("key", 8, value_range=(-20.0, 20.0))
+    value = InputNode("value", 1, value_range=(-2000.0, 2000.0))
+    out = attend_most_recent_matching(pe, query, key, value)
+
+    # Place matches at every `match_every`-th position.
+    key_in = torch.stack(
+        [target_e8 if (p % match_every == 0) else non_target_e8 for p in range(n_pos)]
+    )
+    query_in = target_e8.unsqueeze(0).expand(n_pos, -1).contiguous()
+    # Encode position into value so we can verify which one we picked.
+    value_in = torch.arange(0.0, float(n_pos)).unsqueeze(1)
+
+    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    # Check a sample of query positions across the range.
+    for p in (50, 200, 500, 900, 1499):
+        expected_pick = (p // match_every) * match_every
+        got = result[p].item()
+        assert (
+            abs(got - float(expected_pick)) < 1e-1
+        ), f"pos {p}: got {got}, expected {float(expected_pick)}"
+
+
+def test_most_recent_matching_value_wider_than_d_pos():
+    """Value can be wider than the positional encoding — the compiler
+    splits V/O across physical heads, same as ``attend_argmax_dot``."""
+    pe = _pe()  # d_pos = 16
+    query = InputNode("query", 4, value_range=(-1.0, 1.0))
+    key = InputNode("key", 4, value_range=(-1.0, 1.0))
+    # Width 24 > d_pos = 16.
+    value = InputNode("value", 24, value_range=(-100.0, 100.0))
+    out = attend_most_recent_matching(pe, query, key, value)
+
+    n_pos = 3
+    key_in = torch.eye(4)[torch.tensor([0, 1, 0])]
+    query_in = torch.eye(4)[torch.tensor([0, 0, 0])]
+    value_in = torch.arange(0.0, float(n_pos * 24)).reshape(n_pos, 24)
+
+    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    # pos 0: match is pos 0 → value row 0.
+    # pos 1: match is pos 0 → value row 0.
+    # pos 2: match is pos 2 → value row 2.
+    assert torch.allclose(result[0], value_in[0], atol=1e-2)
+    assert torch.allclose(result[1], value_in[0], atol=1e-2)
+    assert torch.allclose(result[2], value_in[2], atol=1e-2)

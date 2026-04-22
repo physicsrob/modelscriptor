@@ -9,7 +9,8 @@ Input schema (per position):
     player_{x,y,angle}, input_* — player state and controls
     wall_{ax,ay,bx,by,tex_id}, wall_index — wall geometry (WALL tokens)
     wall_counter (1) — sort position index for SORTED_WALL / RENDER tokens
-    render_col, render_chunk_k, render_wall_index — RENDER state
+    render_col, render_chunk_k — RENDER state (wall identity is read
+        via attention to the most recent SORTED position)
 
 Output schema: token-type-dependent (see game_graph module docstring).
 

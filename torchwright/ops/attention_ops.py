@@ -1002,3 +1002,183 @@ def attend_argmax_dot(
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt
     )
+
+
+def attend_most_recent_matching(
+    pos_encoding: PosEncoding,
+    query_vector: Node,
+    key_vector: Node,
+    value: Node,
+    *,
+    match_gain: float = 200.0,
+    assert_hardness_gt: Optional[float] = None,
+) -> Node:
+    """Attend to the **most recent** key position whose ``key_vector``
+    matches ``query_vector``.
+
+    At each query position, the attention returns ``value`` at the
+    causal-window position whose dot-product score
+    ``match_gain · (query_vector_j · key_vector_i)`` is largest, with
+    ties broken by position: among positions sharing the maximum dot
+    product, the one with the highest ``position_idx`` wins.  (The
+    position_idx is the raw integer counter stored in PE column
+    ``d_pos - 2``.)
+
+    Combining content match with a recency tiebreak gives the building
+    block that Phase A thinking tokens use to find data in the KV cache
+    — "most recent token of type X" is exactly this op with ``query``
+    as the target type vector and ``key`` as each token's own type
+    vector.
+
+    ``attend_argmax_dot`` does the pure-content-match case but
+    soft-averages across tied keys; this primitive adds the recency
+    tiebreak so a query with multiple matching keys (e.g. all SORTED
+    markers in a rendering loop) still concentrates on exactly one.
+
+    Compile cost: one attention head (auto-split across multiple
+    physical heads when ``d_v > d_head``).
+    ``d_qk = W + 1``, ``d_v = len(value)``.
+
+    **Required invariant on ``match_gain``.**  Callers must set
+    ``match_gain`` such that
+
+        match_gain · (min_match_dot − max_no_match_dot)
+            > _QUERY_GAIN · max_n_pos
+
+    where ``max_n_pos`` is the maximum causal-window length the caller
+    expects to run at.  Without this, a very recent **unmatched**
+    position can outscore a less-recent **matched** one and the op
+    returns the wrong value.
+
+    Quick sizing guide:
+
+    - Unit dot products (one-hot match, ``match_dot=1`` on match,
+      ``0`` off) at ``max_n_pos ≈ 2000``: pick
+      ``match_gain ≥ 20000 + margin`` (e.g. ``30000``).
+    - 10×-scaled E8 codes (``match_dot=1600``, worst off-diagonal
+      ``~800``) at ``max_n_pos ≈ 2000``: the ``800``-unit dot gap gives
+      plenty of headroom even at the default ``match_gain = 200``
+      (``200 · 800 = 160000`` vs ``_QUERY_GAIN · 2000 = 16000``).
+
+    **Softmax concentration within the matched tier.**  The recency
+    term contributes ``_QUERY_GAIN · position_idx`` to the logit.
+    Consecutive matched positions a single position_idx apart produce
+    a logit gap of ``_QUERY_GAIN = 8`` — enough for
+    ``exp(8) ≈ 3000×`` weight concentration on the most recent — so
+    even dense matches resolve cleanly.  Set ``assert_hardness_gt`` if
+    you need runtime enforcement.
+
+    **TF32 caveat.**  On Ampere GPUs (A100), PyTorch's default matmul
+    path uses TF32 (~10-bit mantissa, ~1e-3 relative precision).  When
+    ``match_gain · match_dot`` is large and ``_QUERY_GAIN · max_n_pos``
+    is also large, the sum can exceed the regime where TF32 resolves
+    the recency-tiebreak gap cleanly.  For example, at match_gain=20
+    with 10×-scaled E8 codes (match_dot=1600) and max_n_pos≈1000, the
+    peak logit is ~30000, where TF32 absolute precision ~30 eats the
+    `_QUERY_GAIN = 8` unit-position gap.  If your callsite hits that
+    regime, either (a) use smaller match vectors so the match
+    contribution is ≲ a few thousand, or (b) switch to
+    :func:`attend_argmax_where` with an explicit integer score if one
+    is available at the callsite — its logits stay around
+    ``_VALIDITY_DIRECT ≈ 1000`` where integer-score gaps resolve
+    cleanly on TF32.  (M3 in the DOOM renderer chose option (b).)
+
+    **When no position matches.**  If no causal-window position has
+    ``query_vector · key_vector`` above the unmatched baseline, the
+    attention degrades to pure recency — returning a soft-weighted
+    mean biased toward recent positions.  Callers must ensure at least
+    one matching position exists within the causal window at every
+    query position whose output is consumed, or wrap the result in a
+    ``select`` against a sentinel.
+
+    Args:
+        pos_encoding: The graph's positional encoding node.  Used for
+            the stable Q-side ≈1 signal (slow cosine at column
+            ``d_pos-1``) and the K-side position counter (raw integer
+            at column ``d_pos-2``).
+        query_vector: Width-``W`` node — what we're looking for at
+            each query position.
+        key_vector: Width-``W`` node — the key-side identity at each
+            position.  Same width as ``query_vector``.
+        value: Node to read at the selected key position.  No width
+            constraint — the compiler splits wide V/O across multiple
+            physical heads.
+        match_gain: Coefficient on the dot-product term.  See the
+            invariant above.
+        assert_hardness_gt: If set, wraps the output in a softmax
+            hardness assertion verifying the max attention weight per
+            query exceeds this threshold during ``debug=True`` forward
+            passes.
+
+    Returns:
+        Attn node of width ``len(value)`` equal to ``value`` at the
+        most-recent best-match key position within the causal window.
+
+    See also:
+        :func:`attend_argmax_dot` — same content match without the
+        recency tiebreak (soft-averages across ties).
+        :meth:`PosEncoding.get_prev_value` — the single-bit-condition
+        analogue; superseded by this primitive for multi-dimensional
+        match vectors.
+    """
+    assert len(query_vector) == len(key_vector), (
+        "query_vector and key_vector must have the same width "
+        f"(got {len(query_vector)} and {len(key_vector)})"
+    )
+    W = len(query_vector)
+    d_v = len(value)
+    d_pos = pos_encoding.d_pos
+
+    # d_qk layout:
+    #   cols 0..W-1   content match:   Q = match_gain · query_vector[c],
+    #                                  K = key_vector[c].
+    #                                  Σ = match_gain · (query · key).
+    #   col  W        recency tiebreak: Q = _QUERY_GAIN (from slow-cos ≈1),
+    #                                  K = position_idx (from PE counter).
+    #                                  Σ = _QUERY_GAIN · position_idx.
+    # Value passes through V/O matrices independently of d_qk layout.
+    d_qk = W + 1
+
+    # Both Q and K include the positional encoding alongside their
+    # content vectors so we can project the counter in on the K side
+    # and the stable slow-cos on the Q side from a single Attn call.
+    query_in = Concatenate([query_vector, pos_encoding])
+    key_in = Concatenate([key_vector, pos_encoding])
+
+    # --- Query matrix, shape (W + d_pos, d_qk) ---
+    query_matrix = torch.zeros((W + d_pos, d_qk))
+    # Cols 0..W-1: match_gain · query_vector[c].
+    for c in range(W):
+        query_matrix[c, c] = match_gain
+    # Col W: stable ≈1 from slow-cos at PE row d_pos-1, scaled by
+    # _QUERY_GAIN so unit position gaps produce _QUERY_GAIN-sized
+    # logit gaps — the codebase convention for integer-score signals.
+    # This row lives inside the pos_encoding block, which starts at
+    # row W in query_in.
+    query_matrix[W + (d_pos - 1), W] = _QUERY_GAIN
+
+    # --- Key matrix, shape (W + d_pos, d_qk) ---
+    key_matrix = torch.zeros((W + d_pos, d_qk))
+    # Cols 0..W-1: identity on key_vector[c].
+    for c in range(W):
+        key_matrix[c, c] = 1.0
+    # Col W: raw position counter from PE row d_pos-2 (unit coefficient
+    # on the K side; the gain lives on the Q side).
+    key_matrix[W + (d_pos - 2), W] = 1.0
+
+    # --- Value / Output: identity pass-through on value. ---
+    value_matrix = torch.eye(d_v)
+    output_matrix = torch.eye(d_v)
+
+    attn = Attn(
+        query_in=query_in,
+        key_in=key_in,
+        value_in=value,
+        query_matrix=query_matrix,
+        key_matrix=key_matrix,
+        value_matrix=value_matrix,
+        output_matrix=output_matrix,
+    )
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )

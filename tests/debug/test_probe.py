@@ -314,7 +314,6 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         "wall_bsp_const": torch.tensor([[0.0]]),
         "render_col": torch.tensor([[0.0]]),
         "render_chunk_k": torch.tensor([[0.0]]),
-        "render_wall_index": torch.tensor([[0.0]]),
     }
 
     # The v2 graph has large intermediate values in square_signed and

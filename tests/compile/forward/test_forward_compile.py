@@ -664,3 +664,29 @@ def test_compile_attend_argmax_dot():
         },
         pos_encoding=pos,
     )
+
+
+def test_compile_attend_most_recent_matching():
+    """attend_most_recent_matching — content match + recency tiebreak."""
+    from torchwright.ops.attention_ops import attend_most_recent_matching
+
+    pos = create_pos_encoding()
+    qv = create_input("qv", 4)
+    kv = create_input("kv", 4)
+    value = create_input("value", 3)
+    out = attend_most_recent_matching(pos, qv, kv, value)
+
+    # Construct a small sequence where position 2 and position 4 both
+    # match the query's type; the op must pick position 4 at every
+    # query position ≥ 4 via recency.
+    n_pos = 5
+    key_in = torch.eye(4)[torch.tensor([0, 1, 2, 0, 2])]
+    # Every query asks for type 2.
+    query_in = torch.eye(4)[torch.tensor([2, 2, 2, 2, 2])]
+    value_in = torch.randn(n_pos, 3)
+    _verify(
+        out,
+        n_pos=n_pos,
+        input_values={"qv": query_in, "kv": key_in, "value": value_in},
+        pos_encoding=pos,
+    )

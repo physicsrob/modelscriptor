@@ -61,7 +61,10 @@ from torchwright.ops.arithmetic_ops import (
     sum_nodes,
     thermometer_floor_div,
 )
-from torchwright.ops.attention_ops import attend_argmax_dot
+from torchwright.ops.attention_ops import (
+    attend_argmax_dot,
+    attend_argmax_where,
+)
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.logic_ops import bool_all_true, bool_not, cond_gate
 from torchwright.ops.map_select import in_range, select
@@ -84,12 +87,18 @@ from torchwright.doom.renderer import _textured_column_fill
 
 @dataclass
 class RenderToken:
-    """Four bounded integers — the minimal autoregressive state."""
+    """Three bounded integers — the minimal autoregressive state.
+
+    ``wall_index`` used to live here as a fourth overlaid integer, but
+    Phase A's M3 step moved it into the KV cache: RENDER now reads the
+    current wall index via ``attend_most_recent_matching`` against the
+    most-recent ``E8_SORTED_WALL`` position rather than from an
+    overlaid input slot.
+    """
 
     col: Node  # current screen column (0..W)
     chunk_k: Node  # chunk index within current column (0..ceil(H/cs))
     wall_counter: Node  # how many walls sorted so far (0..max_walls)
-    wall_index: Node  # which wall position being rendered (0..max_walls-1)
 
 
 @dataclass
@@ -116,6 +125,15 @@ class RenderKVInput:
     tex_pixels: Node  # host-fed at TEX_COL positions
     tc_onehot_01: Node  # from TexColKVOutput
 
+    # From SORTED positions.  Phase A M3: wall identity travels through
+    # the KV cache now rather than through an overlaid input.  RENDER
+    # reads ``sorted_wall_index`` via attend_argmax_where on
+    # ``wall_counter`` (SORTED's monotonically-increasing input counter),
+    # gated by ``is_sorted`` so only SORTED positions are eligible.
+    wall_counter: Node  # host-fed integer counter, unique per SORTED
+    sorted_wall_index: Node  # sorted_out.wall_index (valid at SORTED)
+    is_sorted: Node  # ±1 flag: restricts the attention to SORTED keys
+
 
 @dataclass
 class RenderTokenOutput:
@@ -126,7 +144,6 @@ class RenderTokenOutput:
     next_col: Node
     next_chunk_k: Node
     next_wall_counter: Node  # forwarded unchanged
-    next_wall_index: Node  # forwarded unchanged
 
     # Overflow (host reads).
     pixels: Node  # chunk_size * 3 floats
@@ -163,9 +180,38 @@ def build_render(
     tex_w, tex_h = textures[0].shape[0], textures[0].shape[1]
     cs = chunk_size
 
+    with annotate("render/wall_index_attention"):
+        # Pick up the current wall index from the most recent SORTED_WALL
+        # position in the KV cache.  Phase A M3: wall identity is no
+        # longer an overlaid input; it travels through the token stream.
+        #
+        # Mechanism: attend_argmax_where with score = wall_counter (the
+        # host-fed 0..max_walls counter that SORTED increments at each
+        # sort step), validity = is_sorted.  Among causal-window SORTED
+        # positions, max score is the most recent (SORTED_N has
+        # wall_counter = N); RENDER_N naturally resolves to SORTED_N.
+        #
+        # Why not attend_most_recent_matching with E8 type codes?
+        # 10×-scaled E8 self-dot is 1600, pushing match-gain-scaled logits
+        # up to ~30000.  TF32 matmul on A100 (~1e-3 relative precision,
+        # default on Ampere) gives absolute precision ~30 at that
+        # magnitude, which eats the unit-position recency tiebreak
+        # between adjacent SORTED tokens.  attend_argmax_where keeps
+        # logits around _VALIDITY_DIRECT + _QUERY_GAIN · max_score ≈ 1064,
+        # where the _QUERY_GAIN = 8 convention resolves cleanly on
+        # TF32 — the same regime SORTED already runs in.
+        gated_sorted_wall_index = cond_gate(kv.is_sorted, kv.sorted_wall_index)
+        wall_index = attend_argmax_where(
+            pos_encoding=pos_encoding,
+            score=kv.wall_counter,
+            validity=kv.is_sorted,
+            value=gated_sorted_wall_index,
+            assert_hardness_gt=0.99,
+        )
+
     with annotate("render/wall_index_onehot"):
-        wall_index_p1 = add_const(token.wall_index, 1.0)
-        wall_j_onehot = bool_to_01(in_range(token.wall_index, wall_index_p1, max_walls))
+        wall_index_p1 = add_const(wall_index, 1.0)
+        wall_j_onehot = bool_to_01(in_range(wall_index, wall_index_p1, max_walls))
 
     with annotate("render/wall_geom_attention"):
         sel_ax, sel_ay, sel_bx, sel_by, sel_tex_id = _attend_wall_geometry(
@@ -285,7 +331,6 @@ def build_render(
         next_col=next_col,
         next_chunk_k=next_chunk_k,
         next_wall_counter=token.wall_counter,
-        next_wall_index=token.wall_index,
         pixels=pixels,
         active_col=active_col,
         active_start=active_start,
