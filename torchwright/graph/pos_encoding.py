@@ -15,7 +15,6 @@ class PosEncoding(Node):
         return NodeValueType()
 
     def get_pos_encoding(self, n_pos: int):
-        # Compute the positional encodings once in log space.
         pe = torch.zeros((n_pos, self.d_pos))
         div_term = torch.exp(
             torch.arange(0, self.d_pos, 2) * -(math.log(10000.0) / self.d_pos)
@@ -23,6 +22,10 @@ class PosEncoding(Node):
         for pos in range(n_pos):
             pe[pos, 0::2] = torch.sin(pos * div_term)
             pe[pos, 1::2] = torch.cos(pos * div_term)
+        # Replace the slowest sin (column d_pos-2) with a raw integer
+        # position counter.  One Linear extraction gives exact position
+        # indices — no piecewise-linear asin inversion needed.
+        pe[:, self.d_pos - 2] = torch.arange(n_pos, dtype=pe.dtype)
         return pe
 
     def compute(self, n_pos: int, input_values: dict):
@@ -44,36 +47,14 @@ class PosEncoding(Node):
     def get_position_scalar(self, max_pos: int = 2048) -> Node:
         """Recover position index as a 1D scalar node.
 
-        Extracts the slowest-frequency sin component of the positional
-        encoding and applies ``asin`` (via piecewise-linear) to invert
-        it back to position space.  Accurate to within 0.5 for
-        positions 0 through ``max_pos``.
+        Extracts the raw integer counter at column ``d_pos - 2``.
+        Exact for all positions.
         """
         from torchwright.graph.linear import Linear
-        from torchwright.ops.arithmetic_ops import piecewise_linear
 
-        freq = self.slow_sin_freq()
-
-        # Extract the slowest sin component (raw, no scaling)
         weight = torch.zeros(self.d_pos, 1)
         weight[self.d_pos - 2, 0] = 1.0
-        sin_val = Linear(self, weight, name="position_sin")
-
-        # asin correction: pos = asin(sin(pos * freq)) / freq
-        # Quadratic spacing: dense at the top where asin curves,
-        # sparse near zero where sin(x) ≈ x is already accurate.
-        max_sin = math.sin(max_pos * freq) * 1.05  # slight margin
-        n_bp = 18
-        bps = [
-            max_sin * (1.0 - ((n_bp - 1 - k) / (n_bp - 1)) ** 2) for k in range(n_bp)
-        ]
-
-        return piecewise_linear(
-            sin_val,
-            bps,
-            lambda x: math.asin(max(-1.0, min(1.0, x))) / freq,
-            name="position_scalar",
-        )
+        return Linear(self, weight, name="position_scalar")
 
     def attend_to_offset(self, value: Node, delta_pos=-1) -> Node:
         if delta_pos == 0:
@@ -86,11 +67,18 @@ class PosEncoding(Node):
         assert len(value) <= d_head
 
         # key_matrix shape (d_key_in, d_head)
+        delta = get_pos_delta_matrix(delta_pos, self.d_pos)
+        # The last sin/cos pair (columns d_pos-2, d_pos-1) contains the
+        # raw position counter instead of a sinusoid.  Zero it out so the
+        # counter doesn't participate in the trig-identity attention.
+        delta[self.d_pos - 2 :, :] = 0.0
+        delta[:, self.d_pos - 2 :] = 0.0
         key_matrix = torch.zeros((len(self), d_head))
-        key_matrix[:, : self.d_pos] = get_pos_delta_matrix(delta_pos, self.d_pos)
+        key_matrix[:, : self.d_pos] = delta
 
         # query_matrix shape (d_query_in, d_head)
         query_matrix = attention_hardness * torch.eye(len(self), d_head)
+        query_matrix[self.d_pos - 2 :, :] = 0.0
 
         # value_matrix shape (d_value_in, d_head)
         value_matrix = torch.eye(len(value), d_head)
@@ -123,15 +111,19 @@ class PosEncoding(Node):
         assert len(value) <= d_head
         assert len(cond) == 1
 
-        # We'll setup the key matrix such that query * pos_encoding = [(cond + pos[-2]) 0 ... 0]
         # key_matrix shape (d_key_in, d_head)
         key_matrix = torch.zeros((len(key_in), d_head))
         key_matrix[-1, 0] = 1.0  # Cond
-        key_matrix[-3, 0] = 100.0  # 100 * pos[-2]
+        # Column d_pos-2 is the raw position counter.  Scale it by the
+        # old slow-sin frequency so the key contribution matches the
+        # magnitude of the sinusoidal value it replaced.
+        key_matrix[self.d_pos - 2, 0] = 100.0 * self.slow_sin_freq()
 
         # query_matrix shape (d_query_in, d_head)
-        # query_in is self, and the project doesn't really matter as long as it's non-zero.
         query_matrix = attention_hardness * torch.ones(len(self), d_head)
+        # Exclude the counter from the query — its large magnitude
+        # would dominate the sinusoidal position-matching logit.
+        query_matrix[self.d_pos - 2, :] = 0.0
 
         # value_matrix shape (d_value_in, d_head)
         value_matrix = torch.eye(len(value), d_head)

@@ -732,9 +732,13 @@ class TestPosEncodingRule:
         assert pe.node_id in ab.input_ranges
         assert torch.equal(ab.A_lo, torch.eye(8, dtype=torch.float64))
         intervals = ab.to_interval()
-        for iv in intervals:
-            assert iv.lo == pytest.approx(-1.0)
-            assert iv.hi == pytest.approx(1.0)
+        for i, iv in enumerate(intervals):
+            if i == 6:  # d_pos - 2: raw position counter
+                assert iv.lo == pytest.approx(0.0)
+                assert iv.hi == pytest.approx(100000.0)
+            else:
+                assert iv.lo == pytest.approx(-1.0)
+                assert iv.hi == pytest.approx(1.0)
 
 
 class TestAttnRule:

@@ -35,9 +35,9 @@ def test_position_scalar_exhaustive():
     errors = (out - expected).abs()
     max_err = errors.max().item()
     worst_pos = errors.argmax().item()
-    assert max_err < 0.5, (
-        f"position_scalar max error {max_err:.3f} at pos={worst_pos} "
-        f"(got {out[worst_pos].item():.3f}, expected {worst_pos})"
+    assert max_err < 1e-6, (
+        f"position_scalar max error {max_err:.3e} at pos={worst_pos} "
+        f"(got {out[worst_pos].item():.6f}, expected {worst_pos})"
     )
 
 

@@ -36,20 +36,27 @@ def test_attend_to_offset():
 
 
 def test_delta_matrix():
-    delta_matrix = get_pos_delta_matrix(delta_pos=1, d=d_pos)
-    delta_pos_encoding = pos_encoding @ delta_matrix
-    assert torch.allclose(delta_pos_encoding[1:, :], pos_encoding[:-1, :], atol=atol)
+    # The last pair (d_pos-2, d_pos-1) contains the counter — exclude it.
+    s = d_pos - 2
+    delta_matrix = get_pos_delta_matrix(delta_pos=1, d=d_pos)[:s, :s]
+    sin_part = pos_encoding[:, :s]
+    delta_pos_encoding = sin_part @ delta_matrix
+    assert torch.allclose(delta_pos_encoding[1:, :], sin_part[:-1, :], atol=atol)
 
 
 def test_delta_matrix2():
-    delta_matrix = get_pos_delta_matrix(delta_pos=2, d=d_pos)
-    delta_pos_encoding = pos_encoding @ delta_matrix
-    assert torch.allclose(delta_pos_encoding[2:, :], pos_encoding[:-2, :], atol=atol)
+    s = d_pos - 2
+    delta_matrix = get_pos_delta_matrix(delta_pos=2, d=d_pos)[:s, :s]
+    sin_part = pos_encoding[:, :s]
+    delta_pos_encoding = sin_part @ delta_matrix
+    assert torch.allclose(delta_pos_encoding[2:, :], sin_part[:-2, :], atol=atol)
 
 
 def test_delta_matrix_neg():
-    delta_matrix = get_pos_delta_matrix(delta_pos=-1, d=d_pos)
-    delta_pos_encoding = pos_encoding @ delta_matrix
-    assert torch.allclose(delta_pos_encoding[:-1, :], pos_encoding[1:, :], atol=atol)
+    s = d_pos - 2
+    delta_matrix = get_pos_delta_matrix(delta_pos=-1, d=d_pos)[:s, :s]
+    sin_part = pos_encoding[:, :s]
+    delta_pos_encoding = sin_part @ delta_matrix
+    assert torch.allclose(delta_pos_encoding[:-1, :], sin_part[1:, :], atol=atol)
 
-    assert torch.allclose(delta_pos_encoding[1], pos_encoding[2], atol=atol)
+    assert torch.allclose(delta_pos_encoding[1], sin_part[2], atol=atol)

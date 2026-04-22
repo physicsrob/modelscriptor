@@ -38,10 +38,12 @@ def test_placeholder_is_unknown():
     assert n.value_type == NodeValueType.unknown()
 
 
-def test_pos_encoding_bounded_to_pm1():
+def test_pos_encoding_bounded():
     n = PosEncoding(d_pos=8)
     vt = n.value_type
-    assert vt.value_range == Range(-1.0, 1.0)
+    # Sinusoidal columns are [-1, 1]; the counter column (d_pos-2)
+    # has range [0, 100000].  The scalar range is the envelope.
+    assert vt.value_range == Range(-1.0, 100000.0)
 
 
 def test_literal_range():
