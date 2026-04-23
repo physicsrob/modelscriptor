@@ -128,9 +128,9 @@ class TestPipeline:
 
         _, _, trace = run(0.0, 0.0, angle)
 
-        assert trace.eos_resolved_x == pytest.approx(ref.x, abs=0.15)
-        assert trace.eos_resolved_y == pytest.approx(ref.y, abs=0.15)
-        assert trace.eos_new_angle == pytest.approx(float(ref.angle), abs=1.5)
+        assert trace.resolved_x == pytest.approx(ref.x, abs=0.15)
+        assert trace.resolved_y == pytest.approx(ref.y, abs=0.15)
+        assert trace.new_angle == pytest.approx(float(ref.angle), abs=1.5)
 
     @pytest.mark.parametrize("angle", [20, 45, 100, 160, 210])
     def test_eos_state_matches_reference_oblique(self, run, scene, angle):
@@ -140,9 +140,9 @@ class TestPipeline:
 
         _, _, trace = run(0.0, 0.0, angle)
 
-        assert trace.eos_resolved_x == pytest.approx(ref.x, abs=0.15)
-        assert trace.eos_resolved_y == pytest.approx(ref.y, abs=0.15)
-        assert trace.eos_new_angle == pytest.approx(float(ref.angle), abs=1.5)
+        assert trace.resolved_x == pytest.approx(ref.x, abs=0.15)
+        assert trace.resolved_y == pytest.approx(ref.y, abs=0.15)
+        assert trace.new_angle == pytest.approx(float(ref.angle), abs=1.5)
 
     def test_eos_collision_blocks_wall(self, run, scene):
         config, textures, subset, segs = scene
@@ -151,10 +151,8 @@ class TestPipeline:
 
         _, _, trace = run(4.0, 0.0, 0, forward=True)
 
-        assert trace.eos_resolved_x == pytest.approx(ref.x, abs=0.15)
-        assert (
-            trace.eos_resolved_x < 5.0
-        ), f"Passed through wall: x={trace.eos_resolved_x}"
+        assert trace.resolved_x == pytest.approx(ref.x, abs=0.15)
+        assert trace.resolved_x < 5.0, f"Passed through wall: x={trace.resolved_x}"
 
     # ── SORTED boundary ───────────────────────────────────────────
 

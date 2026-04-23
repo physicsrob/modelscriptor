@@ -79,6 +79,7 @@ from torchwright.ops.arithmetic_ops import (
 )
 from torchwright.ops.attention_ops import (
     attend_argmax_dot,
+    attend_mean_where,
     attend_most_recent_matching,
 )
 from torchwright.ops.inout_nodes import create_literal_value
@@ -101,6 +102,7 @@ from torchwright.doom.graph_constants import (
 )
 from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.thinking_readback import (
+    ThinkingReadback,
     build_thinking_readback,
     factor_q_to_embedding,
 )
@@ -215,9 +217,21 @@ class ThinkingWallKVInput:
 
     # From PLAYER broadcasts (pre-collision; collision math needs the
     # player's *intended* movement origin, which is the pre-collision
-    # position).
+    # position).  Post-Part-4: the PLAYER broadcast is pre-collision —
+    # the host feeds pre-collision game_state to PLAYER_X / PLAYER_Y.
     player_x: Node
     player_y: Node
+
+    # From INPUT broadcast (post-turn, pre-collision).  Used by the
+    # RESOLVED_ANGLE identifier — collision doesn't change angle, so
+    # RESOLVED_ANGLE is a pass-through of the post-turn angle.
+    new_angle: Node
+
+    # From WALL positions (per-wall collision flags, aggregated via
+    # attend_mean_where for the RESOLVED_X/RESOLVED_Y identifiers).
+    hit_full: Node  # 1 if the full (vel_dx, vel_dy) ray hit this wall
+    hit_x: Node  # 1 if the x-only ray hit this wall
+    hit_y: Node  # 1 if the y-only ray hit this wall
 
 
 @dataclass
@@ -233,10 +247,18 @@ class ThinkingWallOutput:
     marker, identifier, or value" — used by ``_assemble_output`` to
     decide whether to take this stage's next-token embedding or the
     SORTED/RENDER path.
+
+    ``readback`` is the :class:`ThinkingReadback` instance that
+    thinking-wall built internally.  Exposed so downstream stages
+    (e.g. RENDER) can call ``get_value_after_last(...)`` to retrieve
+    previously-emitted identifier values (e.g. RESOLVED_X/Y) from the
+    KV cache — sharing the instance lets its per-name attention-head
+    cache dedupe queries across stages.
     """
 
     next_token_embedding: Node
     is_thinking_active: Node
+    readback: "ThinkingReadback"
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +449,25 @@ def build_thinking_wall(
         )
 
     # ---------------------------------------------------------------------
+    # RESOLVED computation: aggregate per-WALL collision flags across all
+    # WALL prefill positions via attend_mean_where, then apply the
+    # axis-separated wall-sliding logic from the former EOS stage.
+    # ---------------------------------------------------------------------
+    with annotate("thinking_wall/resolved_compute"):
+        resolved_x, resolved_y, resolved_angle = _compute_resolved(
+            hit_full=kv.hit_full,
+            hit_x=kv.hit_x,
+            hit_y=kv.hit_y,
+            player_x=kv.player_x,
+            player_y=kv.player_y,
+            vel_dx=kv.vel_dx,
+            vel_dy=kv.vel_dy,
+            new_angle=kv.new_angle,
+            is_wall=is_wall,
+            pos_encoding=pos_encoding,
+        )
+
+    # ---------------------------------------------------------------------
     # Derived-value computations.  Build the readback handle first so
     # ``get_value_after_last(...)`` calls route through a shared
     # attention head per identifier name.
@@ -503,9 +544,8 @@ def build_thinking_wall(
         # are no more gates to accumulate through.  Booleans pass
         # through ``bool_to_01`` first so the ±1 input lands as 0/1
         # (already in ``[0, 1]``; no normalization needed but a
-        # uniform path keeps the helper simple).  RESOLVED slots are
-        # stubbed — they don't participate in the factor path below.
-        per_wall_norm_by_slot: dict[int, Node] = {
+        # uniform path keeps the helper simple).
+        norm_by_slot: dict[int, Node] = {
             _SLOT_BSP_RANK: _norm(bsp_rank, "BSP_RANK"),
             _SLOT_IS_RENDERABLE: _norm(bool_to_01(is_renderable), "IS_RENDERABLE"),
             _SLOT_CROSS_A: _norm(cross_a, "CROSS_A"),
@@ -519,6 +559,9 @@ def build_thinking_wall(
             _SLOT_HIT_FULL: _norm(bool_to_01(hit_full), "HIT_FULL"),
             _SLOT_HIT_X: _norm(bool_to_01(hit_x), "HIT_X"),
             _SLOT_HIT_Y: _norm(bool_to_01(hit_y), "HIT_Y"),
+            _SLOT_RESOLVED_X: _norm(resolved_x, "RESOLVED_X"),
+            _SLOT_RESOLVED_Y: _norm(resolved_y, "RESOLVED_Y"),
+            _SLOT_RESOLVED_ANGLE: _norm(resolved_angle, "RESOLVED_ANGLE"),
         }
 
     with annotate("thinking_wall/select_and_factor"):
@@ -527,48 +570,21 @@ def build_thinking_wall(
         # one term is non-zero in the sum.  Each ``cond_gate`` has
         # ``M = 2`` (input range ``[0, 1]``) — small enough to pass
         # the ratchet.  ``sum_nodes`` is a pure Linear (no gate).
-        per_wall_gated_norm = [
-            cond_gate(is_identifier_by_slot[slot], per_wall_norm_by_slot[slot])
-            for slot in sorted(per_wall_norm_by_slot.keys())
+        gated_norm = [
+            cond_gate(is_identifier_by_slot[slot], norm_by_slot[slot])
+            for slot in sorted(norm_by_slot.keys())
         ]
-        n_selected = sum_nodes(per_wall_gated_norm)
+        n_selected = sum_nodes(gated_norm)
         # Scale once from normalized [0, 1] back into q ∈ [0, 65535]
         # for the factor stage.  No more gates after this — the scale
         # is a plain Linear.
         q_selected = multiply_const(n_selected, float(DEFAULT_N_LEVELS - 1))
-        per_wall_emit = factor_q_to_embedding(q_selected, suffix="_id_emit")
-        # Gate to zero at non-per-wall-identifier positions.  At
-        # non-firing positions ``q_selected = 0`` and the factor
-        # produces ``W_EMBED[VALUE_0]``; the gate cleanly suppresses
-        # that so it doesn't leak into the RESOLVED or marker paths.
-        is_any_per_wall_id = bool_any_true(
-            [is_identifier_by_slot[slot] for slot in per_wall_norm_by_slot]
-        )
-        per_wall_contribution = cond_gate(is_any_per_wall_id, per_wall_emit)
-
-    with annotate("thinking_wall/resolved_stubs"):
-        # RESOLVED_X/Y/ANGLE still emit VALUE_0 in Part 3 — real math
-        # lands in Part 4.  Use the VALUE_0 embedding literal directly
-        # rather than routing through the factor path (which would
-        # require staging q_zero through cond_gate with a degenerate
-        # M=0 offset).
-        is_any_resolved_id = bool_any_true(
-            [
-                is_identifier_by_slot[_SLOT_RESOLVED_X],
-                is_identifier_by_slot[_SLOT_RESOLVED_Y],
-                is_identifier_by_slot[_SLOT_RESOLVED_ANGLE],
-            ]
-        )
-        e_value_0_resolved = create_literal_value(
-            embed_lookup("VALUE_0"), name="e_value_0_resolved_stub"
-        )
-        resolved_contribution = cond_gate(is_any_resolved_id, e_value_0_resolved)
-
-        # Combine per-wall and RESOLVED contributions.  At most one is
-        # non-zero at any position (disjoint identifier subsets), so
-        # the sum is exact with peak residual 2×72=144 cols at the
-        # reduction.
-        identifier_emit = sum_nodes([per_wall_contribution, resolved_contribution])
+        emit = factor_q_to_embedding(q_selected, suffix="_id_emit")
+        # Gate to zero at non-identifier positions.  At non-firing
+        # positions ``q_selected = 0`` and the factor produces
+        # ``W_EMBED[VALUE_0]``; the gate cleanly suppresses that so
+        # it doesn't leak into the marker or value paths.
+        identifier_emit = cond_gate(is_any_identifier, emit)
 
     with annotate("thinking_wall/next_token_embedding"):
         next_token_embedding = _compute_next_token_embedding(
@@ -594,6 +610,7 @@ def build_thinking_wall(
     return ThinkingWallOutput(
         next_token_embedding=next_token_embedding,
         is_thinking_active=is_thinking_active,
+        readback=readback,
     )
 
 
@@ -977,6 +994,63 @@ def _endpoint_to_column(
     )
     col_final = select(dot_sign, col_front, col_back, c_tol=_VIS_C_TOL)
     return clamp(col_final, col_lo, col_hi)
+
+
+# ---------------------------------------------------------------------------
+# RESOLVED computation
+# ---------------------------------------------------------------------------
+
+
+def _compute_resolved(
+    *,
+    hit_full: Node,
+    hit_x: Node,
+    hit_y: Node,
+    player_x: Node,
+    player_y: Node,
+    vel_dx: Node,
+    vel_dy: Node,
+    new_angle: Node,
+    is_wall: Node,
+    pos_encoding: PosEncoding,
+):
+    """Axis-separated wall sliding — ported from the former EOS stage.
+
+    Aggregates per-WALL collision flags across WALL prefill positions
+    via ``attend_mean_where``; any per-flag mean above ``1/max_walls``
+    implies at least one wall was hit on that ray.  The resolved
+    position on each axis uses the velocity component if *neither* the
+    full ray nor that axis's lone ray hit anything; otherwise the
+    player stays put on that axis.
+
+    ``new_angle`` passes through unchanged — collision doesn't rotate
+    the player.
+    """
+    hit_full_01 = bool_to_01(hit_full)
+    hit_x_01 = bool_to_01(hit_x)
+    hit_y_01 = bool_to_01(hit_y)
+
+    resolve_attn = attend_mean_where(
+        pos_encoding,
+        validity=is_wall,
+        value=Concatenate([hit_full_01, hit_x_01, hit_y_01]),
+    )
+    avg_hf = extract_from(resolve_attn, 3, 0, 1, "tw_avg_hf")
+    avg_hx = extract_from(resolve_attn, 3, 1, 1, "tw_avg_hx")
+    avg_hy = extract_from(resolve_attn, 3, 2, 1, "tw_avg_hy")
+
+    any_hit_full = compare(avg_hf, 0.05)
+    any_hit_x = compare(avg_hx, 0.05)
+    any_hit_y = compare(avg_hy, 0.05)
+
+    use_new_x = bool_any_true([negate(any_hit_full), negate(any_hit_x)])
+    use_new_y = bool_any_true([negate(any_hit_full), negate(any_hit_y)])
+
+    new_x = add(player_x, vel_dx)
+    new_y = add(player_y, vel_dy)
+    resolved_x = select(use_new_x, new_x, player_x)
+    resolved_y = select(use_new_y, new_y, player_y)
+    return resolved_x, resolved_y, new_angle
 
 
 # ---------------------------------------------------------------------------

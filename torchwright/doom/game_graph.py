@@ -55,9 +55,8 @@ __all__ = [
 ]
 from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.stages.bsp import BspToken, build_bsp
-from torchwright.doom.stages.eos import EosKVInput, EosToken, build_eos
 from torchwright.doom.stages.input import InputToken, build_input
-from torchwright.doom.stages.player import PlayerToken, build_player
+from torchwright.doom.stages.player import PlayerKVInput, PlayerToken, build_player
 from torchwright.doom.stages.render import RenderKVInput, RenderToken, build_render
 from torchwright.doom.stages.sorted import SortedKVInput, SortedToken, build_sorted
 from torchwright.doom.stages.tex_col import TexColToken, build_tex_col
@@ -217,28 +216,20 @@ def build_game_graph(
         max_bsp_nodes=max_bsp_nodes,
     )
 
-    # ---------- EOS ----------
-    eos_out = build_eos(
-        EosToken(
-            player_x=inputs["player_x"],
-            player_y=inputs["player_y"],
-        ),
-        EosKVInput(
-            collision=wall_out.collision,
-            vel_dx=input_out.vel_dx,
-            vel_dy=input_out.vel_dy,
-        ),
-        is_wall=tf["is_wall"],
-        pos_encoding=pos_encoding,
-    )
+    # EOS stage: gutted in Phase A Part 4.  The EOS token remains in
+    # the prompt as an end-of-prompt marker but performs no graph
+    # computation.  Collision resolution moved to the RESOLVED_X /
+    # RESOLVED_Y identifiers in the thinking phase; the post-turn
+    # angle is carried by INPUT's ``new_angle`` broadcast and emitted
+    # at the RESOLVED_ANGLE identifier step.
 
     # ---------- PLAYER ----------
     player_out = build_player(
         PlayerToken(
             player_x=inputs["player_x"],
             player_y=inputs["player_y"],
-            player_angle=inputs["player_angle"],
         ),
+        PlayerKVInput(new_angle=input_out.new_angle),
         is_player_x=tf["is_player_x"],
         is_player_y=tf["is_player_y"],
         is_player_angle=tf["is_player_angle"],
@@ -246,20 +237,15 @@ def build_game_graph(
     )
 
     # ---------- THINKING_WALL ----------
-    # Phase A M4: emits hit_full/hit_x/hit_y per wall as autoregressive
-    # value tokens.  Lives between PLAYER and SORTED in the token stream
-    # but participates in the per-position graph the same way every
-    # other stage does — token-type detectors gate which positions emit.
-    #
-    # Pre-collision player position note: PLAYER tokens currently carry
-    # the EOS-resolved (post-collision) player state, since RENDER needs
-    # post-collision to project the actual on-screen view.  HIT_*
-    # computation, however, needs pre-collision position (the question
-    # is whether this *intended* velocity ray hits anything before
-    # resolution).  We grab pre-collision via the raw ``inputs["player_x"]``
-    # / ``inputs["player_y"]`` slots — the host fills them with
-    # pre-collision values at thinking-token positions (see
-    # ``compile.step_frame``).
+    # Phase A Part 4: the thinking-wall stage now carries the full
+    # 16-identifier state machine including the 3 RESOLVED slots at the
+    # frame boundary.  Pre-collision player position comes from the
+    # PLAYER broadcast (post-Part-4 the PLAYER broadcast is pre-collision
+    # — the host feeds pre-collision game_state to PLAYER_X / PLAYER_Y);
+    # the previous pre-collision bypass at thinking positions is gone.
+    # RESOLVED_X/Y aggregate WALL-stage collision flags via
+    # ``attend_mean_where``; RESOLVED_ANGLE forwards the post-turn angle
+    # from INPUT's broadcast.
     thinking_wall_out = build_thinking_wall(
         ThinkingWallKVInput(
             wall_ax=inputs["wall_ax"],
@@ -274,8 +260,12 @@ def build_game_graph(
             move_cos=input_out.move_cos,
             move_sin=input_out.move_sin,
             side_P_vec=bsp_out.side_P_vec,
-            player_x=inputs["player_x"],
-            player_y=inputs["player_y"],
+            player_x=player_out.px,
+            player_y=player_out.py,
+            new_angle=input_out.new_angle,
+            hit_full=wall_out.collision.hit_full,
+            hit_x=wall_out.collision.hit_x,
+            hit_y=wall_out.collision.hit_y,
         ),
         embedding=embedding,
         is_wall=tf["is_wall"],
@@ -308,6 +298,13 @@ def build_game_graph(
     )
 
     # ---------- RENDER ----------
+    # Phase A Part 4: post-collision (x, y) come from the RESOLVED_X /
+    # RESOLVED_Y thinking tokens via the shared readback helper rather
+    # than the PLAYER broadcast (which is pre-collision now).  cos/sin
+    # still come from PLAYER_ANGLE's broadcast — collision doesn't
+    # change angle.
+    resolved_x_readback = thinking_wall_out.readback.get_value_after_last("RESOLVED_X")
+    resolved_y_readback = thinking_wall_out.readback.get_value_after_last("RESOLVED_Y")
     render_out = build_render(
         RenderToken(
             col=inputs["render_col"],
@@ -322,8 +319,8 @@ def build_game_graph(
             wall_tex_id=inputs["wall_tex_id"],
             wall_vis_hi=wall_out.vis_hi,
             wall_position_onehot=wall_out.position_onehot,
-            player_x=player_out.px,
-            player_y=player_out.py,
+            player_x=resolved_x_readback,
+            player_y=resolved_y_readback,
             player_cos=player_out.cos_theta,
             player_sin=player_out.sin_theta,
             texture_id_e8=inputs["texture_id_e8"],
@@ -354,7 +351,6 @@ def build_game_graph(
     overlaid, overflow = _assemble_output(
         token_flags=tf,
         inputs=inputs,
-        eos_out=eos_out,
         input_out=input_out,
         sorted_out=sorted_out,
         render_out=render_out,
@@ -518,7 +514,6 @@ def _assemble_output(
     *,
     token_flags: Dict[str, Node],
     inputs: Dict[str, Node],
-    eos_out,
     input_out,
     sorted_out,
     render_out,
@@ -535,13 +530,20 @@ def _assemble_output(
         next_token_embedding (72-wide — CompiledToken argmaxes it to
         pick the next ``token_ids`` input),
         pixels, col, start, length, done, advance_wall,
-        sort_done, sort_vis_hi, sort_wall_index,
-        eos_resolved_x, eos_resolved_y, eos_new_angle
+        sort_done, sort_vis_hi, sort_wall_index
 
     ``sort_wall_index`` is host-visible but not fed back — the trace
     harness reads it for walkthrough recording and the autoregressive
     loop doesn't need it as input (RENDER gets its wall identity via
     attention, not via this field).
+
+    Phase A Part 4: the former per-EOS-token overflow outputs for
+    resolved state are gone — collision-resolved state now flows
+    through the RESOLVED_X/Y/ANGLE thinking-token stream, and the
+    host reads it from argmax outputs at known step offsets.  The
+    PLAYER_ANGLE step emits ``THINKING_WALL_0`` as its next-token
+    prediction so the host no longer synthesizes the first thinking
+    token.
     """
     with annotate("output"):
         zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
@@ -594,13 +596,20 @@ def _assemble_output(
         # positions drive the first half of the sequence (marker →
         # identifier → value → ...); at SORTED positions the next token
         # is always RENDER; at RENDER positions it's RENDER or
-        # SORTED_WALL depending on wall-advance state.  Everywhere
-        # else (prompt positions before the autoregressive loop begins)
-        # the emitted value is a don't-care zero — the host never
-        # argmaxes these because it feeds the known prompt tokens
-        # directly.
+        # SORTED_WALL depending on wall-advance state.
+        #
+        # Phase A Part 4: PLAYER_ANGLE's step now emits ``THINKING_WALL_0``
+        # as its next-token prediction so the autoregressive loop picks
+        # it up naturally — the host no longer synthesizes the first
+        # thinking token.  Elsewhere (prompt positions before
+        # PLAYER_ANGLE) the emitted value is a don't-care zero — the
+        # host never argmaxes these because it feeds the known prompt
+        # tokens directly.
         type_render = create_literal_value(
             embed_lookup("RENDER"), name="out_type_render"
+        )
+        type_thinking_wall_0 = create_literal_value(
+            embed_lookup("THINKING_WALL_0"), name="out_type_thinking_wall_0"
         )
         out_next_token_embedding = select(
             thinking_wall_out.is_thinking_active,
@@ -611,7 +620,11 @@ def _assemble_output(
                 select(
                     token_flags["is_render"],
                     render_out.render_next_type,
-                    zero_embedding,
+                    select(
+                        token_flags["is_player_angle"],
+                        type_thinking_wall_0,
+                        zero_embedding,
+                    ),
                 ),
             ),
         )
@@ -627,10 +640,6 @@ def _assemble_output(
 
         out_sort_done = select(token_flags["is_sorted"], sorted_out.sort_done, neg_one)
         out_sort_vis_hi = select(token_flags["is_sorted"], sorted_out.vis_hi, zero_1)
-
-        out_eos_rx = select(token_flags["is_eos"], eos_out.resolved_x, zero_1)
-        out_eos_ry = select(token_flags["is_eos"], eos_out.resolved_y, zero_1)
-        out_eos_angle = select(token_flags["is_eos"], input_out.new_angle, zero_1)
 
     overlaid = {
         "render_col": out_render_col,
@@ -648,8 +657,5 @@ def _assemble_output(
         "sort_done": out_sort_done,
         "sort_vis_hi": out_sort_vis_hi,
         "sort_wall_index": out_sort_wall_index,
-        "eos_resolved_x": out_eos_rx,
-        "eos_resolved_y": out_eos_ry,
-        "eos_new_angle": out_eos_angle,
     }
     return overlaid, overflow

@@ -40,9 +40,9 @@ class RenderStepTrace:
 class FrameTrace:
     """Full trace of one step_frame call."""
 
-    eos_resolved_x: float = 0.0
-    eos_resolved_y: float = 0.0
-    eos_new_angle: float = 0.0
+    resolved_x: float = 0.0
+    resolved_y: float = 0.0
+    new_angle: float = 0.0
     sort_steps: List[SortStepTrace] = field(default_factory=list)
     n_renderable: int = 0
     render_steps: List[RenderStepTrace] = field(default_factory=list)

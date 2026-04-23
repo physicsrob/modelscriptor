@@ -2,15 +2,15 @@
 
 Three token types emitted after EOS, before SORTED:
 
-    PLAYER_X     Broadcasts the resolved x position to all positions.
-    PLAYER_Y     Broadcasts the resolved y position to all positions.
-    PLAYER_ANGLE Looks up cos(θ)/sin(θ) and broadcasts them to all
-                 positions.
+    PLAYER_X     Broadcasts the pre-collision x position to all positions.
+    PLAYER_Y     Broadcasts the pre-collision y position to all positions.
+    PLAYER_ANGLE Looks up cos(θ)/sin(θ) for the post-turn angle and
+                 broadcasts them to all positions.
 
-The host feeds the resolved player state (from EOS overflow outputs)
-as the ``player_x``, ``player_y``, ``player_angle`` inputs at these
-positions.  The broadcasts land in the KV cache so downstream tokens
-(SORTED, RENDER) can read them via attention.
+The host feeds the pre-collision player state as the ``player_x`` and
+``player_y`` inputs.  The ``player_angle`` input at PLAYER_ANGLE is
+ignored by this stage — cos/sin are computed from INPUT's post-turn
+``new_angle`` broadcast so the host never does angle arithmetic.
 """
 
 from dataclasses import dataclass
@@ -29,9 +29,13 @@ from torchwright.doom.renderer import trig_lookup
 
 @dataclass
 class PlayerToken:
-    player_x: Node  # host-fed at PLAYER_X position
-    player_y: Node  # host-fed at PLAYER_Y position
-    player_angle: Node  # host-fed at PLAYER_ANGLE position
+    player_x: Node  # host-fed at PLAYER_X position (pre-collision)
+    player_y: Node  # host-fed at PLAYER_Y position (pre-collision)
+
+
+@dataclass
+class PlayerKVInput:
+    new_angle: Node  # from INPUT's broadcast — post-turn angle
 
 
 @dataclass
@@ -49,6 +53,7 @@ class PlayerKVOutput:
 
 def build_player(
     token: PlayerToken,
+    kv: PlayerKVInput,
     *,
     is_player_x: Node,
     is_player_y: Node,
@@ -68,7 +73,14 @@ def build_player(
             value=token.player_y,
         )
 
-        cos_theta, sin_theta = trig_lookup(token.player_angle)
+        # cos/sin of the post-turn angle.  Sourced from INPUT's
+        # ``new_angle`` broadcast so the host doesn't need to compute
+        # (state.angle + turn_delta) % 256 itself.  The value is
+        # identical at every position (INPUT already broadcast it), so
+        # the PLAYER_ANGLE re-broadcast is semantically a no-op;
+        # keeping the ``attend_mean_where`` hop preserves the stage
+        # boundary and costs only one extra attention layer.
+        cos_theta, sin_theta = trig_lookup(kv.new_angle)
         trig_attn = attend_mean_where(
             pos_encoding,
             validity=is_player_angle,

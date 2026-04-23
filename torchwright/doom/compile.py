@@ -25,7 +25,12 @@ import torch
 
 from torchwright.compiler.token_model import CompiledToken, compile_token
 from torchwright.graph.node import Node
-from torchwright.doom.embedding import V, vocab_id
+from torchwright.doom.embedding import (
+    N_VALUES,
+    V,
+    VALUE_RANGE_BY_NAME,
+    vocab_id,
+)
 from torchwright.doom.game import GameState
 from torchwright.doom.input import PlayerInput
 from torchwright.doom.game_graph import (
@@ -336,12 +341,13 @@ def step_frame(
     past = module.empty_past()
     step = 0
     px, py, angle = float(state.x), float(state.y), float(state.angle)
-    # Pre-collision player position: HIT_* thinking computation needs
-    # the player's intended movement origin, so the host fills the
-    # raw player_x/y bypasses with pre-collision values at
-    # thinking-token positions.  PLAYER's attention broadcast runs on
-    # post-collision state (which RENDER reads).
-    pre_px, pre_py = px, py
+    # Phase A Part 4: the host feeds pre-collision (frame-start)
+    # player_x/y to PLAYER_X / PLAYER_Y; collision resolution now lives
+    # in the thinking phase and the post-collision state is read from
+    # the RESOLVED_X / RESOLVED_Y thinking tokens.  The pre-collision
+    # bypass slot at thinking-token positions is gone — thinking_wall
+    # reads player_x/y from the PLAYER broadcast (which is
+    # pre-collision under the Part 4 semantics).
 
     # Host-visible overlaid bypass names (fields shared between input
     # and output specs).  The host copies each one's value from the
@@ -451,42 +457,36 @@ def step_frame(
     rows.append(_common(token_id=vocab_id("EOS")))
 
     prefill = _stack_inputs(rows)
-    next_ids, overflow, past = _step(prefill, past, 0)
+    _, _, past = _step(prefill, past, 0)
     step = prefill["token_ids"].shape[0]
 
     t_prefill = time.perf_counter() - t0
     print(f"  prefill  {step} steps  kv={_kv_len(past)}  {t_prefill*1000:.0f}ms")
 
-    # Read collision-resolved state from the EOS position (last prefill row).
-    eos_px = overflow["eos_resolved_x"][-1, 0].item()
-    eos_py = overflow["eos_resolved_y"][-1, 0].item()
-    new_angle_raw = overflow["eos_new_angle"][-1, 0].item()
-    px = eos_px
-    py = eos_py
-    angle = new_angle_raw
-
-    if trace is not None:
-        trace.eos_resolved_x = px
-        trace.eos_resolved_y = py
-        trace.eos_new_angle = new_angle_raw
-
     def _next_inputs_from_overflow(next_id_scalar: int, overflow_row: dict) -> dict:
         """Build a single-position inputs dict for the NEXT step.
 
         Copies overlaid bypass fields (render_col, render_chunk_k,
-        wall_counter) from the previous step's overflow.  Fills
-        pre-collision player_x/y (every autoregressive position gets
-        them; only thinking-wall positions actually read them).
+        wall_counter) from the previous step's overflow.  Post-Part-4
+        the thinking-position player_x/y bypass is gone — the graph
+        reads pre-collision player state from the PLAYER broadcast
+        rather than a raw input slot, so default-zero is fine.
         """
-        kwargs: dict = {
-            "player_x": torch.tensor([pre_px]),
-            "player_y": torch.tensor([pre_py]),
-        }
+        kwargs: dict = {}
         for name in overlaid_names:
             kwargs[name] = overflow_row[name][0]  # (width,) 1-D tensor
         return _build_inputs(module, token_id=int(next_id_scalar), **kwargs)
 
     # --- Phase 0b: Player state tokens ---
+    # Host feeds pre-collision (frame-start) px, py to PLAYER_X /
+    # PLAYER_Y.  PLAYER_ANGLE's ``player_angle`` input is ignored by
+    # the player stage under Part 4 (trig is sourced from INPUT's
+    # post-turn ``new_angle`` broadcast instead) — but we still feed
+    # the pre-turn angle here so the declared input range isn't
+    # violated.  PLAYER_ANGLE's next-token argmax yields
+    # ``THINKING_WALL_0`` (the graph emits that at PLAYER_ANGLE
+    # positions), which becomes the first token of the autoregressive
+    # thinking loop — the host no longer synthesizes it.
     t0 = time.perf_counter()
     player_row_x = _build_inputs(
         module,
@@ -509,36 +509,33 @@ def step_frame(
         token_id=vocab_id("PLAYER_ANGLE"),
         player_angle=torch.tensor([angle]),
     )
-    _, _, past = _step(player_row_angle, past, step)
+    next_ids_after_pa, overflow_after_pa, past = _step(player_row_angle, past, step)
     step += 1
+    first_thinking_id = int(next_ids_after_pa[0].item())
 
     t_player = time.perf_counter() - t0
     print(f"  player   3 steps  kv={_kv_len(past)}  {t_player*1000:.0f}ms")
 
     # --- Thinking + Sort + Render (single autoregressive loop) ---
     #
-    # Phase A Part 1: the host injects THINKING_WALL_0 as the first
-    # autoregressive token.  The transformer then drives the full
-    # sequence: thinking tokens (markers, identifiers, values), then
-    # SORTED, then RENDER, until done.  The host loop is identical
-    # across all three phases — copy overlaid bypass overflow back
+    # Phase A Part 4: the PLAYER_ANGLE step emits ``THINKING_WALL_0``
+    # as its next-token prediction (via the graph's next-token-embedding
+    # output at PLAYER_ANGLE positions).  The host no longer
+    # synthesizes the first thinking token — it just feeds the argmaxed
+    # ID back in.  From there the transformer drives the full sequence:
+    # marker → identifier → value → … → RESOLVED_X/Y/ANGLE →
+    # SORTED_WALL → RENDER×k → …, until done.  The host loop is
+    # identical across all phases — copy overlaid bypass overflow back
     # into the next bypass dict, blit pixels for any RENDER positions,
-    # terminate on done/sort_done.  next_token_id at every step comes
-    # from CompiledToken's argmax; the host doesn't introspect further.
+    # terminate on done/sort_done.
 
     t0 = time.perf_counter()
     frame = np.full((H, W, 3), -1.0, dtype=np.float32)
     filled = np.zeros((H, W), dtype=bool)
 
-    prev = _build_inputs(
-        module,
-        token_id=vocab_id("THINKING_WALL_0"),
-        wall_counter=torch.tensor([0.0]),
-        player_x=torch.tensor([pre_px]),
-        player_y=torch.tensor([pre_py]),
-    )
+    prev = _next_inputs_from_overflow(first_thinking_id, overflow_after_pa)
 
-    # Thinking phase budget (Part 2): per wall, 1 marker + 13 identifiers
+    # Thinking phase budget (Part 4): per wall, 1 marker + 13 identifiers
     # + 13 values = 27 steps.  After the last wall, 3 RESOLVED identifiers
     # + 3 RESOLVED values = 6 steps.  Total = max_walls * 27 + 6, plus a
     # small safety margin.
@@ -547,14 +544,11 @@ def step_frame(
     total_steps = 0
     prev_wc = 0.0
     # Capture the token-stream trace as the test sees it: one entry per
-    # autoregressive position T, holding the token the host fed (or
-    # the transformer emitted at T-1) at that position.  The dual-path
-    # test reads log[wall_base + k] for k in {2, 4, 6} to recover the
-    # three VALUE tokens per wall, whose IDs ARE the hit flags.
-    #
-    # Position 0 is the host-fed initial thinking marker; every
-    # subsequent position's ID is the previous step's ``next_ids``.
-    token_id_log: List[int] = [vocab_id("THINKING_WALL_0")]
+    # autoregressive position T, holding the token at that position.
+    # Position 0 is ``THINKING_WALL_0`` (the PLAYER_ANGLE step's
+    # argmax); every subsequent position's ID is the previous step's
+    # ``next_ids``.
+    token_id_log: List[int] = [first_thinking_id]
 
     for k in range(max_steps):
         next_ids, overflow, past = _step(prev, past, step)
@@ -635,7 +629,44 @@ def step_frame(
     if trace is not None:
         trace.token_id_log = token_id_log
 
-    print(f"  resolved state: px={px:.3f} py={py:.3f} angle={angle:.3f}")
+    # Read post-collision (x, y) and post-turn angle from the RESOLVED
+    # thinking tokens.  Under Part 4 the graph emits RESOLVED_X /
+    # RESOLVED_Y / RESOLVED_ANGLE as VALUE tokens in the thinking
+    # stream; the host dequantizes them back to floats using each
+    # identifier's (lo, hi) range.  Thinking phase layout: per wall
+    # offsets 0..26 = 1 marker + 13 id-value pairs; after all walls,
+    # offsets 0..5 of the RESOLVED tail = [X_ID, X_VAL, Y_ID, Y_VAL,
+    # ANGLE_ID, ANGLE_VAL].  So the VALUE positions land at
+    # ``max_walls * 27 + {1, 3, 5}``.
+    def _dequant(token_id: int, name: str) -> float:
+        lo, hi = VALUE_RANGE_BY_NAME[name]
+        q = max(0, min(N_VALUES - 1, int(token_id)))
+        return lo + q * (hi - lo) / float(N_VALUES - 1)
+
+    resolved_x_offset = max_walls * 27 + 1
+    resolved_y_offset = max_walls * 27 + 3
+    resolved_angle_offset = max_walls * 27 + 5
+
+    if len(token_id_log) > resolved_angle_offset:
+        resolved_x = _dequant(token_id_log[resolved_x_offset], "RESOLVED_X")
+        resolved_y = _dequant(token_id_log[resolved_y_offset], "RESOLVED_Y")
+        resolved_angle = _dequant(token_id_log[resolved_angle_offset], "RESOLVED_ANGLE")
+        px = resolved_x
+        py = resolved_y
+        new_angle_raw = resolved_angle
+    else:
+        # The loop exited before reaching the RESOLVED tokens (e.g.
+        # ``stop_after_thinking`` tripped early or a degenerate scene
+        # short-circuited).  Fall back to pre-collision state so
+        # downstream trace/state construction doesn't NaN.
+        new_angle_raw = angle
+
+    if trace is not None:
+        trace.resolved_x = px
+        trace.resolved_y = py
+        trace.new_angle = new_angle_raw
+
+    print(f"  resolved state: px={px:.3f} py={py:.3f} angle={new_angle_raw:.3f}")
 
     # Fill unfilled pixels with ceiling/floor
     # (Known violation of dumb-host principle — rendering logic that

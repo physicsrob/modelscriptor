@@ -344,8 +344,8 @@ class TestThinkingWallDualPath:
             ``VALUE_0`` for false / ``VALUE_65535`` for true under
             uniform 16-bit quantization).
           * 3 RESOLVED identifier positions.
-          * 3 RESOLVED stub VALUE positions (still emit VALUE_0 in
-            Part 3; real math lands in Part 4).
+          * 3 RESOLVED VALUE positions (range-checked only — per-value
+            dual-path checks land in the pipeline tests).
           * 1 SORTED_WALL hand-off position.
 
         The HIT_* values are additionally checked against the pure-
@@ -474,30 +474,27 @@ class TestThinkingWallDualPath:
             vocab_id("RESOLVED_X"),
             "RESOLVED_X identifier",
         )
-        _check(
+        _check_value_range(
             resolved_base + _RESOLVED_X_OFFSET + 1,
-            value_id(0),
-            "RESOLVED_X stub VALUE",
+            "RESOLVED_X VALUE",
         )
         _check(
             resolved_base + _RESOLVED_Y_OFFSET,
             vocab_id("RESOLVED_Y"),
             "RESOLVED_Y identifier",
         )
-        _check(
+        _check_value_range(
             resolved_base + _RESOLVED_Y_OFFSET + 1,
-            value_id(0),
-            "RESOLVED_Y stub VALUE",
+            "RESOLVED_Y VALUE",
         )
         _check(
             resolved_base + _RESOLVED_ANGLE_OFFSET,
             vocab_id("RESOLVED_ANGLE"),
             "RESOLVED_ANGLE identifier",
         )
-        _check(
+        _check_value_range(
             resolved_base + _RESOLVED_ANGLE_OFFSET + 1,
-            value_id(0),
-            "RESOLVED_ANGLE stub VALUE",
+            "RESOLVED_ANGLE VALUE",
         )
 
         # --- SORTED_WALL hand-off. ---
