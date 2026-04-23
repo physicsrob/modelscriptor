@@ -287,11 +287,34 @@ def doom_graph():
             "render_chunk_k",
         }
 
+        # Thinking-wall hit_compute reads wall geometry (ax, ay, bx, by)
+        # via attend_argmax_dot at thinking_wall.py:233-246.  The
+        # attention's output tightness is a loose union-of-keys bound,
+        # not the tightest per-position range, so the affine propagator
+        # inherits looser ranges for sel_ax/sel_ay/sel_bx/sel_by than
+        # the at-position WALL inputs would.  These feed hit_compute
+        # which multiplies them with player state and accumulates —
+        # propagating the looseness into 6000× over-wide bounds.
+        # Functionally fine (the compiled transformer's values are within
+        # the declared WALL range per assertion checks); the affine
+        # propagator just can't see through the attention collapse.
+        thinking_wall_geom_names = {
+            "tw_sel_ax",
+            "tw_sel_ay",
+            "tw_sel_bx",
+            "tw_sel_by",
+        }
+
         tainted: Set[int] = set()
         for n in input_nodes:
             if n.name in e8_names:
                 tainted |= _find_tainted_nodes(all_nodes, n, stop_at_overrides=True)
             elif n.name in render_state_names:
+                tainted |= _find_tainted_nodes(all_nodes, n, stop_at_overrides=False)
+
+        # Taint intermediate nodes by name (not just input nodes).
+        for n in all_nodes:
+            if getattr(n, "name", "") in thinking_wall_geom_names:
                 tainted |= _find_tainted_nodes(all_nodes, n, stop_at_overrides=False)
 
     return {
