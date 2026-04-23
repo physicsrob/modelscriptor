@@ -835,7 +835,19 @@ def _compute_next_state(
     type_render = create_literal_value(E8_RENDER, name="type_render")
     type_sorted = create_literal_value(E8_SORTED_WALL, name="type_sorted_wall")
     advance_not_done = bool_all_true([advance_wall, bool_not(all_walls_done)])
-    render_next_type = select(advance_not_done, type_sorted, type_render)
+    # approximate=False: both branches are fixed E8 literals with
+    # magnitude 30.  In approximate mode, cond drift ε on the order of
+    # 1e-3 gets amplified by M=30 into per-component output drift ~0.03.
+    # That drift feeds back into the next step's input token_type,
+    # pushing d=inp@E8_RENDER-800 in equals_vector into its
+    # [-1, 0] transition zone, which then bleeds across is_render /
+    # is_sorted flags.  Over several hundred RENDER steps this compounds
+    # into the off_center[3,2,20] hang.  The non-approximate mode is
+    # float-exact on the winning branch and immune to cond noise, at the
+    # cost of one extra sublayer in this one op.
+    render_next_type = select(
+        advance_not_done, type_sorted, type_render, approximate=False
+    )
 
     return (
         done_flag,
