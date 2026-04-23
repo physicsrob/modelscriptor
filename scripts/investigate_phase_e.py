@@ -23,13 +23,23 @@ from torchwright.debug.probe import (
     probe_layer_diff,
     probe_residual,
 )
-from torchwright.doom.compile import _build_row
+from torchwright.doom.compile import _build_inputs, _stack_inputs
+from torchwright.doom.embedding import vocab_id
+
+
+def _pack_flat(module, fields: dict) -> torch.Tensor:
+    """Pack a per-field dict into the flat ``(n, d_input)`` tensor shape
+    that ``CompiledHeadless.step`` consumes directly."""
+    n = fields["token_ids"].shape[0]
+    d_input = max(s + w for _, s, w in module._input_specs)
+    out = torch.zeros((n, d_input), dtype=torch.float32)
+    for name, start, width in module._input_specs:
+        if name in fields:
+            out[:, start : start + width] = fields[name]
+    return out
+
+
 from torchwright.doom.game_graph import (
-    E8_BSP_NODE,
-    E8_EOS,
-    E8_INPUT,
-    E8_TEX_COL,
-    E8_WALL,
     TEX_E8_OFFSET,
     build_game_graph,
 )
@@ -216,17 +226,16 @@ def _build_prefill(module, subset, *, px, py, angle):
         for col in range(tex_w):
             pixel_data = subset.textures[tex_idx][col].flatten()
             rows.append(
-                _build_row(
+                _build_inputs(
                     module,
-                    max_walls,
-                    token_type=E8_TEX_COL,
+                    token_id=vocab_id("TEX_COL"),
                     texture_id_e8=tex_e8,
                     tex_col_input=torch.tensor([float(col)]),
                     tex_pixels=torch.tensor(pixel_data, dtype=torch.float32),
                     **common,
                 )
             )
-    rows.append(_build_row(module, max_walls, token_type=E8_INPUT, **common))
+    rows.append(_build_inputs(module, token_id=vocab_id("INPUT"), **common))
     for i in range(max_bsp_nodes):
         onehot = torch.zeros(max_bsp_nodes)
         onehot[i] = 1.0
@@ -236,10 +245,9 @@ def _build_prefill(module, subset, *, px, py, angle):
         else:
             nx, ny, d = 0.0, 0.0, 0.0
         rows.append(
-            _build_row(
+            _build_inputs(
                 module,
-                max_walls,
-                token_type=E8_BSP_NODE,
+                token_id=vocab_id("BSP_NODE"),
                 bsp_plane_nx=torch.tensor([nx], dtype=torch.float32),
                 bsp_plane_ny=torch.tensor([ny], dtype=torch.float32),
                 bsp_plane_d=torch.tensor([d], dtype=torch.float32),
@@ -257,10 +265,9 @@ def _build_prefill(module, subset, *, px, py, angle):
             dtype=torch.float32,
         )
         rows.append(
-            _build_row(
+            _build_inputs(
                 module,
-                max_walls,
-                token_type=E8_WALL,
+                token_id=vocab_id("WALL"),
                 wall_ax=torch.tensor([float(seg.ax)]),
                 wall_ay=torch.tensor([float(seg.ay)]),
                 wall_bx=torch.tensor([float(seg.bx)]),
@@ -272,8 +279,8 @@ def _build_prefill(module, subset, *, px, py, angle):
                 **common,
             )
         )
-    rows.append(_build_row(module, max_walls, token_type=E8_EOS, **common))
-    return torch.cat(rows, dim=0)
+    rows.append(_build_inputs(module, token_id=vocab_id("EOS"), **common))
+    return _stack_inputs(rows)
 
 
 def main():
@@ -352,23 +359,24 @@ def main():
     # Drive prefill -> EOS, then build sort[0] input from scratch.
     print("Running prefill...")
     past = module.empty_past()
+    prefill_flat = _pack_flat(module, prefill)
     with torch.no_grad():
-        pre_out, past = module.step(prefill, past, past_len=0)
-    step = prefill.shape[0]
+        pre_out, past = module.step(prefill_flat, past, past_len=0)
+    step = prefill["token_ids"].shape[0]
 
     d_input = max(s + w for _, s, w in module._input_specs)
     device = module._net.device
 
-    from torchwright.doom.game_graph import E8_SORTED_WALL
-
-    sort0_in = _build_row(
+    sort0_in = _pack_flat(
         module,
-        _MAX_WALLS,
-        token_type=E8_SORTED_WALL,
-        wall_counter=torch.tensor([0.0]),
-        player_x=torch.tensor([3.0]),
-        player_y=torch.tensor([2.0]),
-        player_angle=torch.tensor([20.0]),
+        _build_inputs(
+            module,
+            token_id=vocab_id("SORTED_WALL"),
+            wall_counter=torch.tensor([0.0]),
+            player_x=torch.tensor([3.0]),
+            player_y=torch.tensor([2.0]),
+            player_angle=torch.tensor([20.0]),
+        ),
     )
 
     past_K, past_V = past
@@ -534,12 +542,10 @@ def main():
     )
 
     # Build input_values dict from the prefill for reference_eval.
-    in_by_name = {n: (s, w) for n, s, w in module._input_specs}
-    input_values = {}
-    for name, (s, w) in in_by_name.items():
-        input_values[name] = prefill[:, s : s + w]
+    # ``prefill`` is already the per-field dict produced by ``_stack_inputs``.
+    input_values = dict(prefill)
 
-    n_prefill = prefill.shape[0]
+    n_prefill = prefill["token_ids"].shape[0]
     print(f"\n  Running reference_eval over {n_prefill} prefill positions...")
     try:
         ref_vals = reference_eval(

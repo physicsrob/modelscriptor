@@ -13,49 +13,12 @@ from torchwright.graph.spherical_codes import index_to_vector
 # Token types
 # ---------------------------------------------------------------------------
 
-TOKEN_INPUT = 0
-TOKEN_WALL = 1
-TOKEN_EOS = 2
-TOKEN_SORTED_WALL = 3
-TOKEN_RENDER = 4
-TOKEN_TEX_COL = 5
-TOKEN_BSP_NODE = 7
-TOKEN_PLAYER_X = 240
-TOKEN_PLAYER_Y = 241
-TOKEN_PLAYER_ANGLE = 242
-
-# Phase A M4: thinking-token vocabulary entries.
-#
-# Markers (one per wall, 8 total): TOKEN_THINKING_WALL_BASE..+7.
-# Identifier tokens name the value the next step should compute.
-# A single shared TOKEN_THINKING_VALUE token type tags all value steps;
-# the value-step graph reads "most recent identifier" from the KV cache
-# to decide what to compute and what identifier comes next.
-TOKEN_THINKING_WALL_BASE = 250  # 250..257 for wall 0..7
-TOKEN_HIT_FULL_ID = 258
-TOKEN_HIT_X_ID = 259
-TOKEN_HIT_Y_ID = 260
-TOKEN_THINKING_VALUE = 261
-
-E8_INPUT = index_to_vector(TOKEN_INPUT)
-E8_WALL = index_to_vector(TOKEN_WALL)
-E8_EOS = index_to_vector(TOKEN_EOS)
-E8_SORTED_WALL = index_to_vector(TOKEN_SORTED_WALL)
-E8_RENDER = index_to_vector(TOKEN_RENDER)
-E8_TEX_COL = index_to_vector(TOKEN_TEX_COL)
-E8_BSP_NODE = index_to_vector(TOKEN_BSP_NODE)
-E8_PLAYER_X = index_to_vector(TOKEN_PLAYER_X)
-E8_PLAYER_Y = index_to_vector(TOKEN_PLAYER_Y)
-E8_PLAYER_ANGLE = index_to_vector(TOKEN_PLAYER_ANGLE)
-
-E8_THINKING_WALL = [index_to_vector(TOKEN_THINKING_WALL_BASE + i) for i in range(8)]
-E8_HIT_FULL_ID = index_to_vector(TOKEN_HIT_FULL_ID)
-E8_HIT_X_ID = index_to_vector(TOKEN_HIT_X_ID)
-E8_HIT_Y_ID = index_to_vector(TOKEN_HIT_Y_ID)
-E8_THINKING_VALUE = index_to_vector(TOKEN_THINKING_VALUE)
-
-# Texture E8 codes start at index 8 (after the 8 semantic token types),
-# so texture i maps to ``index_to_vector(8 + i)``.
+# Texture E8 codes live in a dedicated 8-wide bypass slot (not in the
+# embedding).  Texture i is identified by ``index_to_vector(TEX_E8_OFFSET + i)``.
+# The offset historically sat after the 8-wide semantic token type
+# codes used by the pre-Phase-A overlaid carrier; that carrier is gone
+# (token identity is now a vocab ID in the 72-wide embedding leaf) but
+# the texture-bypass layout is retained unchanged.
 TEX_E8_OFFSET = 8
 
 

@@ -37,11 +37,11 @@ _TURN_SPEED = 4
 # Thinking phase layout per wall: 7 autoregressive steps.
 #   step+0: marker (THINKING_WALL_N)
 #   step+1: HIT_FULL_ID
-#   step+2: VALUE for HIT_FULL  ← thinking_value live here
+#   step+2: VALUE for HIT_FULL      ← the token_id at this offset *is* the hit flag
 #   step+3: HIT_X_ID
-#   step+4: VALUE for HIT_X     ← live
+#   step+4: VALUE for HIT_X         ← token_id ∈ {0, 1}
 #   step+5: HIT_Y_ID
-#   step+6: VALUE for HIT_Y     ← live
+#   step+6: VALUE for HIT_Y         ← token_id ∈ {0, 1}
 _STEPS_PER_WALL = 7
 _HF_OFFSET = 2
 _HX_OFFSET = 4
@@ -217,9 +217,9 @@ class TestThinkingWallDualPath:
         _, _, trace, inputs = run(px, py, angle, **inp_kw)
         vx, vy = _player_velocity(angle, inputs)
 
-        log = trace.thinking_value_log
+        log = trace.token_id_log
         assert len(log) >= len(segs) * _STEPS_PER_WALL, (
-            f"Thinking value log too short ({len(log)} < "
+            f"Token ID log too short ({len(log)} < "
             f"{len(segs) * _STEPS_PER_WALL}); thinking phase likely truncated."
         )
 
@@ -227,21 +227,18 @@ class TestThinkingWallDualPath:
         for i, seg in enumerate(segs):
             ref_hf, ref_hx, ref_hy = _ref_hits(seg, px, py, vx, vy)
             base = i * _STEPS_PER_WALL
-            raw_hf = log[base + _HF_OFFSET]
-            raw_hx = log[base + _HX_OFFSET]
-            raw_hy = log[base + _HY_OFFSET]
-            comp_hf = round(raw_hf)
-            comp_hx = round(raw_hx)
-            comp_hy = round(raw_hy)
-            for name, ref, comp, raw in [
-                ("HIT_FULL", ref_hf, comp_hf, raw_hf),
-                ("HIT_X", ref_hx, comp_hx, raw_hx),
-                ("HIT_Y", ref_hy, comp_hy, raw_hy),
+            # At a VALUE position the emitted token ID *is* the hit
+            # flag (VALUE IDs 0 and 1 are native vocab entries).
+            comp_hf = int(log[base + _HF_OFFSET])
+            comp_hx = int(log[base + _HX_OFFSET])
+            comp_hy = int(log[base + _HY_OFFSET])
+            for name, ref, comp in [
+                ("HIT_FULL", ref_hf, comp_hf),
+                ("HIT_X", ref_hx, comp_hx),
+                ("HIT_Y", ref_hy, comp_hy),
             ]:
                 if ref != comp:
-                    mismatches.append(
-                        f"wall {i} {name}: ref={ref}, compiled={comp} (raw={raw:.3f})"
-                    )
+                    mismatches.append(f"wall {i} {name}: ref={ref}, compiled={comp}")
         assert not mismatches, (
             f"Thinking-token HIT_* disagrees with reference at "
             f"(px={px}, py={py}, angle={angle}, inputs={inp_kw}):\n"

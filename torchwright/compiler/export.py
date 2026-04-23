@@ -1226,6 +1226,10 @@ class CompiledHeadless:
     def eval(self) -> "CompiledHeadless":
         return self
 
+    @property
+    def device(self) -> torch.device:
+        return self._net.device
+
     def input_slice(self, name: str, inputs: torch.Tensor) -> torch.Tensor:
         """Return the slice of ``inputs`` for the named input field."""
         for n, s, w in self._input_specs:
@@ -1701,10 +1705,26 @@ def _compile_headless_legacy(
     out_state = net.layers[-1].mlp.out_state
 
     input_nodes_list: List[tuple] = []  # (name, width)
+    declared_names: set = set()
     for node in net.residual_assignment.get_nodes(in_state):
         if isinstance(node, InputNode):
             indices = net.residual_assignment.get_node_indices(in_state, node)
             input_nodes_list.append((node.name, len(indices)))
+            declared_names.add(node.name)
+    # Embedding leaves read their raw token-ID input from
+    # ``input_values[embedding.input_name]`` during get_input_res_stream.
+    # When the user graph doesn't also wire a matching InputNode
+    # (common in tests that only pass the Embedding as part of the
+    # graph without declaring inputs["token_ids"]), the ID slot still
+    # needs an entry in input_specs so CompiledHeadless._build_res_stream
+    # can populate the dict from the flat input tensor.  Allocate a
+    # 1-wide pass-through slot per distinct embedding input_name.
+    from torchwright.graph.embedding import Embedding as _Embedding
+
+    for node in net.residual_assignment.get_nodes(in_state):
+        if isinstance(node, _Embedding) and node.input_name not in declared_names:
+            input_nodes_list.append((node.input_name, 1))
+            declared_names.add(node.input_name)
     input_nodes_list.sort(key=lambda x: x[0])
 
     input_specs: List[tuple] = []

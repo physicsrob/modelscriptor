@@ -46,9 +46,9 @@ class FrameTrace:
     sort_steps: List[SortStepTrace] = field(default_factory=list)
     n_renderable: int = 0
     render_steps: List[RenderStepTrace] = field(default_factory=list)
-    # Phase A M4: thinking-token value outputs, one entry per
-    # autoregressive step (zero except at THINKING_VALUE positions).
-    # Indexed by step number from the start of the autoregressive loop;
-    # the test harness maps indices to (wall_index, hit_field) using the
-    # known marker→ID→VALUE pattern.
-    thinking_value_log: List[float] = field(default_factory=list)
+    # Phase A Part 1: next-token IDs emitted by the transformer, one
+    # entry per autoregressive step (the argmax output from
+    # CompiledToken).  Indexed by step number from the start of the
+    # autoregressive loop; the dual-path test maps indices to
+    # (wall_index, hit_field) via the marker→ID→VALUE pattern.
+    token_id_log: List[int] = field(default_factory=list)

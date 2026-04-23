@@ -8,13 +8,13 @@ Multi-phase autoregressive rollout:
     Phase 1+2 — Sort+Render (interleaved):
         SORTED_WALL → RENDER×k → SORTED_WALL → RENDER×k → ...
 
-The host is a dumb token feeder and pixel bitblitter.  It seeds the
-first SORTED_WALL token, then loops: step the transformer, blit any
-pixels from overflow output, copy overlaid output to next input.  The
-transformer controls the token sequence via the ``token_type`` overlaid
-output — SORTED emits E8_RENDER, RENDER emits E8_SORTED_WALL on wall
-transitions.  The host never inspects token type, never caches wall
-data, never patches inputs.
+The host is a dumb token feeder and pixel bitblitter.  Every
+autoregressive step produces exactly one ``next_token_id`` (argmaxed
+against ``W_EMBED.T`` inside :class:`CompiledToken`), which becomes
+the next step's ``token_ids`` input.  Bypass fields (player state,
+wall geometry, overlaid autoregressive state) flow alongside as a
+separate dict.  The host never inspects token identity, never caches
+wall data, never patches inputs.
 """
 
 import time
@@ -23,26 +23,12 @@ from typing import Iterator, List, Optional, Tuple
 import numpy as np
 import torch
 
-from torchwright.compiler.export import compile_headless
+from torchwright.compiler.token_model import CompiledToken, compile_token
 from torchwright.graph.node import Node
+from torchwright.doom.embedding import V, vocab_id
 from torchwright.doom.game import GameState
 from torchwright.doom.input import PlayerInput
 from torchwright.doom.game_graph import (
-    E8_BSP_NODE,
-    E8_EOS,
-    E8_HIT_FULL_ID,
-    E8_HIT_X_ID,
-    E8_HIT_Y_ID,
-    E8_INPUT,
-    E8_PLAYER_ANGLE,
-    E8_PLAYER_X,
-    E8_PLAYER_Y,
-    E8_RENDER,
-    E8_SORTED_WALL,
-    E8_TEX_COL,
-    E8_THINKING_VALUE,
-    E8_THINKING_WALL,
-    E8_WALL,
     TEX_E8_OFFSET,
     build_game_graph,
 )
@@ -189,8 +175,9 @@ def compile_game(
         assert name not in io, f"overflow name collides with input: {name}"
         io[name] = (None, node)
 
-    module = compile_headless(
+    module = compile_token(
         pos_encoding,
+        graph_io.embedding,
         io=io,
         d=d,
         d_head=d_head,
@@ -205,18 +192,30 @@ def compile_game(
             "overflow_names": list(graph_io.overflow_outputs),
         },
         d_hidden=d_hidden,
+        token_id_input_name="token_ids",
+        logit_output_name="next_token_embedding",
     )
     module.eval()
     return module
 
 
-def _build_row(compiled, max_walls, **kwargs):
-    """Build a (1, d_input) row for module.step()."""
-    device = compiled._net.device
+def _build_inputs(compiled, *, token_id: int, **kwargs) -> dict:
+    """Build a single-position inputs dict for :meth:`CompiledToken.step`.
+
+    ``token_id`` is the integer vocab ID for this position.  Every
+    other bypass field defaults to zero at the module's declared
+    width; pass ``**kwargs`` to override by name.
+
+    ``compiled`` may be a :class:`CompiledToken` or a
+    :class:`CompiledHeadless` — this helper only needs the shared
+    ``device`` / ``metadata`` / ``input_names`` surface, so the
+    annotation stays duck-typed for test / script reuse.
+    """
+    device = compiled.device
     tex_h = int(compiled.metadata.get("tex_h", 8))
-    max_walls_meta = int(compiled.metadata.get("max_walls", 8))
     max_bsp_nodes = int(compiled.metadata.get("max_bsp_nodes", 48))
     defaults = {
+        "token_ids": torch.tensor([float(token_id)], device=device),
         "input_backward": torch.zeros(1, device=device),
         "input_forward": torch.zeros(1, device=device),
         "input_strafe_left": torch.zeros(1, device=device),
@@ -232,35 +231,39 @@ def _build_row(compiled, max_walls, **kwargs):
         "tex_col_input": torch.zeros(1, device=device),
         "tex_pixels": torch.zeros(tex_h * 3, device=device),
         "texture_id_e8": torch.zeros(8, device=device),
-        "token_type": torch.zeros(8, device=device),
         "wall_ax": torch.zeros(1, device=device),
         "wall_ay": torch.zeros(1, device=device),
         "wall_bx": torch.zeros(1, device=device),
         "wall_by": torch.zeros(1, device=device),
         "wall_index": torch.zeros(1, device=device),
         "wall_tex_id": torch.zeros(1, device=device),
-        # BSP-related inputs (zero at positions that don't use them).
         "bsp_plane_nx": torch.zeros(1, device=device),
         "bsp_plane_ny": torch.zeros(1, device=device),
         "bsp_plane_d": torch.zeros(1, device=device),
         "bsp_node_id_onehot": torch.zeros(max_bsp_nodes, device=device),
         "wall_bsp_coeffs": torch.zeros(max_bsp_nodes, device=device),
         "wall_bsp_const": torch.zeros(1, device=device),
-        # Phase A M4: thinking-token value payload.  Carried autoregressively
-        # via overlaid copy from the previous output's thinking_value slot.
-        "thinking_value": torch.zeros(1, device=device),
     }
     defaults.update(kwargs)
-    d_input = max(s + w for _, s, w in compiled._input_specs)
-    row = torch.zeros(1, d_input, device=device)
-    for name, start, width in compiled._input_specs:
+    # Normalise every field to (1, width) float32 on the target device.
+    out: dict = {}
+    for name in compiled.input_names:
         v = defaults[name]
         if isinstance(v, (int, float)):
             v = torch.tensor([v], device=device)
+        v = v.to(device=device, dtype=torch.float32)
         if v.dim() == 1:
             v = v.unsqueeze(0)
-        row[:, start : start + width] = v.to(device)
-    return row
+        out[name] = v
+    return out
+
+
+def _stack_inputs(rows: List[dict]) -> dict:
+    """Concatenate a list of single-position inputs dicts along dim 0."""
+    if not rows:
+        return {}
+    keys = list(rows[0].keys())
+    return {k: torch.cat([r[k] for r in rows], dim=0) for k in keys}
 
 
 def step_frame(
@@ -308,7 +311,6 @@ def step_frame(
     if textures is None:
         textures = subset.textures
 
-    # The prefill loop below iterates walls as dicts; convert once.
     walls = [
         {"ax": s.ax, "ay": s.ay, "bx": s.bx, "by": s.by, "tex_id": float(s.texture_id)}
         for s in subset.segments
@@ -325,33 +327,19 @@ def step_frame(
     past = module.empty_past()
     step = 0
     px, py, angle = float(state.x), float(state.y), float(state.angle)
-    # Phase A M4: keep pre-collision player position around so the host
-    # can feed it to the raw player_x/y slots at thinking-token positions.
-    # PLAYER's broadcast goes post-collision (see step_frame docstring),
-    # but HIT_* computation needs pre-collision.
+    # Pre-collision player position: HIT_* thinking computation needs
+    # the player's intended movement origin, so the host fills the
+    # raw player_x/y bypasses with pre-collision values at
+    # thinking-token positions.  PLAYER's attention broadcast runs on
+    # post-collision state (which RENDER reads).
     pre_px, pre_py = px, py
 
-    # Compute layout from compiled module
-    d_input = max(s + w for _, s, w in module._input_specs)
-    device = module._net.device
-
-    # Field offsets resolved by name — host stays layout-agnostic.
-    in_by_name = {n: (s, w) for n, s, w in module._input_specs}
-    out_by_name = {n: (s, w) for n, s, w in module._output_specs}
-
-    # Output-side offsets in the gathered output tensor
-    pix_out_s, _ = out_by_name["pixels"]
-    col_out_s, _ = out_by_name["col"]
-    start_out_s, _ = out_by_name["start"]
-    length_out_s, _ = out_by_name["length"]
-    done_out_s, _ = out_by_name["done"]
-    sort_done_out_s, _ = out_by_name["sort_done"]
-    eos_rx_out_s, _ = out_by_name["eos_resolved_x"]
-    eos_ry_out_s, _ = out_by_name["eos_resolved_y"]
-    eos_angle_out_s, _ = out_by_name["eos_new_angle"]
-
-    # Overlaid fields: any name appearing in both input and output specs.
-    overlaid_names = [n for n, _s, _w in module._input_specs if n in out_by_name]
+    # Host-visible overlaid bypass names (fields shared between input
+    # and output specs).  The host copies each one's value from the
+    # previous step's overflow back into the next step's bypass dict.
+    input_names = set(module.input_names)
+    output_names = set(module.output_names)
+    overlaid_names = [n for n in module.input_names if n in output_names]
 
     # Player input tensors
     input_kw = dict(
@@ -363,10 +351,10 @@ def step_frame(
         input_strafe_right=torch.tensor([float(inputs.strafe_right)]),
     )
 
-    def _common(**extra):
-        return _build_row(
+    def _common(token_id: int, **extra):
+        return _build_inputs(
             module,
-            max_walls,
+            token_id=token_id,
             player_x=torch.tensor([px]),
             player_y=torch.tensor([py]),
             player_angle=torch.tensor([angle]),
@@ -376,15 +364,15 @@ def step_frame(
     def _kv_len(past):
         return past[0][0].shape[1] if past[0][0].numel() > 0 else 0
 
-    def _step(row, past, step):
+    def _step(inputs_dict, past, step):
         with torch.no_grad():
-            return module.step(row, past, past_len=step)
+            return module.step(inputs_dict, past, past_len=step)
 
     t_frame = time.perf_counter()
 
     # --- Batched prefill: TEX_COL + INPUT + BSP_NODE + WALL + EOS ---
     t0 = time.perf_counter()
-    rows = []
+    rows: List[dict] = []
 
     # TEX_COL × (num_tex × tex_w)
     for tex_idx in range(num_tex):
@@ -393,7 +381,7 @@ def step_frame(
             pixel_data = textures[tex_idx][col].flatten()
             rows.append(
                 _common(
-                    token_type=E8_TEX_COL,
+                    token_id=vocab_id("TEX_COL"),
                     texture_id_e8=tex_e8,
                     tex_col_input=torch.tensor([float(col)]),
                     tex_pixels=torch.tensor(pixel_data, dtype=torch.float32),
@@ -401,7 +389,7 @@ def step_frame(
             )
 
     # INPUT (controls only here)
-    rows.append(_common(token_type=E8_INPUT, **input_kw))
+    rows.append(_common(token_id=vocab_id("INPUT"), **input_kw))
 
     # BSP_NODE × max_bsp_nodes
     for i in range(max_bsp_nodes):
@@ -414,7 +402,7 @@ def step_frame(
             nx, ny, d = 0.0, 0.0, 0.0
         rows.append(
             _common(
-                token_type=E8_BSP_NODE,
+                token_id=vocab_id("BSP_NODE"),
                 bsp_plane_nx=torch.tensor([nx], dtype=torch.float32),
                 bsp_plane_ny=torch.tensor([ny], dtype=torch.float32),
                 bsp_plane_d=torch.tensor([d], dtype=torch.float32),
@@ -438,7 +426,7 @@ def step_frame(
             const = torch.zeros(1, dtype=torch.float32)
         rows.append(
             _common(
-                token_type=E8_WALL,
+                token_id=vocab_id("WALL"),
                 wall_ax=torch.tensor([w["ax"]]),
                 wall_ay=torch.tensor([w["ay"]]),
                 wall_bx=torch.tensor([w["bx"]]),
@@ -451,21 +439,21 @@ def step_frame(
         )
 
     # EOS
-    rows.append(_common(token_type=E8_EOS))
+    rows.append(_common(token_id=vocab_id("EOS")))
 
-    prefill = torch.cat(rows, dim=0)  # (n_prefill, d_input)
-    with torch.no_grad():
-        out, past = module.step(prefill, past, past_len=0)
-    step = prefill.shape[0]
+    prefill = _stack_inputs(rows)
+    next_ids, overflow, past = _step(prefill, past, 0)
+    step = prefill["token_ids"].shape[0]
 
     t_prefill = time.perf_counter() - t0
     print(f"  prefill  {step} steps  kv={_kv_len(past)}  {t_prefill*1000:.0f}ms")
 
-    # Read collision-resolved state from EOS overflow outputs.
-    eos_out = out[-1:]  # (1, d_output)
-    px = eos_out[0, eos_rx_out_s].item()
-    py = eos_out[0, eos_ry_out_s].item()
-    new_angle_raw = eos_out[0, eos_angle_out_s].item()
+    # Read collision-resolved state from the EOS position (last prefill row).
+    eos_px = overflow["eos_resolved_x"][-1, 0].item()
+    eos_py = overflow["eos_resolved_y"][-1, 0].item()
+    new_angle_raw = overflow["eos_new_angle"][-1, 0].item()
+    px = eos_px
+    py = eos_py
     angle = new_angle_raw
 
     if trace is not None:
@@ -473,54 +461,46 @@ def step_frame(
         trace.eos_resolved_y = py
         trace.eos_new_angle = new_angle_raw
 
-    def _out_to_input(raw_out):
-        """Map overlaid output fields to a flat input row.
+    def _next_inputs_from_overflow(next_id_scalar: int, overflow_row: dict) -> dict:
+        """Build a single-position inputs dict for the NEXT step.
 
-        Also fills pre-collision player_x/y in the raw input slots at
-        every autoregressive position.  Thinking-wall reads these at
-        THINKING_VALUE positions for HIT_* computation; SORTED/RENDER
-        ignore them (they read post-collision via the PLAYER broadcast).
+        Copies overlaid bypass fields (render_col, render_chunk_k,
+        wall_counter) from the previous step's overflow.  Fills
+        pre-collision player_x/y (every autoregressive position gets
+        them; only thinking-wall positions actually read them).
         """
-        row = torch.zeros(1, d_input, device=device)
+        kwargs: dict = {
+            "player_x": torch.tensor([pre_px]),
+            "player_y": torch.tensor([pre_py]),
+        }
         for name in overlaid_names:
-            in_s, w = in_by_name[name]
-            out_s, _ = out_by_name[name]
-            row[0, in_s : in_s + w] = raw_out[0, out_s : out_s + w]
-        if "player_x" in in_by_name:
-            ix_s, ix_w = in_by_name["player_x"]
-            row[0, ix_s : ix_s + ix_w] = pre_px
-        if "player_y" in in_by_name:
-            iy_s, iy_w = in_by_name["player_y"]
-            row[0, iy_s : iy_s + iy_w] = pre_py
-        return row
+            kwargs[name] = overflow_row[name][0]  # (width,) 1-D tensor
+        return _build_inputs(module, token_id=int(next_id_scalar), **kwargs)
 
     # --- Phase 0b: Player state tokens ---
     t0 = time.perf_counter()
-    player_row_x = _build_row(
+    player_row_x = _build_inputs(
         module,
-        max_walls,
-        token_type=E8_PLAYER_X,
+        token_id=vocab_id("PLAYER_X"),
         player_x=torch.tensor([px]),
     )
-    out, past = _step(player_row_x, past, step)
+    _, _, past = _step(player_row_x, past, step)
     step += 1
 
-    player_row_y = _build_row(
+    player_row_y = _build_inputs(
         module,
-        max_walls,
-        token_type=E8_PLAYER_Y,
+        token_id=vocab_id("PLAYER_Y"),
         player_y=torch.tensor([py]),
     )
-    out, past = _step(player_row_y, past, step)
+    _, _, past = _step(player_row_y, past, step)
     step += 1
 
-    player_row_angle = _build_row(
+    player_row_angle = _build_inputs(
         module,
-        max_walls,
-        token_type=E8_PLAYER_ANGLE,
+        token_id=vocab_id("PLAYER_ANGLE"),
         player_angle=torch.tensor([angle]),
     )
-    out, past = _step(player_row_angle, past, step)
+    _, _, past = _step(player_row_angle, past, step)
     step += 1
 
     t_player = time.perf_counter() - t0
@@ -528,39 +508,22 @@ def step_frame(
 
     # --- Thinking + Sort + Render (single autoregressive loop) ---
     #
-    # Phase A M4: the host injects THINKING_WALL_0 as the first
+    # Phase A Part 1: the host injects THINKING_WALL_0 as the first
     # autoregressive token.  The transformer then drives the full
     # sequence: thinking tokens (markers, identifiers, values), then
     # SORTED, then RENDER, until done.  The host loop is identical
-    # across all three phases — copy overlaid outputs (_out_to_input),
-    # blit pixels for any RENDER positions, terminate on done/sort_done.
-    #
-    # The transformer controls the token sequence by emitting
-    # next_token_type at every step; the host doesn't introspect.
+    # across all three phases — copy overlaid bypass overflow back
+    # into the next bypass dict, blit pixels for any RENDER positions,
+    # terminate on done/sort_done.  next_token_id at every step comes
+    # from CompiledToken's argmax; the host doesn't introspect further.
 
-    # Output field offsets for trace recording.
-    # Phase A M3: wall identity is no longer an overlaid input; RENDER
-    # reads it from the KV cache via attention.  The SORTED stage still
-    # emits its picked wall index as an overflow field ("sort_wall_index")
-    # so the trace harness can record which wall the transformer chose
-    # at each sort step — this field is host-visible but not fed back.
-    wi_out_s, _ = out_by_name["sort_wall_index"]
-    wc_out_s, _ = out_by_name["wall_counter"]
-    col_overlay_s, _ = out_by_name["render_col"]
-    svhi_out_s, _ = out_by_name["sort_vis_hi"]
-    tv_out_s, _ = out_by_name["thinking_value"]
-    tt_out_s, _ = out_by_name["token_type"]
     t0 = time.perf_counter()
     frame = np.full((H, W, 3), -1.0, dtype=np.float32)
     filled = np.zeros((H, W), dtype=bool)
 
-    # Phase A M4: first autoregressive token is THINKING_WALL_0.
-    # Pre-collision player position is fed via the raw player_x/y slots
-    # (host-side helper feeds pre_px/pre_py).
-    prev = _build_row(
+    prev = _build_inputs(
         module,
-        max_walls,
-        token_type=E8_THINKING_WALL[0],
+        token_id=vocab_id("THINKING_WALL_0"),
         wall_counter=torch.tensor([0.0]),
         player_x=torch.tensor([pre_px]),
         player_y=torch.tensor([pre_py]),
@@ -572,41 +535,42 @@ def step_frame(
     max_steps = n_thinking + N * (W * (H // cs + 1) + 1) + 10
     total_steps = 0
     prev_wc = 0.0
-    # Capture thinking-value outputs by step index for the dual-path
-    # regression test.  Keyed by autoregressive step number; the test
-    # walks the sequence to map values back to (wall_index, hit_field).
-    thinking_value_log = []
+    # Capture the token-stream trace as the test sees it: one entry per
+    # autoregressive position T, holding the token the host fed (or
+    # the transformer emitted at T-1) at that position.  The dual-path
+    # test reads log[wall_base + k] for k in {2, 4, 6} to recover the
+    # three VALUE tokens per wall, whose IDs ARE the hit flags.
+    #
+    # Position 0 is the host-fed initial thinking marker; every
+    # subsequent position's ID is the previous step's ``next_ids``.
+    token_id_log: List[int] = [vocab_id("THINKING_WALL_0")]
 
     for k in range(max_steps):
-        out, past = _step(prev, past, step)
+        next_ids, overflow, past = _step(prev, past, step)
         step += 1
         total_steps += 1
-        raw = out[0].detach().cpu().numpy()
 
-        # Capture thinking_value at every step (zero except at
-        # THINKING_VALUE positions).  Test harness walks the log to map
-        # values back to (wall_index, hit_field) by step index.
-        thinking_value_log.append(float(raw[tv_out_s]))
+        next_id_scalar = int(next_ids[0].item())
+        token_id_log.append(next_id_scalar)
 
-        # Read overflow outputs (zero/neg at non-RENDER positions).
-        col = int(round(raw[col_out_s]))
-        start_y = int(round(raw[start_out_s]))
-        length = int(round(raw[length_out_s]))
-        done = raw[done_out_s]
-        sort_done = raw[sort_done_out_s]
-        pix = raw[pix_out_s : pix_out_s + cs * 3].reshape(cs, 3)
+        col = int(round(overflow["col"][0, 0].item()))
+        start_y = int(round(overflow["start"][0, 0].item()))
+        length = int(round(overflow["length"][0, 0].item()))
+        done = overflow["done"][0, 0].item()
+        sort_done = overflow["sort_done"][0, 0].item()
+        pix = overflow["pixels"][0].detach().cpu().numpy().reshape(cs, 3)
 
         # Trace: detect token type from wall_counter changes.
         # SORTED tokens increment wall_counter; RENDER tokens forward it.
         if trace is not None:
-            cur_wc = raw[wc_out_s]
+            cur_wc = overflow["wall_counter"][0, 0].item()
             if cur_wc > prev_wc + 0.5:
                 # Garbage picks (after sort exhaustion) can produce
                 # nonsensical wall_idx values from soft-averaged
                 # attention; clamp to keep the trace harness from
                 # crashing on np.eye() out-of-bounds.  The next
                 # iteration's done/sort_done check will break the loop.
-                raw_wi = raw[wi_out_s]
+                raw_wi = overflow["sort_wall_index"][0, 0].item()
                 if 0.0 <= raw_wi < max_walls:
                     wall_idx = int(round(raw_wi))
                 else:
@@ -616,8 +580,8 @@ def step_frame(
                         position_index=len(trace.sort_steps),
                         wall_j_onehot=np.eye(max_walls)[wall_idx],
                         selected_wall_index=wall_idx,
-                        vis_lo=raw[col_overlay_s],
-                        vis_hi=raw[svhi_out_s],
+                        vis_lo=overflow["render_col"][0, 0].item(),
+                        vis_hi=overflow["sort_vis_hi"][0, 0].item(),
                         tex_id=0.0,
                         sort_done=sort_done > 0.0,
                     )
@@ -638,7 +602,7 @@ def step_frame(
                 )
             prev_wc = cur_wc
 
-        # Bitblit pixels (length=0 at SORTED positions → no-op).
+        # Bitblit pixels (length=0 at non-RENDER positions → no-op).
         for row_idx in range(length):
             y = start_y + row_idx
             if 0 <= y < H and 0 <= col < W and not filled[y, col]:
@@ -648,10 +612,10 @@ def step_frame(
         if done > 0.0 or sort_done > 0.0:
             break
 
-        prev = _out_to_input(out)
+        prev = _next_inputs_from_overflow(next_id_scalar, overflow)
 
     if trace is not None:
-        trace.thinking_value_log = thinking_value_log
+        trace.token_id_log = token_id_log
 
     print(f"  resolved state: px={px:.3f} py={py:.3f} angle={angle:.3f}")
 

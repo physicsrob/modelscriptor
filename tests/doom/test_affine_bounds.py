@@ -26,12 +26,8 @@ import torch
 
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.debug.probe import reference_eval
+from torchwright.doom.embedding import vocab_id
 from torchwright.doom.game_graph import (
-    E8_BSP_NODE,
-    E8_EOS,
-    E8_INPUT,
-    E8_TEX_COL,
-    E8_WALL,
     TEX_E8_OFFSET,
     build_game_graph,
 )
@@ -131,7 +127,7 @@ def _build_input_values(
     for tex_idx in range(num_tex):
         tex_e8 = index_to_vector(tex_idx + TEX_E8_OFFSET)
         for col in range(tex_w):
-            _set("token_type", p, tex_e8)
+            _set("token_ids", p, float(vocab_id("TEX_COL")))
             _set("texture_id_e8", p, tex_e8)
             _set("tex_col_input", p, float(col))
             pixel_data = textures[tex_idx][col].flatten()
@@ -139,13 +135,13 @@ def _build_input_values(
             _set_common(p)
             p += 1
 
-    _set("token_type", p, E8_INPUT)
+    _set("token_ids", p, float(vocab_id("INPUT")))
     _set("input_forward", p, 1.0)
     _set_common(p)
     p += 1
 
     for i in range(MAX_BSP_NODES):
-        _set("token_type", p, E8_BSP_NODE)
+        _set("token_ids", p, float(vocab_id("BSP_NODE")))
         onehot = torch.zeros(MAX_BSP_NODES)
         onehot[i] = 1.0
         _set("bsp_node_id_onehot", p, onehot)
@@ -158,7 +154,7 @@ def _build_input_values(
         p += 1
 
     for i, seg in enumerate(subset.segments):
-        _set("token_type", p, E8_WALL)
+        _set("token_ids", p, float(vocab_id("WALL")))
         _set("wall_ax", p, seg.ax)
         _set("wall_ay", p, seg.ay)
         _set("wall_bx", p, seg.bx)
@@ -173,7 +169,7 @@ def _build_input_values(
         _set_common(p)
         p += 1
 
-    _set("token_type", p, E8_EOS)
+    _set("token_ids", p, float(vocab_id("EOS")))
     _set_common(p)
     p += 1
 
@@ -275,10 +271,21 @@ def doom_graph():
         )
         output = gio.concat_output()
         all_nodes = get_ancestor_nodes({output, pos_enc})
-        input_nodes = [n for n in all_nodes if isinstance(n, InputNode)]
+        # Include every declared graph input, not just those reachable
+        # from the output — ``token_ids`` is consumed only by the
+        # Embedding leaf and isn't an InputNode ancestor of the output,
+        # but reference_eval still needs a dict entry for it.
+        declared_inputs = {n for n in gio.inputs.values() if isinstance(n, InputNode)}
+        input_nodes = list(
+            {n for n in all_nodes if isinstance(n, InputNode)} | declared_inputs
+        )
 
         # Known input-range mismatches (see module docstring).
-        e8_names = {"token_type", "texture_id_e8"}
+        # ``token_ids`` is an integer in [0, V-1] which propagates to
+        # the Embedding leaf at runtime — the InputNode's 1-wide slot
+        # doesn't itself feed any Linear/ReLU chain, so its declared
+        # range is never exercised by the taint walk.
+        e8_names = {"texture_id_e8"}
         # Render state inputs have over-declared ranges (0-255 for column
         # indices that are really 0-W at runtime).  The full declared range
         # causes spurious bound violations in the state machine.

@@ -70,10 +70,9 @@ from torchwright.ops.logic_ops import bool_all_true, bool_not, cond_gate
 from torchwright.ops.map_select import in_range, select
 from torchwright.reference_renderer.types import RenderConfig
 
+from torchwright.doom.embedding import embed_lookup
 from torchwright.doom.graph_constants import (
     DIFF_BP,
-    E8_RENDER,
-    E8_SORTED_WALL,
     TEX_E8_OFFSET,
     TRIG_BP,
 )
@@ -139,8 +138,10 @@ class RenderKVInput:
 class RenderTokenOutput:
     """Overlay + overflow outputs at RENDER positions."""
 
-    # Overlaid (copied to next input).
-    render_next_type: Node  # 8-wide: E8_SORTED_WALL on advance, E8_RENDER otherwise
+    # 72-wide next-token embedding (goes to _assemble_output as part
+    # of next_token_embedding overflow): embed_lookup("SORTED_WALL")
+    # on wall advance, embed_lookup("RENDER") otherwise.
+    render_next_type: Node
     next_col: Node
     next_chunk_k: Node
     next_wall_counter: Node  # forwarded unchanged
@@ -832,8 +833,10 @@ def _compute_next_state(
     zero_chunk_k = create_literal_value(torch.tensor([0.0]), name="zero_chunk_k")
     next_chunk_k = select(has_more_chunks, chunk_k_plus_1, zero_chunk_k)
 
-    type_render = create_literal_value(E8_RENDER, name="type_render")
-    type_sorted = create_literal_value(E8_SORTED_WALL, name="type_sorted_wall")
+    type_render = create_literal_value(embed_lookup("RENDER"), name="type_render")
+    type_sorted = create_literal_value(
+        embed_lookup("SORTED_WALL"), name="type_sorted_wall"
+    )
     advance_not_done = bool_all_true([advance_wall, bool_not(all_walls_done)])
     # approximate=False: both branches are fixed E8 literals with
     # magnitude 30.  In approximate mode, cond drift ε on the order of

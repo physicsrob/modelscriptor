@@ -282,7 +282,7 @@ def test_probe_clean_on_v2_box_room(tiny_config):
     )
     output_node = graph_io.concat_output()
 
-    from torchwright.doom.game_graph import E8_INPUT
+    from torchwright.doom.embedding import vocab_id
 
     tex_h = textures[0].shape[1]
     input_values = {
@@ -299,7 +299,7 @@ def test_probe_clean_on_v2_box_room(tiny_config):
         "tex_col_input": torch.tensor([[0.0]]),
         "tex_pixels": torch.zeros(1, tex_h * 3),
         "texture_id_e8": torch.zeros(1, 8),
-        "token_type": E8_INPUT.unsqueeze(0),
+        "token_ids": torch.tensor([[float(vocab_id("INPUT"))]]),
         "wall_ax": torch.tensor([[0.0]]),
         "wall_ay": torch.tensor([[0.0]]),
         "wall_bx": torch.tensor([[0.0]]),

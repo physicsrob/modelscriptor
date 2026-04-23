@@ -27,13 +27,9 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import probe_compiled, reference_eval
-from torchwright.doom.compile import _build_row
+from torchwright.doom.compile import _build_inputs, _stack_inputs
+from torchwright.doom.embedding import vocab_id
 from torchwright.doom.game_graph import (
-    E8_BSP_NODE,
-    E8_EOS,
-    E8_INPUT,
-    E8_TEX_COL,
-    E8_WALL,
     TEX_E8_OFFSET,
     build_game_graph,
 )
@@ -87,7 +83,6 @@ def _segments(half=5.0):
 
 
 def _build_prefill(module, subset, *, px, py, angle):
-    max_walls = int(module.metadata["max_walls"])
     max_bsp_nodes = int(module.metadata["max_bsp_nodes"])
     common = dict(
         player_x=torch.tensor([px]),
@@ -101,17 +96,16 @@ def _build_prefill(module, subset, *, px, py, angle):
         for col in range(tex_w):
             pixel_data = subset.textures[tex_idx][col].flatten()
             rows.append(
-                _build_row(
+                _build_inputs(
                     module,
-                    max_walls,
-                    token_type=E8_TEX_COL,
+                    token_id=vocab_id("TEX_COL"),
                     texture_id_e8=tex_e8,
                     tex_col_input=torch.tensor([float(col)]),
                     tex_pixels=torch.tensor(pixel_data, dtype=torch.float32),
                     **common,
                 )
             )
-    rows.append(_build_row(module, max_walls, token_type=E8_INPUT, **common))
+    rows.append(_build_inputs(module, token_id=vocab_id("INPUT"), **common))
     for i in range(max_bsp_nodes):
         onehot = torch.zeros(max_bsp_nodes)
         onehot[i] = 1.0
@@ -121,10 +115,9 @@ def _build_prefill(module, subset, *, px, py, angle):
         else:
             nx, ny, d = 0.0, 0.0, 0.0
         rows.append(
-            _build_row(
+            _build_inputs(
                 module,
-                max_walls,
-                token_type=E8_BSP_NODE,
+                token_id=vocab_id("BSP_NODE"),
                 bsp_plane_nx=torch.tensor([nx], dtype=torch.float32),
                 bsp_plane_ny=torch.tensor([ny], dtype=torch.float32),
                 bsp_plane_d=torch.tensor([d], dtype=torch.float32),
@@ -139,10 +132,9 @@ def _build_prefill(module, subset, *, px, py, angle):
         )
         const = torch.tensor([float(subset.seg_bsp_consts[i])], dtype=torch.float32)
         rows.append(
-            _build_row(
+            _build_inputs(
                 module,
-                max_walls,
-                token_type=E8_WALL,
+                token_id=vocab_id("WALL"),
                 wall_ax=torch.tensor([float(seg.ax)]),
                 wall_ay=torch.tensor([float(seg.ay)]),
                 wall_bx=torch.tensor([float(seg.bx)]),
@@ -154,13 +146,13 @@ def _build_prefill(module, subset, *, px, py, angle):
                 **common,
             )
         )
-    rows.append(_build_row(module, max_walls, token_type=E8_EOS, **common))
-    return torch.cat(rows, dim=0)
+    rows.append(_build_inputs(module, token_id=vocab_id("EOS"), **common))
+    return _stack_inputs(rows)
 
 
 def _input_values_from_prefill(module, prefill):
-    in_by_name = {name: (s, w) for name, s, w in module._input_specs}
-    return {name: prefill[:, s : s + w].clone() for name, (s, w) in in_by_name.items()}
+    # ``prefill`` is already the per-field dict produced by ``_stack_inputs``.
+    return dict(prefill)
 
 
 def _summarize_errors(label, errors):
@@ -304,7 +296,7 @@ def main():
         print(f"\n--- Scene (px={px}, py={py}, angle={angle}) fp32 GPU ---")
         prefill = _build_prefill(module, subset, px=px, py=py, angle=angle)
         input_values = _input_values_from_prefill(module, prefill)
-        n_pos = prefill.shape[0]
+        n_pos = prefill["token_ids"].shape[0]
         # atol=1e9 so first_divergent classification is moot; we want the
         # full per-node distribution, not just divergent ones.
         report = probe_compiled(module, probe_root, input_values, n_pos, atol=1e9)

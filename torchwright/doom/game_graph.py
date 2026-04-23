@@ -6,21 +6,18 @@ Token sequence per frame:
     EOS → PLAYER_X → PLAYER_Y → PLAYER_ANGLE →
     [SORTED_WALL → RENDER×k]×N  (interleaved sort + render)
 
-Token types (E8 spherical codes):
+Token carrier: every position consumes a single integer ``token_ids``
+input and produces a single integer ``next_token_id`` via the
+embedding lookup + argmax head in :class:`CompiledToken`.  Detectors
+for each named category compare the per-position embedding leaf
+against the appropriate ``W_EMBED`` row (see
+``torchwright.doom.embedding``).  Bypasses (wall geometry, player
+state, texture pixels, overlaid autoregressive state) flow through
+separate residual leaves alongside the embedding.
 
-    TEX_COL (5)      Texture column pixel data.
-    INPUT (0)        Player state + movement inputs.
-    BSP_NODE (7)     BSP splitting plane classification.
-    WALL (1)         Wall geometry + BSP rank + visibility.
-    EOS (2)          Collision resolution + state broadcast.
-    PLAYER_X (240)   Broadcast resolved x position.
-    PLAYER_Y (241)   Broadcast resolved y position.
-    PLAYER_ANGLE (242) Broadcast cos(θ)/sin(θ).
-    SORTED_WALL (3)  Autoregressive front-to-back sort.
-    RENDER (4)       Pixel generation (chunked column fill).
-
-Every cross-position data dependency flows through attention.  See each
-stage file for per-stage math.  This module does orchestration only.
+Every cross-position data dependency flows through attention.  See
+each stage file for per-stage math.  This module does orchestration
+only.
 """
 
 from dataclasses import dataclass
@@ -30,6 +27,7 @@ import numpy as np
 import torch
 
 from torchwright.graph import Concatenate, Node, annotate
+from torchwright.graph.embedding import Embedding
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.inout_nodes import (
     create_input,
@@ -40,47 +38,18 @@ from torchwright.ops.logic_ops import bool_any_true, equals_vector
 from torchwright.ops.map_select import select
 from torchwright.reference_renderer.types import RenderConfig
 
-from torchwright.doom.graph_constants import (
-    E8_BSP_NODE,
-    E8_EOS,
-    E8_HIT_FULL_ID,
-    E8_HIT_X_ID,
-    E8_HIT_Y_ID,
-    E8_INPUT,
-    E8_PLAYER_ANGLE,
-    E8_PLAYER_X,
-    E8_PLAYER_Y,
-    E8_RENDER,
-    E8_SORTED_WALL,
-    E8_TEX_COL,
-    E8_THINKING_VALUE,
-    E8_THINKING_WALL,
-    E8_WALL,
-    TEX_E8_OFFSET,
+from torchwright.doom.embedding import (
+    D_EMBED,
+    E8_VALUE,
+    V,
+    build_doom_embedding,
+    embed_lookup,
 )
+from torchwright.doom.graph_constants import TEX_E8_OFFSET
 
-# Re-export token constants for legacy callers that import them from
-# game_graph (compile.py, tooling, tests).  graph_constants is the
-# authoritative definition; these re-exports are just a compatibility
-# surface.
 __all__ = [
     "GameGraphIO",
     "build_game_graph",
-    "E8_INPUT",
-    "E8_WALL",
-    "E8_EOS",
-    "E8_SORTED_WALL",
-    "E8_RENDER",
-    "E8_TEX_COL",
-    "E8_BSP_NODE",
-    "E8_PLAYER_X",
-    "E8_PLAYER_Y",
-    "E8_PLAYER_ANGLE",
-    "E8_THINKING_WALL",
-    "E8_HIT_FULL_ID",
-    "E8_HIT_X_ID",
-    "E8_HIT_Y_ID",
-    "E8_THINKING_VALUE",
     "TEX_E8_OFFSET",
 ]
 from torchwright.doom.graph_utils import extract_from
@@ -107,15 +76,28 @@ class GameGraphIO:
     """Structured return value of :func:`build_game_graph`.
 
     ``inputs`` maps name → input node (host-fed at every position).
-    ``overlaid_outputs`` maps name → output node whose value lands back
-    at the matching input's columns via delta transfer — these carry
-    autoregressive feedback.  ``overflow_outputs`` maps name → output
-    node placed after the input region (pixels + metadata).
+    Includes ``token_ids`` (1-wide integer slot feeding the embedding
+    leaf) plus every bypass field.
+
+    ``overlaid_outputs`` maps name → output node whose value lands
+    back at the matching input's columns via delta transfer — these
+    carry autoregressive bypass feedback (render_col, render_chunk_k,
+    wall_counter).
+
+    ``overflow_outputs`` maps name → output node placed after the
+    input region.  Includes ``next_token_embedding`` (72-wide) which
+    the :class:`CompiledToken` wrapper argmaxes against ``W_EMBED.T``
+    to produce ``next_token_id``.
+
+    ``embedding`` is the :class:`Embedding` leaf hand-wired to read
+    from ``token_ids`` — callers need it to build the
+    :class:`CompiledToken` wrapper.
     """
 
     inputs: Dict[str, Node]
     overlaid_outputs: Dict[str, Node]
     overflow_outputs: Dict[str, Node]
+    embedding: Embedding
 
     def concat_output(self) -> Node:
         """Single concatenated output node for legacy callers."""
@@ -160,7 +142,12 @@ def build_game_graph(
         max_bsp_nodes=max_bsp_nodes,
         max_coord=max_coord,
     )
-    tf = _detect_token_types(inputs["token_type"])
+    # The embedding is the per-position 72-wide residual leaf produced
+    # by looking up ``inputs["token_ids"]`` in ``W_EMBED``.  All
+    # token-type detectors run against this leaf (specific-ID
+    # comparisons or a category-only slice for ``is_thinking_value``).
+    embedding = build_doom_embedding(input_name="token_ids")
+    tf = _detect_token_types(embedding)
 
     # ---------- INPUT ----------
     input_out = build_input(
@@ -372,6 +359,7 @@ def build_game_graph(
             inputs=inputs,
             overlaid_outputs=overlaid,
             overflow_outputs=overflow,
+            embedding=embedding,
         ),
         pos_encoding,
     )
@@ -391,12 +379,16 @@ def _create_inputs(
 ) -> Dict[str, Node]:
     """Create host-fed input nodes.
 
-    No feedback vectors — all state is carried by discrete overlaid
-    fields that the host copies verbatim from output to input.
+    One token-ID slot plus bypass leaves.  Overlaid bypasses
+    (render_col, render_chunk_k, wall_counter) carry autoregressive
+    state via delta-transfer; everything else is prompt-fed.
     """
     inputs: Dict[str, Node] = {}
 
-    inputs["token_type"] = create_input("token_type", 8, value_range=(-30.0, 30.0))
+    # Phase A Part 1: discrete token ID slot (one per position).  The
+    # graph's ``Embedding`` leaf reads this and produces the 72-wide
+    # per-position embedding; detectors run against that.
+    inputs["token_ids"] = create_input("token_ids", 1, value_range=(0.0, float(V - 1)))
     inputs["player_x"] = create_input(
         "player_x", 1, value_range=(-max_coord, max_coord)
     )
@@ -456,48 +448,48 @@ def _create_inputs(
         "render_chunk_k", 1, value_range=(0.0, 20.0)
     )
 
-    # Phase A M4: thinking-token value payload.  At THINKING_VALUE
-    # positions the host re-feeds the previous output's quantized
-    # integer here.  HIT_* values are 0/1, but we keep the wider range
-    # so the same slot can carry M5+ values (cross/dot in [-40, 40],
-    # vis_lo/hi in [-2, 122], etc.) without an IO-surface change.
-    inputs["thinking_value"] = create_input(
-        "thinking_value", 1, value_range=(-128.0, 65535.0)
-    )
-
     return inputs
 
 
-def _detect_token_types(token_type: Node) -> Dict[str, Any]:
-    """Derive per-type boolean flags from the 8-wide token_type vector.
+def _detect_token_types(embedding: Node) -> Dict[str, Any]:
+    """Derive per-type boolean flags from the 72-wide embedding leaf.
 
-    Most entries are ``Node`` booleans, but ``is_thinking_wall_n`` is a
-    ``list[Node]`` — one detector per marker — hence the wider ``Any``
-    value type.
+    Every detector is an ``equals_vector`` against a fixed ``W_EMBED``
+    row (for specific-ID categories) or against the ``E8_VALUE``
+    category code (for the category-only ``is_thinking_value`` — all
+    65,536 VALUE rows share this 8-wide prefix).
+
+    Most entries are ``Node`` booleans, but ``is_thinking_wall_n`` is
+    a ``list[Node]`` — one detector per marker.
     """
     with annotate("token_type"):
         flags: Dict[str, Any] = {
-            "is_input": equals_vector(token_type, E8_INPUT),
-            "is_wall": equals_vector(token_type, E8_WALL),
-            "is_eos": equals_vector(token_type, E8_EOS),
-            "is_sorted": equals_vector(token_type, E8_SORTED_WALL),
-            "is_render": equals_vector(token_type, E8_RENDER),
-            "is_tex_col": equals_vector(token_type, E8_TEX_COL),
-            "is_bsp_node": equals_vector(token_type, E8_BSP_NODE),
-            "is_player_x": equals_vector(token_type, E8_PLAYER_X),
-            "is_player_y": equals_vector(token_type, E8_PLAYER_Y),
-            "is_player_angle": equals_vector(token_type, E8_PLAYER_ANGLE),
-            # Phase A M4: thinking-token detectors.
-            "is_hit_full_id": equals_vector(token_type, E8_HIT_FULL_ID),
-            "is_hit_x_id": equals_vector(token_type, E8_HIT_X_ID),
-            "is_hit_y_id": equals_vector(token_type, E8_HIT_Y_ID),
-            "is_thinking_value": equals_vector(token_type, E8_THINKING_VALUE),
+            "is_input": equals_vector(embedding, embed_lookup("INPUT")),
+            "is_wall": equals_vector(embedding, embed_lookup("WALL")),
+            "is_eos": equals_vector(embedding, embed_lookup("EOS")),
+            "is_sorted": equals_vector(embedding, embed_lookup("SORTED_WALL")),
+            "is_render": equals_vector(embedding, embed_lookup("RENDER")),
+            "is_tex_col": equals_vector(embedding, embed_lookup("TEX_COL")),
+            "is_bsp_node": equals_vector(embedding, embed_lookup("BSP_NODE")),
+            "is_player_x": equals_vector(embedding, embed_lookup("PLAYER_X")),
+            "is_player_y": equals_vector(embedding, embed_lookup("PLAYER_Y")),
+            "is_player_angle": equals_vector(embedding, embed_lookup("PLAYER_ANGLE")),
+            # Phase A M4: thinking-token identifier detectors.
+            "is_hit_full_id": equals_vector(embedding, embed_lookup("HIT_FULL")),
+            "is_hit_x_id": equals_vector(embedding, embed_lookup("HIT_X")),
+            "is_hit_y_id": equals_vector(embedding, embed_lookup("HIT_Y")),
+            # Category-only: any VALUE token (cols [0:8] == E8_VALUE).
+            "is_thinking_value": equals_vector(
+                extract_from(embedding, D_EMBED, 0, 8, "value_category_cols"),
+                E8_VALUE,
+            ),
         }
         # Per-marker detectors (8 walls).  is_thinking_wall_marker is the
         # OR — used as the validity signal in the value step's "find
         # current wall_index" attention.
         is_thinking_wall_n = [
-            equals_vector(token_type, E8_THINKING_WALL[i]) for i in range(8)
+            equals_vector(embedding, embed_lookup(f"THINKING_WALL_{i}"))
+            for i in range(8)
         ]
         flags["is_thinking_wall_n"] = is_thinking_wall_n
         flags["is_thinking_wall_marker"] = bool_any_true(is_thinking_wall_n)
@@ -524,17 +516,13 @@ def _assemble_output(
 ) -> Tuple[Dict[str, Node], Dict[str, Node]]:
     """Build the overlaid outputs + overflow outputs.
 
-    Overlaid outputs fed back into the next step's input:
-        token_type, render_col, render_chunk_k, wall_counter
+    Overlaid outputs fed back into the next step's input (bypass
+    autoregressive state — delta-transferred via matching input slots):
+        render_col, render_chunk_k, wall_counter
 
-    SORTED sets col for the first RENDER token, then outputs
-    token_type = E8_RENDER.  RENDER tokens advance col/chunk_k and
-    output token_type = E8_SORTED_WALL on wall transitions (not done).
-    Wall identity travels through the KV cache now (Phase A M3): RENDER
-    reads ``sorted_out.wall_index`` from the most-recent SORTED position
-    via ``attend_most_recent_matching``.
-
-    Overflow outputs bitblitted/inspected by the host:
+    Overflow outputs (placed after the input region):
+        next_token_embedding (72-wide — CompiledToken argmaxes it to
+        pick the next ``token_ids`` input),
         pixels, col, start, length, done, advance_wall,
         sort_done, sort_vis_hi, sort_wall_index,
         eos_resolved_x, eos_resolved_y, eos_new_angle
@@ -546,7 +534,9 @@ def _assemble_output(
     """
     with annotate("output"):
         zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
-        zero_8 = create_literal_value(torch.zeros(8), name="zero_8")
+        zero_embedding = create_literal_value(
+            torch.zeros(D_EMBED), name="zero_embedding"
+        )
         zero_pixels = create_literal_value(
             torch.zeros(chunk_size * 3),
             name="zero_pixels",
@@ -587,33 +577,32 @@ def _assemble_output(
             zero_1,
         )
 
-        # --- Token type ---
-        # Phase A M4: thinking-token positions emit their own next type
-        # (marker → HIT_FULL_ID, identifier → THINKING_VALUE, value →
-        # next identifier or marker or SORTED).  Outside thinking,
-        # SORTED→RENDER and RENDER→SORTED_WALL/RENDER as before.
-        type_render = create_literal_value(E8_RENDER, name="out_type_render")
-        out_token_type = select(
+        # --- Next-token embedding ---
+        # Phase A Part 1: every position emits the 72-wide embedding of
+        # the next token the transformer should receive.  Thinking
+        # positions drive the first half of the sequence (marker →
+        # identifier → value → ...); at SORTED positions the next token
+        # is always RENDER; at RENDER positions it's RENDER or
+        # SORTED_WALL depending on wall-advance state.  Everywhere
+        # else (prompt positions before the autoregressive loop begins)
+        # the emitted value is a don't-care zero — the host never
+        # argmaxes these because it feeds the known prompt tokens
+        # directly.
+        type_render = create_literal_value(
+            embed_lookup("RENDER"), name="out_type_render"
+        )
+        out_next_token_embedding = select(
             thinking_wall_out.is_thinking_active,
-            thinking_wall_out.next_token_type,
+            thinking_wall_out.next_token_embedding,
             select(
                 token_flags["is_sorted"],
                 type_render,
                 select(
                     token_flags["is_render"],
                     render_out.render_next_type,
-                    zero_8,
+                    zero_embedding,
                 ),
             ),
-        )
-
-        # Phase A M4: thinking_value overlaid output.  Carries the
-        # quantized integer the host re-feeds at the next THINKING_VALUE
-        # input.  Zero at non-VALUE positions.
-        out_thinking_value = select(
-            token_flags["is_thinking_value"],
-            thinking_wall_out.thinking_value,
-            zero_1,
         )
 
         out_pixels = select(token_flags["is_render"], render_out.pixels, zero_pixels)
@@ -633,13 +622,12 @@ def _assemble_output(
         out_eos_angle = select(token_flags["is_eos"], input_out.new_angle, zero_1)
 
     overlaid = {
-        "token_type": out_token_type,
         "render_col": out_render_col,
         "render_chunk_k": out_render_chunk_k,
         "wall_counter": out_wall_counter,
-        "thinking_value": out_thinking_value,
     }
     overflow = {
+        "next_token_embedding": out_next_token_embedding,
         "pixels": out_pixels,
         "col": out_col,
         "start": out_start,

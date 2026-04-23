@@ -41,13 +41,24 @@ from torchwright.debug.probe import (
     probe_residual,
     reference_eval,
 )
-from torchwright.doom.compile import _build_row
+from torchwright.doom.compile import _build_inputs, _stack_inputs
+from torchwright.doom.embedding import vocab_id
+
+
+def _pack_flat(module, fields: dict) -> torch.Tensor:
+    """Pack a per-field dict into a flat ``(n, d_input)`` tensor —
+    the shape ``CompiledHeadless.step`` / ``_run_with_states`` expect
+    before residual packing."""
+    n = fields["token_ids"].shape[0]
+    d_input = max(s + w for _, s, w in module._input_specs)
+    out = torch.zeros((n, d_input), dtype=torch.float32)
+    for name, start, width in module._input_specs:
+        if name in fields:
+            out[:, start : start + width] = fields[name]
+    return out
+
+
 from torchwright.doom.game_graph import (
-    E8_BSP_NODE,
-    E8_EOS,
-    E8_INPUT,
-    E8_TEX_COL,
-    E8_WALL,
     TEX_E8_OFFSET,
     build_game_graph,
 )
@@ -149,17 +160,16 @@ def _build_prefill(module, subset, *, px, py, angle):
         for col in range(tex_w):
             pixel_data = subset.textures[tex_idx][col].flatten()
             rows.append(
-                _build_row(
+                _build_inputs(
                     module,
-                    max_walls,
-                    token_type=E8_TEX_COL,
+                    token_id=vocab_id("TEX_COL"),
                     texture_id_e8=tex_e8,
                     tex_col_input=torch.tensor([float(col)]),
                     tex_pixels=torch.tensor(pixel_data, dtype=torch.float32),
                     **common,
                 )
             )
-    rows.append(_build_row(module, max_walls, token_type=E8_INPUT, **common))
+    rows.append(_build_inputs(module, token_id=vocab_id("INPUT"), **common))
     for i in range(max_bsp_nodes):
         onehot = torch.zeros(max_bsp_nodes)
         onehot[i] = 1.0
@@ -169,10 +179,9 @@ def _build_prefill(module, subset, *, px, py, angle):
         else:
             nx, ny, d = 0.0, 0.0, 0.0
         rows.append(
-            _build_row(
+            _build_inputs(
                 module,
-                max_walls,
-                token_type=E8_BSP_NODE,
+                token_id=vocab_id("BSP_NODE"),
                 bsp_plane_nx=torch.tensor([nx], dtype=torch.float32),
                 bsp_plane_ny=torch.tensor([ny], dtype=torch.float32),
                 bsp_plane_d=torch.tensor([d], dtype=torch.float32),
@@ -190,10 +199,9 @@ def _build_prefill(module, subset, *, px, py, angle):
             dtype=torch.float32,
         )
         rows.append(
-            _build_row(
+            _build_inputs(
                 module,
-                max_walls,
-                token_type=E8_WALL,
+                token_id=vocab_id("WALL"),
                 wall_ax=torch.tensor([float(seg.ax)]),
                 wall_ay=torch.tensor([float(seg.ay)]),
                 wall_bx=torch.tensor([float(seg.bx)]),
@@ -205,8 +213,8 @@ def _build_prefill(module, subset, *, px, py, angle):
                 **common,
             )
         )
-    rows.append(_build_row(module, max_walls, token_type=E8_EOS, **common))
-    return torch.cat(rows, dim=0)
+    rows.append(_build_inputs(module, token_id=vocab_id("EOS"), **common))
+    return _stack_inputs(rows)
 
 
 def _build_labels(subset):
@@ -437,7 +445,8 @@ def main():
     positions_to_show.append(len(labels) - 1)  # EOS
 
     # Compiled values at the read state.
-    _net, _ra, state_tensor = _run_with_states(module, prefill, past_len=0)
+    prefill_flat = _pack_flat(module, prefill)
+    _net, _ra, state_tensor = _run_with_states(module, prefill_flat, past_len=0)
     res_tensor, _ = state_tensor[read_state]
 
     def _extract(node):
@@ -447,16 +456,15 @@ def main():
     compiled_score = _extract(score_node)
     compiled_indicators = _extract(indicators_node)
 
-    # Oracle via reference_eval.
-    in_by_name = {n: (s, w) for n, s, w in module._input_specs}
-    input_values = {}
-    for name, (s, w) in in_by_name.items():
-        input_values[name] = prefill[:, s : s + w]
+    # Oracle via reference_eval.  ``prefill`` is already the per-field
+    # dict produced by ``_stack_inputs``.
+    input_values = dict(prefill)
+    n_prefill = prefill["token_ids"].shape[0]
     try:
         ref = reference_eval(
             Concatenate([score_node, indicators_node]),
             input_values,
-            n_pos=prefill.shape[0],
+            n_pos=n_prefill,
         )
         oracle_score = ref[score_node]
         oracle_indicators = ref[indicators_node]
@@ -516,7 +524,7 @@ def main():
         module,
         probe_root,
         input_values,
-        n_pos=prefill.shape[0],
+        n_pos=n_prefill,
         atol=1e-4,
     )
     print(f"  nodes checked: {len(report.nodes_checked)}")
@@ -632,20 +640,16 @@ def main():
     # The residual_assignment links are pickled into the deepcopy so we
     # can just rerun probe_compiled.  Use a fresh prefill in float64 so
     # the input matches.
-    prefill_cpu_f64 = prefill.to(device="cpu", dtype=torch.float64)
-    # Monkey-patch module_cpu to expose the new float64 prefill.  We
-    # pass it through input_values as float64 so reference_eval also
-    # runs in float64 (for bit-identical comparison).
+    # ``prefill`` is the per-field dict; cast each field to fp64.
     input_values_f64 = {
-        name: prefill_cpu_f64[:, s : s + w].to(torch.float64)
-        for name, (s, w) in in_by_name.items()
+        name: v.to(device="cpu", dtype=torch.float64) for name, v in prefill.items()
     }
     try:
         report_f64 = probe_compiled(
             module_cpu,
             probe_root,
             input_values_f64,
-            n_pos=prefill.shape[0],
+            n_pos=n_prefill,
             atol=1e-8,
         )
     finally:
@@ -685,9 +689,9 @@ def main():
         oracle_fp32 = reference_eval(
             side_P_vec_node,
             input_values,
-            n_pos=prefill.shape[0],
+            n_pos=n_prefill,
         ).get(side_P_vec_node)
-        compiled_fp32 = probe_residual(module, prefill, side_P_vec_node)
+        compiled_fp32 = probe_residual(module, prefill_flat, side_P_vec_node)
         # Pick any layer where side_P_vec is materialised.
         if not compiled_fp32.per_layer:
             print("  (side_P_vec not materialised in any captured state)")
