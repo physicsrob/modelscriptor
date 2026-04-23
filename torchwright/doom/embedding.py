@@ -261,6 +261,48 @@ IDENTIFIER_NAMES: List[str] = list(_PER_WALL_IDENTIFIERS) + list(_RESOLVED_IDENT
 assert len(IDENTIFIER_NAMES) == 16
 
 
+# Float range of every identifier's VALUE payload.  The producing
+# identifier step runs ``quantize_to_range(value, lo, hi)`` to convert
+# its float into a continuous float in ``[0, N_VALUES - 1]``; the
+# consuming step runs ``dequantize_from_range(q, lo, hi)`` to get back
+# the float.  Single LSB == (hi - lo) / (N_VALUES - 1) per design-doc
+# table (``docs/design_byte_token_renderer_phase_a.md``).
+#
+# For integer-valued ranges (BSP_RANK 0..7; 0/1 booleans for
+# IS_RENDERABLE / HIT_*; 0..255 for RESOLVED_ANGLE), the identifier
+# step emits a specific VALUE_k row directly rather than going through
+# the generic quantize → factored-one-hot encoder; the (lo, hi)
+# entries here still describe the conceptual range so the readback
+# helper decodes VALUE_k back to the correct float via a single
+# Linear.
+VALUE_RANGE_BY_NAME: Dict[str, tuple[float, float]] = {
+    "BSP_RANK": (0.0, 7.0),
+    "IS_RENDERABLE": (0.0, 1.0),
+    "CROSS_A": (-40.0, 40.0),
+    "DOT_A": (-40.0, 40.0),
+    "CROSS_B": (-40.0, 40.0),
+    "DOT_B": (-40.0, 40.0),
+    "T_LO": (0.0, 1.0),
+    "T_HI": (0.0, 1.0),
+    "VIS_LO": (-2.0, 122.0),
+    "VIS_HI": (-2.0, 122.0),
+    "HIT_FULL": (0.0, 1.0),
+    "HIT_X": (0.0, 1.0),
+    "HIT_Y": (0.0, 1.0),
+    "RESOLVED_X": (-20.0, 20.0),
+    "RESOLVED_Y": (-20.0, 20.0),
+    "RESOLVED_ANGLE": (0.0, 255.0),
+}
+assert set(VALUE_RANGE_BY_NAME.keys()) == set(
+    IDENTIFIER_NAMES
+), "VALUE_RANGE_BY_NAME must cover all IDENTIFIER_NAMES"
+
+# Slot-indexed view for callers that build per-slot machinery.
+VALUE_RANGE_BY_IDX: List[tuple[float, float]] = [
+    VALUE_RANGE_BY_NAME[name] for name in IDENTIFIER_NAMES
+]
+
+
 def vocab_id(name: str) -> int:
     """Look up the integer vocab ID for a named token (raises KeyError)."""
     return _VOCAB_IDS[name]

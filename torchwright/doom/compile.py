@@ -274,6 +274,7 @@ def step_frame(
     config: RenderConfig,
     textures: Optional[List[np.ndarray]] = None,
     trace: Optional[FrameTrace] = None,
+    stop_after_thinking: bool = False,
 ) -> Tuple[np.ndarray, GameState]:
     """Run one frame via the multi-phase rollout.
 
@@ -288,6 +289,14 @@ def step_frame(
         config: Render configuration.
         textures: List of texture arrays, each (tex_w, tex_h, 3).
             Defaults to the subset's textures.
+        stop_after_thinking: If ``True``, break the autoregressive
+            loop as soon as the transformer emits the SORTED_WALL
+            handoff token — i.e. skip the entire SORTED + RENDER
+            phase.  The returned frame stays unfilled (ceiling /
+            floor only); the trace's ``token_id_log`` still covers
+            the full thinking phase + the SORTED_WALL token.  Use
+            for thinking-token tests that only need the token-stream
+            trace and not pixel output.
 
     Returns:
         ``(frame, new_state)`` where frame is ``(H, W, 3)`` float32.
@@ -612,6 +621,13 @@ def step_frame(
                 filled[y, col] = True
 
         if done > 0.0 or sort_done > 0.0:
+            break
+
+        # Thinking-only fast path: the SORTED_WALL token is the
+        # handoff out of the thinking phase.  Tests that only need
+        # the token-stream trace can stop here and skip the SORTED +
+        # RENDER work that follows.
+        if stop_after_thinking and next_id_scalar == vocab_id("SORTED_WALL"):
             break
 
         prev = _next_inputs_from_overflow(next_id_scalar, overflow)

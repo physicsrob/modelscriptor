@@ -2,58 +2,52 @@
 full 16-identifier cascade plus 3 RESOLVED identifiers at the frame
 boundary.
 
-Phase A Part 2 — wire format per wall (27 steps):
+Phase A Part 3 — every per-wall identifier emits a real computed value.
+Wire format per wall (27 steps, unchanged from Part 2):
 
     [THINKING_WALL_N]
-      [BSP_RANK]         v(0)          # stubbed, emits VALUE_0
-      [IS_RENDERABLE]    v(0)          # stubbed
-      [CROSS_A]          v(0)          # stubbed
-      [DOT_A]            v(0)          # stubbed
-      [CROSS_B]          v(0)          # stubbed
-      [DOT_B]            v(0)          # stubbed
-      [T_LO]             v(0)          # stubbed
-      [T_HI]             v(0)          # stubbed
-      [VIS_LO]           v(0)          # stubbed
-      [VIS_HI]           v(0)          # stubbed
-      [HIT_FULL]         v(hit_full)   # real
-      [HIT_X]            v(hit_x)      # real
-      [HIT_Y]            v(hit_y)      # real
+      [BSP_RANK]         v(bsp_rank)      # integer 0..7
+      [IS_RENDERABLE]    v(is_renderable) # 0 / 1
+      [CROSS_A]          v(cross_a)       # signed offset, [-40, 40]
+      [DOT_A]            v(dot_a)         # forward projection, [-40, 40]
+      [CROSS_B]          v(cross_b)
+      [DOT_B]            v(dot_b)
+      [T_LO]             v(t_lo)          # clip parameter, [0, 1]
+      [T_HI]             v(t_hi)
+      [VIS_LO]           v(vis_lo)        # screen col, [-2, 122]
+      [VIS_HI]           v(vis_hi)
+      [HIT_FULL]         v(hit_full)      # 0 / 1
+      [HIT_X]            v(hit_x)         # 0 / 1
+      [HIT_Y]            v(hit_y)         # 0 / 1
 
-After the last wall's HIT_Y value step (frame boundary):
+RESOLVED chain (last wall's HIT_Y value → frame boundary) still stubs
+as ``VALUE_0`` — real math lands in Part 4.
 
-    [RESOLVED_X]        v(0)           # stubbed (real math lands in Part 4)
-    [RESOLVED_Y]        v(0)           # stubbed
-    [RESOLVED_ANGLE]    v(0)           # stubbed
-    [SORTED_WALL]                      # hand-off out of the thinking phase
+Two classes of identifier computation:
 
-Semantic contract: each autoregressive step takes a single ``token_id``
-in and emits the next ``token_id`` as a 72-wide embedding the host
-argmaxes against ``W_EMBED.T``.
+* **Base values** (BSP_RANK, IS_RENDERABLE, CROSS/DOT, HIT_*): compute
+  from first principles using the attended wall geometry, the BSP
+  side-P vector, and the player's pre-collision pose.  Math is ported
+  from ``wall.py`` 1:1.
+* **Derived values** (T_LO/T_HI, VIS_LO/VIS_HI): read CROSS/DOT/T from
+  the KV cache via :class:`ThinkingReadback` at layer 0 of the own
+  step, then apply the ported clip / projection math.  VIS gates on a
+  locally-computed is_renderable (recomputed here rather than read via
+  readback — the recompute is shallower than the round-trip through
+  an attention hop + dequantize).
 
-Under the embedding-carrier architecture, an identifier step computes
-the value and emits the VALUE-ID embedding encoding it; a value step
-uses the most-recent-identifier lookup to decide which identifier /
-marker / RESOLVED-chain / SORTED hand-off to emit next.
+Cross-position data reads (three primary hops):
 
-Stub identifier steps emit the fixed ``embed_lookup("VALUE_0")`` row.
-HIT_FULL / HIT_X / HIT_Y identifier steps compute the ray-segment hit
-flag (identical math to ``wall.py:_compute_collision_flags``) and emit
-``embed_lookup("VALUE_0")`` or ``embed_lookup("VALUE_1")`` depending
-on the flag.
-
-Attention reads (three hops):
-
-1. **Current wall identity.**  ``attend_most_recent_matching`` against
-   ``is_thinking_wall_marker``: value carries the marker's wall_index
-   as a 1-wide scalar.
-2. **Previous identifier slot.**  ``attend_most_recent_matching``
-   against ``is_any_identifier``: value is a 16-wide one-hot, slot
-   ``i`` active iff the most recent identifier was
-   ``IDENTIFIER_NAMES[i]``.
-3. **Wall geometry from prompt.**  ``attend_argmax_dot`` using
-   ``wall_j_onehot`` derived from ``current_wall_index``; restricted
-   to HIT_FULL/X/Y identifier steps via a query gate so the read only
-   fires where the hit math needs it.
+1. **Current wall identity.**  Most-recent ``THINKING_WALL_N`` marker
+   → ``current_wall_index``.
+2. **Wall geometry.**  Single ``attend_argmax_dot`` matching
+   ``wall_j_onehot`` against WALL-position ``wall_position_onehot``;
+   value block concatenates ``(wall_ax, wall_ay, wall_bx, wall_by,
+   wall_bsp_coeffs, wall_bsp_const)``.  Fired at every per-wall
+   identifier step via the ``is_any_identifier`` gate.
+3. **Previous identifier slot** + **prior VALUE readbacks.**  The
+   Part-2 prev-id attention plus :class:`ThinkingReadback`'s per-name
+   attention to recent matching VALUE positions.
 """
 
 from dataclasses import dataclass
@@ -62,15 +56,24 @@ from typing import List
 import torch
 
 from torchwright.graph import Concatenate, Linear, Node, annotate
+from torchwright.graph.asserts import assert_in_range, assert_integer
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import (
+    abs as abs_node,
+    add,
     add_const,
+    add_scaled_nodes,
     bool_to_01,
     clamp,
     compare,
+    low_rank_2d,
+    max as max_node,
+    min as min_node,
+    multiply_2d,
     multiply_const,
     negate,
     piecewise_linear_2d,
+    reciprocal,
     subtract,
     sum_nodes,
 )
@@ -81,49 +84,100 @@ from torchwright.ops.attention_ops import (
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.logic_ops import bool_all_true, bool_any_true, cond_gate
 from torchwright.ops.map_select import in_range, select
+from torchwright.reference_renderer.types import RenderConfig
+
+import math
 
 from torchwright.doom.embedding import (
     D_EMBED,
     IDENTIFIER_NAMES,
+    VALUE_RANGE_BY_NAME,
     embed_lookup,
 )
 from torchwright.doom.graph_constants import (
     DIFF_BP,
+    TRIG_BP,
     VEL_BP,
 )
 from torchwright.doom.graph_utils import extract_from
+from torchwright.doom.thinking_readback import (
+    build_thinking_readback,
+    factor_q_to_embedding,
+)
+from torchwright.ops.quantization import DEFAULT_N_LEVELS
 
 # ---------------------------------------------------------------------------
-# Slot indices for the three HIT_* identifiers the state machine
-# special-cases for real value computation.  Other slots are stubs whose
-# identifier step emits VALUE_0 unconditionally.
+# Slot indices for per-identifier machinery.  One constant per slot so the
+# per-value wiring reads as ``is_identifier_by_slot[_SLOT_CROSS_A]`` rather
+# than repeated ``IDENTIFIER_NAMES.index("CROSS_A")`` calls.
 # ---------------------------------------------------------------------------
 
+_SLOT_BSP_RANK = IDENTIFIER_NAMES.index("BSP_RANK")
+_SLOT_IS_RENDERABLE = IDENTIFIER_NAMES.index("IS_RENDERABLE")
+_SLOT_CROSS_A = IDENTIFIER_NAMES.index("CROSS_A")
+_SLOT_DOT_A = IDENTIFIER_NAMES.index("DOT_A")
+_SLOT_CROSS_B = IDENTIFIER_NAMES.index("CROSS_B")
+_SLOT_DOT_B = IDENTIFIER_NAMES.index("DOT_B")
+_SLOT_T_LO = IDENTIFIER_NAMES.index("T_LO")
+_SLOT_T_HI = IDENTIFIER_NAMES.index("T_HI")
+_SLOT_VIS_LO = IDENTIFIER_NAMES.index("VIS_LO")
+_SLOT_VIS_HI = IDENTIFIER_NAMES.index("VIS_HI")
 _SLOT_HIT_FULL = IDENTIFIER_NAMES.index("HIT_FULL")
 _SLOT_HIT_X = IDENTIFIER_NAMES.index("HIT_X")
 _SLOT_HIT_Y = IDENTIFIER_NAMES.index("HIT_Y")
+_SLOT_RESOLVED_X = IDENTIFIER_NAMES.index("RESOLVED_X")
+_SLOT_RESOLVED_Y = IDENTIFIER_NAMES.index("RESOLVED_Y")
+_SLOT_RESOLVED_ANGLE = IDENTIFIER_NAMES.index("RESOLVED_ANGLE")
 
 # Slot i → name of the next token to emit at the VALUE step whose most
 # recent identifier was at slot i.  Slot ``_SLOT_HIT_Y`` is deliberately
 # absent — its successor is wall-index-dependent (next marker or
 # RESOLVED_X if last wall) and is handled separately.
 _VALUE_SUCCESSOR_BY_SLOT = {
-    IDENTIFIER_NAMES.index("BSP_RANK"): "IS_RENDERABLE",
-    IDENTIFIER_NAMES.index("IS_RENDERABLE"): "CROSS_A",
-    IDENTIFIER_NAMES.index("CROSS_A"): "DOT_A",
-    IDENTIFIER_NAMES.index("DOT_A"): "CROSS_B",
-    IDENTIFIER_NAMES.index("CROSS_B"): "DOT_B",
-    IDENTIFIER_NAMES.index("DOT_B"): "T_LO",
-    IDENTIFIER_NAMES.index("T_LO"): "T_HI",
-    IDENTIFIER_NAMES.index("T_HI"): "VIS_LO",
-    IDENTIFIER_NAMES.index("VIS_LO"): "VIS_HI",
-    IDENTIFIER_NAMES.index("VIS_HI"): "HIT_FULL",
-    IDENTIFIER_NAMES.index("HIT_FULL"): "HIT_X",
-    IDENTIFIER_NAMES.index("HIT_X"): "HIT_Y",
-    IDENTIFIER_NAMES.index("RESOLVED_X"): "RESOLVED_Y",
-    IDENTIFIER_NAMES.index("RESOLVED_Y"): "RESOLVED_ANGLE",
-    IDENTIFIER_NAMES.index("RESOLVED_ANGLE"): "SORTED_WALL",
+    _SLOT_BSP_RANK: "IS_RENDERABLE",
+    _SLOT_IS_RENDERABLE: "CROSS_A",
+    _SLOT_CROSS_A: "DOT_A",
+    _SLOT_DOT_A: "CROSS_B",
+    _SLOT_CROSS_B: "DOT_B",
+    _SLOT_DOT_B: "T_LO",
+    _SLOT_T_LO: "T_HI",
+    _SLOT_T_HI: "VIS_LO",
+    _SLOT_VIS_LO: "VIS_HI",
+    _SLOT_VIS_HI: "HIT_FULL",
+    _SLOT_HIT_FULL: "HIT_X",
+    _SLOT_HIT_X: "HIT_Y",
+    _SLOT_RESOLVED_X: "RESOLVED_Y",
+    _SLOT_RESOLVED_Y: "RESOLVED_ANGLE",
+    _SLOT_RESOLVED_ANGLE: "SORTED_WALL",
 }
+
+# Widened cond tolerance for ``select`` / ``cond_gate`` inside the
+# visibility-projection chain — matches ``wall._VIS_C_TOL`` since the
+# math is a 1:1 port.  See the comment on that constant in ``wall.py``
+# for the provenance.
+_VIS_C_TOL = 0.01
+_T_COMPARE_SCALE = 100.0
+
+# Breakpoint grid for the ``atan`` lookup in ``_endpoint_to_column``.
+# Ported 1:1 from ``wall.py`` — same tolerance envelope.
+_COL_FOLD_BP_CROSS = [
+    -2.0,
+    -1.5,
+    -1.0,
+    -0.75,
+    -0.5,
+    -0.25,
+    -0.1,
+    0.0,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1.0,
+    1.5,
+    2.0,
+]
+_COL_FOLD_BP_DOT_ABS = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
 
 
 # ---------------------------------------------------------------------------
@@ -133,11 +187,12 @@ _VALUE_SUCCESSOR_BY_SLOT = {
 
 @dataclass
 class ThinkingWallKVInput:
-    """Cross-position values the hit computation needs.
+    """Cross-position values every per-wall identifier step consumes.
 
-    Wall geometry, position one-hot, INPUT velocities, PLAYER
-    positions — all already broadcast or readable from the prompt by
-    other stages.
+    Wall geometry + BSP-rank coefficients live at WALL prompt
+    positions, read via ``attend_argmax_dot`` on a per-wall one-hot.
+    INPUT velocities / move trig / BSP side-P-vec are per-position
+    broadcasts available at every position.
     """
 
     # From WALL prompt positions (read via attend_argmax_dot).
@@ -146,13 +201,21 @@ class ThinkingWallKVInput:
     wall_bx: Node
     wall_by: Node
     wall_position_onehot: Node
+    wall_bsp_coeffs: Node  # max_bsp_nodes-wide
+    wall_bsp_const: Node  # 1-wide
 
     # From INPUT broadcast.
     vel_dx: Node
     vel_dy: Node
+    move_cos: Node
+    move_sin: Node
 
-    # From PLAYER broadcasts (pre-collision; collision needs the player's
-    # *intended* movement origin, which is the pre-collision position).
+    # From BSP broadcast (per-position BSP-side indicator).
+    side_P_vec: Node  # max_bsp_nodes-wide, ≈{0, 1} per component
+
+    # From PLAYER broadcasts (pre-collision; collision math needs the
+    # player's *intended* movement origin, which is the pre-collision
+    # position).
     player_x: Node
     player_y: Node
 
@@ -172,8 +235,8 @@ class ThinkingWallOutput:
     SORTED/RENDER path.
     """
 
-    next_token_embedding: Node  # 72-wide W_EMBED row
-    is_thinking_active: Node  # 1-wide ±1
+    next_token_embedding: Node
+    is_thinking_active: Node
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +247,7 @@ class ThinkingWallOutput:
 def build_thinking_wall(
     kv: ThinkingWallKVInput,
     *,
+    embedding: Node,
     is_wall: Node,
     is_thinking_wall_marker: Node,
     is_thinking_wall_n: list,
@@ -192,6 +256,9 @@ def build_thinking_wall(
     is_thinking_value: Node,
     pos_encoding: PosEncoding,
     max_walls: int,
+    max_coord: float,
+    max_bsp_nodes: int,
+    config: RenderConfig,
 ) -> ThinkingWallOutput:
     """Wire up the thinking-wall stage end to end."""
     assert max_walls <= 8, (
@@ -204,15 +271,10 @@ def build_thinking_wall(
     )
     is_thinking_wall_n = is_thinking_wall_n[:max_walls]
 
-    is_hit_full_id = is_identifier_by_slot[_SLOT_HIT_FULL]
-    is_hit_x_id = is_identifier_by_slot[_SLOT_HIT_X]
-    is_hit_y_id = is_identifier_by_slot[_SLOT_HIT_Y]
-
+    # ---------------------------------------------------------------------
+    # Attention hop 1: current wall index from the most recent marker.
+    # ---------------------------------------------------------------------
     with annotate("thinking_wall/marker_index"):
-        # At marker positions, decode wall_index from which of the 8
-        # THINKING_WALL_i detectors matched.  Off-marker positions get
-        # 0 (don't-care: only used at marker positions, validated via
-        # attention below).
         wall_index_at_marker = sum_nodes(
             [
                 multiply_const(bool_to_01(is_thinking_wall_n[i]), float(i))
@@ -235,14 +297,13 @@ def build_thinking_wall(
             match_gain=12000.0,
         )
 
+    # ---------------------------------------------------------------------
+    # Attention hop 2 (Part 2 mechanism): most-recent-identifier slot
+    # one-hot.  Stored as a 16-wide cond_gate(is_X_id, 1) at every
+    # identifier position; read at VALUE positions via
+    # attend_most_recent_matching against is_any_identifier.
+    # ---------------------------------------------------------------------
     with annotate("thinking_wall/find_prev_identifier"):
-        # Store a 16-wide slot one-hot at every identifier position;
-        # ``attend_most_recent_matching`` against ``is_any_identifier``
-        # reads back "which identifier was most recent" as that same
-        # one-hot.  At non-identifier positions the concatenation is
-        # zero-valued (so even without the outer ``is_any_identifier``
-        # gate the key-side would filter cleanly), but the explicit
-        # gate keeps intent visible and bounds the value more tightly.
         slot_onehot_at_id = Concatenate(
             [
                 cond_gate(is_identifier_by_slot[i], query_const_1)
@@ -259,31 +320,55 @@ def build_thinking_wall(
             assert_hardness_gt=0.99,
         )
 
+    # ---------------------------------------------------------------------
+    # Attention hop 3: wall geometry for the current wall.  Value block
+    # packs (ax, ay, bx, by, bsp_coeffs..., bsp_const) so a single
+    # attention head covers every per-wall identifier's geometric need.
+    # ---------------------------------------------------------------------
     with annotate("thinking_wall/wall_geom_attention"):
         wi_clamped = clamp(current_wall_index, 0.0, float(max_walls - 1))
         wi_p1 = add_const(wi_clamped, 1.0)
         wall_j_onehot = bool_to_01(in_range(wi_clamped, wi_p1, max_walls))
 
-        # Only HIT_FULL/X/Y identifier steps read wall geometry — stub
-        # identifier steps emit VALUE_0 unconditionally and don't need
-        # the geometry read.  Gating the query keeps the attention head
-        # off the stub positions' work path.
-        is_hit_any = bool_any_true([is_hit_full_id, is_hit_x_id, is_hit_y_id])
+        # Gate on any per-wall identifier step (13 slots 0..12); the 3
+        # RESOLVED slots don't need wall geom.  Using ``is_any_identifier``
+        # subsumes this with no harm (the extra 3 positions waste a
+        # compute cycle but don't affect correctness).
+        wall_geom_value = Concatenate(
+            [
+                kv.wall_ax,
+                kv.wall_ay,
+                kv.wall_bx,
+                kv.wall_by,
+                kv.wall_bsp_coeffs,
+                kv.wall_bsp_const,
+            ]
+        )
         wall_geom = attend_argmax_dot(
-            query_vector=cond_gate(is_hit_any, wall_j_onehot),
+            query_vector=cond_gate(is_any_identifier, wall_j_onehot),
             key_vector=cond_gate(is_wall, kv.wall_position_onehot),
-            value=cond_gate(
-                is_wall,
-                Concatenate([kv.wall_ax, kv.wall_ay, kv.wall_bx, kv.wall_by]),
-            ),
+            value=cond_gate(is_wall, wall_geom_value),
             match_gain=1000.0,
             assert_hardness_gt=0.99,
         )
-        sel_ax = extract_from(wall_geom, 4, 0, 1, "tw_sel_ax")
-        sel_ay = extract_from(wall_geom, 4, 1, 1, "tw_sel_ay")
-        sel_bx = extract_from(wall_geom, 4, 2, 1, "tw_sel_bx")
-        sel_by = extract_from(wall_geom, 4, 3, 1, "tw_sel_by")
+        sel_ax = extract_from(wall_geom, 4 + max_bsp_nodes + 1, 0, 1, "tw_sel_ax")
+        sel_ay = extract_from(wall_geom, 4 + max_bsp_nodes + 1, 1, 1, "tw_sel_ay")
+        sel_bx = extract_from(wall_geom, 4 + max_bsp_nodes + 1, 2, 1, "tw_sel_bx")
+        sel_by = extract_from(wall_geom, 4 + max_bsp_nodes + 1, 3, 1, "tw_sel_by")
+        sel_bsp_coeffs = extract_from(
+            wall_geom, 4 + max_bsp_nodes + 1, 4, max_bsp_nodes, "tw_sel_bsp_coeffs"
+        )
+        sel_bsp_const = extract_from(
+            wall_geom,
+            4 + max_bsp_nodes + 1,
+            4 + max_bsp_nodes,
+            1,
+            "tw_sel_bsp_const",
+        )
 
+    # ---------------------------------------------------------------------
+    # Base-value computations.
+    # ---------------------------------------------------------------------
     with annotate("thinking_wall/hit_compute"):
         hit_full, hit_x, hit_y = _compute_hit_flags(
             sel_ax,
@@ -296,18 +381,201 @@ def build_thinking_wall(
             kv.vel_dy,
         )
 
+    with annotate("thinking_wall/rotate_endpoints"):
+        dax = subtract(sel_ax, kv.player_x)
+        day = subtract(sel_ay, kv.player_y)
+        dbx = subtract(sel_bx, kv.player_x)
+        dby = subtract(sel_by, kv.player_y)
+        cross_a, dot_a = _rotate_into_player_frame(
+            kv.move_cos, kv.move_sin, dax, day, "va"
+        )
+        cross_b, dot_b = _rotate_into_player_frame(
+            kv.move_cos, kv.move_sin, dbx, dby, "vb"
+        )
+        # Clamp into the wire-format CROSS/DOT range so the
+        # downstream ``quantize_to_range`` has a tight input
+        # value_type.  The natural range from ``piecewise_linear_2d``
+        # subtract is ±80 (twice the grid max), which would make
+        # ``quantize_to_range(..., -40, 40)`` declare a ~16× inflated
+        # output and fire the affine-bounds soundness test.
+        cross_dot_max = 40.0
+        cross_a = clamp(cross_a, -cross_dot_max, cross_dot_max)
+        dot_a = clamp(dot_a, -cross_dot_max, cross_dot_max)
+        cross_b = clamp(cross_b, -cross_dot_max, cross_dot_max)
+        dot_b = clamp(dot_b, -cross_dot_max, cross_dot_max)
+
+    with annotate("thinking_wall/central_ray"):
+        sort_den, sort_num_t = _compute_central_ray_intersection(
+            sel_ax,
+            sel_ay,
+            sel_bx,
+            sel_by,
+            kv.player_x,
+            kv.player_y,
+            kv.move_cos,
+            kv.move_sin,
+        )
+
+    with annotate("thinking_wall/bsp_rank"):
+        bsp_rank, is_renderable = _compute_bsp_and_renderable(
+            sel_bsp_coeffs,
+            sel_bsp_const,
+            kv.side_P_vec,
+            sort_den,
+            sort_num_t,
+            max_bsp_nodes,
+        )
+
+    # ---------------------------------------------------------------------
+    # Derived-value computations.  Build the readback handle first so
+    # ``get_value_after_last(...)`` calls route through a shared
+    # attention head per identifier name.
+    # ---------------------------------------------------------------------
+    readback = build_thinking_readback(
+        embedding=embedding,
+        prev_id_slots=prev_slot_onehot,
+        is_value_category=is_thinking_value,
+        pos_encoding=pos_encoding,
+    )
+
+    with annotate("thinking_wall/bsp_rank_bound"):
+        # BSP_RANK is an integer 0..7 per design doc.  The raw
+        # ``assert_integer`` call in ``_compute_bsp_and_renderable``
+        # preserves the natural value_type of the dot-product
+        # accumulation (``max_bsp_nodes × max_coord``), which is too
+        # wide for the downstream quantize affine (scale = 65535/7
+        # amplifies).  Clamping to [0, 7] enforces a tight value_type
+        # without adding runtime error on well-formed inputs.
+        bsp_rank = clamp(bsp_rank, 0.0, 7.0)
+
+    with annotate("thinking_wall/t_and_vis"):
+        # T_LO/T_HI and VIS_LO/VIS_HI share FOV-cone clip intermediates
+        # (f_L_a/b, f_R_a/b, per-plane t contribs).  Compute once and
+        # emit each of the 4 values at its own identifier step.  All
+        # four derived values read CROSS_A, DOT_A, CROSS_B, DOT_B from
+        # the KV cache — the shared attention heads per-name, cached
+        # inside ``ThinkingReadback``, make the 4-way readback cost
+        # one attention per distinct name (not per consumer).
+        ca_kv = readback.get_value_after_last("CROSS_A")
+        da_kv = readback.get_value_after_last("DOT_A")
+        cb_kv = readback.get_value_after_last("CROSS_B")
+        db_kv = readback.get_value_after_last("DOT_B")
+        t_lo, t_hi, vis_lo, vis_hi = _compute_clip_and_project(
+            ca_kv,
+            da_kv,
+            cb_kv,
+            db_kv,
+            is_renderable,
+            config=config,
+            cross_dot_max=40.0,
+        )
+        # Clamp into the wire-format range so each quantize's input
+        # value_type is tight.  Without the clamp, the natural
+        # value_types from the select / cond_gate chain above inflate
+        # by M·c_tol at every link, eventually overshooting the
+        # quantize's declared output ``[0, 65535]`` assert.
+        t_lo = clamp(t_lo, 0.0, 1.0)
+        t_hi = clamp(t_hi, 0.0, 1.0)
+        vis_lo_bound_hi = float(VALUE_RANGE_BY_NAME["VIS_LO"][1])
+        vis_lo = clamp(vis_lo, -2.0, vis_lo_bound_hi)
+        vis_hi = clamp(vis_hi, -2.0, vis_lo_bound_hi)
+
+    # ---------------------------------------------------------------------
+    # Per-slot quantize → select-q → factor-once.
+    #
+    # Each identifier slot quantizes its computed float into a 1-wide
+    # ``q ∈ [0, 65535]`` using the slot's design-doc (lo, hi) range.
+    # We then sum-cond-gate to pick the active slot's q (exactly one is
+    # +1 at any identifier position; sum collapses to the active one).
+    # The expensive ``thermometer_floor_div`` × 3 + ``in_range`` × 4
+    # cascade in :func:`factor_q_to_embedding` runs **once** per
+    # position on the selected q rather than 16 times across all slots
+    # — drops the residual peak from ~1100 cols to ~80 cols.
+    # ---------------------------------------------------------------------
+    with annotate("thinking_wall/normalize_per_slot"):
+        # Each per-wall value gets normalized to ``[0, 1]`` using its
+        # design-doc (lo, hi) range.  Gating 1-wide ``[0, 1]`` signals
+        # keeps ``cond_gate.M = 2``; if we gated on q ∈ ``[0, 65535]``
+        # the per-gate ``M ≈ 131070`` would blow past
+        # ``test_gate_M_bounded``'s 50 000 ratchet at every slot.  A
+        # single ``multiply_const`` scales the selected normalized
+        # value to ``[0, 65535]`` *after* the selection, where there
+        # are no more gates to accumulate through.  Booleans pass
+        # through ``bool_to_01`` first so the ±1 input lands as 0/1
+        # (already in ``[0, 1]``; no normalization needed but a
+        # uniform path keeps the helper simple).  RESOLVED slots are
+        # stubbed — they don't participate in the factor path below.
+        per_wall_norm_by_slot: dict[int, Node] = {
+            _SLOT_BSP_RANK: _norm(bsp_rank, "BSP_RANK"),
+            _SLOT_IS_RENDERABLE: _norm(bool_to_01(is_renderable), "IS_RENDERABLE"),
+            _SLOT_CROSS_A: _norm(cross_a, "CROSS_A"),
+            _SLOT_DOT_A: _norm(dot_a, "DOT_A"),
+            _SLOT_CROSS_B: _norm(cross_b, "CROSS_B"),
+            _SLOT_DOT_B: _norm(dot_b, "DOT_B"),
+            _SLOT_T_LO: _norm(t_lo, "T_LO"),
+            _SLOT_T_HI: _norm(t_hi, "T_HI"),
+            _SLOT_VIS_LO: _norm(vis_lo, "VIS_LO"),
+            _SLOT_VIS_HI: _norm(vis_hi, "VIS_HI"),
+            _SLOT_HIT_FULL: _norm(bool_to_01(hit_full), "HIT_FULL"),
+            _SLOT_HIT_X: _norm(bool_to_01(hit_x), "HIT_X"),
+            _SLOT_HIT_Y: _norm(bool_to_01(hit_y), "HIT_Y"),
+        }
+
+    with annotate("thinking_wall/select_and_factor"):
+        # Select via sum-of-cond-gated-1-wide-normalized values.  At
+        # most one slot's detector fires at any position, so exactly
+        # one term is non-zero in the sum.  Each ``cond_gate`` has
+        # ``M = 2`` (input range ``[0, 1]``) — small enough to pass
+        # the ratchet.  ``sum_nodes`` is a pure Linear (no gate).
+        per_wall_gated_norm = [
+            cond_gate(is_identifier_by_slot[slot], per_wall_norm_by_slot[slot])
+            for slot in sorted(per_wall_norm_by_slot.keys())
+        ]
+        n_selected = sum_nodes(per_wall_gated_norm)
+        # Scale once from normalized [0, 1] back into q ∈ [0, 65535]
+        # for the factor stage.  No more gates after this — the scale
+        # is a plain Linear.
+        q_selected = multiply_const(n_selected, float(DEFAULT_N_LEVELS - 1))
+        per_wall_emit = factor_q_to_embedding(q_selected, suffix="_id_emit")
+        # Gate to zero at non-per-wall-identifier positions.  At
+        # non-firing positions ``q_selected = 0`` and the factor
+        # produces ``W_EMBED[VALUE_0]``; the gate cleanly suppresses
+        # that so it doesn't leak into the RESOLVED or marker paths.
+        is_any_per_wall_id = bool_any_true(
+            [is_identifier_by_slot[slot] for slot in per_wall_norm_by_slot]
+        )
+        per_wall_contribution = cond_gate(is_any_per_wall_id, per_wall_emit)
+
+    with annotate("thinking_wall/resolved_stubs"):
+        # RESOLVED_X/Y/ANGLE still emit VALUE_0 in Part 3 — real math
+        # lands in Part 4.  Use the VALUE_0 embedding literal directly
+        # rather than routing through the factor path (which would
+        # require staging q_zero through cond_gate with a degenerate
+        # M=0 offset).
+        is_any_resolved_id = bool_any_true(
+            [
+                is_identifier_by_slot[_SLOT_RESOLVED_X],
+                is_identifier_by_slot[_SLOT_RESOLVED_Y],
+                is_identifier_by_slot[_SLOT_RESOLVED_ANGLE],
+            ]
+        )
+        e_value_0_resolved = create_literal_value(
+            embed_lookup("VALUE_0"), name="e_value_0_resolved_stub"
+        )
+        resolved_contribution = cond_gate(is_any_resolved_id, e_value_0_resolved)
+
+        # Combine per-wall and RESOLVED contributions.  At most one is
+        # non-zero at any position (disjoint identifier subsets), so
+        # the sum is exact with peak residual 2×72=144 cols at the
+        # reduction.
+        identifier_emit = sum_nodes([per_wall_contribution, resolved_contribution])
+
     with annotate("thinking_wall/next_token_embedding"):
         next_token_embedding = _compute_next_token_embedding(
             is_thinking_wall_marker=is_thinking_wall_marker,
-            is_any_identifier=is_any_identifier,
             is_thinking_value=is_thinking_value,
-            is_hit_full_id=is_hit_full_id,
-            is_hit_x_id=is_hit_x_id,
-            is_hit_y_id=is_hit_y_id,
             prev_slot_onehot=prev_slot_onehot,
-            hit_full=hit_full,
-            hit_x=hit_x,
-            hit_y=hit_y,
+            identifier_contribution=identifier_emit,
             current_wall_index=current_wall_index,
             max_walls=max_walls,
         )
@@ -330,10 +598,7 @@ def build_thinking_wall(
 
 
 # ---------------------------------------------------------------------------
-# Hit-flag computation (same math as wall.py:_compute_collision_flags,
-# but using attended-in wall geometry rather than host-fed at-position
-# fields, and without the is_wall outer gate — these values are only
-# consumed at HIT_*_ID thinking identifier positions).
+# Base-value helpers
 # ---------------------------------------------------------------------------
 
 
@@ -347,6 +612,7 @@ def _compute_hit_flags(
     vel_dx: Node,
     vel_dy: Node,
 ):
+    """Ray-segment hit flags for three rays — ported from ``wall.py``."""
     ex = subtract(wall_bx, wall_ax)
     ey = subtract(wall_by, wall_ay)
     dax = subtract(wall_ax, player_x)
@@ -407,23 +673,337 @@ def _validity(den: Node, num_t: Node, num_u: Node) -> Node:
     return bool_all_true([is_den_ok, is_t_pos, is_t_le_den, is_u_ge_0, is_u_le_den])
 
 
+def _rotate_into_player_frame(
+    cos_p: Node,
+    sin_p: Node,
+    dx: Node,
+    dy: Node,
+    suffix: str,
+):
+    """``(cross, dot) = rotate((dx, dy), by -theta)`` — wall.py port."""
+    cross = subtract(
+        piecewise_linear_2d(
+            cos_p, dy, TRIG_BP, DIFF_BP, lambda a, b: a * b, name=f"tw_cos_dy_{suffix}"
+        ),
+        piecewise_linear_2d(
+            sin_p, dx, TRIG_BP, DIFF_BP, lambda a, b: a * b, name=f"tw_sin_dx_{suffix}"
+        ),
+    )
+    dot = add(
+        piecewise_linear_2d(
+            cos_p, dx, TRIG_BP, DIFF_BP, lambda a, b: a * b, name=f"tw_cos_dx_{suffix}"
+        ),
+        piecewise_linear_2d(
+            sin_p, dy, TRIG_BP, DIFF_BP, lambda a, b: a * b, name=f"tw_sin_dy_{suffix}"
+        ),
+    )
+    return cross, dot
+
+
+def _compute_central_ray_intersection(
+    wall_ax: Node,
+    wall_ay: Node,
+    wall_bx: Node,
+    wall_by: Node,
+    player_x: Node,
+    player_y: Node,
+    move_cos: Node,
+    move_sin: Node,
+):
+    """Intersect the player's central viewing ray with this wall's line.
+
+    ``(sort_den, sort_num_t)`` port of ``wall._compute_central_ray_intersection``.
+    """
+    w_ex = subtract(wall_bx, wall_ax)
+    w_ey = subtract(wall_by, wall_ay)
+    w_fx = subtract(wall_ax, player_x)
+    w_gy = subtract(player_y, wall_ay)
+
+    sort_ey_cos = piecewise_linear_2d(
+        w_ey, move_cos, DIFF_BP, TRIG_BP, lambda a, b: a * b, name="tw_sort_ey_cos"
+    )
+    sort_ex_sin = piecewise_linear_2d(
+        w_ex, move_sin, DIFF_BP, TRIG_BP, lambda a, b: a * b, name="tw_sort_ex_sin"
+    )
+    sort_den = subtract(sort_ey_cos, sort_ex_sin)
+
+    sort_ey_fx = piecewise_linear_2d(
+        w_ey, w_fx, DIFF_BP, DIFF_BP, lambda a, b: a * b, name="tw_sort_ey_fx"
+    )
+    sort_ex_gy = piecewise_linear_2d(
+        w_ex, w_gy, DIFF_BP, DIFF_BP, lambda a, b: a * b, name="tw_sort_ex_gy"
+    )
+    sort_num_t = add(sort_ey_fx, sort_ex_gy)
+    return sort_den, sort_num_t
+
+
+def _compute_bsp_and_renderable(
+    wall_bsp_coeffs: Node,
+    wall_bsp_const: Node,
+    side_P_vec: Node,
+    sort_den: Node,
+    sort_num_t: Node,
+    max_bsp_nodes: int,
+):
+    """Port of ``wall._compute_bsp_rank`` (minus the ``is_wall`` gate).
+
+    Returns ``(bsp_rank, is_renderable)`` — integer 0..7 and ±1
+    boolean.  The wall.py version ANDs with ``is_wall``; here we're at
+    thinking-identifier positions (never WALL positions), so the
+    ``is_wall`` check is dropped — renderability is purely a function
+    of the (attended) wall geometry and the player pose.
+    """
+    bsp_products = []
+    for i in range(max_bsp_nodes):
+        c_i = extract_from(wall_bsp_coeffs, max_bsp_nodes, i, 1, f"tw_bsp_c_{i}")
+        s_i = extract_from(side_P_vec, max_bsp_nodes, i, 1, f"tw_bsp_s_{i}")
+        s_bool = compare(s_i, 0.5)
+        bsp_products.append(cond_gate(s_bool, c_i))
+    bsp_dot = sum_nodes(bsp_products)
+    bsp_rank = assert_integer(add(bsp_dot, wall_bsp_const))
+
+    abs_sort_den = abs_node(sort_den)
+    is_den_ok = compare(abs_sort_den, 0.05)
+    den_sign = compare(sort_den, 0.0)
+    adj_num_t = select(den_sign, sort_num_t, negate(sort_num_t))
+    is_t_pos = compare(adj_num_t, 0.0)
+    is_renderable = bool_all_true([is_den_ok, is_t_pos])
+
+    return bsp_rank, is_renderable
+
+
+# ---------------------------------------------------------------------------
+# Derived-value helpers (ported from wall._compute_visibility_columns).
+# Split into two stages so T_LO/T_HI can emit before VIS needs them.
+# ---------------------------------------------------------------------------
+
+
+def _compute_clip_and_project(
+    cross_a: Node,
+    dot_a: Node,
+    cross_b: Node,
+    dot_b: Node,
+    is_renderable: Node,
+    *,
+    config: RenderConfig,
+    cross_dot_max: float,
+):
+    """T_LO / T_HI / VIS_LO / VIS_HI in one pass.
+
+    Shares FOV-cone-clip intermediates (``f_L_a/b``, ``f_R_a/b``,
+    per-plane ``(t_lo_contrib, t_hi_contrib)``) between the
+    T-parameter aggregation and the VIS projection's clip-side
+    decision.  Matches ``wall._compute_visibility_columns`` 1:1 in
+    structure — the split into separate emit steps happens at the
+    caller, not here.
+
+    T_LO / T_HI appear in the VIS-empty check (``t_lo > t_hi``) and
+    the clip-side decisions (``a_clipped_on_L``, ``b_clipped_on_L``)
+    derive from the *same* ``t_lo_L/R`` / ``t_hi_L/R`` nodes T_LO/T_HI
+    do, so there is no round-trip through the KV cache — every shared
+    intermediate is computed once.
+
+    is_renderable is the locally-computed flag (not a KV-cache
+    readback) — gating with the fresh value avoids routing a boolean
+    through a readback round-trip.
+    """
+    W = config.screen_width
+    fov = config.fov_columns
+    fov_rad = float(fov) * math.pi / 128.0
+    half_fov_rad = fov_rad / 2.0
+    sin_hf = math.sin(half_fov_rad)
+    cos_hf = math.cos(half_fov_rad)
+
+    # FOV-boundary evaluations at both endpoints.
+    f_L_a = add_scaled_nodes(sin_hf, dot_a, -cos_hf, cross_a)
+    f_L_b = add_scaled_nodes(sin_hf, dot_b, -cos_hf, cross_b)
+    f_R_a = add_scaled_nodes(sin_hf, dot_a, cos_hf, cross_a)
+    f_R_b = add_scaled_nodes(sin_hf, dot_b, cos_hf, cross_b)
+
+    # Size reciprocal / multiply_2d grids by the readback cross/dot
+    # range (the design-doc CROSS_A/DOT_A nominal), not ``max_coord``.
+    # In wall.py these were sized from ``max_coord`` because cross/dot
+    # came from locally-rotated ``max_coord``-bounded geometry; here
+    # they come from the KV-cache readback with the wider wire-format
+    # range (±40 per design doc).
+    max_f_mag = (sin_hf + cos_hf) * cross_dot_max
+    max_denom = 2.0 * max_f_mag
+
+    t_lo_L, t_hi_L = _plane_clip_contribs(
+        f_L_a, f_L_b, max_denom=max_denom, max_f_mag=max_f_mag, suffix="tw_L"
+    )
+    t_lo_R, t_hi_R = _plane_clip_contribs(
+        f_R_a, f_R_b, max_denom=max_denom, max_f_mag=max_f_mag, suffix="tw_R"
+    )
+
+    zero_lit = create_literal_value(torch.tensor([0.0]), name="tw_t_zero")
+    one_lit = create_literal_value(torch.tensor([1.0]), name="tw_t_one")
+    W_lit = create_literal_value(torch.tensor([float(W)]), name="tw_col_W")
+
+    t_lo = max_node(max_node(zero_lit, t_lo_L), t_lo_R)
+    t_hi = min_node(min_node(one_lit, t_hi_L), t_hi_R)
+
+    is_empty = compare(multiply_const(subtract(t_lo, t_hi), _T_COMPARE_SCALE), 0.0)
+
+    col_A_interior = _endpoint_to_column(cross_a, dot_a, W=W, fov=fov, suffix="tw_a")
+    col_B_interior = _endpoint_to_column(cross_b, dot_b, W=W, fov=fov, suffix="tw_b")
+
+    a_inside_L = compare(f_L_a, 0.0)
+    a_inside_R = compare(f_R_a, 0.0)
+    a_clipped_on_L = compare(
+        multiply_const(subtract(t_lo_L, t_lo_R), _T_COMPARE_SCALE), 0.0
+    )
+    col_A_boundary = select(a_clipped_on_L, W_lit, zero_lit, c_tol=_VIS_C_TOL)
+    col_A = select(
+        a_inside_L,
+        select(a_inside_R, col_A_interior, col_A_boundary, c_tol=_VIS_C_TOL),
+        col_A_boundary,
+        c_tol=_VIS_C_TOL,
+    )
+
+    b_inside_L = compare(f_L_b, 0.0)
+    b_inside_R = compare(f_R_b, 0.0)
+    b_clipped_on_L = compare(
+        multiply_const(subtract(t_hi_R, t_hi_L), _T_COMPARE_SCALE), 0.0
+    )
+    col_B_boundary = select(b_clipped_on_L, W_lit, zero_lit, c_tol=_VIS_C_TOL)
+    col_B = select(
+        b_inside_L,
+        select(b_inside_R, col_B_interior, col_B_boundary, c_tol=_VIS_C_TOL),
+        col_B_boundary,
+        c_tol=_VIS_C_TOL,
+    )
+
+    vis_lo_visible = min_node(col_A, col_B)
+    vis_hi_visible = max_node(col_A, col_B)
+
+    sentinel = create_literal_value(
+        torch.tensor([float(W + 2)]), name="tw_vis_sentinel"
+    )
+    vis_lo_raw = select(is_empty, sentinel, vis_lo_visible, c_tol=_VIS_C_TOL)
+    vis_hi_raw = select(is_empty, sentinel, vis_hi_visible, c_tol=_VIS_C_TOL)
+
+    vis_lo = cond_gate(is_renderable, vis_lo_raw, c_tol=_VIS_C_TOL)
+    vis_hi = cond_gate(is_renderable, vis_hi_raw, c_tol=_VIS_C_TOL)
+    return t_lo, t_hi, vis_lo, vis_hi
+
+
+def _plane_clip_contribs(
+    f_a: Node,
+    f_b: Node,
+    *,
+    max_denom: float,
+    max_f_mag: float,
+    suffix: str,
+):
+    """Per-plane clip contrib — ported from ``wall._plane_clip_contribs``."""
+    denom = subtract(f_a, f_b)
+    denom_pos = compare(denom, 0.0)
+    denom_abs = clamp(abs_node(denom), 0.1, max_denom)
+    inv_denom_abs = reciprocal(denom_abs, min_value=0.1, max_value=max_denom, step=0.1)
+    max_inv = 1.0 / 0.1
+
+    t_star_pos = multiply_2d(
+        f_a,
+        inv_denom_abs,
+        max_abs1=max_f_mag,
+        max_abs2=max_inv,
+        step1=0.5,
+        step2=0.5,
+        min2=0.0,
+        name=f"tw_t_star_{suffix}",
+    )
+    t_star_neg = multiply_const(t_star_pos, -1.0)
+    t_star = select(denom_pos, t_star_pos, t_star_neg, c_tol=_VIS_C_TOL)
+
+    zero_lit = create_literal_value(torch.tensor([0.0]), name=f"tw_tzero_{suffix}")
+    one_lit = create_literal_value(torch.tensor([1.0]), name=f"tw_tone_{suffix}")
+    a_inside = compare(f_a, 0.0)
+    b_inside = compare(f_b, 0.0)
+
+    t_lo_contrib = select(a_inside, zero_lit, t_star, c_tol=_VIS_C_TOL)
+    t_hi_contrib = select(b_inside, one_lit, t_star, c_tol=_VIS_C_TOL)
+    return t_lo_contrib, t_hi_contrib
+
+
+def _endpoint_to_column(
+    cross: Node,
+    dot: Node,
+    *,
+    W: int,
+    fov: int,
+    suffix: str,
+):
+    """``(cross, dot) → screen column`` — ported from
+    ``wall._endpoint_to_column``."""
+    col_lo, col_hi = -2.0, float(W + 2)
+    fov_rad = float(fov) * math.pi / 128.0
+    col_scale = float(W) / fov_rad
+    half_W = float(W) / 2.0
+
+    def _atan_of(cr: float, dt_abs: float) -> float:
+        return math.atan(cr / dt_abs)
+
+    bp_cross_lo = _COL_FOLD_BP_CROSS[0]
+    bp_cross_hi = _COL_FOLD_BP_CROSS[-1]
+    bp_dot_lo = _COL_FOLD_BP_DOT_ABS[0]
+    bp_dot_hi = _COL_FOLD_BP_DOT_ABS[-1]
+
+    dot_sign = compare(dot, 0.0)
+    abs_dot = abs_node(dot)
+    cross_clamped = clamp(cross, bp_cross_lo, bp_cross_hi)
+    dot_pos = clamp(abs_dot, bp_dot_lo, bp_dot_hi)
+
+    atan_val = low_rank_2d(
+        cross_clamped,
+        dot_pos,
+        _COL_FOLD_BP_CROSS,
+        _COL_FOLD_BP_DOT_ABS,
+        _atan_of,
+        rank=3,
+        name=f"tw_atan_front_{suffix}",
+    )
+    col_front = Linear(
+        atan_val,
+        torch.tensor([[col_scale]]),
+        torch.tensor([half_W]),
+        name=f"tw_col_front_{suffix}",
+    )
+    col_back = Linear(
+        col_front,
+        torch.tensor([[-1.0]]),
+        torch.tensor([float(W)]),
+        name=f"tw_col_back_{suffix}",
+    )
+    col_final = select(dot_sign, col_front, col_back, c_tol=_VIS_C_TOL)
+    return clamp(col_final, col_lo, col_hi)
+
+
 # ---------------------------------------------------------------------------
 # Next-token embedding state machine
 # ---------------------------------------------------------------------------
 
 
+def _norm(value: Node, name: str) -> Node:
+    """Normalize ``value`` to ``[0, 1]`` using the slot's ``(lo, hi)``.
+
+    ``n = (value - lo) / (hi - lo)``.  Pure affine.  The caller pipes
+    this through a ``cond_gate`` before scaling up to ``[0, 65535]``
+    for the factor stage — gating in normalized space keeps
+    ``cond_gate.M = 2`` instead of ``131070``.
+    """
+    lo, hi = VALUE_RANGE_BY_NAME[name]
+    width = hi - lo
+    shifted = add_const(value, -lo)
+    return multiply_const(shifted, 1.0 / width)
+
+
 def _compute_next_token_embedding(
     *,
     is_thinking_wall_marker: Node,
-    is_any_identifier: Node,
     is_thinking_value: Node,
-    is_hit_full_id: Node,
-    is_hit_x_id: Node,
-    is_hit_y_id: Node,
     prev_slot_onehot: Node,
-    hit_full: Node,
-    hit_x: Node,
-    hit_y: Node,
+    identifier_contribution: Node,
     current_wall_index: Node,
     max_walls: int,
 ) -> Node:
@@ -432,7 +1012,9 @@ def _compute_next_token_embedding(
     Three mutually-exclusive contributions sum into the output:
 
     * marker step emits the BSP_RANK identifier embedding.
-    * identifier step emits VALUE_0 (stubs) or VALUE_{hit} (HIT_*).
+    * identifier step emits the pre-gated per-slot VALUE embedding
+      (``identifier_contribution`` passed in — already zero at
+      non-identifier positions).
     * value step emits the successor identifier / marker / RESOLVED_X
       / SORTED_WALL, selected via ``prev_slot_onehot``.
 
@@ -440,33 +1022,12 @@ def _compute_next_token_embedding(
     orchestrator further masks via ``is_thinking_active``.
     """
     e_bsp_rank = create_literal_value(embed_lookup("BSP_RANK"), name="e_bsp_rank")
-    e_value_0 = create_literal_value(embed_lookup("VALUE_0"), name="e_value_0")
-    e_value_1 = create_literal_value(embed_lookup("VALUE_1"), name="e_value_1")
     e_resolved_x = create_literal_value(embed_lookup("RESOLVED_X"), name="e_resolved_x")
 
     # ---- Marker step: emit BSP_RANK_ID. ----
     marker_contribution = cond_gate(is_thinking_wall_marker, e_bsp_rank)
 
-    # ---- Identifier step: emit VALUE_0 baseline; override with
-    # (VALUE_1 - VALUE_0) at HIT_*_ID positions whose hit flag is +1.
-    # The inner cond_gate zeros the delta when the flag is negative;
-    # the outer cond_gate zeros the delta at non-HIT_* positions.  At
-    # stub identifier positions, only the VALUE_0 baseline survives.
-    delta_value_01 = subtract(e_value_1, e_value_0)
-    hf_override = cond_gate(is_hit_full_id, cond_gate(hit_full, delta_value_01))
-    hx_override = cond_gate(is_hit_x_id, cond_gate(hit_x, delta_value_01))
-    hy_override = cond_gate(is_hit_y_id, cond_gate(hit_y, delta_value_01))
-    base_at_id = cond_gate(is_any_identifier, e_value_0)
-    identifier_contribution = sum_nodes(
-        [base_at_id, hf_override, hx_override, hy_override]
-    )
-
     # ---- Value step: emit successor token. ----
-    # Fifteen of the 16 slot outcomes are static: a Linear indexes a
-    # fixed (16, 72) matrix with ``prev_slot_onehot`` to look up the
-    # successor embedding.  The HIT_Y row is zero in that matrix and
-    # is filled in by a dedicated contribution below that branches on
-    # wall_index (next marker vs RESOLVED_X).
     next_after_slot = torch.zeros(len(IDENTIFIER_NAMES), D_EMBED)
     for slot, name in _VALUE_SUCCESSOR_BY_SLOT.items():
         next_after_slot[slot] = embed_lookup(name)
@@ -494,9 +1055,6 @@ def _compute_next_token_embedding(
     is_last_wall = compare(current_wall_index, float(max_walls) - 1.5)
     hy_successor = select(is_last_wall, e_resolved_x, next_marker_embed)
 
-    # Gate the HIT_Y-specific successor by the slot-12 component of
-    # ``prev_slot_onehot``.  ``prev_slot_onehot`` is 0/1 per slot, so
-    # compare to 0.5 gives a clean ±1 bool for cond_gate.
     prev_was_hy_01 = extract_from(
         prev_slot_onehot, len(IDENTIFIER_NAMES), _SLOT_HIT_Y, 1, "prev_was_hy"
     )

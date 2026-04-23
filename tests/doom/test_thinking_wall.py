@@ -78,9 +78,14 @@ _SORTED_WALL_OFFSET = 6
 
 
 def _box_room_config():
+    # Tiny screen for the thinking-token tests — they only consume
+    # ``trace.token_id_log`` from the thinking phase, so resolution
+    # doesn't affect what's measured.  Combined with
+    # ``stop_after_thinking=True`` in the per-frame run, this drops
+    # the test runtime by ~10x vs the 64×80 walkthrough config.
     return RenderConfig(
-        screen_width=64,
-        screen_height=80,
+        screen_width=16,
+        screen_height=20,
         fov_columns=32,
         trig_table=_TRIG,
         ceiling_color=(0.2, 0.2, 0.2),
@@ -234,7 +239,14 @@ class TestThinkingWallDualPath:
                 inp = PlayerInput(**input_kw)
                 trace = FrameTrace()
                 frame, new_state = step_frame(
-                    module, state, inp, subset, config, textures=textures, trace=trace
+                    module,
+                    state,
+                    inp,
+                    subset,
+                    config,
+                    textures=textures,
+                    trace=trace,
+                    stop_after_thinking=True,
                 )
                 cache[key] = (frame, new_state, trace, inp)
             return cache[key]
@@ -242,7 +254,13 @@ class TestThinkingWallDualPath:
         return _run
 
     def _check_wall_hits(self, run, segs, px, py, angle, inp_kw):
-        """Run a frame and verify per-wall HIT_*/HIT_X/HIT_Y match reference."""
+        """Run a frame and verify per-wall HIT_*/HIT_X/HIT_Y match reference.
+
+        Phase A Part 3: HIT_* booleans are now uniform-quantized into
+        the (0, 1) range like every other VALUE — false → VALUE_0,
+        true → VALUE_65535.  Convert wire-format ID back to 0/1 by
+        comparing against the half-range.
+        """
         _, _, trace, inputs = run(px, py, angle, **inp_kw)
         vx, vy = _player_velocity(angle, inputs)
 
@@ -256,11 +274,11 @@ class TestThinkingWallDualPath:
         for i, seg in enumerate(segs):
             ref_hf, ref_hx, ref_hy = _ref_hits(seg, px, py, vx, vy)
             base = i * _STEPS_PER_WALL
-            # At a VALUE position the emitted token ID *is* the hit
-            # flag (VALUE IDs 0 and 1 are native vocab entries).
-            comp_hf = int(log[base + _HF_OFFSET])
-            comp_hx = int(log[base + _HX_OFFSET])
-            comp_hy = int(log[base + _HY_OFFSET])
+            # Wire-format VALUE for a 0/1 boolean: 0 → VALUE_0,
+            # 1 → VALUE_65535.  Recover the bool by thresholding.
+            comp_hf = 1 if int(log[base + _HF_OFFSET]) > 32767 else 0
+            comp_hx = 1 if int(log[base + _HX_OFFSET]) > 32767 else 0
+            comp_hy = 1 if int(log[base + _HY_OFFSET]) > 32767 else 0
             for name, ref, comp in [
                 ("HIT_FULL", ref_hf, comp_hf),
                 ("HIT_X", ref_hx, comp_hx),
@@ -311,23 +329,27 @@ class TestThinkingWallDualPath:
         self._check_wall_hits(run, segs, px, py, angle, inp)
 
     def test_full_sequence_trace(self, run, scene):
-        """Walk the full Part-2 thinking sequence, asserting the exact
+        """Walk the full Part-3 thinking sequence, asserting the exact
         token ID at every autoregressive position.
 
         Positions covered:
           * 8 marker positions (one per wall; host injects wall 0).
           * 8 × 13 = 104 identifier positions.
-          * 8 × 10 = 80 stub VALUE positions (emit VALUE_0).
-          * 8 × 3 = 24 HIT_* VALUE positions (emit VALUE_{hit_flag}).
+          * 8 × 10 = 80 per-wall VALUE positions for the 10 base /
+            derived value types (BSP_RANK, IS_RENDERABLE, CROSS/DOT,
+            T_LO/T_HI, VIS_LO/VIS_HI) — checked as ints in
+            ``[0, 65535]``; per-value dual-path checks land in
+            dedicated tests.
+          * 8 × 3 = 24 HIT_* VALUE positions (booleans encoded as
+            ``VALUE_0`` for false / ``VALUE_65535`` for true under
+            uniform 16-bit quantization).
           * 3 RESOLVED identifier positions.
-          * 3 RESOLVED stub VALUE positions (emit VALUE_0).
+          * 3 RESOLVED stub VALUE positions (still emit VALUE_0 in
+            Part 3; real math lands in Part 4).
           * 1 SORTED_WALL hand-off position.
 
-        The HIT_* values are additionally checked against the pure-Python
-        reference for the subset-walls (the transformer always walks
-        max_walls=8 markers, but only ``len(segs)`` of them have real
-        wall geometry attached; HIT_* values for the rest are produced
-        from degenerate attention reads and are not asserted).
+        The HIT_* values are additionally checked against the pure-
+        Python reference for the subset-walls.
         """
         max_walls = 8  # matches the compile_game fixture
         # A scenario with at least one real hit so the HIT_*-value
@@ -357,6 +379,35 @@ class TestThinkingWallDualPath:
                     f"pos {pos} ({label}): expected {expected}, got {actual}"
                 )
 
+        def _check_value_range(pos, label):
+            """Assert the ID at ``pos`` is a VALUE token (in [0, 65535])."""
+            actual = int(log[pos])
+            if not (0 <= actual <= 65535):
+                mismatches.append(
+                    f"pos {pos} ({label}): expected VALUE in [0, 65535], "
+                    f"got {actual}"
+                )
+
+        def _check_bool_value(pos, ref_bool, label):
+            """Assert the ID is the uniform-quantized boolean encoding.
+
+            Phase A Part 3: booleans are emitted as VALUE_0 (false) /
+            VALUE_65535 (true) under uniform 16-bit quantization.  The
+            factor cascade has ≤1-LSB drift on GPU FP, so the actual
+            argmaxed VALUE can land one integer off (VALUE_65534 still
+            reads back as ≈1.0 via dequantize, which is correct).  The
+            test thresholds the wire value at the half-range to
+            recover the intended boolean.
+            """
+            actual = int(log[pos])
+            recovered_bool = actual > 32767
+            if recovered_bool != ref_bool:
+                mismatches.append(
+                    f"pos {pos} ({label}): expected bool={ref_bool} "
+                    f"(wire near VALUE_{65535 if ref_bool else 0}), "
+                    f"got {actual}"
+                )
+
         # --- Per-wall assertions (all 8 walls). ---
         for wall_i in range(max_walls):
             base = wall_i * _STEPS_PER_WALL
@@ -379,54 +430,41 @@ class TestThinkingWallDualPath:
                     f"wall{wall_i} identifier {IDENTIFIER_NAMES[slot]}",
                 )
 
-            # Stub VALUE positions at base + (2, 4, 6, 8, 10, 12, 14, 16,
-            # 18, 20) — 10 stub emits per wall, all VALUE_0.
-            for stub_slot in range(10):  # BSP_RANK..VIS_HI
-                pos = base + 2 + 2 * stub_slot
-                _check(
+            # 10 base/derived VALUE positions (BSP_RANK..VIS_HI).  Range
+            # check only — per-value dual-path tests live separately.
+            for slot in range(10):
+                pos = base + 2 + 2 * slot
+                _check_value_range(
                     pos,
-                    value_id(0),
-                    f"wall{wall_i} stub VALUE for {IDENTIFIER_NAMES[stub_slot]}",
+                    f"wall{wall_i} VALUE for {IDENTIFIER_NAMES[slot]}",
                 )
 
             # HIT_* VALUEs: compare against the pure-Python reference for
-            # the subset walls; for max_walls beyond the subset, just
-            # check the ID is a valid VALUE token (0 or 1 — the hit
-            # math ran on garbage wall geometry and we don't know the
-            # "correct" outcome, but the emit machinery still pipes it
-            # through as VALUE_{0,1}).
+            # the subset walls; phantom walls just need a valid VALUE ID
+            # in {0, 65535} since the hit math ran on degenerate inputs.
             if wall_i < len(segs):
                 ref_hf, ref_hx, ref_hy = _ref_hits(segs[wall_i], px, py, vx, vy)
-                _check(
-                    base + _HF_OFFSET,
-                    value_id(ref_hf),
-                    f"wall{wall_i} VALUE HIT_FULL",
+                _check_bool_value(
+                    base + _HF_OFFSET, bool(ref_hf), f"wall{wall_i} VALUE HIT_FULL"
                 )
-                _check(
-                    base + _HX_OFFSET,
-                    value_id(ref_hx),
-                    f"wall{wall_i} VALUE HIT_X",
+                _check_bool_value(
+                    base + _HX_OFFSET, bool(ref_hx), f"wall{wall_i} VALUE HIT_X"
                 )
-                _check(
-                    base + _HY_OFFSET,
-                    value_id(ref_hy),
-                    f"wall{wall_i} VALUE HIT_Y",
+                _check_bool_value(
+                    base + _HY_OFFSET, bool(ref_hy), f"wall{wall_i} VALUE HIT_Y"
                 )
             else:
-                # For phantom walls, just insist the emission stays in
-                # {VALUE_0, VALUE_1}.  The hit-math input is degenerate
-                # (no real wall) so we don't assert which of the two.
                 for offset, lbl in [
                     (_HF_OFFSET, "HIT_FULL"),
                     (_HX_OFFSET, "HIT_X"),
                     (_HY_OFFSET, "HIT_Y"),
                 ]:
                     actual = int(log[base + offset])
-                    if actual not in (value_id(0), value_id(1)):
+                    if actual not in (value_id(0), value_id(65535)):
                         mismatches.append(
                             f"pos {base + offset} (wall{wall_i} phantom "
-                            f"VALUE {lbl}): expected VALUE_0 or VALUE_1, "
-                            f"got {actual}"
+                            f"VALUE {lbl}): expected VALUE_0 or "
+                            f"VALUE_65535, got {actual}"
                         )
 
         # --- RESOLVED chain after the last wall. ---

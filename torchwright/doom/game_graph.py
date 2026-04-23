@@ -267,11 +267,17 @@ def build_game_graph(
             wall_bx=inputs["wall_bx"],
             wall_by=inputs["wall_by"],
             wall_position_onehot=wall_out.position_onehot,
+            wall_bsp_coeffs=inputs["wall_bsp_coeffs"],
+            wall_bsp_const=inputs["wall_bsp_const"],
             vel_dx=input_out.vel_dx,
             vel_dy=input_out.vel_dy,
+            move_cos=input_out.move_cos,
+            move_sin=input_out.move_sin,
+            side_P_vec=bsp_out.side_P_vec,
             player_x=inputs["player_x"],
             player_y=inputs["player_y"],
         ),
+        embedding=embedding,
         is_wall=tf["is_wall"],
         is_thinking_wall_marker=tf["is_thinking_wall_marker"],
         is_thinking_wall_n=tf["is_thinking_wall_n"],
@@ -280,6 +286,9 @@ def build_game_graph(
         is_thinking_value=tf["is_thinking_value"],
         pos_encoding=pos_encoding,
         max_walls=max_walls,
+        max_coord=max_coord,
+        max_bsp_nodes=max_bsp_nodes,
+        config=config,
     )
 
     # ---------- SORTED ----------
