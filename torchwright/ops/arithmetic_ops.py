@@ -717,7 +717,13 @@ def piecewise_linear_2d(
     x_part = torch.linalg.pinv(A_v) @ bv
 
     if xs_int:
-        _U, S, Vh = torch.linalg.svd(A_v, full_matrices=True)
+        # full_matrices=False returns U of shape (m, min(m, n)) instead
+        # of (m, m).  We only use Vh (for the row-space nullspace via
+        # ``Vh[rank:]``) — never U — so the huge U matrix is pure waste.
+        # At multiply_2d's normalized grid sizes A_v is ~(n², 3 + 4n)
+        # with n ≈ 210; full matrices would allocate a 44k × 44k U
+        # (~15 GB float64) that torch spends minutes materializing.
+        _U, S, Vh = torch.linalg.svd(A_v, full_matrices=False)
         tol = S.max().item() * 1e-10 if S.numel() else 0.0
         rank = int((S > tol).sum().item())
         N_basis = Vh[rank:].T  # (3+K, nulldim)

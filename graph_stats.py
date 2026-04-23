@@ -834,6 +834,9 @@ def main():
         f"n_heads={d // d_head}"
     )
 
+    import time as _time
+
+    _t0 = _time.perf_counter()
     graph_io, pos = build_game_graph(
         config,
         textures,
@@ -842,8 +845,15 @@ def main():
         chunk_size=args.chunk_size,
     )
     output = graph_io.concat_output()
+    print(f"build_game_graph: {_time.perf_counter() - _t0:.1f}s", flush=True)
 
+    _t0 = _time.perf_counter()
     all_nodes = get_ancestor_nodes({output, pos})
+    print(
+        f"get_ancestor_nodes: {_time.perf_counter() - _t0:.1f}s  "
+        f"({len(all_nodes)} nodes)",
+        flush=True,
+    )
 
     # Compile to get actual layer assignments
     print("Compiling...")

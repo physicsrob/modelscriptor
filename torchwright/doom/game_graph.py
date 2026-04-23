@@ -131,6 +131,17 @@ def build_game_graph(
     ``max_bsp_nodes`` is the width of the BSP side vector (one slot per
     BSP_NODE token); it bounds how deep × broad the BSP tree can be.
     """
+    import time as _time
+
+    _t = _time.perf_counter()
+
+    def _mark(label: str) -> None:
+        nonlocal _t
+        print(
+            f"  build_game_graph/{label}: {_time.perf_counter() - _t:.1f}s", flush=True
+        )
+        _t = _time.perf_counter()
+
     tex_w, tex_h = textures[0].shape[0], textures[0].shape[1]
     cs = chunk_size
 
@@ -148,6 +159,7 @@ def build_game_graph(
     # comparisons or a category-only slice for ``is_thinking_value``).
     embedding = build_doom_embedding(input_name="token_ids")
     tf = _detect_token_types(embedding)
+    _mark("inputs+detect")
 
     # ---------- INPUT ----------
     input_out = build_input(
@@ -165,12 +177,14 @@ def build_game_graph(
         turn_speed=turn_speed,
         move_speed=move_speed,
     )
+    _mark("input")
 
     # ---------- TEX_COL ----------
     tex_col_out = build_tex_col(
         TexColToken(tex_col_input=inputs["tex_col_input"]),
         tex_w=tex_w,
     )
+    _mark("tex_col")
 
     # ---------- BSP ----------
     bsp_out = build_bsp(
@@ -187,6 +201,7 @@ def build_game_graph(
         max_coord=max_coord,
         max_bsp_nodes=max_bsp_nodes,
     )
+    _mark("bsp")
 
     # ---------- WALL ----------
     wall_out = build_wall(
@@ -215,6 +230,7 @@ def build_game_graph(
         max_coord=max_coord,
         max_bsp_nodes=max_bsp_nodes,
     )
+    _mark("wall")
 
     # EOS stage: gutted in Phase A Part 4.  The EOS token remains in
     # the prompt as an end-of-prompt marker but performs no graph
@@ -235,6 +251,7 @@ def build_game_graph(
         is_player_angle=tf["is_player_angle"],
         pos_encoding=pos_encoding,
     )
+    _mark("player")
 
     # ---------- THINKING_WALL ----------
     # Phase A Part 4: the thinking-wall stage now carries the full
@@ -280,6 +297,7 @@ def build_game_graph(
         max_bsp_nodes=max_bsp_nodes,
         config=config,
     )
+    _mark("thinking_wall")
 
     # ---------- SORTED ----------
     sorted_out = build_sorted(
@@ -296,6 +314,7 @@ def build_game_graph(
         pos_encoding=pos_encoding,
         max_walls=max_walls,
     )
+    _mark("sorted")
 
     # ---------- RENDER ----------
     # Phase A Part 4: post-collision (x, y) come from the RESOLVED_X /
@@ -304,7 +323,9 @@ def build_game_graph(
     # still come from PLAYER_ANGLE's broadcast — collision doesn't
     # change angle.
     resolved_x_readback = thinking_wall_out.readback.get_value_after_last("RESOLVED_X")
+    _mark("render/resolved_x_readback")
     resolved_y_readback = thinking_wall_out.readback.get_value_after_last("RESOLVED_Y")
+    _mark("render/resolved_y_readback")
     render_out = build_render(
         RenderToken(
             col=inputs["render_col"],
@@ -346,6 +367,7 @@ def build_game_graph(
         max_walls=max_walls,
         tex_sample_batch_size=tex_sample_batch_size,
     )
+    _mark("render")
 
     # ---------- Output assembly ----------
     overlaid, overflow = _assemble_output(
@@ -357,6 +379,7 @@ def build_game_graph(
         thinking_wall_out=thinking_wall_out,
         chunk_size=cs,
     )
+    _mark("assemble_output")
 
     return (
         GameGraphIO(
