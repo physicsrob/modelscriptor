@@ -1,55 +1,63 @@
-"""THINKING_WALL stage: per-wall hit_full/hit_x/hit_y as autoregressive
-tokens.
+"""THINKING_WALL stage: per-wall thinking-phase state machine with a
+full 16-identifier cascade plus 3 RESOLVED identifiers at the frame
+boundary.
 
-Phase A Part 1 — wire format unchanged from M4 (7 tokens per wall):
+Phase A Part 2 — wire format per wall (27 steps):
 
     [THINKING_WALL_N]
-      [HIT_FULL]  v(hit_full)
-      [HIT_X]     v(hit_x)
-      [HIT_Y]     v(hit_y)
+      [BSP_RANK]         v(0)          # stubbed, emits VALUE_0
+      [IS_RENDERABLE]    v(0)          # stubbed
+      [CROSS_A]          v(0)          # stubbed
+      [DOT_A]            v(0)          # stubbed
+      [CROSS_B]          v(0)          # stubbed
+      [DOT_B]            v(0)          # stubbed
+      [T_LO]             v(0)          # stubbed
+      [T_HI]             v(0)          # stubbed
+      [VIS_LO]           v(0)          # stubbed
+      [VIS_HI]           v(0)          # stubbed
+      [HIT_FULL]         v(hit_full)   # real
+      [HIT_X]            v(hit_x)      # real
+      [HIT_Y]            v(hit_y)      # real
 
-The three hit values are 0 or 1 ("did the player's velocity-ray hit
-this wall along axis A?"), so quantization is exact.  After all
-walls' hits emit, the last value step hands off to SORTED.
+After the last wall's HIT_Y value step (frame boundary):
 
-Representation shifted from M4's overlaid ``(next_token_type,
-thinking_value)`` pair to a single ``next_token_id`` emitted as the
-72-wide embedding of the next token.  The semantic shift is forced
-by the one-ID-per-step model: at an identifier step the graph
-produces the next position's full token content (including its
-payload), so the hit-value computation runs at the identifier step
-rather than the value step.  The value step's job reduces to
-emitting the next identifier (or the next marker / SORTED hand-off
-after HIT_Y).
+    [RESOLVED_X]        v(0)           # stubbed (real math lands in Part 4)
+    [RESOLVED_Y]        v(0)           # stubbed
+    [RESOLVED_ANGLE]    v(0)           # stubbed
+    [SORTED_WALL]                      # hand-off out of the thinking phase
 
-State graph (thinking positions only):
+Semantic contract: each autoregressive step takes a single ``token_id``
+in and emits the next ``token_id`` as a 72-wide embedding the host
+argmaxes against ``W_EMBED.T``.
 
-* marker           → HIT_FULL    (emit embed_lookup("HIT_FULL"))
-* HIT_FULL         → VALUE of hit_full (embed W_EMBED[hit_full_01])
-* HIT_X            → VALUE of hit_x
-* HIT_Y            → VALUE of hit_y
-* VALUE, prev=HF   → HIT_X
-* VALUE, prev=HX   → HIT_Y
-* VALUE, prev=HY:
-       if wall_idx < max_walls - 1 → THINKING_WALL[wall_idx + 1]
-       else                        → SORTED_WALL
+Under the embedding-carrier architecture, an identifier step computes
+the value and emits the VALUE-ID embedding encoding it; a value step
+uses the most-recent-identifier lookup to decide which identifier /
+marker / RESOLVED-chain / SORTED hand-off to emit next.
 
-Three attention reads (same as M4):
+Stub identifier steps emit the fixed ``embed_lookup("VALUE_0")`` row.
+HIT_FULL / HIT_X / HIT_Y identifier steps compute the ray-segment hit
+flag (identical math to ``wall.py:_compute_collision_flags``) and emit
+``embed_lookup("VALUE_0")`` or ``embed_lookup("VALUE_1")`` depending
+on the flag.
+
+Attention reads (three hops):
 
 1. **Current wall identity.**  ``attend_most_recent_matching`` against
-   ``is_thinking_wall_marker``: value carries the marker's wall_index.
-2. **Previous identifier type.**  ``attend_most_recent_matching``
-   against ``is_any_identifier``: carries 3-wide one-hot
-   ``[is_HF, is_HX, is_HY]``.
+   ``is_thinking_wall_marker``: value carries the marker's wall_index
+   as a 1-wide scalar.
+2. **Previous identifier slot.**  ``attend_most_recent_matching``
+   against ``is_any_identifier``: value is a 16-wide one-hot, slot
+   ``i`` active iff the most recent identifier was
+   ``IDENTIFIER_NAMES[i]``.
 3. **Wall geometry from prompt.**  ``attend_argmax_dot`` using
-   ``wall_j_onehot`` derived from ``current_wall_index``.
-
-Hit math (``_compute_hit_flags`` / ``_validity``) is identical to
-``stages.wall._compute_collision_flags`` — six piecewise products +
-three five-predicate validity checks.
+   ``wall_j_onehot`` derived from ``current_wall_index``; restricted
+   to HIT_FULL/X/Y identifier steps via a query gate so the read only
+   fires where the hit math needs it.
 """
 
 from dataclasses import dataclass
+from typing import List
 
 import torch
 
@@ -71,15 +79,52 @@ from torchwright.ops.attention_ops import (
     attend_most_recent_matching,
 )
 from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.logic_ops import bool_all_true, cond_gate
+from torchwright.ops.logic_ops import bool_all_true, bool_any_true, cond_gate
 from torchwright.ops.map_select import in_range, select
 
-from torchwright.doom.embedding import D_EMBED, embed_lookup
+from torchwright.doom.embedding import (
+    D_EMBED,
+    IDENTIFIER_NAMES,
+    embed_lookup,
+)
 from torchwright.doom.graph_constants import (
     DIFF_BP,
     VEL_BP,
 )
 from torchwright.doom.graph_utils import extract_from
+
+# ---------------------------------------------------------------------------
+# Slot indices for the three HIT_* identifiers the state machine
+# special-cases for real value computation.  Other slots are stubs whose
+# identifier step emits VALUE_0 unconditionally.
+# ---------------------------------------------------------------------------
+
+_SLOT_HIT_FULL = IDENTIFIER_NAMES.index("HIT_FULL")
+_SLOT_HIT_X = IDENTIFIER_NAMES.index("HIT_X")
+_SLOT_HIT_Y = IDENTIFIER_NAMES.index("HIT_Y")
+
+# Slot i → name of the next token to emit at the VALUE step whose most
+# recent identifier was at slot i.  Slot ``_SLOT_HIT_Y`` is deliberately
+# absent — its successor is wall-index-dependent (next marker or
+# RESOLVED_X if last wall) and is handled separately.
+_VALUE_SUCCESSOR_BY_SLOT = {
+    IDENTIFIER_NAMES.index("BSP_RANK"): "IS_RENDERABLE",
+    IDENTIFIER_NAMES.index("IS_RENDERABLE"): "CROSS_A",
+    IDENTIFIER_NAMES.index("CROSS_A"): "DOT_A",
+    IDENTIFIER_NAMES.index("DOT_A"): "CROSS_B",
+    IDENTIFIER_NAMES.index("CROSS_B"): "DOT_B",
+    IDENTIFIER_NAMES.index("DOT_B"): "T_LO",
+    IDENTIFIER_NAMES.index("T_LO"): "T_HI",
+    IDENTIFIER_NAMES.index("T_HI"): "VIS_LO",
+    IDENTIFIER_NAMES.index("VIS_LO"): "VIS_HI",
+    IDENTIFIER_NAMES.index("VIS_HI"): "HIT_FULL",
+    IDENTIFIER_NAMES.index("HIT_FULL"): "HIT_X",
+    IDENTIFIER_NAMES.index("HIT_X"): "HIT_Y",
+    IDENTIFIER_NAMES.index("RESOLVED_X"): "RESOLVED_Y",
+    IDENTIFIER_NAMES.index("RESOLVED_Y"): "RESOLVED_ANGLE",
+    IDENTIFIER_NAMES.index("RESOLVED_ANGLE"): "SORTED_WALL",
+}
+
 
 # ---------------------------------------------------------------------------
 # Contract
@@ -143,9 +188,7 @@ def build_thinking_wall(
     is_thinking_wall_marker: Node,
     is_thinking_wall_n: list,
     is_any_identifier: Node,
-    is_hit_full_id: Node,
-    is_hit_x_id: Node,
-    is_hit_y_id: Node,
+    is_identifier_by_slot: List[Node],
     is_thinking_value: Node,
     pos_encoding: PosEncoding,
     max_walls: int,
@@ -155,7 +198,15 @@ def build_thinking_wall(
         "thinking_wall vocabulary defines 8 markers (THINKING_WALL_0..7); "
         f"max_walls={max_walls} would need additional vocabulary entries."
     )
+    assert len(is_identifier_by_slot) == len(IDENTIFIER_NAMES) == 16, (
+        f"expected 16 per-slot identifier detectors, got "
+        f"{len(is_identifier_by_slot)}"
+    )
     is_thinking_wall_n = is_thinking_wall_n[:max_walls]
+
+    is_hit_full_id = is_identifier_by_slot[_SLOT_HIT_FULL]
+    is_hit_x_id = is_identifier_by_slot[_SLOT_HIT_X]
+    is_hit_y_id = is_identifier_by_slot[_SLOT_HIT_Y]
 
     with annotate("thinking_wall/marker_index"):
         # At marker positions, decode wall_index from which of the 8
@@ -185,36 +236,41 @@ def build_thinking_wall(
         )
 
     with annotate("thinking_wall/find_prev_identifier"):
-        prev_id_value_at_id = Concatenate(
+        # Store a 16-wide slot one-hot at every identifier position;
+        # ``attend_most_recent_matching`` against ``is_any_identifier``
+        # reads back "which identifier was most recent" as that same
+        # one-hot.  At non-identifier positions the concatenation is
+        # zero-valued (so even without the outer ``is_any_identifier``
+        # gate the key-side would filter cleanly), but the explicit
+        # gate keeps intent visible and bounds the value more tightly.
+        slot_onehot_at_id = Concatenate(
             [
-                cond_gate(is_hit_full_id, query_const_1),
-                cond_gate(is_hit_x_id, query_const_1),
-                cond_gate(is_hit_y_id, query_const_1),
+                cond_gate(is_identifier_by_slot[i], query_const_1)
+                for i in range(len(IDENTIFIER_NAMES))
             ]
         )
-        prev_id_value_gated = cond_gate(is_any_identifier, prev_id_value_at_id)
-        prev_id_onehot = attend_most_recent_matching(
+        slot_onehot_gated = cond_gate(is_any_identifier, slot_onehot_at_id)
+        prev_slot_onehot = attend_most_recent_matching(
             pos_encoding=pos_encoding,
             query_vector=query_const_1,
             key_vector=is_any_identifier,
-            value=prev_id_value_gated,
+            value=slot_onehot_gated,
             match_gain=12000.0,
+            assert_hardness_gt=0.99,
         )
-        prev_was_hf_01 = extract_from(prev_id_onehot, 3, 0, 1, "prev_was_hf")
-        prev_was_hx_01 = extract_from(prev_id_onehot, 3, 1, 1, "prev_was_hx")
-        prev_was_hy_01 = extract_from(prev_id_onehot, 3, 2, 1, "prev_was_hy")
 
     with annotate("thinking_wall/wall_geom_attention"):
         wi_clamped = clamp(current_wall_index, 0.0, float(max_walls - 1))
         wi_p1 = add_const(wi_clamped, 1.0)
         wall_j_onehot = bool_to_01(in_range(wi_clamped, wi_p1, max_walls))
 
-        # Restrict the attend query to identifier positions — that's
-        # where the hit value gets computed and emitted as the next
-        # token.  Other thinking positions (marker, value) don't need
-        # the wall-geometry read.
+        # Only HIT_FULL/X/Y identifier steps read wall geometry — stub
+        # identifier steps emit VALUE_0 unconditionally and don't need
+        # the geometry read.  Gating the query keeps the attention head
+        # off the stub positions' work path.
+        is_hit_any = bool_any_true([is_hit_full_id, is_hit_x_id, is_hit_y_id])
         wall_geom = attend_argmax_dot(
-            query_vector=cond_gate(is_any_identifier, wall_j_onehot),
+            query_vector=cond_gate(is_hit_any, wall_j_onehot),
             key_vector=cond_gate(is_wall, kv.wall_position_onehot),
             value=cond_gate(
                 is_wall,
@@ -243,12 +299,12 @@ def build_thinking_wall(
     with annotate("thinking_wall/next_token_embedding"):
         next_token_embedding = _compute_next_token_embedding(
             is_thinking_wall_marker=is_thinking_wall_marker,
+            is_any_identifier=is_any_identifier,
+            is_thinking_value=is_thinking_value,
             is_hit_full_id=is_hit_full_id,
             is_hit_x_id=is_hit_x_id,
             is_hit_y_id=is_hit_y_id,
-            is_thinking_value=is_thinking_value,
-            prev_was_hf_01=prev_was_hf_01,
-            prev_was_hx_01=prev_was_hx_01,
+            prev_slot_onehot=prev_slot_onehot,
             hit_full=hit_full,
             hit_x=hit_x,
             hit_y=hit_y,
@@ -277,7 +333,7 @@ def build_thinking_wall(
 # Hit-flag computation (same math as wall.py:_compute_collision_flags,
 # but using attended-in wall geometry rather than host-fed at-position
 # fields, and without the is_wall outer gate — these values are only
-# consumed at THINKING identifier positions).
+# consumed at HIT_*_ID thinking identifier positions).
 # ---------------------------------------------------------------------------
 
 
@@ -359,80 +415,95 @@ def _validity(den: Node, num_t: Node, num_u: Node) -> Node:
 def _compute_next_token_embedding(
     *,
     is_thinking_wall_marker: Node,
+    is_any_identifier: Node,
+    is_thinking_value: Node,
     is_hit_full_id: Node,
     is_hit_x_id: Node,
     is_hit_y_id: Node,
-    is_thinking_value: Node,
-    prev_was_hf_01: Node,
-    prev_was_hx_01: Node,
+    prev_slot_onehot: Node,
     hit_full: Node,
     hit_x: Node,
     hit_y: Node,
     current_wall_index: Node,
     max_walls: int,
 ) -> Node:
-    """Emit the 72-wide embedding of the next token.
+    """Build the 72-wide next-token embedding at every position.
 
-    See module docstring for the state graph.  Non-thinking positions
-    get a don't-care zero output that the orchestrator gates away via
-    ``is_thinking_active``.
+    Three mutually-exclusive contributions sum into the output:
+
+    * marker step emits the BSP_RANK identifier embedding.
+    * identifier step emits VALUE_0 (stubs) or VALUE_{hit} (HIT_*).
+    * value step emits the successor identifier / marker / RESOLVED_X
+      / SORTED_WALL, selected via ``prev_slot_onehot``.
+
+    Non-thinking positions zero out in all three contributions; the
+    orchestrator further masks via ``is_thinking_active``.
     """
-    e_hf = create_literal_value(embed_lookup("HIT_FULL"), name="e_hf")
-    e_hx = create_literal_value(embed_lookup("HIT_X"), name="e_hx")
-    e_hy = create_literal_value(embed_lookup("HIT_Y"), name="e_hy")
-    e_sorted = create_literal_value(embed_lookup("SORTED_WALL"), name="e_sorted")
+    e_bsp_rank = create_literal_value(embed_lookup("BSP_RANK"), name="e_bsp_rank")
     e_value_0 = create_literal_value(embed_lookup("VALUE_0"), name="e_value_0")
     e_value_1 = create_literal_value(embed_lookup("VALUE_1"), name="e_value_1")
-    zero_embedding = create_literal_value(torch.zeros(D_EMBED), name="e_zero")
+    e_resolved_x = create_literal_value(embed_lookup("RESOLVED_X"), name="e_resolved_x")
 
-    # Hit-value emission at each HIT_*_ID step.  VALUE IDs 0 and 1
-    # have distinct W_EMBED rows that ``select`` cleanly picks between
-    # via the ±1 hit-flag predicate.
-    e_hit_full_value = select(hit_full, e_value_1, e_value_0)
-    e_hit_x_value = select(hit_x, e_value_1, e_value_0)
-    e_hit_y_value = select(hit_y, e_value_1, e_value_0)
+    # ---- Marker step: emit BSP_RANK_ID. ----
+    marker_contribution = cond_gate(is_thinking_wall_marker, e_bsp_rank)
 
-    # At a VALUE step, emit the next identifier / marker / SORTED.
-    # next_marker_embed: one-hot(wall_index + 1) projected through the
-    # stacked per-wall marker embeddings.
+    # ---- Identifier step: emit VALUE_0 baseline; override with
+    # (VALUE_1 - VALUE_0) at HIT_*_ID positions whose hit flag is +1.
+    # The inner cond_gate zeros the delta when the flag is negative;
+    # the outer cond_gate zeros the delta at non-HIT_* positions.  At
+    # stub identifier positions, only the VALUE_0 baseline survives.
+    delta_value_01 = subtract(e_value_1, e_value_0)
+    hf_override = cond_gate(is_hit_full_id, cond_gate(hit_full, delta_value_01))
+    hx_override = cond_gate(is_hit_x_id, cond_gate(hit_x, delta_value_01))
+    hy_override = cond_gate(is_hit_y_id, cond_gate(hit_y, delta_value_01))
+    base_at_id = cond_gate(is_any_identifier, e_value_0)
+    identifier_contribution = sum_nodes(
+        [base_at_id, hf_override, hx_override, hy_override]
+    )
+
+    # ---- Value step: emit successor token. ----
+    # Fifteen of the 16 slot outcomes are static: a Linear indexes a
+    # fixed (16, 72) matrix with ``prev_slot_onehot`` to look up the
+    # successor embedding.  The HIT_Y row is zero in that matrix and
+    # is filled in by a dedicated contribution below that branches on
+    # wall_index (next marker vs RESOLVED_X).
+    next_after_slot = torch.zeros(len(IDENTIFIER_NAMES), D_EMBED)
+    for slot, name in _VALUE_SUCCESSOR_BY_SLOT.items():
+        next_after_slot[slot] = embed_lookup(name)
+    static_next_at_value = Linear(
+        prev_slot_onehot,
+        next_after_slot,
+        torch.zeros(D_EMBED),
+        name="next_at_value_static",
+    )
+
+    # HIT_Y successor: next wall's THINKING_WALL marker, or RESOLVED_X
+    # if we've just finished the last wall.
     wi_p1 = clamp(add_const(current_wall_index, 1.0), 0.0, float(max_walls - 1))
     wi_p2 = add_const(wi_p1, 1.0)
     wi_p1_onehot = bool_to_01(in_range(wi_p1, wi_p2, max_walls))
     marker_codes = torch.stack(
         [embed_lookup(f"THINKING_WALL_{i}") for i in range(max_walls)], dim=0
-    )  # (max_walls, D_EMBED)
+    )
     next_marker_embed = Linear(
         wi_p1_onehot,
         marker_codes,
         torch.zeros(D_EMBED),
         name="next_marker_embed",
     )
-
     is_last_wall = compare(current_wall_index, float(max_walls) - 1.5)
-    next_after_hy = select(is_last_wall, e_sorted, next_marker_embed)
+    hy_successor = select(is_last_wall, e_resolved_x, next_marker_embed)
 
-    prev_was_hf = compare(prev_was_hf_01, 0.5)
-    prev_was_hx = compare(prev_was_hx_01, 0.5)
-    next_at_value = select(
-        prev_was_hf,
-        e_hx,
-        select(prev_was_hx, e_hy, next_after_hy),
+    # Gate the HIT_Y-specific successor by the slot-12 component of
+    # ``prev_slot_onehot``.  ``prev_slot_onehot`` is 0/1 per slot, so
+    # compare to 0.5 gives a clean ±1 bool for cond_gate.
+    prev_was_hy_01 = extract_from(
+        prev_slot_onehot, len(IDENTIFIER_NAMES), _SLOT_HIT_Y, 1, "prev_was_hy"
     )
+    prev_was_hy_bool = compare(prev_was_hy_01, 0.5)
+    hy_contribution = cond_gate(prev_was_hy_bool, hy_successor)
 
-    return select(
-        is_thinking_wall_marker,
-        e_hf,
-        select(
-            is_hit_full_id,
-            e_hit_full_value,
-            select(
-                is_hit_x_id,
-                e_hit_x_value,
-                select(
-                    is_hit_y_id,
-                    e_hit_y_value,
-                    select(is_thinking_value, next_at_value, zero_embedding),
-                ),
-            ),
-        ),
-    )
+    next_at_value_total = sum_nodes([static_next_at_value, hy_contribution])
+    value_contribution = cond_gate(is_thinking_value, next_at_value_total)
+
+    return sum_nodes([marker_contribution, identifier_contribution, value_contribution])

@@ -529,9 +529,11 @@ def step_frame(
         player_y=torch.tensor([pre_py]),
     )
 
-    # Thinking phase budget: 8 markers + 8 walls × (3 IDs + 3 values) = 56.
-    # Add a small safety margin.
-    n_thinking = 8 + max_walls * 6 + 4
+    # Thinking phase budget (Part 2): per wall, 1 marker + 13 identifiers
+    # + 13 values = 27 steps.  After the last wall, 3 RESOLVED identifiers
+    # + 3 RESOLVED values = 6 steps.  Total = max_walls * 27 + 6, plus a
+    # small safety margin.
+    n_thinking = max_walls * 27 + 6 + 4
     max_steps = n_thinking + N * (W * (H // cs + 1) + 1) + 10
     total_steps = 0
     prev_wc = 0.0

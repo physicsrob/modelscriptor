@@ -41,6 +41,7 @@ from torchwright.reference_renderer.types import RenderConfig
 from torchwright.doom.embedding import (
     D_EMBED,
     E8_VALUE,
+    IDENTIFIER_NAMES,
     V,
     build_doom_embedding,
     embed_lookup,
@@ -275,9 +276,7 @@ def build_game_graph(
         is_thinking_wall_marker=tf["is_thinking_wall_marker"],
         is_thinking_wall_n=tf["is_thinking_wall_n"],
         is_any_identifier=tf["is_any_identifier"],
-        is_hit_full_id=tf["is_hit_full_id"],
-        is_hit_x_id=tf["is_hit_x_id"],
-        is_hit_y_id=tf["is_hit_y_id"],
+        is_identifier_by_slot=tf["is_identifier_by_slot"],
         is_thinking_value=tf["is_thinking_value"],
         pos_encoding=pos_encoding,
         max_walls=max_walls,
@@ -459,8 +458,12 @@ def _detect_token_types(embedding: Node) -> Dict[str, Any]:
     category code (for the category-only ``is_thinking_value`` — all
     65,536 VALUE rows share this 8-wide prefix).
 
-    Most entries are ``Node`` booleans, but ``is_thinking_wall_n`` is
-    a ``list[Node]`` — one detector per marker.
+    Per-identifier detectors (Part 2): one detector per entry in
+    ``IDENTIFIER_NAMES`` (16 total — 13 per-wall + 3 RESOLVED).  Both a
+    dict-keyed convenience form (``is_bsp_rank_id``, ``is_hit_full_id``,
+    ``is_resolved_x_id``, …) and an ordered ``is_identifier_by_slot``
+    list are exposed; the thinking-wall stage indexes by slot while
+    other stages read by name.
     """
     with annotate("token_type"):
         flags: Dict[str, Any] = {
@@ -474,16 +477,22 @@ def _detect_token_types(embedding: Node) -> Dict[str, Any]:
             "is_player_x": equals_vector(embedding, embed_lookup("PLAYER_X")),
             "is_player_y": equals_vector(embedding, embed_lookup("PLAYER_Y")),
             "is_player_angle": equals_vector(embedding, embed_lookup("PLAYER_ANGLE")),
-            # Phase A M4: thinking-token identifier detectors.
-            "is_hit_full_id": equals_vector(embedding, embed_lookup("HIT_FULL")),
-            "is_hit_x_id": equals_vector(embedding, embed_lookup("HIT_X")),
-            "is_hit_y_id": equals_vector(embedding, embed_lookup("HIT_Y")),
             # Category-only: any VALUE token (cols [0:8] == E8_VALUE).
             "is_thinking_value": equals_vector(
                 extract_from(embedding, D_EMBED, 0, 8, "value_category_cols"),
                 E8_VALUE,
             ),
         }
+        # Per-identifier detectors (16 total).  Built in IDENTIFIER_NAMES
+        # order; both indexed (by slot) and keyed (by name) for downstream
+        # convenience.
+        is_identifier_by_slot = [
+            equals_vector(embedding, embed_lookup(name)) for name in IDENTIFIER_NAMES
+        ]
+        flags["is_identifier_by_slot"] = is_identifier_by_slot
+        for name, detector in zip(IDENTIFIER_NAMES, is_identifier_by_slot):
+            flags[f"is_{name.lower()}_id"] = detector
+        flags["is_any_identifier"] = bool_any_true(is_identifier_by_slot)
         # Per-marker detectors (8 walls).  is_thinking_wall_marker is the
         # OR — used as the validity signal in the value step's "find
         # current wall_index" attention.
@@ -493,13 +502,6 @@ def _detect_token_types(embedding: Node) -> Dict[str, Any]:
         ]
         flags["is_thinking_wall_n"] = is_thinking_wall_n
         flags["is_thinking_wall_marker"] = bool_any_true(is_thinking_wall_n)
-        flags["is_any_identifier"] = bool_any_true(
-            [
-                flags["is_hit_full_id"],
-                flags["is_hit_x_id"],
-                flags["is_hit_y_id"],
-            ]
-        )
         return flags
 
 

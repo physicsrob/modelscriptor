@@ -250,6 +250,17 @@ assert W_EMBED.shape == (V, D_EMBED)
 # ---------------------------------------------------------------------------
 
 
+# Ordered list of the 16 identifier names that the thinking-phase state
+# machine walks per wall (13 per-wall) plus per-frame (3 RESOLVED).  The
+# ordering is the cascade order: each entry at index ``i`` is the
+# identifier emitted at the VALUE step whose most recent identifier was
+# the entry at index ``i - 1``.  The ``thinking_wall`` stage and
+# ``_detect_token_types`` both iterate this list to build the 16-wide
+# slot machinery.
+IDENTIFIER_NAMES: List[str] = list(_PER_WALL_IDENTIFIERS) + list(_RESOLVED_IDENTIFIERS)
+assert len(IDENTIFIER_NAMES) == 16
+
+
 def vocab_id(name: str) -> int:
     """Look up the integer vocab ID for a named token (raises KeyError)."""
     return _VOCAB_IDS[name]

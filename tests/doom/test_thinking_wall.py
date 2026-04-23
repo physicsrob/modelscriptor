@@ -1,20 +1,28 @@
-"""Phase A M4 dual-path test: thinking-token HIT_* values match reference.
+"""Phase A Part 2 thinking-token trace + dual-path tests.
 
-Compiles the full game graph (with the thinking-wall stage), runs a
-single frame, and checks that the per-wall HIT_FULL/HIT_X/HIT_Y values
-emitted as thinking tokens match a Python reference computed from the
-same scene + player state.
+Two kinds of assertion:
 
-The reference is the same intersect-segment math the WALL stage runs
-(see ``torchwright.doom.stages.wall._collision_validity``), reimplemented
-in pure Python so we can compare without depending on the WALL stage's
-output (which is only consumed by EOS — the dual paths are independent).
+1. **Dual-path** (``TestThinkingWallDualPath``): compares the per-wall
+   HIT_FULL/HIT_X/HIT_Y values the compiled graph emits against a pure-
+   Python reference of the same intersect-segment math.  If all three
+   hits per wall agree with the reference across the parameterised
+   player/input configurations, the hit-math path through the embedding
+   carrier is end-to-end correct (current-wall_index attention, prompt-
+   geometry attention, hit math, VALUE ID emission).
 
-If a wall's three thinking-token hits agree with the reference for
-every wall in the scene, the M4 thinking-token mechanism is end-to-end
-correct: marker → identifier → value sequencing, current-wall_index
-attention, prompt-geometry attention, hit math, value selection, and
-output thinking_value all line up.
+2. **Full-sequence trace** (``TestThinkingSequenceTrace``): asserts the
+   compiled graph emits the exact expected token at every position of
+   the Part 2 thinking sequence — markers, identifiers, VALUE_0 stubs,
+   HIT_* values, RESOLVED_* chain, and the SORTED_WALL hand-off.  This
+   covers the cascade state machine itself (which identifier comes
+   next, when RESOLVED fires, when SORTED is handed off) independently
+   of hit-math correctness.
+
+The references in both tests are the same intersect-segment math the
+WALL stage runs (see ``torchwright.doom.stages.wall._collision_validity``),
+reimplemented in pure Python so we can compare without depending on the
+WALL stage's output (which is only consumed by EOS — the dual paths are
+independent).
 """
 
 import math
@@ -22,6 +30,7 @@ import math
 import pytest
 
 from torchwright.doom.compile import compile_game, step_frame
+from torchwright.doom.embedding import IDENTIFIER_NAMES, value_id, vocab_id
 from torchwright.doom.game import GameState
 from torchwright.doom.input import PlayerInput
 from torchwright.doom.map_subset import build_scene_subset
@@ -34,18 +43,38 @@ _TRIG = generate_trig_table()
 _MOVE_SPEED = 0.3
 _TURN_SPEED = 4
 
-# Thinking phase layout per wall: 7 autoregressive steps.
-#   step+0: marker (THINKING_WALL_N)
-#   step+1: HIT_FULL_ID
-#   step+2: VALUE for HIT_FULL      ← the token_id at this offset *is* the hit flag
-#   step+3: HIT_X_ID
-#   step+4: VALUE for HIT_X         ← token_id ∈ {0, 1}
-#   step+5: HIT_Y_ID
-#   step+6: VALUE for HIT_Y         ← token_id ∈ {0, 1}
-_STEPS_PER_WALL = 7
-_HF_OFFSET = 2
-_HX_OFFSET = 4
-_HY_OFFSET = 6
+# Thinking phase layout per wall (Part 2, 27 autoregressive steps):
+#
+#   step+0:  marker          (THINKING_WALL_N)
+#   step+1:  BSP_RANK_ID     step+2:  VALUE (stub = VALUE_0)
+#   step+3:  IS_RENDERABLE_ID step+4:  VALUE (stub)
+#   step+5:  CROSS_A_ID       step+6:  VALUE (stub)
+#   step+7:  DOT_A_ID         step+8:  VALUE (stub)
+#   step+9:  CROSS_B_ID       step+10: VALUE (stub)
+#   step+11: DOT_B_ID         step+12: VALUE (stub)
+#   step+13: T_LO_ID          step+14: VALUE (stub)
+#   step+15: T_HI_ID          step+16: VALUE (stub)
+#   step+17: VIS_LO_ID        step+18: VALUE (stub)
+#   step+19: VIS_HI_ID        step+20: VALUE (stub)
+#   step+21: HIT_FULL_ID      step+22: VALUE (hit_full ∈ {0, 1})
+#   step+23: HIT_X_ID         step+24: VALUE (hit_x ∈ {0, 1})
+#   step+25: HIT_Y_ID         step+26: VALUE (hit_y ∈ {0, 1})
+#
+# After the last wall's HIT_Y value, the RESOLVED chain runs:
+#   +0: RESOLVED_X_ID   +1: VALUE (stub)
+#   +2: RESOLVED_Y_ID   +3: VALUE (stub)
+#   +4: RESOLVED_ANGLE_ID +5: VALUE (stub)
+#   +6: SORTED_WALL (hand-off)
+_STEPS_PER_WALL = 27
+_HF_OFFSET = 22
+_HX_OFFSET = 24
+_HY_OFFSET = 26
+
+_RESOLVED_BASE_OFFSET = 0  # from the first post-HIT_Y-of-last-wall step
+_RESOLVED_X_OFFSET = 0
+_RESOLVED_Y_OFFSET = 2
+_RESOLVED_ANGLE_OFFSET = 4
+_SORTED_WALL_OFFSET = 6
 
 
 def _box_room_config():
@@ -280,3 +309,164 @@ class TestThinkingWallDualPath:
     def test_per_wall_hits_match_reference(self, run, scene, px, py, angle, inp):
         _, _, _, segs = scene
         self._check_wall_hits(run, segs, px, py, angle, inp)
+
+    def test_full_sequence_trace(self, run, scene):
+        """Walk the full Part-2 thinking sequence, asserting the exact
+        token ID at every autoregressive position.
+
+        Positions covered:
+          * 8 marker positions (one per wall; host injects wall 0).
+          * 8 × 13 = 104 identifier positions.
+          * 8 × 10 = 80 stub VALUE positions (emit VALUE_0).
+          * 8 × 3 = 24 HIT_* VALUE positions (emit VALUE_{hit_flag}).
+          * 3 RESOLVED identifier positions.
+          * 3 RESOLVED stub VALUE positions (emit VALUE_0).
+          * 1 SORTED_WALL hand-off position.
+
+        The HIT_* values are additionally checked against the pure-Python
+        reference for the subset-walls (the transformer always walks
+        max_walls=8 markers, but only ``len(segs)`` of them have real
+        wall geometry attached; HIT_* values for the rest are produced
+        from degenerate attention reads and are not asserted).
+        """
+        max_walls = 8  # matches the compile_game fixture
+        # A scenario with at least one real hit so the HIT_*-value
+        # assertions exercise both 0 and 1 emissions.
+        px, py, angle, inp_kw = 4.9, 0.0, 0, {"forward": True}
+
+        _, _, trace, inputs = run(px, py, angle, **inp_kw)
+        vx, vy = _player_velocity(angle, inputs)
+        _, _, _, segs = scene
+
+        log = trace.token_id_log
+        expected_len = max_walls * _STEPS_PER_WALL + _SORTED_WALL_OFFSET + 1
+        assert len(log) >= expected_len, (
+            f"token_id_log length {len(log)} < expected {expected_len} "
+            f"(thinking phase may be truncated)"
+        )
+
+        # Per-slot expected identifier ID (by IDENTIFIER_NAMES order).
+        expected_id_at_slot = [vocab_id(name) for name in IDENTIFIER_NAMES]
+
+        mismatches = []
+
+        def _check(pos, expected, label):
+            actual = int(log[pos])
+            if actual != expected:
+                mismatches.append(
+                    f"pos {pos} ({label}): expected {expected}, got {actual}"
+                )
+
+        # --- Per-wall assertions (all 8 walls). ---
+        for wall_i in range(max_walls):
+            base = wall_i * _STEPS_PER_WALL
+
+            # Marker at base+0.
+            _check(
+                base + 0,
+                vocab_id(f"THINKING_WALL_{wall_i}"),
+                f"wall{wall_i} marker",
+            )
+
+            # 13 identifier positions at base + (1, 3, 5, ..., 25).
+            # They follow IDENTIFIER_NAMES order for the first 13 entries
+            # (RESOLVED_* are handled after the last wall).
+            for slot in range(13):
+                pos = base + 1 + 2 * slot
+                _check(
+                    pos,
+                    expected_id_at_slot[slot],
+                    f"wall{wall_i} identifier {IDENTIFIER_NAMES[slot]}",
+                )
+
+            # Stub VALUE positions at base + (2, 4, 6, 8, 10, 12, 14, 16,
+            # 18, 20) — 10 stub emits per wall, all VALUE_0.
+            for stub_slot in range(10):  # BSP_RANK..VIS_HI
+                pos = base + 2 + 2 * stub_slot
+                _check(
+                    pos,
+                    value_id(0),
+                    f"wall{wall_i} stub VALUE for {IDENTIFIER_NAMES[stub_slot]}",
+                )
+
+            # HIT_* VALUEs: compare against the pure-Python reference for
+            # the subset walls; for max_walls beyond the subset, just
+            # check the ID is a valid VALUE token (0 or 1 — the hit
+            # math ran on garbage wall geometry and we don't know the
+            # "correct" outcome, but the emit machinery still pipes it
+            # through as VALUE_{0,1}).
+            if wall_i < len(segs):
+                ref_hf, ref_hx, ref_hy = _ref_hits(segs[wall_i], px, py, vx, vy)
+                _check(
+                    base + _HF_OFFSET,
+                    value_id(ref_hf),
+                    f"wall{wall_i} VALUE HIT_FULL",
+                )
+                _check(
+                    base + _HX_OFFSET,
+                    value_id(ref_hx),
+                    f"wall{wall_i} VALUE HIT_X",
+                )
+                _check(
+                    base + _HY_OFFSET,
+                    value_id(ref_hy),
+                    f"wall{wall_i} VALUE HIT_Y",
+                )
+            else:
+                # For phantom walls, just insist the emission stays in
+                # {VALUE_0, VALUE_1}.  The hit-math input is degenerate
+                # (no real wall) so we don't assert which of the two.
+                for offset, lbl in [
+                    (_HF_OFFSET, "HIT_FULL"),
+                    (_HX_OFFSET, "HIT_X"),
+                    (_HY_OFFSET, "HIT_Y"),
+                ]:
+                    actual = int(log[base + offset])
+                    if actual not in (value_id(0), value_id(1)):
+                        mismatches.append(
+                            f"pos {base + offset} (wall{wall_i} phantom "
+                            f"VALUE {lbl}): expected VALUE_0 or VALUE_1, "
+                            f"got {actual}"
+                        )
+
+        # --- RESOLVED chain after the last wall. ---
+        resolved_base = max_walls * _STEPS_PER_WALL
+        _check(
+            resolved_base + _RESOLVED_X_OFFSET,
+            vocab_id("RESOLVED_X"),
+            "RESOLVED_X identifier",
+        )
+        _check(
+            resolved_base + _RESOLVED_X_OFFSET + 1,
+            value_id(0),
+            "RESOLVED_X stub VALUE",
+        )
+        _check(
+            resolved_base + _RESOLVED_Y_OFFSET,
+            vocab_id("RESOLVED_Y"),
+            "RESOLVED_Y identifier",
+        )
+        _check(
+            resolved_base + _RESOLVED_Y_OFFSET + 1,
+            value_id(0),
+            "RESOLVED_Y stub VALUE",
+        )
+        _check(
+            resolved_base + _RESOLVED_ANGLE_OFFSET,
+            vocab_id("RESOLVED_ANGLE"),
+            "RESOLVED_ANGLE identifier",
+        )
+        _check(
+            resolved_base + _RESOLVED_ANGLE_OFFSET + 1,
+            value_id(0),
+            "RESOLVED_ANGLE stub VALUE",
+        )
+
+        # --- SORTED_WALL hand-off. ---
+        _check(
+            resolved_base + _SORTED_WALL_OFFSET,
+            vocab_id("SORTED_WALL"),
+            "SORTED_WALL hand-off",
+        )
+
+        assert not mismatches, "Trace mismatches:\n" + "\n".join(mismatches)
