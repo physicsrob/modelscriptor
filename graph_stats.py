@@ -754,6 +754,261 @@ def _print_per_token_type_analysis(all_nodes: Set[Node], node_to_layer: dict):
     print()
 
 
+# ── Per-Attention Q/K/V Breakdown ───────────────────────────────────
+
+
+def _input_ready_layer(
+    node: Node,
+    node_to_layer: dict,
+    layer_cache: dict,
+) -> int:
+    """Earliest layer at which an attn sublayer can read this node's value.
+
+    An op scheduled at layer N writes its output at the end of layer N,
+    so the earliest attention sublayer that can read it is layer N+1.
+    Host inputs (InputNode / LiteralValue / PosEncoding / Embedding) have
+    no producing layer and are available from layer 0 onward.
+
+    Concatenates are transparent: ready layer is the max over inputs.
+    """
+    producer = _effective_layer(node, node_to_layer, layer_cache)
+    return max(0, producer + 1)
+
+
+def _attn_qkv_ready_layers(
+    attn_node: "Attn",
+    node_to_layer: dict,
+    layer_cache: dict,
+) -> Tuple[int, int, int]:
+    """Return (q_ready, k_ready, v_ready) consumer-ready layers for an Attn.
+
+    Each value is the earliest layer at which the Attn's attention sublayer
+    could read that input (producer-layer + 1, or 0 for host inputs).
+    """
+    q_in, k_in, v_in = attn_node.inputs
+    q = _input_ready_layer(q_in, node_to_layer, layer_cache)
+    k = _input_ready_layer(k_in, node_to_layer, layer_cache)
+    v = _input_ready_layer(v_in, node_to_layer, layer_cache)
+    return q, k, v
+
+
+def _trace_binding_chain(
+    start_node: Node,
+    node_to_layer: dict,
+    layer_cache: dict,
+    host_cache: dict,
+    max_steps: int = 400,
+) -> Tuple[List[Tuple[Node, int, bool]], bool]:
+    """Walk the max-ready-layer ancestor chain, skipping Concatenates.
+
+    At each step, descend into the single input whose consumer-ready
+    layer is highest (that input is the binding one). Concatenates are
+    transparent.
+
+    Returns ``(chain, reached_root)`` where:
+
+    - ``chain`` is a list of ``(node, ready_layer, is_host)`` tuples for
+      the "interesting" non-Concatenate nodes: the first node encountered
+      (the real identity of the binding input), every Attn (cross-position
+      serialization point), and the terminal node (either a host boundary
+      or the last node we visited before giving up).
+    - ``reached_root`` is True when the walk terminated at a host-derived
+      or leaf node; False when max_steps ran out mid-chain.
+    """
+    visited: Set[int] = set()
+    chain: List[Tuple[Node, int, bool]] = []
+    current: Node | None = start_node
+    kept_first = False
+    last_kept_id: int | None = None
+    last_visit: Tuple[Node, int, bool] | None = None
+    steps = 0
+    reached_root = False
+
+    while current is not None and current.node_id not in visited and steps < max_steps:
+        visited.add(current.node_id)
+        steps += 1
+
+        if isinstance(current, Concatenate):
+            if not current.inputs:
+                reached_root = True
+                break
+            current = max(
+                current.inputs,
+                key=lambda i: _input_ready_layer(i, node_to_layer, layer_cache),
+            )
+            continue
+
+        ready_layer = _input_ready_layer(current, node_to_layer, layer_cache)
+        is_host = _is_host_derived(current, host_cache)
+        is_leaf = not current.inputs
+        last_visit = (current, ready_layer, is_host)
+
+        keep = (not kept_first) or isinstance(current, Attn) or is_host or is_leaf
+        if keep:
+            chain.append(last_visit)
+            last_kept_id = current.node_id
+            kept_first = True
+
+        if is_host or is_leaf:
+            reached_root = True
+            break
+
+        current = max(
+            current.inputs,
+            key=lambda i: _input_ready_layer(i, node_to_layer, layer_cache),
+        )
+
+    # If we stopped mid-chain (max_steps or cycle), surface the last node
+    # we actually visited so the reader sees where the trace bottomed out,
+    # even if it wasn't an "interesting" type.
+    if not reached_root and last_visit is not None:
+        if last_visit[0].node_id != last_kept_id:
+            chain.append(last_visit)
+
+    return chain, reached_root
+
+
+def _format_chain_node(node: Node, ready_layer: int, is_host: bool) -> str:
+    """Render one node in a binding-input trace.
+
+    ``ready_layer`` is the consumer-visible layer: the earliest layer
+    an attention reading this node's output could fire at.
+    """
+    label = node.annotation or getattr(node, "name", None) or f"#{node.node_id}"
+    if len(label) > 42:
+        label = label[:39] + "..."
+    ntype = node.node_type()
+    if isinstance(node, Attn):
+        # Flag attentions — these are the cross-position serialization hops.
+        ntype = f"{ntype} (cross-pos)"
+    layer_str = f"{ready_layer:>3d}"
+    suffix = "  ← host inputs" if is_host else ""
+    return f"[ready @ {layer_str}]  {ntype:<18s} {label}{suffix}"
+
+
+def _print_attn_qkv_breakdown(all_nodes: Set[Node], node_to_layer: dict):
+    """Per-Attn Q/K/V ready-layer breakdown and binding-input traces."""
+    print(f"\n{'─' * 72}")
+    print(f"  PER-ATTENTION Q/K/V READY LAYERS")
+    print(f"{'─' * 72}")
+    print()
+    print(
+        "  Q/K/V ready = earliest layer an attention sublayer could read\n"
+        "  this input (producer-layer + 1, or 0 for host inputs). The\n"
+        "  'Bound' column names whichever of Q, K, V arrived last — that\n"
+        "  input is the lever for moving the attention earlier. The other\n"
+        "  two have slack; shortening their upstream chains will not help.\n"
+        "\n"
+        "  A 'capacity-bound (ready @ N)' note means the scheduler placed\n"
+        "  the attention later than layer N because no attn slot was free\n"
+        "  at N — the fix is freeing capacity at N, not shortening inputs."
+    )
+
+    attn_nodes = [n for n in all_nodes if isinstance(n, Attn)]
+    if not attn_nodes:
+        print("\n  (no Attn nodes in graph)")
+        return
+
+    layer_cache: dict = {}
+    host_cache: dict = {}
+
+    # Per-Attn record
+    attn_rows: List[Tuple[int, int, int, int, int, str, Attn]] = []
+    for a in attn_nodes:
+        q, k, v = _attn_qkv_ready_layers(a, node_to_layer, layer_cache)
+        input_ready = max(q, k, v)
+        fires_at = node_to_layer.get(a.node_id, input_ready)
+        bound_labels = [
+            label
+            for label, val in (("Q", q), ("K", k), ("V", v))
+            if val == input_ready
+        ]
+        bound = ",".join(bound_labels)
+        attn_rows.append((fires_at, input_ready, q, k, v, bound, a))
+
+    # Collapse duplicates by (annotation, fires_at, input_ready, q, k, v, bound).
+    # Many attentions repeat per chunk / per wall with identical structure;
+    # a per-node dump would flood the section.
+    groups: Dict[Tuple, List[Attn]] = defaultdict(list)
+    for fires_at, input_ready, q, k, v, bound, a in attn_rows:
+        ann = a.annotation or getattr(a, "name", None) or f"Attn#{a.node_id}"
+        key = (ann, fires_at, input_ready, q, k, v, bound)
+        groups[key].append(a)
+
+    group_list = sorted(
+        groups.items(),
+        key=lambda kv: (kv[0][1], kv[0][2], kv[0][0]),
+    )
+
+    # Summary table
+    print()
+    print(
+        f"  {'Fires':>5s}  {'Annotation':<38s}  "
+        f"{'Q':>4s} {'K':>4s} {'V':>4s}  {'Bound':<6s} {'Count':>5s}  {'Note'}"
+    )
+    print(
+        f"  {'─' * 5}  {'─' * 38}  "
+        f"{'─' * 4} {'─' * 4} {'─' * 4}  {'─' * 6} {'─' * 5}  {'─' * 30}"
+    )
+    for (ann, fires_at, input_ready, q, k, v, bound), members in group_list:
+        name = ann
+        if len(name) > 38:
+            name = name[:35] + "..."
+        if fires_at > input_ready:
+            note = f"capacity-bound (ready @ {input_ready})"
+        else:
+            note = ""
+        print(
+            f"  {fires_at:>5d}  {name:<38s}  "
+            f"{q:>4d} {k:>4d} {v:>4d}  {bound:<6s} {len(members):>5d}  {note}"
+        )
+
+    # Binding-input traces, one per group.
+    print()
+    print(f"  {'─' * 68}")
+    print(f"  BINDING-INPUT TRACES")
+    print(f"  {'─' * 68}")
+    print(
+        "  Walks the max-ready-layer chain from each attention's binding\n"
+        "  input back through ancestors. Concatenates are transparent.\n"
+        "  Every other Attn node marks a cross-position serialization hop\n"
+        "  — chasing its own binding chain exposes the full depth-critical\n"
+        "  sequence.\n"
+    )
+
+    INPUT_INDEX = {"Q": 0, "K": 1, "V": 2}
+
+    for (ann, fires_at, input_ready, q, k, v, bound), members in group_list:
+        representative = members[0]
+        count_str = f"  ×{len(members)}" if len(members) > 1 else ""
+        capacity_str = (
+            f"  [capacity-bound, input-ready at {input_ready}]"
+            if fires_at > input_ready
+            else ""
+        )
+        print(
+            f"  {ann}  (fires at layer {fires_at}, {bound}-bound){count_str}"
+            f"{capacity_str}"
+        )
+        ready_by = {"Q": q, "K": k, "V": v}
+        for label in ("Q", "K", "V"):
+            if label not in bound.split(","):
+                continue
+            binding_input = representative.inputs[INPUT_INDEX[label]]
+            chain, reached_root = _trace_binding_chain(
+                binding_input, node_to_layer, layer_cache, host_cache
+            )
+            print(f"    {label} ready at layer {ready_by[label]}:")
+            if not chain:
+                print(f"      (no non-Concatenate producer found)")
+                continue
+            for node, layer, is_host in chain:
+                print(f"      {_format_chain_node(node, layer, is_host)}")
+            if not reached_root:
+                print(f"      [...]  (trace truncated before reaching host)")
+        print()
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 
@@ -910,6 +1165,9 @@ def main():
 
     # Per-token-type depth analysis
     _print_per_token_type_analysis(all_nodes, node_to_layer)
+
+    # Per-attention Q/K/V ready-layer breakdown
+    _print_attn_qkv_breakdown(all_nodes, node_to_layer)
 
 
 if __name__ == "__main__":
