@@ -34,7 +34,7 @@ from torchwright.doom.embedding import (
 
 
 def test_vocab_size_matches_plan():
-    assert V == 65575
+    assert V == 65576
     assert len(DOOM_VOCAB) == V
     assert W_EMBED.shape == (V, D_EMBED)
     assert D_EMBED == 25
@@ -50,15 +50,17 @@ def test_id_ranges():
     # Per-wall identifiers (17): 65544..65560
     assert vocab_id("BSP_RANK") == 65544
     assert vocab_id("HIT_Y") == 65560
-    # RESOLVED: 65561..65563
+    # RESOLVED (3): 65561..65563
     assert vocab_id("RESOLVED_X") == 65561
     assert vocab_id("RESOLVED_ANGLE") == 65563
-    # Decode: 65564..65566
-    assert vocab_id("SORTED_WALL") == 65564
-    assert vocab_id("DONE") == 65566
-    # Prompt-position: 65567..65574
-    assert vocab_id("INPUT") == 65567
-    assert vocab_id("PLAYER_ANGLE") == 65574
+    # Sort-phase identifier (1): 65564
+    assert vocab_id("SORT_RESULT") == 65564
+    # Decode (3): 65565..65567
+    assert vocab_id("SORTED_WALL") == 65565
+    assert vocab_id("DONE") == 65567
+    # Prompt-position (8): 65568..65575
+    assert vocab_id("INPUT") == 65568
+    assert vocab_id("PLAYER_ANGLE") == 65575
 
 
 def test_vocab_roundtrip():
@@ -150,8 +152,12 @@ def test_category_codes_pairwise_distinct():
         "DOT_A",
         "CROSS_B",
         "DOT_B",
+        "T_STAR_L",
+        "T_STAR_R",
         "T_LO",
         "T_HI",
+        "COL_A",
+        "COL_B",
         "VIS_LO",
         "VIS_HI",
         "HIT_FULL",
@@ -160,6 +166,7 @@ def test_category_codes_pairwise_distinct():
         "RESOLVED_X",
         "RESOLVED_Y",
         "RESOLVED_ANGLE",
+        "SORT_RESULT",
         "SORTED_WALL",
         "RENDER",
         "DONE",

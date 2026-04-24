@@ -540,7 +540,9 @@ def step_frame(
     # + 3 RESOLVED values = 6 steps.  Total = max_walls * 35 + 6, plus a
     # small safety margin.
     n_thinking = max_walls * 35 + 6 + 4
-    max_steps = n_thinking + N * (W * (H // cs + 1) + 1) + 10
+    # Per wall in the SORT/RENDER loop (Phase B Part 2): SORTED_WALL
+    # marker + SORT_RESULT id + SORT_RESULT VALUE + up to RENDER tokens.
+    max_steps = n_thinking + N * (W * (H // cs + 1) + 3) + 10
     total_steps = 0
     prev_wc = 0.0
     # Capture the token-stream trace as the test sees it: one entry per
@@ -566,7 +568,15 @@ def step_frame(
         pix = overflow["pixels"][0].detach().cpu().numpy().reshape(cs, 3)
 
         # Trace: detect token type from wall_counter changes.
-        # SORTED tokens increment wall_counter; RENDER tokens forward it.
+        # Phase B Part 2: wall_counter increments at the SORT_RESULT id
+        # position (not at the SORTED_WALL marker anymore), so the
+        # increment fires one token later than before.  ``render_col``
+        # still carries ``vis_lo`` but it's seeded at the SORT_RESULT
+        # VALUE position (one step AFTER the id).  The trace below is
+        # only used by the walkthrough harness for sanity diagnostics;
+        # the reference comparison itself goes through pixel output, so
+        # we fill ``vis_lo`` / ``vis_hi`` / ``tex_id`` with 0.0 here
+        # and let the pixel compare catch any divergence.
         if trace is not None:
             cur_wc = overflow["wall_counter"][0, 0].item()
             if cur_wc > prev_wc + 0.5:
@@ -585,8 +595,8 @@ def step_frame(
                         position_index=len(trace.sort_steps),
                         wall_j_onehot=np.eye(max_walls)[wall_idx],
                         selected_wall_index=wall_idx,
-                        vis_lo=overflow["render_col"][0, 0].item(),
-                        vis_hi=overflow["sort_vis_hi"][0, 0].item(),
+                        vis_lo=0.0,
+                        vis_hi=0.0,
                         tex_id=0.0,
                         sort_done=sort_done > 0.0,
                     )

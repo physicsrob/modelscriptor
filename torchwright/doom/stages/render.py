@@ -63,14 +63,14 @@ from torchwright.ops.arithmetic_ops import (
 )
 from torchwright.ops.attention_ops import (
     attend_argmax_dot,
-    attend_argmax_where,
+    attend_most_recent_matching,
 )
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.logic_ops import bool_all_true, bool_not, cond_gate
 from torchwright.ops.map_select import in_range, select
 from torchwright.reference_renderer.types import RenderConfig
 
-from torchwright.doom.embedding import embed_lookup
+from torchwright.doom.embedding import D_EMBED, VALUE_RANGE_BY_NAME, embed_lookup
 from torchwright.doom.graph_constants import (
     DIFF_BP,
     TEX_E8_OFFSET,
@@ -78,6 +78,7 @@ from torchwright.doom.graph_constants import (
 )
 from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.renderer import _textured_column_fill
+from torchwright.doom.thinking_readback import ThinkingReadback
 
 # ---------------------------------------------------------------------------
 # Contract
@@ -110,7 +111,6 @@ class RenderKVInput:
     wall_bx: Node
     wall_by: Node
     wall_tex_id: Node  # host-fed at WALL positions
-    wall_vis_hi: Node  # from WallKVOutput (late attention, off critical path)
     wall_position_onehot: Node  # from WallKVOutput
 
     # From PLAYER broadcasts.
@@ -124,14 +124,21 @@ class RenderKVInput:
     tex_pixels: Node  # host-fed at TEX_COL positions
     tc_onehot_01: Node  # from TexColKVOutput
 
-    # From SORTED positions.  Phase A M3: wall identity travels through
-    # the KV cache now rather than through an overlaid input.  RENDER
-    # reads ``sorted_wall_index`` via attend_argmax_where on
-    # ``wall_counter`` (SORTED's monotonically-increasing input counter),
-    # gated by ``is_sorted`` so only SORTED positions are eligible.
-    wall_counter: Node  # host-fed integer counter, unique per SORTED
-    sorted_wall_index: Node  # sorted_out.wall_index (valid at SORTED)
-    is_sorted: Node  # ±1 flag: restricts the attention to SORTED keys
+    # Host-fed wall counter for RENDER's termination check
+    # (``wall_counter >= max_walls`` → emit DONE).
+    wall_counter: Node
+
+    # Phase B Part 2: wall identity + visibility extent come from
+    # thinking-phase VALUE tokens, not from prefill WALL or overlay.
+    # ``readback`` decodes the most recent SORT_RESULT VALUE (for
+    # wall_index) and the (wall-indexed) VIS_HI VALUE (for the
+    # column-range upper bound).  ``embedding`` and
+    # ``value_wall_index_onehot`` back the VIS_HI content attention's
+    # key.  ``is_thinking_value`` gates the payload extraction.
+    readback: "ThinkingReadback"
+    embedding: Node
+    value_wall_index_onehot: Node
+    is_thinking_value: Node
 
 
 @dataclass
@@ -181,38 +188,23 @@ def build_render(
     tex_w, tex_h = textures[0].shape[0], textures[0].shape[1]
     cs = chunk_size
 
-    with annotate("render/wall_index_attention"):
-        # Pick up the current wall index from the most recent SORTED_WALL
-        # position in the KV cache.  Phase A M3: wall identity is no
-        # longer an overlaid input; it travels through the token stream.
-        #
-        # Mechanism: attend_argmax_where with score = wall_counter (the
-        # host-fed 0..max_walls counter that SORTED increments at each
-        # sort step), validity = is_sorted.  Among causal-window SORTED
-        # positions, max score is the most recent (SORTED_N has
-        # wall_counter = N); RENDER_N naturally resolves to SORTED_N.
-        #
-        # Why not attend_most_recent_matching with E8 type codes?
-        # 10×-scaled E8 self-dot is 1600, pushing match-gain-scaled logits
-        # up to ~30000.  TF32 matmul on A100 (~1e-3 relative precision,
-        # default on Ampere) gives absolute precision ~30 at that
-        # magnitude, which eats the unit-position recency tiebreak
-        # between adjacent SORTED tokens.  attend_argmax_where keeps
-        # logits around _VALIDITY_DIRECT + _QUERY_GAIN · max_score ≈ 1064,
-        # where the _QUERY_GAIN = 8 convention resolves cleanly on
-        # TF32 — the same regime SORTED already runs in.
-        gated_sorted_wall_index = cond_gate(kv.is_sorted, kv.sorted_wall_index)
-        wall_index = attend_argmax_where(
-            pos_encoding=pos_encoding,
-            score=kv.wall_counter,
-            validity=kv.is_sorted,
-            value=gated_sorted_wall_index,
-            assert_hardness_gt=0.99,
-        )
+    with annotate("render/wall_index_readback"):
+        # Phase B Part 2: wall_index rides as a VALUE token emitted by
+        # the SORT_RESULT identifier.  The host echoes that token's id
+        # (VALUE_{wall_index}) back at the next position, where the
+        # embedding lookup places the factored 4+4+4+4 payload in
+        # cols [8:72] at layer 0.  RENDER reads it via
+        # ``attend_most_recent_matching(is_SORT_RESULT_value)`` and
+        # decodes through the readback Linear — no dependency on any
+        # compute chain at the producing position.
+        wall_index = kv.readback.get_value_after_last("SORT_RESULT")
 
     with annotate("render/wall_index_onehot"):
-        wall_index_p1 = add_const(wall_index, 1.0)
-        wall_j_onehot = bool_to_01(in_range(wall_index, wall_index_p1, max_walls))
+        wall_index_clamped = clamp(wall_index, 0.0, float(max_walls - 1))
+        wall_index_p1 = add_const(wall_index_clamped, 1.0)
+        wall_j_onehot = bool_to_01(
+            in_range(wall_index_clamped, wall_index_p1, max_walls)
+        )
 
     with annotate("render/wall_geom_attention"):
         sel_ax, sel_ay, sel_bx, sel_by, sel_tex_id = _attend_wall_geometry(
@@ -228,13 +220,20 @@ def build_render(
             wall_tex_id=kv.wall_tex_id,
         )
 
-    with annotate("render/wall_vis_attention"):
-        sel_vis_hi = _attend_wall_vis_hi(
-            is_render=is_render,
-            is_wall=is_wall,
-            wall_j_onehot=wall_j_onehot,
-            wall_position_onehot=kv.wall_position_onehot,
-            wall_vis_hi=kv.wall_vis_hi,
+    with annotate("render/vis_hi_content_attention"):
+        # Phase B Part 2: vis_hi comes from the thinking VIS_HI VALUE
+        # token for this wall, not from the prefill WALL stage's FOV
+        # clip.  Match against thinking VIS_HI VALUE positions keyed
+        # by ``(identifier=VIS_HI, wall_index)`` and decode the
+        # matched payload back to a scalar.
+        sel_vis_hi = _content_attend_thinking_value(
+            readback=kv.readback,
+            embedding=kv.embedding,
+            value_wall_index_onehot=kv.value_wall_index_onehot,
+            query_wall_onehot=wall_j_onehot,
+            consumer_gate=is_render,
+            name="VIS_HI",
+            pos_encoding=pos_encoding,
         )
 
     with annotate("render/precompute"):
@@ -383,30 +382,77 @@ def _attend_wall_geometry(
     return sel_ax, sel_ay, sel_bx, sel_by, sel_tex_id
 
 
-def _attend_wall_vis_hi(
+def _content_attend_thinking_value(
     *,
-    is_render: Node,
-    is_wall: Node,
-    wall_j_onehot: Node,
-    wall_position_onehot: Node,
-    wall_vis_hi: Node,
+    readback: ThinkingReadback,
+    embedding: Node,
+    value_wall_index_onehot: Node,
+    query_wall_onehot: Node,
+    consumer_gate: Node,
+    name: str,
+    pos_encoding: PosEncoding,
 ) -> Node:
-    """Read vis_hi from the WALL position matching wall_j_onehot.
+    """Read the per-wall ``name``-VALUE payload via content attention
+    keyed by ``(identifier=name, wall_index)``.
 
-    Separate from the geometry attention because vis_hi is computed by the
-    WALL stage's FOV clipping (available at ~layer 40), while the geometry
-    fields are host-fed (layer 0).  The state machine doesn't need vis_hi
-    until after chunk fill (~layer 64), so this late attention has plenty
-    of slack and stays off the critical path.
+    Mirrors the vis_lo lookup in ``stages/sorted.py``: the query at the
+    consumer position (gated by ``consumer_gate``) is
+    ``[1, query_wall_onehot]``; the key at thinking ``name``-VALUE
+    positions is ``[is_name_value_01, value_wall_index_onehot_gated]``.
+    The matching VALUE's 64-wide payload is extracted and decoded back
+    to a scalar float via the dequantize affine in
+    ``VALUE_RANGE_BY_NAME``.
     """
-    GEOM_MATCH_GAIN = 1000.0
-    return attend_argmax_dot(
-        query_vector=cond_gate(is_render, wall_j_onehot),
-        key_vector=cond_gate(is_wall, wall_position_onehot),
-        value=cond_gate(is_wall, wall_vis_hi),
-        match_gain=GEOM_MATCH_GAIN,
-        assert_hardness_gt=0.99,
+    # Key-side type indicator from the shared readback handle.
+    is_name_value = readback.is_value_of(name)
+
+    key_type = bool_to_01(is_name_value)
+    key_wall = cond_gate(is_name_value, value_wall_index_onehot)
+    composite_key = Concatenate([key_type, key_wall])
+
+    one_literal = create_literal_value(
+        torch.tensor([1.0]), name=f"render_{name.lower()}_q_one"
     )
+    query_raw = Concatenate([one_literal, query_wall_onehot])
+    query_gated = cond_gate(consumer_gate, query_raw)
+
+    payload = extract_from(
+        embedding, D_EMBED, 8, D_EMBED - 8, f"render_{name.lower()}_payload"
+    )
+    gated_payload = cond_gate(is_name_value, payload)
+
+    # Content match-gain sized for ~1000-position causal windows.  Same
+    # regime as the thinking-phase prev-id attention (12000 for
+    # 20-wide slot keys).  Dot on match is 2 (one type + one
+    # wall-index match); on non-match ≤ 1.  ``12000·(2-1)`` = 12000
+    # logit gap, which resolves softmax to ≥ 0.999 concentration.
+    matched_payload = attend_most_recent_matching(
+        pos_encoding=pos_encoding,
+        query_vector=query_gated,
+        key_vector=composite_key,
+        value=gated_payload,
+        match_gain=12000.0,
+    )
+
+    # Decode 4+4+4+4 one-hots → dequantized float.
+    from torchwright.ops.quantization import DEFAULT_N_LEVELS
+    from torchwright.graph.asserts import assert_in_range
+
+    lo, hi = VALUE_RANGE_BY_NAME[name]
+    inv_scale = (hi - lo) / (DEFAULT_N_LEVELS - 1)
+    _hex_block = 16
+    weights = torch.zeros(D_EMBED - 8, 1)
+    for i in range(_hex_block):
+        weights[0 * _hex_block + i, 0] = i * 4096.0
+        weights[1 * _hex_block + i, 0] = i * 256.0
+        weights[2 * _hex_block + i, 0] = i * 16.0
+        weights[3 * _hex_block + i, 0] = float(i)
+    weights = weights * inv_scale
+    bias = torch.tensor([lo])
+    decoded = Linear(
+        matched_payload, weights, bias, name=f"render_decode_{name.lower()}"
+    )
+    return assert_in_range(decoded, lo, hi)
 
 
 # ---------------------------------------------------------------------------
