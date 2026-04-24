@@ -90,7 +90,6 @@ from torchwright.ops.arithmetic_ops import (
 )
 from torchwright.ops.attention_ops import (
     attend_argmax_dot,
-    attend_mean_where,
     attend_most_recent_matching,
 )
 from torchwright.ops.inout_nodes import create_literal_value
@@ -245,12 +244,6 @@ class ThinkingWallKVInput:
     # RESOLVED_ANGLE identifier — collision doesn't change angle, so
     # RESOLVED_ANGLE is a pass-through of the post-turn angle.
     new_angle: Node
-
-    # From WALL positions (per-wall collision flags, aggregated via
-    # attend_mean_where for the RESOLVED_X/RESOLVED_Y identifiers).
-    hit_full: Node  # 1 if the full (vel_dx, vel_dy) ray hit this wall
-    hit_x: Node  # 1 if the x-only ray hit this wall
-    hit_y: Node  # 1 if the y-only ray hit this wall
 
 
 @dataclass
@@ -506,25 +499,6 @@ def build_thinking_wall(
         )
 
     # ---------------------------------------------------------------------
-    # RESOLVED computation: aggregate per-WALL collision flags across all
-    # WALL prefill positions via attend_mean_where, then apply the
-    # axis-separated wall-sliding logic from the former EOS stage.
-    # ---------------------------------------------------------------------
-    with annotate("thinking_wall/resolved_compute"):
-        resolved_x, resolved_y, resolved_angle = _compute_resolved(
-            hit_full=kv.hit_full,
-            hit_x=kv.hit_x,
-            hit_y=kv.hit_y,
-            player_x=kv.player_x,
-            player_y=kv.player_y,
-            vel_dx=kv.vel_dx,
-            vel_dy=kv.vel_dy,
-            new_angle=kv.new_angle,
-            is_wall=is_wall,
-            pos_encoding=pos_encoding,
-        )
-
-    # ---------------------------------------------------------------------
     # Derived-value computations.  Build the readback handle first so
     # ``get_value_after_last(...)`` calls route through a shared
     # attention head per identifier name.
@@ -535,6 +509,24 @@ def build_thinking_wall(
         is_value_category=is_thinking_value,
         pos_encoding=pos_encoding,
     )
+
+    # ---------------------------------------------------------------------
+    # RESOLVED computation: the running-OR HIT_* thinking tokens from
+    # Part 1 carry the global any-hit aggregate by wall 7, so at
+    # RESOLVED_X/Y/ANGLE positions ``get_value_after_last`` returns it
+    # as a scalar in [0, 1].  The cross-position attend_mean_where
+    # aggregation from Phase A Part 4 is gone; the sliding math is
+    # unchanged.
+    # ---------------------------------------------------------------------
+    with annotate("thinking_wall/resolved_compute"):
+        resolved_x, resolved_y, resolved_angle = _compute_resolved(
+            readback=readback,
+            player_x=kv.player_x,
+            player_y=kv.player_y,
+            vel_dx=kv.vel_dx,
+            vel_dy=kv.vel_dy,
+            new_angle=kv.new_angle,
+        )
 
     with annotate("thinking_wall/bsp_rank_bound"):
         # BSP_RANK is an integer 0..7 per design doc.  The raw
@@ -1187,45 +1179,30 @@ def _endpoint_to_column(
 
 def _compute_resolved(
     *,
-    hit_full: Node,
-    hit_x: Node,
-    hit_y: Node,
+    readback: ThinkingReadback,
     player_x: Node,
     player_y: Node,
     vel_dx: Node,
     vel_dy: Node,
     new_angle: Node,
-    is_wall: Node,
-    pos_encoding: PosEncoding,
 ):
-    """Axis-separated wall sliding — ported from the former EOS stage.
+    """Axis-separated wall sliding via running-OR HIT_* readbacks.
 
-    Aggregates per-WALL collision flags across WALL prefill positions
-    via ``attend_mean_where``; any per-flag mean above ``1/max_walls``
-    implies at least one wall was hit on that ray.  The resolved
-    position on each axis uses the velocity component if *neither* the
-    full ray nor that axis's lone ray hit anything; otherwise the
-    player stays put on that axis.
+    Each HIT_FULL / HIT_X / HIT_Y thinking token emits the OR of its
+    wall's local flag with every prior wall's (Phase B Part 1).  By
+    wall 7 the emitted value is the global any-hit aggregate across all
+    walls.  At RESOLVED_X/Y/ANGLE positions (which fire after wall 7's
+    HIT_Y), ``get_value_after_last`` returns that global aggregate as a
+    scalar in [0, 1] — 0 if no wall was hit on that ray, 1 otherwise.
 
-    ``new_angle`` passes through unchanged — collision doesn't rotate
-    the player.
+    The resolved position on each axis uses the velocity component if
+    *neither* the full ray nor that axis's lone ray hit anything;
+    otherwise the player stays put on that axis.  ``new_angle`` passes
+    through unchanged — collision doesn't rotate the player.
     """
-    hit_full_01 = bool_to_01(hit_full)
-    hit_x_01 = bool_to_01(hit_x)
-    hit_y_01 = bool_to_01(hit_y)
-
-    resolve_attn = attend_mean_where(
-        pos_encoding,
-        validity=is_wall,
-        value=Concatenate([hit_full_01, hit_x_01, hit_y_01]),
-    )
-    avg_hf = extract_from(resolve_attn, 3, 0, 1, "tw_avg_hf")
-    avg_hx = extract_from(resolve_attn, 3, 1, 1, "tw_avg_hx")
-    avg_hy = extract_from(resolve_attn, 3, 2, 1, "tw_avg_hy")
-
-    any_hit_full = compare(avg_hf, 0.05)
-    any_hit_x = compare(avg_hx, 0.05)
-    any_hit_y = compare(avg_hy, 0.05)
+    any_hit_full = compare(readback.get_value_after_last("HIT_FULL"), 0.5)
+    any_hit_x = compare(readback.get_value_after_last("HIT_X"), 0.5)
+    any_hit_y = compare(readback.get_value_after_last("HIT_Y"), 0.5)
 
     use_new_x = bool_any_true([negate(any_hit_full), negate(any_hit_x)])
     use_new_y = bool_any_true([negate(any_hit_full), negate(any_hit_y)])

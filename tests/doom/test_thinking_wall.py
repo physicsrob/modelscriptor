@@ -19,10 +19,9 @@ Two kinds of assertion:
    of hit-math correctness.
 
 The references in both tests are the same intersect-segment math the
-WALL stage runs (see ``torchwright.doom.stages.wall._collision_validity``),
-reimplemented in pure Python so we can compare without depending on the
-WALL stage's output (which is only consumed by EOS — the dual paths are
-independent).
+thinking-wall stage runs inside ``_compute_hit_flags``, reimplemented
+in pure Python so we can compare without depending on any compiled
+output.
 """
 
 import math
@@ -149,9 +148,10 @@ def _player_velocity(angle: int, inputs: PlayerInput) -> tuple[float, float]:
 def _ref_collision_validity(den, num_t, num_u, epsilon=0.05) -> bool:
     """Ray-segment intersection validity check.
 
-    Same predicates as ``stages.wall._collision_validity`` but on
-    floats: the ray hits iff the parametric (t, u) both lie in [0, 1]
-    with the configured epsilon margin and the determinant is non-zero.
+    Same predicates as the thinking-wall stage's inner ``_validity``
+    helper but on floats: the ray hits iff the parametric (t, u) both
+    lie in [0, 1] with the configured epsilon margin and the
+    determinant is non-zero.
     """
     sign_den = 1.0 if den > 0 else -1.0
     adj_t = num_t * sign_den
