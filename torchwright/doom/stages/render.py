@@ -105,13 +105,18 @@ class RenderToken:
 class RenderKVInput:
     """Data at other positions read via attention."""
 
-    # From WALL positions (attend_argmax_dot on wall_index one-hot).
+    # From WALL positions (quadratic-equality attend_argmax_dot keyed on
+    # the wall_index integer — see ``_attend_wall_geometry_quad``).
     wall_ax: Node
     wall_ay: Node
     wall_bx: Node
     wall_by: Node
     wall_tex_id: Node  # host-fed at WALL positions
-    wall_position_onehot: Node  # from WallKVOutput
+    wall_index_at_wall: Node  # host-fed wall_index at WALL positions; the
+    # first K channel of wall_geom_attention.
+    wall_index_neg_sq_at_wall: Node  # ``-wall_index²`` at WALL positions; from
+    # WallKVOutput.  Second K channel of
+    # wall_geom_attention.
 
     # From PLAYER broadcasts.
     player_x: Node  # resolved x
@@ -197,27 +202,51 @@ def build_render(
         # ``attend_most_recent_matching(is_SORT_RESULT_value)`` and
         # decodes through the readback Linear — no dependency on any
         # compute chain at the producing position.
+        #
+        # Phase C Part 1 note: an earlier draft fed the raw slot
+        # (pre-decode) directly into the wall_geom Q-projection to
+        # fold the dequantize Linear into W_Q.  That path needs a
+        # 131072× weight on raw (≈1e-5 to 1e-4), which amplifies the
+        # readback softmax's tail mass into a Q drift large enough to
+        # break ``test_frame_matches_reference_oblique[20]``.  The
+        # dequantized scalar is float-exact at integer k (no W_Q
+        # blow-up) and the decode Linear folds into W_Q like any other
+        # affine — so the depth cost of using the decoded form is just
+        # the readback's Linear, which the scheduler already absorbed
+        # into the next consumer.
         wall_index = kv.readback.get_value_after_last("SORT_RESULT")
 
-    with annotate("render/wall_index_onehot"):
-        wall_index_clamped = clamp(wall_index, 0.0, float(max_walls - 1))
-        wall_index_p1 = add_const(wall_index_clamped, 1.0)
-        wall_j_onehot = bool_to_01(
-            in_range(wall_index_clamped, wall_index_p1, max_walls)
-        )
-
     with annotate("render/wall_geom_attention"):
-        sel_ax, sel_ay, sel_bx, sel_by, sel_tex_id = _attend_wall_geometry(
-            pos_encoding,
+        # Phase C Part 1: quadratic-equality match on the wall_index
+        # integer.  Q = [2·wall_j, 1] folds into W_Q from the readback
+        # scalar; K = [wall_index, -wall_index²] reads two 1-wide WALL
+        # KV channels.  Eliminates the in_range → 8-wide one-hot Q-prep
+        # (was ~5 layers between readback and the old one-hot match).
+        sel_ax, sel_ay, sel_bx, sel_by, sel_tex_id = _attend_wall_geometry_quad(
             is_render=is_render,
             is_wall=is_wall,
-            wall_j_onehot=wall_j_onehot,
-            wall_position_onehot=kv.wall_position_onehot,
+            wall_index_render=wall_index,
+            wall_index_at_wall=kv.wall_index_at_wall,
+            wall_index_neg_sq_at_wall=kv.wall_index_neg_sq_at_wall,
             wall_ax=kv.wall_ax,
             wall_ay=kv.wall_ay,
             wall_bx=kv.wall_bx,
             wall_by=kv.wall_by,
             wall_tex_id=kv.wall_tex_id,
+        )
+
+    with annotate("render/wall_index_onehot"):
+        # The 8-wide wall_j_onehot is still needed downstream by the
+        # vis_hi content attention (keyed on
+        # ``(identifier=VIS_HI, wall_index)`` against thinking VIS_HI
+        # VALUE positions — see ``_content_attend_thinking_value``).
+        # Building it here keeps the construction at one site;
+        # vis_hi_content_attention is on a separate dependency chain
+        # and does not block wall_geom_attention.
+        wall_index_clamped = clamp(wall_index, 0.0, float(max_walls - 1))
+        wall_index_p1 = add_const(wall_index_clamped, 1.0)
+        wall_j_onehot = bool_to_01(
+            in_range(wall_index_clamped, wall_index_p1, max_walls)
         )
 
     with annotate("render/vis_hi_content_attention"):
@@ -345,32 +374,92 @@ def build_render(
 # ---------------------------------------------------------------------------
 
 
-def _attend_wall_geometry(
-    pos_encoding: PosEncoding,
+def _attend_wall_geometry_quad(
     *,
     is_render: Node,
     is_wall: Node,
-    wall_j_onehot: Node,
-    wall_position_onehot: Node,
+    wall_index_render: Node,
+    wall_index_at_wall: Node,
+    wall_index_neg_sq_at_wall: Node,
     wall_ax: Node,
     wall_ay: Node,
     wall_bx: Node,
     wall_by: Node,
     wall_tex_id: Node,
 ) -> tuple[Node, Node, Node, Node, Node]:
-    """Read (ax, ay, bx, by, tex_id) from the WALL position matching
-    wall_j_onehot.  All values are host-fed (available at layer 0), so this
-    attention can fire early — no dependency on WALL stage computation.
+    """Read (ax, ay, bx, by, tex_id) from the WALL position whose
+    ``wall_index`` equals the SORTED stage's pick (``wall_index_render``).
+
+    Quadratic-equality form:
+
+        score(k) = -(wall_k - wall_j)²
+                 = 2·wall_j·wall_k - wall_k²  -  wall_j²
+
+    The query-only ``-wall_j²`` term is constant across keys and drops
+    out of softmax.  The remaining dot product is
+
+        Q = [2·wall_j,    1]      (RENDER positions)
+        K = [wall_k,    -wall_k²] (WALL positions)
+        K = sentinel              (elsewhere)
+
+    The matching wall scores ``wall_j²``; adjacent walls score
+    ``wall_j² - 1``.  Sentinel keys score ``-200·wall_j - 1000``,
+    well below every renderable wall.  ``match_gain=20`` saturates
+    softmax to ≥0.999 mass on the matching wall (mirrors the
+    ``_QUAD_MATCH_GAIN`` choice in ``stages/sorted.py``).
+
+    Q's 2·wall_j affine and the cond_gate fuse into a single MLP
+    sublayer at the consumer; K depends only on host-fed wall_index
+    plus one ``square`` sublayer at WALL (layer 1-2 over all WALL
+    positions).  The attention itself is one attention sublayer —
+    so wall_geom output is available a few layers after the readback,
+    rather than after the 5-layer ``in_range → wall_j_onehot`` cascade
+    the old form needed.
     """
     _GEOM_WIDTH = 5
-    GEOM_MATCH_GAIN = 1000.0
+    _SENTINEL_SCALAR = -100.0
+    _SENTINEL_NEG_SQ = -1000.0
+    GEOM_MATCH_GAIN = 20.0
+
+    # Q at RENDER: [2·wall_j, 1].  multiply_const + Concatenate are
+    # layout/Linear; cond_gate is the only sublayer.  The 2× scale and
+    # the readback's dequantize Linear both fuse into the attention's
+    # W_Q at compile time.
+    two_n = multiply_const(wall_index_render, 2.0)
+    one_lit = create_literal_value(
+        torch.tensor([1.0]), name="render_wall_geom_q_one"
+    )
+    q_raw = Concatenate([two_n, one_lit])
+    q_gated = cond_gate(is_render, q_raw)
+
+    # K at WALL: real values; sentinel everywhere else.  ``approximate=False``
+    # mirrors ``stages/thinking_wall.py`` for ``bsp_rank_*_for_sort``: the
+    # on-path is float-exact so the integer wall_index and -wall_index² pass
+    # through without ``select``'s M·c_tol noise contaminating the dot.
+    sentinel_scalar = create_literal_value(
+        torch.tensor([_SENTINEL_SCALAR]),
+        name="render_wgeom_k_sentinel_scalar",
+    )
+    sentinel_neg_sq = create_literal_value(
+        torch.tensor([_SENTINEL_NEG_SQ]),
+        name="render_wgeom_k_sentinel_neg_sq",
+    )
+    k_idx = select(is_wall, wall_index_at_wall, sentinel_scalar, approximate=False)
+    k_negsq = select(
+        is_wall, wall_index_neg_sq_at_wall, sentinel_neg_sq, approximate=False
+    )
+    k = Concatenate([k_idx, k_negsq])
+
+    # V at WALL: same 5-wide geometry block as the old form.
+    v_gated = cond_gate(
+        is_wall,
+        Concatenate([wall_ax, wall_ay, wall_bx, wall_by, wall_tex_id]),
+    )
+
     wall_geom = attend_argmax_dot(
-        query_vector=cond_gate(is_render, wall_j_onehot),
-        key_vector=cond_gate(is_wall, wall_position_onehot),
-        value=cond_gate(
-            is_wall,
-            Concatenate([wall_ax, wall_ay, wall_bx, wall_by, wall_tex_id]),
-        ),
+        query_vector=q_gated,
+        key_vector=k,
+        value=v_gated,
         match_gain=GEOM_MATCH_GAIN,
         assert_hardness_gt=0.99,
     )

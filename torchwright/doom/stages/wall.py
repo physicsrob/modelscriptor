@@ -47,6 +47,7 @@ from torchwright.ops.arithmetic_ops import (
     negate,
     piecewise_linear_2d,
     reciprocal,
+    square,
     subtract,
     sum_nodes,
 )
@@ -109,12 +110,19 @@ class WallKVOutput:
     collision: CollisionFlags
     sort_score: Node  # per-position, fed as ``score`` to SORTED's argmin
     sort_value: Node  # packed payload, fed as ``value`` to SORTED's argmin
-    position_onehot: Node  # per-wall one-hot + 0.5 bias, fed to SORTED argmin
+    position_onehot: Node  # per-wall one-hot + 0.5 bias, consumed by thinking_wall's
+    # wall_geom_attention to retrieve raw geometry per wall.
     indicators_above: Node  # max_walls-wide thermometer I(bsp_rank >= c AND
     # is_renderable) — fed as key_in to SORTED's
     # attend_argmin_above_integer
     vis_lo: Node  # screen-column visibility range start (RENDER reads via attention)
     vis_hi: Node  # screen-column visibility range end (RENDER reads via attention)
+    wall_index_neg_sq: Node  # 1-wide ``-wall_index²`` channel.  Phase C Part 1: the
+    # second K channel of RENDER's quadratic-equality
+    # ``wall_geom_attention``.  ``wall_index`` itself is forwarded
+    # unchanged from the host (layer 0); ``-wall_index²`` is one
+    # ``square`` sublayer on the host-fed scalar at ``[0, max_walls-1]``
+    # with integer breakpoints (exact at every wall).
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +176,17 @@ def build_wall(
     with annotate("wall/onehot"):
         position_onehot = _compute_position_onehot(token.wall_index, max_walls)
 
+    with annotate("wall/wall_index_neg_sq"):
+        # K's second channel for RENDER's quadratic-equality wall_geom
+        # attention.  ``wall_index`` lands on integers in
+        # ``[0, max_walls-1]``; ``square`` on a unit grid is exact at
+        # those points and contributes one MLP sublayer.  The
+        # ``multiply_const(-1)`` is fold-only.
+        wall_index_sq = square(
+            token.wall_index, max_value=float(max_walls - 1), step=1.0
+        )
+        wall_index_neg_sq = multiply_const(wall_index_sq, -1.0)
+
     with annotate("wall/indicators_above"):
         indicators_above = _compute_indicators_above(
             bsp_rank,
@@ -195,6 +214,7 @@ def build_wall(
         indicators_above=indicators_above,
         vis_lo=vis_lo,
         vis_hi=vis_hi,
+        wall_index_neg_sq=wall_index_neg_sq,
     )
 
 
