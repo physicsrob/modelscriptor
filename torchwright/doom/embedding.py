@@ -6,17 +6,19 @@ graph looks the ID up in ``W_EMBED`` to produce a 72-wide residual
 leaf. On the output side, the 72-wide output slice is projected
 through ``W_EMBED.T`` and argmaxed to pick the next ID.
 
-Vocabulary layout (Phase B Part 1 widens per-wall identifiers 13→17
-by adding T_STAR_L / T_STAR_R / COL_A / COL_B intermediate slots):
+Vocabulary layout (Phase B Part 2 adds SORT_RESULT between RESOLVED
+and the decode tokens; Part 1 added T_STAR_L/R + COL_A/B to per-wall
+identifiers, widening them 13→17):
 
-  |      0 .. 65535 | VALUE (quantized 16-bit integers)          |
-  |  65536 .. 65543 | THINKING_WALL markers 0..7                 |
-  |  65544 .. 65560 | Per-wall identifiers (BSP_RANK..HIT_Y)     |
-  |  65561 .. 65563 | RESOLVED identifiers (X / Y / ANGLE)       |
-  |  65564 .. 65566 | Decode tokens (SORTED_WALL, RENDER, DONE)  |
-  |  65567 .. 65574 | Prompt-position categories                 |
+  |      0 .. 65535 | VALUE (quantized 16-bit integers)            |
+  |  65536 .. 65543 | THINKING_WALL markers 0..7                   |
+  |  65544 .. 65560 | Per-wall identifiers (17: BSP_RANK..HIT_Y)   |
+  |  65561 .. 65563 | RESOLVED identifiers (X / Y / ANGLE)         |
+  |           65564 | SORT_RESULT identifier                       |
+  |  65565 .. 65567 | Decode tokens (SORTED_WALL, RENDER, DONE)    |
+  |  65568 .. 65575 | Prompt-position categories                   |
 
-Total ``V = 65575``.
+Total ``V = 65576``.
 
 Embedding layout (``d_embed = 72``):
 
@@ -88,6 +90,8 @@ _CATEGORY_INDEX: Dict[str, int] = {
     "RESOLVED_X": 280,
     "RESOLVED_Y": 281,
     "RESOLVED_ANGLE": 282,
+    # Sort-phase identifier (1).
+    "SORT_RESULT": 288,
     # Decode tokens (3).
     "SORTED_WALL": 3,
     "RENDER": 4,
@@ -141,8 +145,17 @@ _PER_WALL_BASE = _THINKING_WALL_BASE + 8  # 65544 .. 65560
 _RESOLVED_IDENTIFIERS: List[str] = ["RESOLVED_X", "RESOLVED_Y", "RESOLVED_ANGLE"]
 _RESOLVED_BASE = _PER_WALL_BASE + len(_PER_WALL_IDENTIFIERS)  # 65561 .. 65563
 
+# Sort-phase identifier: ``SORT_RESULT`` tags the VALUE token that
+# emits the picked wall_index after each ``SORTED_WALL`` marker.
+# Structurally it sits alongside the per-wall + RESOLVED identifiers
+# — same prev-id / readback / factor-to-embedding machinery — but it
+# lives at SORTED-phase positions rather than inside the thinking
+# cascade.
+_SORT_IDENTIFIERS: List[str] = ["SORT_RESULT"]
+_SORT_BASE = _RESOLVED_BASE + len(_RESOLVED_IDENTIFIERS)  # 65564
+
 _DECODE_TOKENS: List[str] = ["SORTED_WALL", "RENDER", "DONE"]
-_DECODE_BASE = _RESOLVED_BASE + len(_RESOLVED_IDENTIFIERS)  # 65564 .. 65566
+_DECODE_BASE = _SORT_BASE + len(_SORT_IDENTIFIERS)  # 65565 .. 65567
 
 _PROMPT_TOKENS: List[str] = [
     "INPUT",
@@ -154,10 +167,10 @@ _PROMPT_TOKENS: List[str] = [
     "PLAYER_Y",
     "PLAYER_ANGLE",
 ]
-_PROMPT_BASE = _DECODE_BASE + len(_DECODE_TOKENS)  # 65567 .. 65574
+_PROMPT_BASE = _DECODE_BASE + len(_DECODE_TOKENS)  # 65568 .. 65575
 
-V: int = _PROMPT_BASE + len(_PROMPT_TOKENS)  # 65575
-assert V == 65575, f"Vocabulary size mismatch: got {V}, expected 65575"
+V: int = _PROMPT_BASE + len(_PROMPT_TOKENS)  # 65576
+assert V == 65576, f"Vocabulary size mismatch: got {V}, expected 65576"
 
 
 def _build_id_map() -> Dict[str, int]:
@@ -170,6 +183,8 @@ def _build_id_map() -> Dict[str, int]:
         ids[name] = _PER_WALL_BASE + i
     for i, name in enumerate(_RESOLVED_IDENTIFIERS):
         ids[name] = _RESOLVED_BASE + i
+    for i, name in enumerate(_SORT_IDENTIFIERS):
+        ids[name] = _SORT_BASE + i
     for i, name in enumerate(_DECODE_TOKENS):
         ids[name] = _DECODE_BASE + i
     for i, name in enumerate(_PROMPT_TOKENS):
@@ -234,6 +249,8 @@ def _build_w_embed() -> torch.Tensor:
         w[_PER_WALL_BASE + offset, 0:D_CATEGORY] = _category_code(name)
     for offset, name in enumerate(_RESOLVED_IDENTIFIERS):
         w[_RESOLVED_BASE + offset, 0:D_CATEGORY] = _category_code(name)
+    for offset, name in enumerate(_SORT_IDENTIFIERS):
+        w[_SORT_BASE + offset, 0:D_CATEGORY] = _category_code(name)
     for offset, name in enumerate(_DECODE_TOKENS):
         w[_DECODE_BASE + offset, 0:D_CATEGORY] = _category_code(name)
     for offset, name in enumerate(_PROMPT_TOKENS):
@@ -258,15 +275,30 @@ assert W_EMBED.shape == (V, D_EMBED)
 # ---------------------------------------------------------------------------
 
 
-# Ordered list of the 20 identifier names that the thinking-phase state
-# machine walks per wall (17 per-wall) plus per-frame (3 RESOLVED).  The
-# ordering is the cascade order: each entry at index ``i`` is the
-# identifier emitted at the VALUE step whose most recent identifier was
-# the entry at index ``i - 1``.  The ``thinking_wall`` stage and
-# ``_detect_token_types`` both iterate this list to build the 20-wide
-# slot machinery.
-IDENTIFIER_NAMES: List[str] = list(_PER_WALL_IDENTIFIERS) + list(_RESOLVED_IDENTIFIERS)
-assert len(IDENTIFIER_NAMES) == 20
+# Ordered list of the 21 identifier names: 17 per-wall + 3 RESOLVED
+# (thinking-phase cascade) + 1 SORT_RESULT (tags the VALUE token that
+# carries the picked wall_index after each SORTED_WALL marker).  The
+# first 20 entries form the thinking-phase cascade — each entry at
+# index ``i`` is the identifier emitted at the VALUE step whose most
+# recent identifier was the entry at index ``i - 1``.  SORT_RESULT at
+# index 20 sits outside that cascade: its identifier-position emit
+# comes from the SORTED stage's quadratic-equality attention (bypasses
+# thinking_wall's norm_by_slot), but it participates in the shared
+# prev-id storage + readback machinery so ``ThinkingReadback`` and
+# downstream consumers can retrieve its VALUE uniformly.
+IDENTIFIER_NAMES: List[str] = (
+    list(_PER_WALL_IDENTIFIERS) + list(_RESOLVED_IDENTIFIERS) + list(_SORT_IDENTIFIERS)
+)
+assert len(IDENTIFIER_NAMES) == 21
+
+# Subset used by the thinking-phase state machine (``thinking_wall``
+# builds per-slot norm/factor machinery only over these).  SORT_RESULT
+# is intentionally absent — its payload is computed by the SORTED
+# stage, not by the thinking cascade.
+THINKING_IDENTIFIER_NAMES: List[str] = list(_PER_WALL_IDENTIFIERS) + list(
+    _RESOLVED_IDENTIFIERS
+)
+assert len(THINKING_IDENTIFIER_NAMES) == 20
 
 
 # Float range of every identifier's VALUE payload.  The producing
@@ -304,6 +336,11 @@ VALUE_RANGE_BY_NAME: Dict[str, tuple[float, float]] = {
     "RESOLVED_X": (-20.0, 20.0),
     "RESOLVED_Y": (-20.0, 20.0),
     "RESOLVED_ANGLE": (0.0, 255.0),
+    # SORT_RESULT's VALUE carries the picked wall_index ∈ [0, max_walls).
+    # The range declared here must cover every wall_index value the
+    # autoregressive loop can emit; max_walls=8 today, so 0..7.  If a
+    # future max_walls exceeds 8, widen this range.
+    "SORT_RESULT": (0.0, 7.0),
 }
 assert set(VALUE_RANGE_BY_NAME.keys()) == set(
     IDENTIFIER_NAMES

@@ -299,18 +299,36 @@ def build_game_graph(
     )
     _mark("thinking_wall")
 
+    # Phase B Part 2: ``is_sort_result_value`` is built via the shared
+    # readback handle (prev_slot_onehot[SORT_RESULT] AND is_thinking_value).
+    # The readback is cheap — one ``extract_from`` + ``bool_all_true``.
+    is_sort_result_value = thinking_wall_out.readback.is_value_of("SORT_RESULT")
+    _mark("sort_result_value_indicator")
+
     # ---------- SORTED ----------
+    # Phase B Part 2: 3-position pipeline reading BSP ranks + VIS_LO
+    # from thinking-phase KV rather than the prefill WALL payload.
+    # SORTED_WALL emits SORT_RESULT; SORT_RESULT id runs the quadratic
+    # attention and emits VALUE(wall_index); VALUE position reads VIS_LO
+    # via content attention and emits RENDER.
     sorted_out = build_sorted(
         SortedToken(
             wall_counter=inputs["wall_counter"],
         ),
         SortedKVInput(
-            sort_score=wall_out.sort_score,
-            sort_value=wall_out.sort_value,
-            indicators_above=wall_out.indicators_above,
+            bsp_rank_scalar=thinking_wall_out.bsp_rank_scalar_for_sort,
+            bsp_rank_neg_sq=thinking_wall_out.bsp_rank_neg_sq_for_sort,
+            identifier_wall_index_onehot=(
+                thinking_wall_out.identifier_wall_index_onehot
+            ),
+            value_wall_index_onehot=thinking_wall_out.value_wall_index_onehot,
+            is_bsp_rank_id=tf["is_bsp_rank_id"],
+            readback=thinking_wall_out.readback,
+            embedding=embedding,
         ),
-        is_sorted=tf["is_sorted"],
-        is_wall=tf["is_wall"],
+        is_sorted_marker=tf["is_sorted"],
+        is_sort_result_id=tf["is_sort_result_id"],
+        is_sort_result_value=is_sort_result_value,
         pos_encoding=pos_encoding,
         max_walls=max_walls,
     )
@@ -322,6 +340,12 @@ def build_game_graph(
     # than the PLAYER broadcast (which is pre-collision now).  cos/sin
     # still come from PLAYER_ANGLE's broadcast — collision doesn't
     # change angle.
+    #
+    # Phase B Part 2: wall_index + vis_hi also travel via thinking
+    # VALUE tokens — wall_index from the SORT_RESULT VALUE the SORTED
+    # stage just emitted, vis_hi from the thinking VIS_HI VALUE for
+    # this wall (content attention keyed by wall_index).  Neither
+    # depends on the prefill WALL stage's FOV clipping anymore.
     resolved_x_readback = thinking_wall_out.readback.get_value_after_last("RESOLVED_X")
     _mark("render/resolved_x_readback")
     resolved_y_readback = thinking_wall_out.readback.get_value_after_last("RESOLVED_Y")
@@ -338,7 +362,6 @@ def build_game_graph(
             wall_bx=inputs["wall_bx"],
             wall_by=inputs["wall_by"],
             wall_tex_id=inputs["wall_tex_id"],
-            wall_vis_hi=wall_out.vis_hi,
             wall_position_onehot=wall_out.position_onehot,
             player_x=resolved_x_readback,
             player_y=resolved_y_readback,
@@ -347,14 +370,11 @@ def build_game_graph(
             texture_id_e8=inputs["texture_id_e8"],
             tex_pixels=inputs["tex_pixels"],
             tc_onehot_01=tex_col_out.tc_onehot_01,
-            # Phase A M3: wall identity reaches RENDER via attention to
-            # the most recent SORTED position.  No more overlaid
-            # render_wall_index feedback.  Score is the host-fed
-            # ``wall_counter`` (monotonically increasing at SORTED);
-            # validity is is_sorted.
             wall_counter=inputs["wall_counter"],
-            sorted_wall_index=sorted_out.wall_index,
-            is_sorted=tf["is_sorted"],
+            readback=thinking_wall_out.readback,
+            embedding=embedding,
+            value_wall_index_onehot=thinking_wall_out.value_wall_index_onehot,
+            is_thinking_value=tf["is_thinking_value"],
         ),
         is_render=tf["is_render"],
         is_wall=tf["is_wall"],
@@ -377,6 +397,7 @@ def build_game_graph(
         sorted_out=sorted_out,
         render_out=render_out,
         thinking_wall_out=thinking_wall_out,
+        is_sort_result_value=is_sort_result_value,
         chunk_size=cs,
     )
     _mark("assemble_output")
@@ -487,9 +508,10 @@ def _detect_token_types(embedding: Node) -> Dict[str, Any]:
     65,536 VALUE rows share this 8-wide prefix).
 
     Per-identifier detectors: one detector per entry in
-    ``IDENTIFIER_NAMES`` (20 total — 17 per-wall + 3 RESOLVED).  Both a
-    dict-keyed convenience form (``is_bsp_rank_id``, ``is_hit_full_id``,
-    ``is_resolved_x_id``, …) and an ordered ``is_identifier_by_slot``
+    ``IDENTIFIER_NAMES`` (21 total — 17 per-wall + 3 RESOLVED + 1
+    SORT_RESULT).  Both a dict-keyed convenience form
+    (``is_bsp_rank_id``, ``is_hit_full_id``, ``is_resolved_x_id``,
+    ``is_sort_result_id``, …) and an ordered ``is_identifier_by_slot``
     list are exposed; the thinking-wall stage indexes by slot while
     other stages read by name.
     """
@@ -511,7 +533,7 @@ def _detect_token_types(embedding: Node) -> Dict[str, Any]:
                 E8_VALUE,
             ),
         }
-        # Per-identifier detectors (20 total).  Built in IDENTIFIER_NAMES
+        # Per-identifier detectors (21 total).  Built in IDENTIFIER_NAMES
         # order; both indexed (by slot) and keyed (by name) for downstream
         # convenience.
         is_identifier_by_slot = [
@@ -541,6 +563,7 @@ def _assemble_output(
     sorted_out,
     render_out,
     thinking_wall_out,
+    is_sort_result_value: Node,
     chunk_size: int,
 ) -> Tuple[Dict[str, Node], Dict[str, Node]]:
     """Build the overlaid outputs + overflow outputs.
@@ -553,12 +576,12 @@ def _assemble_output(
         next_token_embedding (72-wide — CompiledToken argmaxes it to
         pick the next ``token_ids`` input),
         pixels, col, start, length, done, advance_wall,
-        sort_done, sort_vis_hi, sort_wall_index
+        sort_done, sort_wall_index
 
     ``sort_wall_index`` is host-visible but not fed back — the trace
     harness reads it for walkthrough recording and the autoregressive
     loop doesn't need it as input (RENDER gets its wall identity via
-    attention, not via this field).
+    the readback over SORT_RESULT VALUE positions, not via this field).
 
     Phase A Part 4: the former per-EOS-token overflow outputs for
     resolved state are gone — collision-resolved state now flows
@@ -566,6 +589,14 @@ def _assemble_output(
     host reads it from argmax outputs at known step offsets.  The
     PLAYER_ANGLE step emits ``THINKING_WALL_0`` as its next-token
     prediction so the host no longer synthesizes the first thinking
+    token.
+
+    Phase B Part 2: the SORT pipeline now spans 3 token positions
+    (SORTED_WALL marker → SORT_RESULT id → SORT_RESULT VALUE).
+    wall_counter increments at the SORT_RESULT id position; render_col
+    and render_chunk_k are seeded at the SORT_RESULT VALUE position.
+    ``sort_vis_hi`` is gone from overflow — RENDER now reads vis_hi
+    directly via content attention on the thinking VIS_HI VALUE
     token.
     """
     with annotate("output"):
@@ -579,36 +610,54 @@ def _assemble_output(
         )
         neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one_out")
 
-        # render_col: SORTED sets to vis_lo; RENDER advances.
+        # Phase B Part 2: the SORT pipeline spans 3 positions
+        # (SORTED_WALL marker → SORT_RESULT id → SORT_RESULT VALUE).
+        # render_col / render_chunk_k are seeded at the SORT_RESULT
+        # VALUE position (where vis_lo has just been read via content
+        # attention on the thinking VIS_LO KV); wall_counter
+        # increments at the SORT_RESULT id position (where the
+        # quadratic-equality attention uses the current N to pick the
+        # Nth-rank renderable wall).
         out_render_col = select(
-            token_flags["is_sorted"],
-            sorted_out.col,
+            is_sort_result_value,
+            sorted_out.vis_lo,
             select(token_flags["is_render"], render_out.next_col, zero_1),
         )
 
-        # render_chunk_k: SORTED resets to 0; RENDER advances.
+        # render_chunk_k: SORT_RESULT VALUE resets to 0; RENDER advances.
         out_render_chunk_k = select(
             token_flags["is_render"], render_out.next_chunk_k, zero_1
         )
 
-        # wall_counter: SORTED increments; RENDER forwards.
+        # wall_counter: SORT_RESULT id increments; SORTED_WALL marker
+        # and SORT_RESULT VALUE forward unchanged; RENDER forwards.
+        # Everywhere else → zero (thinking / prefill / etc.: wall_counter
+        # stays 0 until the first SORTED_WALL).
         out_wall_counter = select(
-            token_flags["is_sorted"],
+            token_flags["is_sort_result_id"],
             sorted_out.next_wall_counter,
             select(
                 token_flags["is_render"],
                 render_out.next_wall_counter,
-                zero_1,
+                select(
+                    token_flags["is_sorted"],
+                    inputs["wall_counter"],
+                    select(
+                        is_sort_result_value,
+                        inputs["wall_counter"],
+                        zero_1,
+                    ),
+                ),
             ),
         )
 
-        # sort_wall_index: SORTED emits the picked wall index as an
-        # overflow field.  RENDER doesn't forward it (it reads wall
-        # identity from the KV cache via attention).  Only populated at
-        # SORTED positions; zero elsewhere.  Host-visible for the trace
-        # harness, not fed back as input.
+        # sort_wall_index: picked wall index is host-visible for the
+        # trace harness.  Emitted at the SORT_RESULT id position (where
+        # the quadratic attention produced it); the autoregressive loop
+        # doesn't need it as input because RENDER reads wall identity
+        # via readback on the SORT_RESULT VALUE.
         out_sort_wall_index = select(
-            token_flags["is_sorted"],
+            token_flags["is_sort_result_id"],
             sorted_out.wall_index,
             zero_1,
         )
@@ -628,25 +677,43 @@ def _assemble_output(
         # PLAYER_ANGLE) the emitted value is a don't-care zero — the
         # host never argmaxes these because it feeds the known prompt
         # tokens directly.
-        type_render = create_literal_value(
-            embed_lookup("RENDER"), name="out_type_render"
-        )
         type_thinking_wall_0 = create_literal_value(
             embed_lookup("THINKING_WALL_0"), name="out_type_thinking_wall_0"
         )
+        # Phase B Part 2 cascade priority:
+        #   1. SORT_RESULT id       → SORTED's factored VALUE(wall_index)
+        #   2. SORT_RESULT VALUE    → embed("RENDER")
+        #   3. is_thinking_active   → thinking_wall's cascade (markers,
+        #                             thinking identifiers, thinking VALUEs;
+        #                             is_any_identifier / is_thinking_value
+        #                             fire at SORT_RESULT too, so the two
+        #                             SORT_RESULT branches must come first)
+        #   4. SORTED_WALL marker   → embed("SORT_RESULT")
+        #   5. RENDER               → render_out.render_next_type
+        #   6. PLAYER_ANGLE         → embed("THINKING_WALL_0") (hand-off
+        #                             into the thinking phase)
+        #   7. everything else      → don't-care zero embedding
         out_next_token_embedding = select(
-            thinking_wall_out.is_thinking_active,
-            thinking_wall_out.next_token_embedding,
+            token_flags["is_sort_result_id"],
+            sorted_out.sort_result_next_embedding,
             select(
-                token_flags["is_sorted"],
-                type_render,
+                is_sort_result_value,
+                sorted_out.value_next_embedding,
                 select(
-                    token_flags["is_render"],
-                    render_out.render_next_type,
+                    thinking_wall_out.is_thinking_active,
+                    thinking_wall_out.next_token_embedding,
                     select(
-                        token_flags["is_player_angle"],
-                        type_thinking_wall_0,
-                        zero_embedding,
+                        token_flags["is_sorted"],
+                        sorted_out.marker_next_embedding,
+                        select(
+                            token_flags["is_render"],
+                            render_out.render_next_type,
+                            select(
+                                token_flags["is_player_angle"],
+                                type_thinking_wall_0,
+                                zero_embedding,
+                            ),
+                        ),
                     ),
                 ),
             ),
@@ -661,8 +728,15 @@ def _assemble_output(
             token_flags["is_render"], render_out.advance_wall, neg_one
         )
 
-        out_sort_done = select(token_flags["is_sorted"], sorted_out.sort_done, neg_one)
-        out_sort_vis_hi = select(token_flags["is_sorted"], sorted_out.vis_hi, zero_1)
+        # Phase B Part 2: sort_done is produced at SORT_RESULT id (the
+        # position where the quadratic attention resolves the picked
+        # rank and the exhaustion check fires).  sort_vis_hi is no
+        # longer produced — the SORTED stage only reads vis_lo, and
+        # RENDER reads vis_hi directly via content attention on
+        # thinking VIS_HI positions.
+        out_sort_done = select(
+            token_flags["is_sort_result_id"], sorted_out.sort_done, neg_one
+        )
 
     overlaid = {
         "render_col": out_render_col,
@@ -678,7 +752,6 @@ def _assemble_output(
         "done": out_done,
         "advance_wall": out_advance_wall,
         "sort_done": out_sort_done,
-        "sort_vis_hi": out_sort_vis_hi,
         "sort_wall_index": out_sort_wall_index,
     }
     return overlaid, overflow

@@ -82,6 +82,7 @@ from torchwright.ops.arithmetic_ops import (
     multiply_2d,
     multiply_const,
     negate,
+    piecewise_linear,
     piecewise_linear_2d,
     reciprocal,
     subtract,
@@ -272,11 +273,49 @@ class ThinkingWallOutput:
     previously-emitted identifier values (e.g. RESOLVED_X/Y) from the
     KV cache — sharing the instance lets its per-name attention-head
     cache dedupe queries across stages.
+
+    Phase B Part 2 adds two scalar KV channels specifically for the
+    SORTED stage's quadratic-equality attention:
+
+    * ``bsp_rank_scalar_for_sort`` — the wall's BSP rank as a float at
+      BSP_RANK identifier positions of renderable walls; a sentinel
+      (``-100``) at non-renderable walls and non-BSP_RANK positions.
+    * ``bsp_rank_neg_sq_for_sort`` — ``-bsp_rank²`` at renderable
+      BSP_RANK id positions; a sentinel (``-1000``) elsewhere.
+
+    The sentinels are chosen small enough that the final select stays
+    in a regime where ``select`` noise can't swamp the unit-step score
+    gap between adjacent BSP ranks, yet large enough that the
+    attention softmax (match_gain ≈ 20) puts effectively-zero weight
+    on non-renderable / non-BSP_RANK keys.
+
+    Phase B Part 2 also exposes the current-wall one-hot at thinking
+    positions so downstream stages can do content-attention keyed by
+    ``(identifier_name, wall_index)``.  Two variants are needed because
+    consumers key different position types:
+
+    * ``identifier_wall_index_onehot`` — gated by ``is_any_identifier``.
+      The SORTED stage's quadratic-equality attention reads the V from
+      BSP_RANK *identifier* positions, so its V-source channel needs
+      the wall_index one-hot exposed at identifier positions.
+    * ``value_wall_index_onehot`` — gated by ``is_thinking_value``.
+      The SORTED stage's VIS_LO content attention (and RENDER's VIS_HI
+      equivalent) match against VIS_LO / VIS_HI *VALUE* positions.
+
+    Both are zero outside the thinking phase.  At SORT_RESULT id / VALUE
+    positions ``is_any_identifier`` / ``is_thinking_value`` technically
+    fire (SORT_RESULT was added to ``IDENTIFIER_NAMES`` for uniform
+    readback), but ``wall_j_onehot`` there is stale thinking-phase
+    state; sorted.py doesn't consume these fields at its own positions.
     """
 
     next_token_embedding: Node
     is_thinking_active: Node
     readback: "ThinkingReadback"
+    bsp_rank_scalar_for_sort: Node
+    bsp_rank_neg_sq_for_sort: Node
+    identifier_wall_index_onehot: Node
+    value_wall_index_onehot: Node
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +344,8 @@ def build_thinking_wall(
         "thinking_wall vocabulary defines 8 markers (THINKING_WALL_0..7); "
         f"max_walls={max_walls} would need additional vocabulary entries."
     )
-    assert len(is_identifier_by_slot) == len(IDENTIFIER_NAMES) == 20, (
-        f"expected 20 per-slot identifier detectors, got "
+    assert len(is_identifier_by_slot) == len(IDENTIFIER_NAMES) == 21, (
+        f"expected 21 per-slot identifier detectors, got "
         f"{len(is_identifier_by_slot)}"
     )
     is_thinking_wall_n = is_thinking_wall_n[:max_walls]
@@ -506,6 +545,82 @@ def build_thinking_wall(
         # amplifies).  Clamping to [0, 7] enforces a tight value_type
         # without adding runtime error on well-formed inputs.
         bsp_rank = clamp(bsp_rank, 0.0, 7.0)
+
+    # ---------------------------------------------------------------------
+    # Phase B Part 2: expose BSP_RANK scalars as a KV side-channel so the
+    # SORTED stage's quadratic-equality attention at SORT_RESULT id
+    # positions can match bsp_rank against wall_counter.  At every
+    # position we emit ``[bsp_rank_scalar, bsp_rank_neg_sq]``:
+    #
+    #   * BSP_RANK id position of renderable wall: ``[r, -r²]``.  The
+    #     quadratic-attention query ``[2N, 1]`` dots to
+    #     ``2N·r - r²`` = ``-(r-N)² + N²``, peaking at ``r = N``.
+    #   * Non-renderable (at BSP_RANK id) or non-BSP_RANK position: the
+    #     sentinels ``[-100, -1000]``.  Query dot ≤ ``-200N - 1000``,
+    #     which after match_gain ~20 contributes effectively-zero
+    #     softmax weight.
+    #
+    # Sentinels are picked small enough that ``select`` with
+    # ``approximate=False`` (float-exact on the winning branch) adds only
+    # one extra sublayer per select, yet large enough that the
+    # softmax margin swamps FP drift.
+    # ---------------------------------------------------------------------
+    with annotate("thinking_wall/bsp_rank_for_sort"):
+        _BSP_SCALAR_SENTINEL = -100.0
+        _BSP_NEG_SQ_SENTINEL = -1000.0
+
+        # Integer square over bsp_rank ∈ {0..7}.  One piecewise-linear
+        # sublayer; evaluation at integer breakpoints is float-exact.
+        bsp_rank_sq = piecewise_linear(
+            bsp_rank,
+            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            lambda x: x * x,
+            name="bsp_rank_sq",
+        )
+        bsp_rank_neg_sq_value = negate(bsp_rank_sq)
+
+        # ``is_usable`` = this position is BSP_RANK id AND the attended
+        # wall is renderable.  Non-usable positions emit the sentinels.
+        is_usable = bool_all_true(
+            [is_identifier_by_slot[_SLOT_BSP_RANK], is_renderable]
+        )
+
+        sentinel_scalar_lit = create_literal_value(
+            torch.tensor([_BSP_SCALAR_SENTINEL]),
+            name="tw_bsp_scalar_sentinel",
+        )
+        sentinel_neg_sq_lit = create_literal_value(
+            torch.tensor([_BSP_NEG_SQ_SENTINEL]),
+            name="tw_bsp_neg_sq_sentinel",
+        )
+
+        # approximate=False: the on-path is float-exact, so bsp_rank
+        # (integer 0..7) and -r² (in [-49, 0]) pass through without
+        # select's M·c_tol noise contaminating the attention dot.
+        bsp_rank_scalar_for_sort = select(
+            is_usable,
+            bsp_rank,
+            sentinel_scalar_lit,
+            approximate=False,
+        )
+        bsp_rank_neg_sq_for_sort = select(
+            is_usable,
+            bsp_rank_neg_sq_value,
+            sentinel_neg_sq_lit,
+            approximate=False,
+        )
+
+    # ---------------------------------------------------------------------
+    # Phase B Part 2: expose ``current_wall_index`` as a 1-hot at
+    # thinking identifier and thinking VALUE positions.  Two gated
+    # variants so downstream stages can key their content attentions
+    # on identifier positions (e.g. the quadratic SORTED attention
+    # reading BSP_RANK id V) or on VALUE positions (e.g. the VIS_LO /
+    # VIS_HI content attentions reading thinking VALUE payloads).
+    # ---------------------------------------------------------------------
+    with annotate("thinking_wall/wall_index_onehot_exports"):
+        identifier_wall_index_onehot = cond_gate(is_any_identifier, wall_j_onehot)
+        value_wall_index_onehot = cond_gate(is_thinking_value, wall_j_onehot)
 
     # ---------------------------------------------------------------------
     # Phase B Part 1 slot-split: the deep T/VIS chain gets carved into
@@ -784,6 +899,10 @@ def build_thinking_wall(
         next_token_embedding=next_token_embedding,
         is_thinking_active=is_thinking_active,
         readback=readback,
+        bsp_rank_scalar_for_sort=bsp_rank_scalar_for_sort,
+        bsp_rank_neg_sq_for_sort=bsp_rank_neg_sq_for_sort,
+        identifier_wall_index_onehot=identifier_wall_index_onehot,
+        value_wall_index_onehot=value_wall_index_onehot,
     )
 
 

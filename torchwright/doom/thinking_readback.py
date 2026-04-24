@@ -290,6 +290,7 @@ class ThinkingReadback:
     def __init__(self, ctx: _ReadbackContext):
         self._ctx = ctx
         self._cache: Dict[str, Node] = {}
+        self._indicator_cache: Dict[str, Node] = {}
         # The 1-wide constant query vector (``+1``) used by
         # ``attend_most_recent_matching``.  Single shared node so every
         # identifier's attention head shares a literal.
@@ -297,12 +298,44 @@ class ThinkingReadback:
             torch.tensor([1.0]), name="readback_q1"
         )
 
+    def is_value_of(self, name: str) -> Node:
+        """Return the ±1 per-position indicator for "this position is
+        a VALUE token whose preceding identifier was ``name``."
+
+        Useful as a key-side channel for content-attention callers that
+        want to match against ``name``-VALUE positions in the KV cache
+        without paying for the readback Linear.  ``get_value_after_last``
+        builds this same indicator internally; exposing it lets other
+        stages (e.g., the SORTED stage's VIS_LO content attention)
+        compose their own queries.
+
+        Cached per name: repeated calls return the same Node.
+        """
+        if name in self._indicator_cache:
+            return self._indicator_cache[name]
+        if name not in VALUE_RANGE_BY_NAME:
+            raise KeyError(
+                f"unknown identifier {name!r}; must be one of {IDENTIFIER_NAMES}"
+            )
+        slot = IDENTIFIER_NAMES.index(name)
+        prev_slot_i_01 = extract_from(
+            self._ctx.prev_id_slots,
+            len(IDENTIFIER_NAMES),
+            slot,
+            1,
+            f"readback_prev_slot_{name}",
+        )
+        prev_slot_i_bool = compare(prev_slot_i_01, 0.5)
+        indicator = bool_all_true([self._ctx.is_value_category, prev_slot_i_bool])
+        self._indicator_cache[name] = indicator
+        return indicator
+
     def get_value_after_last(
         self, name: str, *, assert_hardness_gt: float | None = 0.99
     ) -> Node:
         """Return the dequantized float for the most recent matching VALUE.
 
-        ``name`` must be one of the 20 entries in ``IDENTIFIER_NAMES``.
+        ``name`` must be one of the 21 entries in ``IDENTIFIER_NAMES``.
         The returned Node is 1-wide with value range
         ``VALUE_RANGE_BY_NAME[name]``.
 
@@ -324,12 +357,6 @@ class ThinkingReadback:
         """
         if name in self._cache:
             return self._cache[name]
-        if name not in VALUE_RANGE_BY_NAME:
-            raise KeyError(
-                f"unknown identifier {name!r}; must be one of {IDENTIFIER_NAMES}"
-            )
-
-        slot = IDENTIFIER_NAMES.index(name)
 
         # 1. Build is_X_value: ``is_value_category AND prev_slot_onehot[slot]``.
         #    The slot one-hot stored by thinking_wall is already gated
@@ -338,15 +365,7 @@ class ThinkingReadback:
         #    slot.  The AND with is_value_category restricts the key
         #    signal to VALUE positions only (keys at identifier
         #    positions would otherwise confuse the attention).
-        prev_slot_i_01 = extract_from(
-            self._ctx.prev_id_slots,
-            len(IDENTIFIER_NAMES),
-            slot,
-            1,
-            f"readback_prev_slot_{name}",
-        )
-        prev_slot_i_bool = compare(prev_slot_i_01, 0.5)
-        is_X_value = bool_all_true([self._ctx.is_value_category, prev_slot_i_bool])
+        is_X_value = self.is_value_of(name)
 
         # 2. Attention value: the 64-wide VALUE payload region of the
         #    embedding.  Category code cols [0:8] are the same at every
