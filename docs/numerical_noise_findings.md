@@ -17,12 +17,27 @@ call-site table in sync with the `doom_*` distributions declared in
 
 ### `piecewise_linear_2d` oscillates on non-uniform grids
 
-`doom_diff_trig` hits **7.78 absolute error** on a product whose reference
-value is `-22.22` — a ~35% relative deviation. The op's own docstring already
-flags this: the constrained least-squares fit used on non-uniform breakpoint
-grids can oscillate inside cell interiors. **Preferred replacement:**
-`low_rank_2d`, which measures 0.065 absolute / 33% relative (rank-3 SVD, with
-a compile-time `σ_{K+1}` bound).
+`doom_diff_trig` hits **19.4 absolute error** on a product whose reference
+value is `-24.3` — a ~80% relative deviation. `doom_diff_vel` hits
+**13.6 absolute error**. The op's own docstring already flags this: the
+constrained least-squares fit used on non-uniform breakpoint grids can
+oscillate inside cell interiors. **Preferred replacement:** `low_rank_2d`,
+which measures 0.065 absolute / 33% relative (rank-3 SVD, with a compile-time
+`σ_{K+1}` bound).
+
+**Noise ~doubled after commit `3895411`** ("perf(ops): drop full_matrices in
+piecewise_linear_2d SVD"). That change moved `torch.linalg.svd` from
+`full_matrices=True` to `False` to save ~15 GB of unused U. For `m > n` the
+two SVD modes compute the same `Vh` in theory, but torch's reduced-SVD
+algorithm produces a slightly different orthonormal basis in the nullspace
+span (which is what the piecewise_linear_2d fit uses via `Vh[rank:]`).
+Different nullspace basis → different constrained least-squares solution →
+different oscillation pattern, same shape but higher amplitude at DIFF_BP's
+sparsely-sampled outer cells. The commit did not re-measure noise (D7
+violation caught by `test_numerical_noise_drift` and resolved on this
+branch). The underlying issue — piecewise_linear_2d is brittle on highly
+non-uniform grids — is unchanged; callers should prefer `low_rank_2d` or a
+uniform grid.
 
 ### `reciprocal` relative error is load-bearing at the high-x tail
 
@@ -111,7 +126,7 @@ not as "here is an error budget."
 
 `doom_reciprocal_sorted` is defined in `scripts/measure_op_noise.py` but
 temporarily **not** wired into the `reciprocal` `TargetOp`. The
-production callsite at `torchwright/doom/stages/wall.py:813` uses
+production callsite at `torchwright/doom/stages/thinking_wall.py:1196` uses
 `reciprocal(denom_abs, min_value=0.1, max_value=max_denom, step=0.1)`,
 which creates ~500 geometric breakpoints. Summing that many ReLU terms
 in float32 accumulates ~2e-3 of error at the tail of the output range,
@@ -132,7 +147,7 @@ issue. Two fixes are both op-math:
 runtime in the DOOM game graph if `denom_abs` ever clamps up to
 `max_denom` during play — the measurement pipeline just surfaces it
 first because it probes the edge regime deliberately. A fix should be
-cross-referenced against `wall.py:813` to confirm both callsites
+cross-referenced against `thinking_wall.py:1196` to confirm both callsites
 benefit.
 
 Restore the measurement by (a) re-adding `doom_reciprocal_sorted` to
@@ -149,12 +164,17 @@ changes.
 
 | Callsite | What it computes | Distribution | Op |
 | --- | --- | --- | --- |
-| `torchwright/doom/stages/wall.py:431` | `inv_abs_num_t = reciprocal(abs_num_t, min=0.3, max=…)` | `doom_reciprocal_wall` | `reciprocal` |
-| `torchwright/doom/stages/wall.py:813` | `inv_denom_abs = reciprocal(denom_abs, min=0.1, max=…)` | `doom_reciprocal_sorted` (currently unwired, see "Known gap" above) | `reciprocal` |
-| `torchwright/doom/stages/wall.py` (family) | `sort_ey_cos`, `sort_ex_sin`, etc. via `piecewise_linear_2d` | `doom_diff_trig` | `piecewise_linear_2d` |
-| `torchwright/doom/stages/wall.py` (family) | `p_dx_ey`, `p_dy_ex`, etc. via `piecewise_linear_2d` | `doom_diff_vel` | `piecewise_linear_2d` |
+| `torchwright/doom/stages/render.py:697` | `inv_abs_num_t = reciprocal(abs_num_t, min=0.3, max=…)` | `doom_reciprocal_wall` | `reciprocal` |
+| `torchwright/doom/stages/thinking_wall.py:1196` | `inv_denom_abs = reciprocal(denom_abs, min=0.1, max=…)` | `doom_reciprocal_sorted` (currently unwired, see "Known gap" above) | `reciprocal` |
+| `torchwright/doom/stages/thinking_wall.py:1115` (family) | `sort_ey_cos`, `sort_ex_sin`, etc. via `piecewise_linear_2d` | `doom_diff_trig` | `piecewise_linear_2d` |
+| `torchwright/doom/stages/thinking_wall.py:1014` (family) | `p_dx_ey`, `p_dy_ex`, etc. via `piecewise_linear_2d` | `doom_diff_vel` | `piecewise_linear_2d` |
 | `torchwright/doom/stages/sorted.py` | `atan_front_* = low_rank_2d(cross, dot, …, rank=3)` | `doom_atan_cross_dot` | `low_rank_2d` |
-| `torchwright/doom/stages/wall.py` | BSP side-bit compare (threshold 0.5) | `compare_near_thresh_05` | `compare` |
+| `torchwright/doom/stages/thinking_wall.py` | BSP side-bit compare (threshold 0.5) | `compare_near_thresh_05` | `compare` |
+
+**Phase B Part 3 moved these call-sites from `stages/wall.py` to
+`stages/thinking_wall.py`** (the prefill WALL stage was gutted to a data
+carrier; all per-wall compute now lives in the thinking cascade).  Line
+numbers above are post-Phase-B-Part-3.
 
 Foundation ops (`piecewise_linear`, `square`, `square_signed`,
 `multiply_integers`, the exact negative controls, and the logic ops) are

@@ -401,7 +401,7 @@ def _distributions() -> Dict[str, InputDistribution]:
             "doom_diff_trig",
             "wall-geometry product over DIFF_BP × TRIG_BP — mirrors the "
             "`sort_ey_cos`/`sort_ex_sin` family of calls at "
-            "`torchwright/doom/stages/wall.py:263` and neighbours.",
+            "`torchwright/doom/stages/thinking_wall.py:1115` and neighbours.",
             -40.0,
             40.0,
             -1.0,
@@ -410,7 +410,8 @@ def _distributions() -> Dict[str, InputDistribution]:
         "doom_diff_vel": _uniform_2d(
             "doom_diff_vel",
             "collision product over DIFF_BP × VEL_BP — mirrors the "
-            "`p_dx_ey`/`p_dy_ex` family at `torchwright/doom/stages/wall.py:205`.",
+            "`p_dx_ey`/`p_dy_ex` family at "
+            "`torchwright/doom/stages/thinking_wall.py:1014`.",
             -40.0,
             40.0,
             -0.7,
