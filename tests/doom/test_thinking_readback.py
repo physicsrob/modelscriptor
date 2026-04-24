@@ -166,7 +166,22 @@ def test_emit_continuous_roundtrip(name, test_values):
 
 
 def test_emit_integer_roundtrip_bsp_rank():
-    """Integer emit path: verify every value 0..7 round-trips exactly."""
+    """Integer emit path: verify every value 0..7 round-trips through the
+    raw + decode path with the (broken) magnitudes the original design
+    produced.
+
+    This test pins the *raw-slot* behavior of emit_integer.  The emitter
+    picks W_EMBED[VALUE_k] for literal k, so the raw slot holds
+    ``(2k+1)/131072`` and the BSP_RANK-calibrated decode (which expects
+    the *continuous* quantization ``q ≈ value · 65535/7``) returns
+    ``k · 7/65535`` ≈ 0 instead of k.  This is the round-trip bug the
+    Phase C Part 2 K-column path bypasses; production code uses the
+    continuous emit for BSP_RANK and never goes through here.
+
+    Kept as documentation of the broken raw-slot decode.  The new
+    correct round-trip via the K column is exercised by
+    ``test_emit_integer_roundtrip_via_k_column`` below.
+    """
     pos_encoding = create_pos_encoding()
     int_in = create_input("int_val", 1)
     emitted = emit_integer_value_embedding(int_in, max_int=7, name="BSP_RANK")
@@ -183,14 +198,6 @@ def test_emit_integer_roundtrip_bsp_rank():
         verbose=False,
     )
 
-    # The decode dequantizes VALUE_ID back to BSP_RANK's [0, 7] range.
-    # An integer k emitted as one-hot → VALUE_k embedding → dequant =
-    # lo + k * (hi - lo) / 65535 = 0 + k * 7/65535 ≈ 0 for k ≤ 7.  So
-    # BSP_RANK 0..7 emits VALUE_0..VALUE_7, decoded back give
-    # k*7/65535 which is essentially zero.  To verify the one-hot path
-    # works end-to-end, test the raw embedding hits the right VALUE
-    # row: decode with the ID-integer-proportional Linear from the
-    # helper should give a float k·(7/65535).
     for k in range(8):
         vals = {"int_val": torch.tensor([[float(k)]])}
         out = net.compute(1, vals)[decoded].squeeze().item()
@@ -198,6 +205,68 @@ def test_emit_integer_roundtrip_bsp_rank():
         assert (
             abs(out - expected) < 5e-4
         ), f"BSP_RANK integer emit at k={k}: got {out}, expected {expected}"
+
+
+def test_emit_integer_roundtrip_via_k_column():
+    """Phase C Part 2: emit_integer_value_embedding's K column carries
+    ``2·k_target``.  Extracting K and dividing by 2 round-trips to the
+    original integer exactly (within float32 ulp).
+
+    This is the new correct round-trip path that fixes the bug
+    documented in test_emit_integer_roundtrip_bsp_rank above.  Used by
+    SORT_RESULT in production: SORTED's local
+    ``_decode_local_value_to_float`` and RENDER's
+    ``readback.get_value_after_last("SORT_RESULT")`` both consume this
+    K column directly, no decode Linear.
+    """
+    from torchwright.doom.embedding import D_K_SLOT, MAX_INT_K
+    from torchwright.ops.arithmetic_ops import multiply_const
+
+    pos_encoding = create_pos_encoding()
+    int_in = create_input("int_val", 1)
+    emitted = emit_integer_value_embedding(int_in, max_int=7, name="SORT_RESULT")
+
+    # Extract the K column (col 25) — holds 2·k_target.
+    k_col_start = 8 + 1 + 16  # D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
+    two_k = extract_from(emitted, D_EMBED, k_col_start, D_K_SLOT, "two_k")
+    # Divide by 2 to recover k_target.
+    recovered = multiply_const(two_k, 0.5)
+
+    net = forward_compile(
+        d=_D,
+        d_head=_D_HEAD,
+        output_node=recovered,
+        pos_encoding=pos_encoding,
+        verbose=False,
+    )
+
+    for k in range(8):
+        vals = {"int_val": torch.tensor([[float(k)]])}
+        out = net.compute(1, vals)[recovered].squeeze().item()
+        assert abs(out - k) < 1e-5, (
+            f"SORT_RESULT integer emit at k={k}: got {out}, expected {k} "
+            f"(K column path)"
+        )
+
+    # Also verify the K_NS column is the constant 1.
+    from torchwright.doom.embedding import D_K_NS_SLOT
+
+    k_ns_node = extract_from(
+        emitted, D_EMBED, k_col_start + D_K_SLOT, D_K_NS_SLOT, "k_ns"
+    )
+    net2 = forward_compile(
+        d=_D, d_head=_D_HEAD, output_node=k_ns_node,
+        pos_encoding=pos_encoding, verbose=False,
+    )
+    for k in range(8):
+        vals = {"int_val": torch.tensor([[float(k)]])}
+        out = net2.compute(1, vals)[k_ns_node].squeeze().item()
+        assert abs(out - 1.0) < 1e-5, (
+            f"SORT_RESULT K_NS column at k={k}: got {out}, expected 1.0"
+        )
+
+    # Sanity: the documented MAX_INT_K covers what we actually use.
+    assert MAX_INT_K >= 7
 
 
 # ---------------------------------------------------------------------------

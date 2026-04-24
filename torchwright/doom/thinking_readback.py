@@ -1,26 +1,29 @@
-"""Codec between thinking-token float values and 25-wide VALUE embeddings.
+"""Codec between thinking-token values and 27-wide VALUE embeddings.
 
-Two sides of the same boundary:
+Two sides of the same boundary, with separate wire formats for
+continuous floats and small-cardinality integers:
 
-* **Emit** (producer): a per-wall identifier step computes a float (e.g.
-  ``CROSS_A = -17.3``) and this module's :func:`emit_continuous_value_embedding`
-  / :func:`emit_integer_value_embedding` / :func:`emit_boolean_value_embedding`
-  produces the 25-wide ``W_EMBED`` row the host argmaxes against to pick
-  the next VALUE token ID.
+* **Emit** (producer): a per-wall identifier step computes a value and
+  one of :func:`emit_continuous_value_embedding`,
+  :func:`emit_integer_value_embedding`,
+  :func:`emit_boolean_value_embedding` produces the 27-wide row the
+  host argmaxes against ``W_EMBED.T`` to pick the next VALUE token ID.
 * **Readback** (consumer): a later thinking step needs a prior value
-  from the KV cache (e.g. ``T_LO`` reads ``CROSS_A``) and
-  :class:`ThinkingReadback` runs a single ``attend_most_recent_matching``
-  + a Linear decode to turn the 1-wide raw slot back into a
-  dequantized float.
+  from the KV cache and :class:`ThinkingReadback` runs a single
+  ``attend_most_recent_matching`` to fetch it.  For continuous
+  identifiers (CROSS_A, T_LO, …), a Linear decode dequantizes the raw
+  slot back to a float.  For integer identifiers in
+  :data:`INT_IDENTIFIER_NAMES` (today: ``SORT_RESULT``), the K column
+  carries the integer directly — no decode Linear.
 
-The wire format between the two is the 16-bit integer VALUE ID: every
-VALUE row ``k`` in ``W_EMBED`` shares the same 8-wide E8 category code
-in cols [0:8], carries the normalized value ``k / 65535`` in col 8 (the
-raw slot), and a 16-wide ±1 Gray code of ``k`` in cols [9:25]. The
-encoder writes the same 25-wide row directly; argmax against
-``W_EMBED.T`` resolves it to the nearest VALUE_k.
+Wire formats
+------------
 
-Float ↔ VALUE-ID mapping per identifier name is
+Continuous (Phase A/B): the 16-bit integer VALUE ID.  Every VALUE row
+``k`` in ``W_EMBED`` shares the same 8-wide E8 category code in cols
+[0:8], carries ``(2k+1) / 131072`` in col 8 (the raw slot — the
+shifted encoder grid), and a 16-wide ±1 Gray code of ``k`` in cols
+[9:25].  Float ↔ VALUE-ID mapping per identifier name is
 ``VALUE_RANGE_BY_NAME[name]``:
 
     q = (value - lo) * (N_VALUES - 1) / (hi - lo)          # produce side
@@ -29,16 +32,37 @@ Float ↔ VALUE-ID mapping per identifier name is
 where ``N_VALUES = 65536``.  Host-side uint16 rounding happens between
 the two and contributes one LSB per quantization boundary.
 
+Integer (Phase C Part 2): cols [25:27] of every VALUE row carry
+``[K = k, K_NS = -k²]`` for ``k ≤ MAX_INT_K`` (zero elsewhere).
+:func:`emit_integer_value_embedding` and
+:func:`emit_boolean_value_embedding` *override* these two columns
+with ``[K = 2·k_target, K_NS = 1]`` in the predicted embedding,
+giving an argmax score contribution of
+``2·k_target·k − k²`` that peaks exactly at ``k = k_target`` (margin
+1 to adjacent k, plus the existing gray-code margin of 2).
+:meth:`ThinkingReadback.get_int_after_last` reads the K column
+directly via attention — the matched value IS the integer, no
+dequantize affine, no W_consumer amplification.  See
+``docs/phase_c_part2_int_slot_embedding.md`` for the full design and
+the integer-emit round-trip bug it fixes.
+
 Depth accounting for the emit path (continuous value):
 
     clamp + scale   0 layers (pure affine, fused)
     L1 triangle PL  1 MLP sublayer (9-channel output)
     L2 triangle PL  1 MLP sublayer (7-channel output, off T_128 of L1)
     compare × 16    1 MLP sublayer (parallel)
+    K, K_NS append  0 layers (literal zeros, fused)
 
-≈3 MLP sublayers after the value is computed. Integer / boolean emits
-are ~2 layers (a single ``Linear`` row lookup or ``select`` between two
-embedding rows).
+≈3 MLP sublayers after the value is computed.  Integer / boolean
+emits are ~2 layers (one-hot ``in_range`` + Linear row lookup; the
+K/K_NS override is ``multiply_const`` + literal, both fold).
+
+Readback depth:
+
+    Continuous (raw + decode): 1 attention sublayer; the decode Linear
+        folds into the next consumer.
+    Integer (K column): 1 attention sublayer; no decode.
 """
 
 import math
@@ -69,9 +93,12 @@ from torchwright.doom.embedding import (
     D_CATEGORY,
     D_EMBED,
     D_GRAY_PAYLOAD,
+    D_K_NS_SLOT,
+    D_K_SLOT,
     D_RAW_SLOT,
     E8_VALUE,
     IDENTIFIER_NAMES,
+    MAX_INT_K,
     VALUE_RANGE_BY_NAME,
     embed_lookup,
 )
@@ -84,6 +111,7 @@ __all__ = [
     "emit_boolean_value_embedding",
     "ThinkingReadback",
     "build_thinking_readback",
+    "INT_IDENTIFIER_NAMES",
 ]
 
 
@@ -94,11 +122,28 @@ __all__ = [
 # Cols [0:D_CATEGORY] are the E8_VALUE category code shared across all
 # VALUE rows.  The raw slot (col D_CATEGORY) carries the normalized
 # value; the 16-wide Gray-code payload sits immediately after it.
+# Phase C Part 2: cols [25:26] hold K = k for VALUE_k with k ≤
+# MAX_INT_K (else 0); cols [26:27] hold K_NS = -k² (else 0).
 _RAW_SLOT_START = D_CATEGORY
 _GRAY_START = D_CATEGORY + D_RAW_SLOT
+_K_SLOT_START = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
+_K_NS_SLOT_START = _K_SLOT_START + D_K_SLOT
 assert _RAW_SLOT_START == 8
 assert _GRAY_START == 9
+assert _K_SLOT_START == 25
+assert _K_NS_SLOT_START == 26
 assert D_GRAY_PAYLOAD == 16
+
+# Identifier names that should round-trip through the K column rather
+# than the raw + decode path.  Today this is only SORT_RESULT — its
+# producer (``emit_integer_value_embedding``) writes the K/K_NS
+# override and its consumer (RENDER's wall_index readback, SORTED's
+# local wall_index decode) reads K directly.  Other small-int names
+# (BSP_RANK, IS_RENDERABLE, HIT_*) currently round-trip correctly
+# through the continuous emit path (encode_value_binary +
+# raw-slot + decode) — they could migrate later if a hot-path
+# consumer pays the decode cost, but they're not broken today.
+INT_IDENTIFIER_NAMES: set[str] = {"SORT_RESULT"}
 
 # Match-gain for the readback's ``attend_most_recent_matching``.  Same
 # value the prev-id attention uses at 16-wide (M4/Part 2 empirics).
@@ -255,7 +300,15 @@ def encode_value_binary(q: Node, suffix: str = "") -> Node:
         bits.append(compare(feat, 0.5, sharpness=_BIT_COMPARE_SHARPNESS))
 
     e8_cat = create_literal_value(E8_VALUE, name=f"e8_value_cat{suffix}")
-    return Concatenate([e8_cat, x, *bits])
+    # Phase C Part 2: continuous emits don't activate the K/K_NS
+    # mechanism (their target k > MAX_INT_K, so the W_EMBED row's K
+    # and K_NS columns are 0).  Predicted K=0, K_NS=0 contributes 0
+    # to argmax — same behavior as before D_EMBED grew by 2.
+    k_zero = create_literal_value(torch.tensor([0.0]), name=f"encode_K_zero{suffix}")
+    k_ns_zero = create_literal_value(
+        torch.tensor([0.0]), name=f"encode_K_NS_zero{suffix}"
+    )
+    return Concatenate([e8_cat, x, *bits, k_zero, k_ns_zero])
 
 
 def emit_continuous_value_embedding(
@@ -278,69 +331,126 @@ def emit_integer_value_embedding(
     max_int: int,
     name: str,
 ) -> Node:
-    """Build a 25-wide VALUE embedding for an integer ``v ∈ [0, max_int]``.
+    """Build a ``D_EMBED``-wide VALUE embedding for an integer ``v ∈ [0, max_int]``.
 
     Used for identifiers whose value is a small-cardinality integer
-    (``BSP_RANK`` 0..7, ``RESOLVED_ANGLE`` 0..255).  Quantize +
-    triangle-wave encode would also work but we build a one-hot over
-    the small-cardinality domain and let a single ``Linear`` index the
-    ``W_EMBED`` rows ``[VALUE_0, ..., VALUE_{max_int}]`` directly.
+    (today: SORT_RESULT carrying wall_index 0..max_walls-1).  ``max_int``
+    must be ≤ ``MAX_INT_K`` so the K/K_NS columns are populated for
+    every reachable VALUE row.
 
-    Depth: 2 MLP sublayers (1 for ``in_range``, 1 for the Linear row
-    lookup — the ``bool_to_01`` is a free affine).
+    Phase C Part 2 design: the predicted embedding's E8/raw/gray columns
+    come from a one-hot lookup over ``W_EMBED[VALUE_0..VALUE_{max_int}]``
+    (preserves the existing argmax discrimination via gray Hamming
+    distance).  The K and K_NS columns are *overridden* with the
+    quadratic-equality pattern ``[2·integer_value, 1]``: for any target
+    ``k_target``, the K/K_NS contribution to score(VALUE_k) is
+    ``2·k_target·k − k²``, peaking at ``k = k_target`` with margin 1
+    to adjacent k.  Total argmax margin (gray + K/K_NS) is 3 — same
+    shape as the prior 25-wide design but with K/K_NS as the primary
+    integer discriminator.
+
+    The override fixes a latent round-trip bug in the prior design: a
+    pure row-lookup put ``raw = (2·k_target+1)/131072`` in the predicted
+    embedding, which the consumer's ``_decode_payload_to_float``
+    (calibrated for the *continuous* emit's quantization) decoded to
+    ``≈ k_target / 9362``, not ``k_target``.  See
+    ``docs/phase_c_part2_int_slot_embedding.md``.
+
+    Depth: 2 MLP sublayers (``in_range`` builds the one-hot; the row
+    lookup is a single Linear; ``multiply_const`` and ``Concatenate``
+    are layout/Linear and fold).
 
     Args:
         integer_value: 1-wide float node whose value is an integer in
             ``[0, max_int]``.
-        max_int: Largest integer the value can take.  The one-hot
-            width is ``max_int + 1``.
+        max_int: Largest integer the value can take.  Must be ≤
+            ``MAX_INT_K``; the one-hot width is ``max_int + 1``.
         name: Identifier name (for node debug naming).
 
     Returns:
-        25-wide embedding node.
+        ``D_EMBED``-wide embedding node.
     """
-    from torchwright.ops.arithmetic_ops import add_const
+    from torchwright.ops.arithmetic_ops import add_const, multiply_const
+
+    assert max_int <= MAX_INT_K, (
+        f"emit_integer_value_embedding: max_int={max_int} exceeds "
+        f"MAX_INT_K={MAX_INT_K}; the K/K_NS argmax mechanism only "
+        f"covers VALUE rows up to MAX_INT_K.  Either widen MAX_INT_K "
+        f"in embedding.py (mind the float32 precision tradeoff) or "
+        f"emit via the continuous path."
+    )
 
     n = max_int + 1
     onehot = bool_to_01(in_range(integer_value, add_const(integer_value, 1.0), n))
 
-    rows = torch.stack(
-        [embed_lookup(f"VALUE_{k}") for k in range(n)], dim=0
-    )  # (n, D_EMBED)
-    return Linear(
+    # Build E8/raw/gray columns from VALUE_0..VALUE_max_int rows.  Slice
+    # off the K and K_NS columns from each row — those will be overridden
+    # below with the quadratic-equality pattern.
+    base_cols = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD  # 25
+    rows_base = torch.stack(
+        [embed_lookup(f"VALUE_{k}")[:base_cols] for k in range(n)], dim=0
+    )  # (n, 25)
+    base = Linear(
         onehot,
-        rows,
-        torch.zeros(D_EMBED),
-        name=f"emit_int_{name}",
+        rows_base,
+        torch.zeros(base_cols),
+        name=f"emit_int_base_{name}",
     )
+
+    # K column = 2·integer_value, K_NS column = 1.  The compiler folds
+    # the multiply_const + literal into the next consumer.
+    two_k = multiply_const(integer_value, 2.0)
+    one_lit = create_literal_value(
+        torch.tensor([1.0]), name=f"emit_int_kns_{name}"
+    )
+    return Concatenate([base, two_k, one_lit])
 
 
 def emit_boolean_value_embedding(
     bool_value: Node,
     name: str,
 ) -> Node:
-    """Build a 25-wide VALUE embedding for a ±1 boolean.
+    """Build a ``D_EMBED``-wide VALUE embedding for a ±1 boolean.
 
-    +1 → ``W_EMBED[VALUE_1]``, -1 → ``W_EMBED[VALUE_0]``.
+    +1 → predicted ``VALUE_1``, -1 → predicted ``VALUE_0``.
 
-    Depth: 1 MLP sublayer (the ``cond_gate`` on the 25-wide delta).
+    Phase C Part 2: the E8/raw/gray columns blend ``W_EMBED[VALUE_0]``
+    and ``W_EMBED[VALUE_1]``'s first 25 cols (cond_gate on the ±1
+    bool — same pattern thinking_wall.py uses for HIT_* emission).
+    The K and K_NS columns are overridden with the quadratic-equality
+    pattern: ``K = bool_value + 1`` (= 2 for true, 0 for false, =
+    ``2·k_target``), ``K_NS = 1``.
+
+    Depth: 1 MLP sublayer (the ``cond_gate`` on the 25-wide delta);
+    ``add_const`` and the literal fold into the next consumer.
 
     Args:
         bool_value: 1-wide node with value in ``{-1, +1}``.
         name: Identifier name (for node debug naming).
 
     Returns:
-        25-wide embedding node.
+        ``D_EMBED``-wide embedding node.
     """
-    e_value_0 = create_literal_value(embed_lookup("VALUE_0"), name=f"e_v0_{name}")
-    e_value_1 = create_literal_value(embed_lookup("VALUE_1"), name=f"e_v1_{name}")
-    # base + cond_gate(bool, delta) — same pattern thinking_wall.py
-    # uses for HIT_* emission today.
-    from torchwright.ops.arithmetic_ops import sum_nodes
+    base_cols = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD  # 25
+    e_value_0 = create_literal_value(
+        embed_lookup("VALUE_0")[:base_cols], name=f"e_v0_{name}"
+    )
+    e_value_1 = create_literal_value(
+        embed_lookup("VALUE_1")[:base_cols], name=f"e_v1_{name}"
+    )
+    from torchwright.ops.arithmetic_ops import add_const, sum_nodes
     from torchwright.ops.logic_ops import cond_gate
 
     delta = subtract(e_value_1, e_value_0)
-    return sum_nodes([e_value_0, cond_gate(bool_value, delta)])
+    base = sum_nodes([e_value_0, cond_gate(bool_value, delta)])
+
+    # K = 2·k_target.  bool_value ∈ {-1, +1}; k_target = (bool+1)/2 ∈
+    # {0, 1}; 2·k_target = bool + 1.
+    two_k = add_const(bool_value, 1.0)
+    one_lit = create_literal_value(
+        torch.tensor([1.0]), name=f"emit_bool_kns_{name}"
+    )
+    return Concatenate([base, two_k, one_lit])
 
 
 # ---------------------------------------------------------------------------
@@ -417,11 +527,18 @@ class ThinkingReadback:
     def get_value_after_last(
         self, name: str, *, assert_hardness_gt: float | None = 0.99
     ) -> Node:
-        """Return the dequantized float for the most recent matching VALUE.
+        """Return the value carried by the most recent matching VALUE.
 
         ``name`` must be one of the 21 entries in ``IDENTIFIER_NAMES``.
         The returned Node is 1-wide with value range
         ``VALUE_RANGE_BY_NAME[name]``.
+
+        Phase C Part 2: this method is now a dispatcher.  Identifiers
+        in :data:`INT_IDENTIFIER_NAMES` (today: ``SORT_RESULT``) route
+        to :meth:`get_int_after_last`, which reads the K column
+        directly — no decode Linear, output is the integer scalar
+        with O(ε) noise.  All other identifiers continue to use the
+        raw + decode path.  Callers don't change.
 
         **Undefined when the referenced identifier has no prior
         instance in the causal window.**  Most Phase-A call sites
@@ -439,6 +556,11 @@ class ThinkingReadback:
         cache hits return the original node regardless of the
         requested threshold.
         """
+        if name in INT_IDENTIFIER_NAMES:
+            return self.get_int_after_last(
+                name, assert_hardness_gt=assert_hardness_gt
+            )
+
         if name in self._cache:
             return self._cache[name]
 
@@ -479,6 +601,64 @@ class ThinkingReadback:
         float_value = _decode_payload_to_float(matched_raw, name)
         self._cache[name] = float_value
         return float_value
+
+    def get_int_after_last(
+        self, name: str, *, assert_hardness_gt: float | None = 0.99
+    ) -> Node:
+        """Return the integer carried by the K column of the most recent
+        matching VALUE — no decode Linear, no W_consumer amplification.
+
+        ``name`` must be in :data:`INT_IDENTIFIER_NAMES`.  The returned
+        Node is 1-wide; its value is the integer ``k`` of the matched
+        VALUE_k token (within softmax-leakage noise ε·MAX_INT_K).
+        Cached per-name (results shared with :meth:`get_value_after_last`
+        when the dispatcher routes here).
+
+        Mechanism: attends the K column of the embedding (col 25)
+        with V = K_slot.  At VALUE_k positions the K column carries
+        ``k`` itself for ``k ≤ MAX_INT_K``; at non-VALUE / non-matching
+        positions the K column is 0 (either by W_EMBED layout or by
+        the ``is_X_value`` softmax gate).  The matched K value IS the
+        integer; no dequantize affine is needed.
+
+        See ``docs/phase_c_part2_int_slot_embedding.md`` for the full
+        design.
+        """
+        cache_key = f"__int__:{name}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        if name not in INT_IDENTIFIER_NAMES:
+            raise KeyError(
+                f"get_int_after_last: {name!r} is not an int identifier; "
+                f"INT_IDENTIFIER_NAMES = {sorted(INT_IDENTIFIER_NAMES)}.  "
+                f"Use get_value_after_last for continuous identifiers."
+            )
+
+        is_X_value = self.is_value_of(name)
+        k_slot = extract_from(
+            self._ctx.embedding,
+            D_EMBED,
+            _K_SLOT_START,
+            D_K_SLOT,
+            f"readback_k_{name}",
+        )
+        matched_k = attend_most_recent_matching(
+            pos_encoding=self._ctx.pos_encoding,
+            query_vector=self._query_const_1,
+            key_vector=is_X_value,
+            value=k_slot,
+            match_gain=_READBACK_MATCH_GAIN,
+            assert_hardness_gt=assert_hardness_gt,
+        )
+        # Declare the integer's value range so downstream ops get tight
+        # bounds.  For SORT_RESULT, range is (0, max_walls-1) — but the
+        # K column is populated for every k ≤ MAX_INT_K, so the
+        # value_range here is the K column's full domain at this
+        # identifier's emit positions.
+        lo, hi = VALUE_RANGE_BY_NAME[name]
+        result = assert_in_range(matched_k, lo, hi)
+        self._cache[cache_key] = result
+        return result
 
 
 def build_thinking_readback(

@@ -37,7 +37,7 @@ def test_vocab_size_matches_plan():
     assert V == 65576
     assert len(DOOM_VOCAB) == V
     assert W_EMBED.shape == (V, D_EMBED)
-    assert D_EMBED == 25
+    assert D_EMBED == 27
 
 
 def test_id_ranges():
@@ -137,9 +137,52 @@ def test_value_row_gray_code_properties():
 
 
 def test_non_value_row_has_zero_payload():
-    """Non-VALUE rows zero out cols [8:25] — only the E8 code is set."""
+    """Non-VALUE rows zero out cols [8:D_EMBED] — only the E8 code is set."""
     non_value_rows = W_EMBED[N_VALUES:, D_CATEGORY:D_EMBED]
     assert torch.all(non_value_rows == 0)
+
+
+def test_int_slot_columns_for_small_k():
+    """Phase C Part 2: K col holds k, K_NS col holds -k² for k ≤ MAX_INT_K."""
+    from torchwright.doom.embedding import D_K_NS_SLOT, D_K_SLOT, MAX_INT_K
+
+    k_col_start = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
+    k_ns_col_start = k_col_start + D_K_SLOT
+    assert D_K_SLOT == 1 and D_K_NS_SLOT == 1
+
+    # In the int range: K = k, K_NS = -k².
+    for k in [0, 1, 2, 3, 7, 100, MAX_INT_K]:
+        assert W_EMBED[k, k_col_start].item() == float(k)
+        assert W_EMBED[k, k_ns_col_start].item() == -float(k * k)
+
+    # Just above the cap: zero.
+    for k in [MAX_INT_K + 1, MAX_INT_K + 100, N_VALUES - 1]:
+        assert W_EMBED[k, k_col_start].item() == 0.0
+        assert W_EMBED[k, k_ns_col_start].item() == 0.0
+
+
+def test_int_slot_argmax_peak_at_target():
+    """A predicted embedding writing [E8|raw|gray|2*k_target|1] argmaxes
+    to VALUE_(k_target).  Verifies the quadratic-equality identity drives
+    argmax to the right row across the full int-slot range."""
+    from torchwright.doom.embedding import D_K_NS_SLOT, D_K_SLOT, MAX_INT_K
+
+    k_col_start = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
+    k_ns_col_start = k_col_start + D_K_SLOT
+
+    for k_target in [0, 1, 3, 7, 100, MAX_INT_K]:
+        # Build the predicted embedding: E8/raw/gray copied from
+        # W_EMBED row, then K=2*k_target, K_NS=1.
+        predicted = W_EMBED[k_target].clone()
+        predicted[k_col_start] = 2.0 * k_target
+        predicted[k_ns_col_start : k_ns_col_start + D_K_NS_SLOT] = 1.0
+
+        # Argmax over all rows.
+        scores = W_EMBED @ predicted
+        assert scores.argmax().item() == k_target, (
+            f"argmax for k_target={k_target} picked {scores.argmax().item()}, "
+            f"score gap to neighbor: {scores[k_target] - scores.sort(descending=True).values[1]}"
+        )
 
 
 def test_category_codes_pairwise_distinct():

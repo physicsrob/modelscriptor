@@ -2,8 +2,8 @@
 
 Phase A Part 1: every autoregressive step consumes and emits a single
 token ID. The host feeds ``token_ids`` as a 1-wide input slot; the
-graph looks the ID up in ``W_EMBED`` to produce a 25-wide residual
-leaf. On the output side, the 25-wide output slice is projected
+graph looks the ID up in ``W_EMBED`` to produce a 27-wide residual
+leaf. On the output side, the 27-wide output slice is projected
 through ``W_EMBED.T`` and argmaxed to pick the next ID.
 
 Vocabulary layout (Phase B Part 2 adds SORT_RESULT between RESOLVED
@@ -20,20 +20,42 @@ identifiers, widening them 13→17):
 
 Total ``V = 65576``.
 
-Embedding layout (``d_embed = 25``):
+Embedding layout (``d_embed = 27``):
 
   cols [ 0 :  8] — E8 category code (distinct per category name)
-  cols [ 8 :  9] — raw slot: k / 65535 for VALUE_k, else 0
+  cols [ 8 :  9] — raw slot: (2k+1)/131072 for VALUE_k, else 0
   cols [ 9 : 25] — 16-wide ±1 Gray code of k for VALUE_k, else 0
+  cols [25 : 26] — K slot:    k          for VALUE_k where k ≤ MAX_INT_K, else 0
+  cols [26 : 27] — K_NS slot: −k²        for VALUE_k where k ≤ MAX_INT_K, else 0
 
 The raw slot and Gray-code columns are zero for non-VALUE rows. All
 65,536 VALUE rows share a single ``E8_VALUE`` category code; they are
 distinguished by the raw slot (dense, gives a monotone cue) and the
-Gray-code payload (±1 per bit, Hamming 1 for adjacent k). On the
-emit side the encoder produces a 25-wide row directly; argmax against
-``W_EMBED.T`` picks the nearest VALUE_k. On the readback side the
-consumer extracts the 1-wide raw slot only and applies a scalar
-dequantize affine.
+Gray-code payload (±1 per bit, Hamming 1 for adjacent k).
+
+The K and K_NS columns (Phase C Part 2) carry small-cardinality
+integer identifiers in a form that's directly readable by attention
+(no decode Linear) and that supports a quadratic-equality argmax
+peak.  For VALUE_k with k ≤ ``MAX_INT_K``, K stores k literally and
+K_NS stores −k².  An emitter targeting VALUE_k_target writes
+``[K = 2·k_target, K_NS = 1]`` in the predicted embedding; the host
+argmax score from these two columns is
+
+    (2·k_target)·k + 1·(−k²) = −(k − k_target)² + k_target²
+
+which peaks exactly at ``k = k_target`` with margin 1 to adjacent k
+(plus the existing gray-code margin of 2, plus E8 of ~1600).  A
+reader does ``attend(V = K_column)`` to recover the integer
+directly, with no decode Linear and no W_consumer amplification.
+
+Continuous emits (k > ``MAX_INT_K``) leave K and K_NS at 0; their
+encoder appends ``[0, 0]`` to the predicted embedding so dot products
+are well-defined.  These columns don't participate in continuous
+identifier round-trips; continuous readback still uses raw + decode
+Linear.
+
+See ``docs/phase_c_part2_int_slot_embedding.md`` for the design
+rationale and the integer-emit bug being fixed.
 """
 
 from __future__ import annotations
@@ -49,10 +71,20 @@ from torchwright.graph.spherical_codes import index_to_vector
 D_CATEGORY: int = 8
 D_RAW_SLOT: int = 1
 D_GRAY_PAYLOAD: int = 16
-D_EMBED: int = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
-assert D_EMBED == 25
+D_K_SLOT: int = 1
+D_K_NS_SLOT: int = 1
+D_EMBED: int = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD + D_K_SLOT + D_K_NS_SLOT
+assert D_EMBED == 27
 
 N_VALUES: int = 65536  # 2**16 VALUE IDs
+
+# Phase C Part 2: K / K_NS columns are populated only for VALUE_k with
+# k ≤ MAX_INT_K.  Cap chosen for float32 argmax precision: at the cap,
+# the K/K_NS quadratic-equality contribution to score(VALUE_k) for an
+# emitter targeting k_target = MAX_INT_K has adjacent-k margin 1 on
+# magnitude ~MAX_INT_K², which is comfortably above ulp at that
+# magnitude.  See docs/phase_c_part2_int_slot_embedding.md.
+MAX_INT_K: int = 255
 
 
 # ---------------------------------------------------------------------------
@@ -302,26 +334,36 @@ def gray_code_16(k: int) -> torch.Tensor:
 
 
 def _build_w_embed() -> torch.Tensor:
-    """Construct the (V, 25) embedding matrix.
+    """Construct the (V, D_EMBED) embedding matrix.
 
     Rows 0..65535 (VALUE) share the ``E8_VALUE`` category code in
     cols [0:8], carry ``(2k + 1) / 131072`` in col 8 (the raw slot —
     shifted so it exactly matches the encoder's ``x`` at integer k),
     and the ±1 Gray-like code of ``k`` in cols [9:25].
 
+    Rows 0..MAX_INT_K of the VALUE block additionally carry K=k in
+    col 25 and K_NS=−k² in col 26 (Phase C Part 2's int-slot scheme
+    for small-cardinality integer identifiers).  Rows MAX_INT_K+1..
+    65535 leave both columns zero.
+
     Rows 65536..V-1 (non-VALUE) carry a distinct category code per
-    row in cols [0:8] and zeros in cols [8:25].
+    row in cols [0:8] and zeros in cols [8:27].
     """
     w = torch.zeros((V, D_EMBED), dtype=torch.float32)
 
     e8_value = _category_code("VALUE")
     raw_col = D_CATEGORY
     gray_start = D_CATEGORY + D_RAW_SLOT  # 9
+    k_col = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD  # 25
+    k_ns_col = k_col + D_K_SLOT  # 26
 
     for vid in range(N_VALUES):
         w[vid, 0:D_CATEGORY] = e8_value
         w[vid, raw_col] = _shifted_x(vid)
         w[vid, gray_start : gray_start + D_GRAY_PAYLOAD] = gray_code_16(vid)
+        if vid <= MAX_INT_K:
+            w[vid, k_col] = float(vid)
+            w[vid, k_ns_col] = -float(vid * vid)
 
     # Non-VALUE rows: only the category code is non-zero.
     _write_category_row(w, "THINKING_WALL_", start_id=_THINKING_WALL_BASE, count=8)

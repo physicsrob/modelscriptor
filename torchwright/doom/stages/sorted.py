@@ -477,21 +477,37 @@ def _read_vis_lo_for_this_wall(
 
 
 def _decode_local_value_to_float(embedding: Node, name: str) -> Node:
-    """Decode the local position's 1-wide raw slot to a dequantized float.
+    """Decode the local position's payload to a dequantized float / int.
 
-    Same decode Linear as
-    :func:`torchwright.doom.thinking_readback._decode_payload_to_float`,
-    but reads the CURRENT position's embedding rather than attending to
-    a prior one.  Useful when the caller has already been placed at the
-    position whose payload carries the value (e.g., SORT_RESULT VALUE
-    decoding its own emitted wall_index).
+    Reads the CURRENT position's embedding rather than attending to
+    a prior one.  Useful when the caller is already at the position
+    whose payload carries the value (e.g., SORT_RESULT VALUE decoding
+    its own emitted wall_index).
 
-    Raw slot layout: cols [D_CATEGORY : D_CATEGORY + D_RAW_SLOT] carries
-    ``(2k + 1) / 131072`` for VALUE_k.  See
-    :func:`torchwright.doom.thinking_readback._decode_payload_to_float`
-    for the half-LSB-offset decode math.
+    Phase C Part 2: dispatches on identifier name.  For names in
+    :data:`INT_IDENTIFIER_NAMES` (today: ``SORT_RESULT``), reads the
+    K column (col 25) directly — the integer is exact, no decode
+    Linear, no consumer-side amplification.  For continuous names,
+    reads the raw slot (col 8) and applies the dequantize affine
+    (same shape as :func:`thinking_readback._decode_payload_to_float`).
     """
-    from torchwright.doom.embedding import D_CATEGORY, D_RAW_SLOT
+    from torchwright.doom.embedding import (
+        D_CATEGORY,
+        D_GRAY_PAYLOAD,
+        D_K_SLOT,
+        D_RAW_SLOT,
+    )
+    from torchwright.doom.thinking_readback import INT_IDENTIFIER_NAMES
+
+    if name in INT_IDENTIFIER_NAMES:
+        # K column lives at col 25 (after E8 + raw + gray).  At a
+        # local VALUE_k position with k ≤ MAX_INT_K, this slot holds
+        # k literally.  At non-VALUE positions it's 0; the caller
+        # must already be gating to the right token type.
+        k_col_start = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
+        return extract_from(
+            embedding, D_EMBED, k_col_start, D_K_SLOT, f"sort_local_int_{name}"
+        )
 
     raw = extract_from(embedding, D_EMBED, D_CATEGORY, D_RAW_SLOT, f"sort_local_{name}")
     return _decode_value_payload_to_float(raw, name)
