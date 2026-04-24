@@ -64,7 +64,7 @@ from torchwright.doom.stages.thinking_wall import (
     ThinkingWallKVInput,
     build_thinking_wall,
 )
-from torchwright.doom.stages.wall import WallKVInput, WallToken, build_wall
+from torchwright.doom.stages.wall import build_wall
 
 # ---------------------------------------------------------------------------
 # I/O contract
@@ -204,31 +204,16 @@ def build_game_graph(
     _mark("bsp")
 
     # ---------- WALL ----------
+    # Phase B Part 3: prefill WALL is now a thin data carrier.  It
+    # produces the per-wall one-hot used by downstream content
+    # attentions; all collision / BSP / visibility computation has
+    # moved into the thinking phase (running-OR HIT_*, BSP_RANK /
+    # IS_RENDERABLE / VIS_LO / VIS_HI identifier tokens).  Raw
+    # geometry stays host-supplied via ``inputs[...]`` at each WALL
+    # position.
     wall_out = build_wall(
-        WallToken(
-            wall_ax=inputs["wall_ax"],
-            wall_ay=inputs["wall_ay"],
-            wall_bx=inputs["wall_bx"],
-            wall_by=inputs["wall_by"],
-            wall_tex_id=inputs["wall_tex_id"],
-            wall_index=inputs["wall_index"],
-            player_x=inputs["player_x"],
-            player_y=inputs["player_y"],
-            wall_bsp_coeffs=inputs["wall_bsp_coeffs"],
-            wall_bsp_const=inputs["wall_bsp_const"],
-        ),
-        WallKVInput(
-            vel_dx=input_out.vel_dx,
-            vel_dy=input_out.vel_dy,
-            move_cos=input_out.move_cos,
-            move_sin=input_out.move_sin,
-            side_P_vec=bsp_out.side_P_vec,
-        ),
-        is_wall=tf["is_wall"],
-        config=config,
+        wall_index=inputs["wall_index"],
         max_walls=max_walls,
-        max_coord=max_coord,
-        max_bsp_nodes=max_bsp_nodes,
     )
     _mark("wall")
 
@@ -254,15 +239,17 @@ def build_game_graph(
     _mark("player")
 
     # ---------- THINKING_WALL ----------
-    # Phase A Part 4: the thinking-wall stage now carries the full
-    # 16-identifier state machine including the 3 RESOLVED slots at the
+    # Phase A Part 4: the thinking-wall stage carries the full
+    # identifier state machine, including the 3 RESOLVED slots at the
     # frame boundary.  Pre-collision player position comes from the
-    # PLAYER broadcast (post-Part-4 the PLAYER broadcast is pre-collision
-    # — the host feeds pre-collision game_state to PLAYER_X / PLAYER_Y);
-    # the previous pre-collision bypass at thinking positions is gone.
-    # RESOLVED_X/Y aggregate WALL-stage collision flags via
-    # ``attend_mean_where``; RESOLVED_ANGLE forwards the post-turn angle
-    # from INPUT's broadcast.
+    # PLAYER broadcast (the host feeds pre-collision game_state to
+    # PLAYER_X / PLAYER_Y).
+    #
+    # Phase B Part 3: RESOLVED_X/Y now read the running-OR HIT_*
+    # values from the thinking KV cache (each wall's HIT_* token emits
+    # the OR through all prior walls, so wall 7's value is the global
+    # aggregate).  The prefill WALL stage no longer produces collision
+    # flags; the kv.hit_* fields are gone from ThinkingWallKVInput.
     thinking_wall_out = build_thinking_wall(
         ThinkingWallKVInput(
             wall_ax=inputs["wall_ax"],
@@ -281,9 +268,6 @@ def build_game_graph(
             player_x=player_out.px,
             player_y=player_out.py,
             new_angle=input_out.new_angle,
-            hit_full=wall_out.collision.hit_full,
-            hit_x=wall_out.collision.hit_x,
-            hit_y=wall_out.collision.hit_y,
         ),
         embedding=embedding,
         is_wall=tf["is_wall"],
