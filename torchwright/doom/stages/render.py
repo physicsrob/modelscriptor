@@ -137,12 +137,19 @@ class RenderKVInput:
     # thinking-phase VALUE tokens, not from prefill WALL or overlay.
     # ``readback`` decodes the most recent SORT_RESULT VALUE (for
     # wall_index) and the (wall-indexed) VIS_HI VALUE (for the
-    # column-range upper bound).  ``embedding`` and
-    # ``value_wall_index_onehot`` back the VIS_HI content attention's
-    # key.  ``is_thinking_value`` gates the payload extraction.
+    # column-range upper bound).
+    #
+    # Phase C Part 3: vis_hi_content_attention uses quadratic-equality
+    # match on wall_index — keyed on the
+    # ``value_wall_index_scalar`` / ``value_wall_index_neg_sq``
+    # channels exported by thinking_wall (sentinel-gated to
+    # thinking-VALUE positions).  ``embedding`` is still needed for
+    # the value-side raw-slot extract on the matched VIS_HI VALUE
+    # row.
     readback: "ThinkingReadback"
     embedding: Node
-    value_wall_index_onehot: Node
+    value_wall_index_scalar: Node
+    value_wall_index_neg_sq: Node
     is_thinking_value: Node
 
 
@@ -235,31 +242,27 @@ def build_render(
             wall_tex_id=kv.wall_tex_id,
         )
 
-    with annotate("render/wall_index_onehot"):
-        # The 8-wide wall_j_onehot is still needed downstream by the
-        # vis_hi content attention (keyed on
-        # ``(identifier=VIS_HI, wall_index)`` against thinking VIS_HI
-        # VALUE positions — see ``_content_attend_thinking_value``).
-        # Building it here keeps the construction at one site;
-        # vis_hi_content_attention is on a separate dependency chain
-        # and does not block wall_geom_attention.
-        wall_index_clamped = clamp(wall_index, 0.0, float(max_walls - 1))
-        wall_index_p1 = add_const(wall_index_clamped, 1.0)
-        wall_j_onehot = bool_to_01(
-            in_range(wall_index_clamped, wall_index_p1, max_walls)
-        )
-
     with annotate("render/vis_hi_content_attention"):
         # Phase B Part 2: vis_hi comes from the thinking VIS_HI VALUE
         # token for this wall, not from the prefill WALL stage's FOV
         # clip.  Match against thinking VIS_HI VALUE positions keyed
         # by ``(identifier=VIS_HI, wall_index)`` and decode the
         # matched payload back to a scalar.
-        sel_vis_hi = _content_attend_thinking_value(
+        #
+        # Phase C Part 3: keys on wall_index via the same quadratic-
+        # equality trick as wall_geom_attention.  Q at RENDER:
+        # ``[1, 2·wall_index, 1]``; K at thinking VIS_HI VALUE:
+        # ``[is_vis_hi_value, value_wall_index_scalar,
+        # value_wall_index_neg_sq]``.  Drops the 8-wide one-hot Q
+        # construction the prior form needed (the in_range cascade
+        # is gone — wall_index_clamped suffices).
+        wall_index_clamped = clamp(wall_index, 0.0, float(max_walls - 1))
+        sel_vis_hi = _content_attend_thinking_value_quad(
             readback=kv.readback,
             embedding=kv.embedding,
-            value_wall_index_onehot=kv.value_wall_index_onehot,
-            query_wall_onehot=wall_j_onehot,
+            value_wall_index_scalar=kv.value_wall_index_scalar,
+            value_wall_index_neg_sq=kv.value_wall_index_neg_sq,
+            wall_index_query=wall_index_clamped,
             consumer_gate=is_render,
             name="VIS_HI",
             pos_encoding=pos_encoding,
@@ -471,38 +474,63 @@ def _attend_wall_geometry_quad(
     return sel_ax, sel_ay, sel_bx, sel_by, sel_tex_id
 
 
-def _content_attend_thinking_value(
+def _content_attend_thinking_value_quad(
     *,
     readback: ThinkingReadback,
     embedding: Node,
-    value_wall_index_onehot: Node,
-    query_wall_onehot: Node,
+    value_wall_index_scalar: Node,
+    value_wall_index_neg_sq: Node,
+    wall_index_query: Node,
     consumer_gate: Node,
     name: str,
     pos_encoding: PosEncoding,
 ) -> Node:
-    """Read the per-wall ``name``-VALUE payload via content attention
-    keyed by ``(identifier=name, wall_index)``.
+    """Read the per-wall ``name``-VALUE payload via quadratic-equality
+    content attention keyed by ``(identifier=name, wall_index)``.
 
-    Mirrors the vis_lo lookup in ``stages/sorted.py``: the query at the
-    consumer position (gated by ``consumer_gate``) is
-    ``[1, query_wall_onehot]``; the key at thinking ``name``-VALUE
-    positions is ``[is_name_value_01, value_wall_index_onehot_gated]``.
-    The matching VALUE's 64-wide payload is extracted and decoded back
-    to a scalar float via the dequantize affine in
-    ``VALUE_RANGE_BY_NAME``.
+    Phase C Part 3 form (replaces the prior 9-wide one-hot match):
+
+        Q at consumer:  [1, 2·wall_index_query, 1]                (3 wide)
+        K at name-VALUE: [is_name_value, w_idx, -w_idx²]          (3 wide)
+        K elsewhere:     [-100, sentinel_scalar, sentinel_neg_sq] (large neg)
+
+    Score at matching key (same name-VALUE, same wall):
+        ``1·1 + 2·k_target·k − k² = 1 − (k − k_target)² + k_target²``
+    Peaks at ``k = k_target`` with margin 1 to adjacent k.  Sentinel
+    keys score ``≤ -1000``; ``match_gain=12000`` saturates softmax to
+    ≥0.999 on the matching wall.
+
+    The value-side raw slot of the matched VALUE row is dequantized
+    back to a float via the standard ``VALUE_RANGE_BY_NAME[name]``
+    affine.
+
+    Args:
+        wall_index_query: 1-wide scalar holding the desired wall_index
+            (an integer in ``[0, max_walls-1]``).  Typically the
+            decoded SORT_RESULT VALUE — Phase C Part 2 makes this a
+            clean integer.
     """
-    # Key-side type indicator from the shared readback handle.
     is_name_value = readback.is_value_of(name)
 
+    # K at name-VALUE positions: [is_name_value (= +1 here), wall_idx,
+    # -wall_idx²].  thinking_wall's value_wall_index_scalar /
+    # value_wall_index_neg_sq are already sentinel-gated to live only
+    # at thinking-VALUE positions; the type-indicator key channel
+    # narrows further to this specific name's VALUE positions.
     key_type = bool_to_01(is_name_value)
-    key_wall = cond_gate(is_name_value, value_wall_index_onehot)
-    composite_key = Concatenate([key_type, key_wall])
+    composite_key = Concatenate(
+        [key_type, value_wall_index_scalar, value_wall_index_neg_sq]
+    )
 
+    # Q at consumer: [1, 2·wall_index, 1].
     one_literal = create_literal_value(
         torch.tensor([1.0]), name=f"render_{name.lower()}_q_one"
     )
-    query_raw = Concatenate([one_literal, query_wall_onehot])
+    one_literal_b = create_literal_value(
+        torch.tensor([1.0]), name=f"render_{name.lower()}_q_neg_sq_const"
+    )
+    two_n = multiply_const(wall_index_query, 2.0)
+    query_raw = Concatenate([one_literal, two_n, one_literal_b])
     query_gated = cond_gate(consumer_gate, query_raw)
 
     # Narrow the attention's value slot to the 1-wide raw slot — the
@@ -519,11 +547,6 @@ def _content_attend_thinking_value(
     )
     gated_raw = cond_gate(is_name_value, raw_slot)
 
-    # Content match-gain sized for ~1000-position causal windows.  Same
-    # regime as the thinking-phase prev-id attention (12000 for
-    # 20-wide slot keys).  Dot on match is 2 (one type + one
-    # wall-index match); on non-match ≤ 1.  ``12000·(2-1)`` = 12000
-    # logit gap, which resolves softmax to ≥ 0.999 concentration.
     matched_raw = attend_most_recent_matching(
         pos_encoding=pos_encoding,
         query_vector=query_gated,

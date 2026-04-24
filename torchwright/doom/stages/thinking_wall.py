@@ -85,6 +85,7 @@ from torchwright.ops.arithmetic_ops import (
     piecewise_linear,
     piecewise_linear_2d,
     reciprocal,
+    square,
     subtract,
     sum_nodes,
 )
@@ -221,7 +222,13 @@ class ThinkingWallKVInput:
     wall_ay: Node
     wall_bx: Node
     wall_by: Node
-    wall_position_onehot: Node
+    wall_index_at_wall: Node  # host-fed wall_index at WALL positions; the
+    # first K channel of wall_geom_attention's
+    # quadratic-equality match (Phase C Part 3).
+    wall_index_neg_sq_at_wall: Node  # ``-wall_index²`` at WALL positions; second
+    # K channel.  From WallKVOutput
+    # (computed in WALL via one ``square``
+    # sublayer; Phase C Part 1 added it).
     wall_bsp_coeffs: Node  # max_bsp_nodes-wide
     wall_bsp_const: Node  # 1-wide
 
@@ -298,15 +305,19 @@ class ThinkingWallOutput:
       The SORTED stage's quadratic-equality attention reads the V from
       BSP_RANK *identifier* positions, so its V-source channel needs
       the wall_index one-hot exposed at identifier positions.
-    * ``value_wall_index_onehot`` — gated by ``is_thinking_value``.
-      The SORTED stage's VIS_LO content attention (and RENDER's VIS_HI
-      equivalent) match against VIS_LO / VIS_HI *VALUE* positions.
+    * ``value_wall_index_scalar`` / ``value_wall_index_neg_sq``
+      (Phase C Part 3) — quadratic-equality K channels for content
+      attentions keyed on ``(name-VALUE, wall_index)``: today
+      ``render/vis_hi_content_attention`` and ``sort/vis_lo_attention``.
+      Sentinel-gated to live at thinking-VALUE positions (sentinel
+      -100 / -1000 elsewhere, same pattern as ``bsp_rank_*_for_sort``).
 
-    Both are zero outside the thinking phase.  At SORT_RESULT id / VALUE
-    positions ``is_any_identifier`` / ``is_thinking_value`` technically
-    fire (SORT_RESULT was added to ``IDENTIFIER_NAMES`` for uniform
-    readback), but ``wall_j_onehot`` there is stale thinking-phase
-    state; sorted.py doesn't consume these fields at its own positions.
+    All three are zero / sentinel outside the thinking phase.  At
+    SORT_RESULT id / VALUE positions ``is_any_identifier`` /
+    ``is_thinking_value`` technically fire (SORT_RESULT was added to
+    ``IDENTIFIER_NAMES`` for uniform readback), but ``wall_j_onehot``
+    there is stale thinking-phase state; sorted.py doesn't consume
+    these fields at its own positions.
     """
 
     next_token_embedding: Node
@@ -315,7 +326,8 @@ class ThinkingWallOutput:
     bsp_rank_scalar_for_sort: Node
     bsp_rank_neg_sq_for_sort: Node
     identifier_wall_index_onehot: Node
-    value_wall_index_onehot: Node
+    value_wall_index_scalar: Node
+    value_wall_index_neg_sq: Node
 
 
 # ---------------------------------------------------------------------------
@@ -400,19 +412,67 @@ def build_thinking_wall(
         )
 
     # ---------------------------------------------------------------------
-    # Attention hop 3: wall geometry for the current wall.  Value block
-    # packs (ax, ay, bx, by, bsp_coeffs..., bsp_const) so a single
-    # attention head covers every per-wall identifier's geometric need.
+    # Phase C Part 3: derive the quadratic-equality K channels for
+    # current_wall_index.  Used by this stage's wall_geom_attention
+    # (Q-side) and exported as value_wall_index_scalar /
+    # value_wall_index_neg_sq for downstream content attentions
+    # (vis_hi at RENDER, vis_lo at SORTED).  ``square`` on a unit
+    # grid is exact at integer wall_index ∈ [0, max_walls-1].
     # ---------------------------------------------------------------------
-    with annotate("thinking_wall/wall_geom_attention"):
+    with annotate("thinking_wall/wall_index_quad"):
         wi_clamped = clamp(current_wall_index, 0.0, float(max_walls - 1))
         wi_p1 = add_const(wi_clamped, 1.0)
         wall_j_onehot = bool_to_01(in_range(wi_clamped, wi_p1, max_walls))
 
-        # Gate on any per-wall identifier step (13 slots 0..12); the 3
-        # RESOLVED slots don't need wall geom.  Using ``is_any_identifier``
-        # subsumes this with no harm (the extra 3 positions waste a
-        # compute cycle but don't affect correctness).
+        current_wall_index_sq = square(
+            wi_clamped, max_value=float(max_walls - 1), step=1.0
+        )
+        current_wall_index_neg_sq = multiply_const(current_wall_index_sq, -1.0)
+
+    # ---------------------------------------------------------------------
+    # Attention hop 3: wall geometry for the current wall.
+    #
+    # Phase C Part 3: 2-wide quadratic-equality match on wall_index
+    # (mirrors Phase C Part 1's render/wall_geom_attention).
+    # Q at thinking-identifier positions: ``[2·current_wall_index, 1]``;
+    # K at WALL positions: ``[wall_index, -wall_index²]`` (the
+    # ``WallKVOutput`` channels Phase C Part 1 added); sentinels at
+    # non-WALL positions keep softmax mass off them.
+    #
+    # V block packs (ax, ay, bx, by, bsp_coeffs..., bsp_const) so a
+    # single attention head covers every per-wall identifier's
+    # geometric need.
+    # ---------------------------------------------------------------------
+    with annotate("thinking_wall/wall_geom_attention"):
+        # Q at identifier positions: [2·wall_j, 1].
+        two_n = multiply_const(wi_clamped, 2.0)
+        one_lit_q = create_literal_value(
+            torch.tensor([1.0]), name="tw_wall_geom_q_one"
+        )
+        q_raw = Concatenate([two_n, one_lit_q])
+        q_gated = cond_gate(is_any_identifier, q_raw)
+
+        # K at WALL: [wall_index, -wall_index²]; sentinels elsewhere.
+        # Same sentinel magnitudes (-100, -1000) as the rest of the
+        # quadratic-equality system; approximate=False keeps the on-path
+        # float-exact so the integer K survives without M·c_tol noise.
+        sentinel_scalar = create_literal_value(
+            torch.tensor([-100.0]), name="tw_wgeom_k_sentinel_scalar"
+        )
+        sentinel_neg_sq = create_literal_value(
+            torch.tensor([-1000.0]), name="tw_wgeom_k_sentinel_neg_sq"
+        )
+        k_idx = select(
+            is_wall, kv.wall_index_at_wall, sentinel_scalar, approximate=False
+        )
+        k_negsq = select(
+            is_wall,
+            kv.wall_index_neg_sq_at_wall,
+            sentinel_neg_sq,
+            approximate=False,
+        )
+        k = Concatenate([k_idx, k_negsq])
+
         wall_geom_value = Concatenate(
             [
                 kv.wall_ax,
@@ -424,10 +484,10 @@ def build_thinking_wall(
             ]
         )
         wall_geom = attend_argmax_dot(
-            query_vector=cond_gate(is_any_identifier, wall_j_onehot),
-            key_vector=cond_gate(is_wall, kv.wall_position_onehot),
+            query_vector=q_gated,
+            key_vector=k,
             value=cond_gate(is_wall, wall_geom_value),
-            match_gain=1000.0,
+            match_gain=20.0,
             assert_hardness_gt=0.99,
         )
         sel_ax = extract_from(wall_geom, 4 + max_bsp_nodes + 1, 0, 1, "tw_sel_ax")
@@ -619,8 +679,39 @@ def build_thinking_wall(
     # VIS_HI content attentions reading thinking VALUE payloads).
     # ---------------------------------------------------------------------
     with annotate("thinking_wall/wall_index_onehot_exports"):
+        # identifier_wall_index_onehot is still consumed by SORTED's
+        # quad_attention V (it returns the picked wall_index as an
+        # 8-wide one-hot, then a Linear with arange weights converts
+        # back to scalar).  Phase C Part 3 migrated the *value*-side
+        # one-hot consumers to the new value_wall_index_scalar /
+        # value_wall_index_neg_sq channels exposed below.
         identifier_wall_index_onehot = cond_gate(is_any_identifier, wall_j_onehot)
-        value_wall_index_onehot = cond_gate(is_thinking_value, wall_j_onehot)
+
+    # Phase C Part 3: quadratic-equality exports for content attentions
+    # keyed by ``(name-VALUE, wall_index)``.  Sentinel pattern mirrors
+    # ``bsp_rank_*_for_sort`` above: real values gated to thinking-VALUE
+    # positions, large-negative sentinels elsewhere keep softmax mass off
+    # non-VALUE keys.  ``approximate=False`` on the select keeps the
+    # on-path float-exact for integer wall_index round-trip.
+    with annotate("thinking_wall/wall_index_quad_exports"):
+        sentinel_value_scalar = create_literal_value(
+            torch.tensor([-100.0]), name="tw_value_widx_sentinel_scalar"
+        )
+        sentinel_value_neg_sq = create_literal_value(
+            torch.tensor([-1000.0]), name="tw_value_widx_sentinel_neg_sq"
+        )
+        value_wall_index_scalar = select(
+            is_thinking_value,
+            wi_clamped,
+            sentinel_value_scalar,
+            approximate=False,
+        )
+        value_wall_index_neg_sq = select(
+            is_thinking_value,
+            current_wall_index_neg_sq,
+            sentinel_value_neg_sq,
+            approximate=False,
+        )
 
     # ---------------------------------------------------------------------
     # Phase B Part 1 slot-split: the deep T/VIS chain gets carved into
@@ -902,7 +993,8 @@ def build_thinking_wall(
         bsp_rank_scalar_for_sort=bsp_rank_scalar_for_sort,
         bsp_rank_neg_sq_for_sort=bsp_rank_neg_sq_for_sort,
         identifier_wall_index_onehot=identifier_wall_index_onehot,
-        value_wall_index_onehot=value_wall_index_onehot,
+        value_wall_index_scalar=value_wall_index_scalar,
+        value_wall_index_neg_sq=value_wall_index_neg_sq,
     )
 
 

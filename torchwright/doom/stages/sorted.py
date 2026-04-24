@@ -75,7 +75,7 @@ from torchwright.ops.attention_ops import (
 )
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.logic_ops import cond_gate
-from torchwright.ops.map_select import in_range, select
+from torchwright.ops.map_select import select
 
 from torchwright.doom.embedding import (
     D_EMBED,
@@ -143,9 +143,12 @@ class SortedKVInput:
     # read of BSP_RANK id positions.  Zero outside the thinking phase.
     identifier_wall_index_onehot: Node
 
-    # 1-hot of the wall_index at thinking VALUE positions — used as a
-    # key-side channel for the VIS_LO content attention.
-    value_wall_index_onehot: Node
+    # Phase C Part 3: quadratic-equality K channels for wall_index at
+    # thinking VALUE positions.  Replace the prior 8-wide
+    # ``value_wall_index_onehot`` for the VIS_LO content attention.
+    # Sentinel-gated to thinking-VALUE positions.
+    value_wall_index_scalar: Node
+    value_wall_index_neg_sq: Node
 
     # BSP_RANK identifier detector (from game_graph._detect_token_types).
     is_bsp_rank_id: Node  # ±1 at BSP_RANK identifier positions
@@ -391,58 +394,46 @@ def _read_vis_lo_for_this_wall(
     """At SORT_RESULT VALUE, read the per-wall ``vis_lo`` from thinking
     VIS_LO VALUE positions keyed by ``(identifier=VIS_LO, wall_index)``.
 
-    ``wall_index`` at this position is the same wall_index encoded in
-    the token's own host-echoed VALUE payload.  We decode it from the
-    local embedding (layer 0 KV), convert to an 8-wide one-hot, and
-    query against thinking VIS_LO VALUE positions whose KV carries both
-    an ``is_vis_lo_value`` flag and the thinking position's
-    ``wall_index_onehot``.
+    Phase C Part 3 quadratic-equality form (mirrors
+    ``render/vis_hi_content_attention``):
 
-    The standard :class:`ThinkingReadback.get_value_after_last` helper
-    returns the *most recent* VIS_LO regardless of wall — not what we
-    want when 8 walls all emitted VIS_LO earlier in the thinking phase.
-    We build a local attention with a composite
-    ``(is_vis_lo_value, wall_index_onehot)`` key instead.
+        Q at SORT_RESULT VALUE: ``[1, 2·wall_index_local, 1]``      (3 wide)
+        K at thinking VIS_LO VALUE: ``[is_vis_lo_value, w_idx, -w_idx²]``
+        K elsewhere:                ``[-100, sentinel, sentinel]`` (large neg)
+
+    ``wall_index_local`` is read from the local SORT_RESULT VALUE
+    position's K column (Phase C Part 2: integer-exact at layer 0,
+    no decode).  Score peaks at the matching ``(VIS_LO, wall_index)``
+    key with margin 1 to adjacent walls and ≥1000 to sentinels.
     """
-    # 1. Decode wall_index from the local VALUE payload at layer 0.
+    # 1. Read wall_index from the local SORT_RESULT VALUE's K column
+    #    (no decode Linear — Phase C Part 2 integer-exact path).
     with annotate("sort/decode_local_wall_index"):
         wall_index_local = _decode_local_value_to_float(kv.embedding, "SORT_RESULT")
         wall_index_clamped = clamp(wall_index_local, 0.0, float(max_walls - 1))
-        wi_p1 = add_const(wall_index_clamped, 1.0)
-        query_wall_onehot = bool_to_01(
-            in_range(wall_index_clamped, wi_p1, _WALL_ONEHOT_WIDTH)
+
+    # 2. Composite key: type indicator + quad K channels.
+    with annotate("sort/vis_lo_key_compose"):
+        is_vis_lo_value = kv.readback.is_value_of("VIS_LO")
+        key_type = bool_to_01(is_vis_lo_value)
+        composite_key = Concatenate(
+            [key_type, kv.value_wall_index_scalar, kv.value_wall_index_neg_sq]
         )
 
-    # 2. Build the composite key at thinking VIS_LO VALUE positions.
-    # Key channel 0: 1 at VIS_LO VALUE positions, 0 elsewhere (gated
-    # form of ``is_vis_lo_value``).
-    # Key channels 1..max_walls: wall_index_onehot at thinking VALUE
-    # positions (already gated to 0 elsewhere by thinking_wall).
-    with annotate("sort/vis_lo_key_compose"):
-        # Restrict to VIS_LO-id-preceded VALUE positions via the shared
-        # indicator on the readback handle.
-        is_vis_lo_value = kv.readback.is_value_of("VIS_LO")
-
-        # Gate wall_index channels by is_vis_lo_value so non-VIS_LO
-        # VALUE positions don't contaminate the dot.  (At non-thinking
-        # positions, wall_index_onehot is already zero from thinking_wall.)
-        key_type = bool_to_01(is_vis_lo_value)
-        key_wall = cond_gate(is_vis_lo_value, kv.value_wall_index_onehot)
-        composite_key = Concatenate([key_type, key_wall])
-
-    # 3. Build the composite query at SORT_RESULT VALUE positions.
+    # 3. Composite query: [1, 2·wall_index, 1].
     with annotate("sort/vis_lo_query_compose"):
         one_literal = create_literal_value(
             torch.tensor([1.0]), name="sort_vis_lo_query_one"
         )
-        query_raw = Concatenate([one_literal, query_wall_onehot])
+        one_literal_b = create_literal_value(
+            torch.tensor([1.0]), name="sort_vis_lo_query_neg_sq_const"
+        )
+        two_n = multiply_const(wall_index_clamped, 2.0)
+        query_raw = Concatenate([one_literal, two_n, one_literal_b])
         query_gated = cond_gate(is_sort_result_value, query_raw)
 
-    # 4. Value-side: the 1-wide raw slot of thinking VIS_LO positions.
-    # Gate by is_vis_lo_value to zero elsewhere.  Narrowing from the
-    # old 17-wide (E8_VALUE + Gray) payload to just the raw slot is
-    # the Phase B Part 3 encoding win — a single scalar flows through
-    # the attention's V head and decodes via one scalar affine.
+    # 4. Value-side: the 1-wide raw slot of thinking VIS_LO positions
+    #    (continuous payload — vis_lo is a float, not an int).
     with annotate("sort/vis_lo_value_gate"):
         from torchwright.doom.embedding import D_CATEGORY, D_RAW_SLOT
 
