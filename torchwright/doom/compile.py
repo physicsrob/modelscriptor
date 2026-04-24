@@ -425,8 +425,22 @@ def step_frame(
             )
         )
 
-    # WALL × N
-    for i, w in enumerate(walls):
+    # WALL × max_walls — pad beyond N real walls with zero geometry so
+    # every thinking-wall position has a matching K at some WALL prefill
+    # slot.  Without this, padded thinking positions' quad-equality
+    # wall_geom_attention concentrates on the highest real WALL (nearest
+    # by score), causing them to inherit that wall's is_renderable /
+    # bsp_rank — which pollutes SORTED's softmax whenever the donor wall
+    # is renderable.  With padding, each padded wall attends to its own
+    # zero-geometry WALL, which fails the renderability gate
+    # (``|sort_den| > 0.05`` on rotated (0,0)→(0,0)) and is sentinel-gated
+    # out of SORTED.
+    for i in range(max_walls):
+        if i < len(walls):
+            w = walls[i]
+            ax, ay, bx, by, tex_id = w["ax"], w["ay"], w["bx"], w["by"], w["tex_id"]
+        else:
+            ax = ay = bx = by = tex_id = 0.0
         if i < subset.seg_bsp_coeffs.shape[0]:
             coeffs = torch.tensor(
                 subset.seg_bsp_coeffs[i, :max_bsp_nodes],
@@ -442,11 +456,11 @@ def step_frame(
         rows.append(
             _common(
                 token_id=vocab_id("WALL"),
-                wall_ax=torch.tensor([w["ax"]]),
-                wall_ay=torch.tensor([w["ay"]]),
-                wall_bx=torch.tensor([w["bx"]]),
-                wall_by=torch.tensor([w["by"]]),
-                wall_tex_id=torch.tensor([w["tex_id"]]),
+                wall_ax=torch.tensor([ax]),
+                wall_ay=torch.tensor([ay]),
+                wall_bx=torch.tensor([bx]),
+                wall_by=torch.tensor([by]),
+                wall_tex_id=torch.tensor([tex_id]),
                 wall_index=torch.tensor([float(i)]),
                 wall_bsp_coeffs=coeffs,
                 wall_bsp_const=const,
