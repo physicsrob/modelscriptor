@@ -554,22 +554,31 @@ def test_picked_from_rejects_blend():
         )
 
 
-def test_picked_from_rejects_no_valid_keys():
-    """Zero valid key positions must fail explicitly."""
+def test_picked_from_skips_no_valid_keys():
+    """Zero valid key positions → skip (caller's type-boolean convention
+    means every query is itself inactive, so there's nothing to check).
+
+    Previously this case raised AssertionError; commit ``ee3047c``
+    changed it to a silent skip with a stdout note, because the skip
+    fires in decode mode at step positions whose type boolean is 0
+    (e.g. a PLAYER_X step for a sort-stage assert keyed on is_wall)
+    and asserting against values the consumer never reads was noise.
+    """
     result = create_input("result", 1)
     values = create_input("values", 1)
     keys = create_input("keys", 1)
     wrapped = assert_picked_from(result, values, keys, atol=1e-3)
-    with pytest.raises(AssertionError, match=r"no valid key positions"):
-        _eval(
-            wrapped,
-            {
-                "result": torch.tensor([[0.5], [0.3]]),
-                "values": torch.tensor([[1.0], [2.0]]),
-                "keys": torch.tensor([[0.0], [0.0]]),
-            },
-            n_pos=2,
-        )
+    # Does not raise — the assert is skipped when no key rows are
+    # valid, per the "every query inactive" semantic.
+    _eval(
+        wrapped,
+        {
+            "result": torch.tensor([[0.5], [0.3]]),
+            "values": torch.tensor([[1.0], [2.0]]),
+            "keys": torch.tensor([[0.0], [0.0]]),
+        },
+        n_pos=2,
+    )
 
 
 def test_picked_from_accepts_duplicate_valid_values():
