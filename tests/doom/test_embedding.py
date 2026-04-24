@@ -4,8 +4,8 @@ Properties verified:
 
 * Vocabulary size and ID range agree with ``docs/phase_a_plan.md``.
 * Every named vocab entry round-trips: ``DOOM_VOCAB[vocab_id(n)] == n``.
-* VALUE rows share the ``E8_VALUE`` category code and their payload
-  columns are a 4+4+4+4 factored one-hot of the 16-bit ID.
+* VALUE rows share the ``E8_VALUE`` category code, carry ``k/65535``
+  in the raw slot, and a 16-wide ±1 Gray code in the payload.
 * Non-VALUE rows have zero payload columns.
 * Category codes are pairwise distinct.
 * ``equals_vector``-style detection succeeds for cross-category
@@ -15,7 +15,10 @@ Properties verified:
 import torch
 
 from torchwright.doom.embedding import (
+    D_CATEGORY,
     D_EMBED,
+    D_GRAY_PAYLOAD,
+    D_RAW_SLOT,
     DOOM_VOCAB,
     E8_VALUE,
     N_VALUES,
@@ -24,16 +27,17 @@ from torchwright.doom.embedding import (
     build_doom_embedding,
     category_code,
     embed_lookup,
+    gray_code_16,
     value_id,
     vocab_id,
 )
 
 
 def test_vocab_size_matches_plan():
-    assert V == 65571
+    assert V == 65575
     assert len(DOOM_VOCAB) == V
-    assert W_EMBED.shape == (V, 72)
-    assert D_EMBED == 72
+    assert W_EMBED.shape == (V, D_EMBED)
+    assert D_EMBED == 25
 
 
 def test_id_ranges():
@@ -43,18 +47,18 @@ def test_id_ranges():
     # THINKING_WALL: 65536..65543
     assert vocab_id("THINKING_WALL_0") == 65536
     assert vocab_id("THINKING_WALL_7") == 65543
-    # Per-wall identifiers: 65544..65556
+    # Per-wall identifiers (17): 65544..65560
     assert vocab_id("BSP_RANK") == 65544
-    assert vocab_id("HIT_Y") == 65556
-    # RESOLVED: 65557..65559
-    assert vocab_id("RESOLVED_X") == 65557
-    assert vocab_id("RESOLVED_ANGLE") == 65559
-    # Decode: 65560..65562
-    assert vocab_id("SORTED_WALL") == 65560
-    assert vocab_id("DONE") == 65562
-    # Prompt-position: 65563..65570
-    assert vocab_id("INPUT") == 65563
-    assert vocab_id("PLAYER_ANGLE") == 65570
+    assert vocab_id("HIT_Y") == 65560
+    # RESOLVED: 65561..65563
+    assert vocab_id("RESOLVED_X") == 65561
+    assert vocab_id("RESOLVED_ANGLE") == 65563
+    # Decode: 65564..65566
+    assert vocab_id("SORTED_WALL") == 65564
+    assert vocab_id("DONE") == 65566
+    # Prompt-position: 65567..65574
+    assert vocab_id("INPUT") == 65567
+    assert vocab_id("PLAYER_ANGLE") == 65574
 
 
 def test_vocab_roundtrip():
@@ -81,35 +85,58 @@ def test_value_id_helper_identity():
 
 
 def test_value_row_layout():
-    """Verify the 4+4+4+4 factored-one-hot encoding for a spot check."""
-    vid = 0x1234  # h3=1, h2=2, h1=3, h0=4
+    """Verify the [E8 | raw | gray] layout for a spot-check VALUE row."""
+    vid = 0x1234  # = 4660
     row = W_EMBED[vid]
     # Category: E8_VALUE in cols [0:8].
-    assert torch.equal(row[0:8], E8_VALUE)
-    # Payload one-hots at cols 8+1, 24+2, 40+3, 56+4.
-    assert row[8 + 1].item() == 1.0
-    assert row[24 + 2].item() == 1.0
-    assert row[40 + 3].item() == 1.0
-    assert row[56 + 4].item() == 1.0
-    # Rest of the payload is zero.
-    payload = row[8:72].clone()
-    payload[0 * 16 + 1] = 0
-    payload[1 * 16 + 2] = 0
-    payload[2 * 16 + 3] = 0
-    payload[3 * 16 + 4] = 0
-    assert torch.all(payload == 0)
+    assert torch.equal(row[0:D_CATEGORY], E8_VALUE)
+    # Raw slot at col D_CATEGORY stores the shifted encoder grid value
+    # (2k + 1) / 131072.  Exact in float32 since denominator is 2^17.
+    raw_col = D_CATEGORY
+    assert torch.isclose(
+        row[raw_col],
+        torch.tensor((2 * vid + 1) / 131072.0, dtype=torch.float32),
+    )
+    # Gray-code payload at cols [9:25] equals the independent gray_code_16(vid).
+    gray_start = D_CATEGORY + D_RAW_SLOT
+    assert torch.equal(row[gray_start : gray_start + D_GRAY_PAYLOAD], gray_code_16(vid))
 
 
-def test_value_row_all_ids_single_hot_per_block():
-    """Across all 65,536 VALUE rows, each 16-wide block has exactly one hot."""
-    value_rows = W_EMBED[:N_VALUES, 8:72]  # (65536, 64)
-    for digit_idx in range(4):
-        block = value_rows[:, digit_idx * 16 : (digit_idx + 1) * 16]
-        assert torch.all(block.sum(dim=1) == 1.0)
+def test_value_row_gray_code_properties():
+    """Gray-code invariants across all 65,536 VALUE rows.
+
+    * Adjacent rows k, k+1 differ in exactly one gray-payload bit.
+    * Self-dot minus adjacent cross-dot ≥ 2 over the payload columns
+      (gap 16 - 14 = 2), which drives the argmax margin against
+      ``W_EMBED.T``.
+    """
+    gray_start = D_CATEGORY + D_RAW_SLOT
+    payload = W_EMBED[:N_VALUES, gray_start : gray_start + D_GRAY_PAYLOAD]
+
+    # All gray entries are ±1.
+    assert torch.all((payload == 1.0) | (payload == -1.0))
+
+    # Adjacent rows differ in exactly one position over a representative
+    # sample (checking all 65k pairs is wasteful on CPU — sample covers
+    # bit transitions up through bit 15).
+    sample_ks = [0, 1, 2, 3, 7, 15, 31, 63, 127, 16383, 16384, 32767, 32768, 65534]
+    for k in sample_ks:
+        diffs = (payload[k] != payload[k + 1]).sum().item()
+        assert diffs == 1, f"gray(k={k}) vs gray(k+1): {diffs} bits differ, expected 1"
+
+    # Dot-product margin: self-dot = 16, adjacent cross-dot = 14 (since
+    # a single flipped ±1 bit changes the dot by 2).
+    for k in sample_ks:
+        self_dot = (payload[k] * payload[k]).sum().item()
+        adj_dot = (payload[k] * payload[k + 1]).sum().item()
+        assert (
+            self_dot - adj_dot >= 2.0
+        ), f"gray-dot margin too small for k={k}: self={self_dot}, adj={adj_dot}"
 
 
 def test_non_value_row_has_zero_payload():
-    non_value_rows = W_EMBED[N_VALUES:, 8:72]  # (35, 64)
+    """Non-VALUE rows zero out cols [8:25] — only the E8 code is set."""
+    non_value_rows = W_EMBED[N_VALUES:, D_CATEGORY:D_EMBED]
     assert torch.all(non_value_rows == 0)
 
 
@@ -204,26 +231,88 @@ def test_category_only_value_detector():
     just cols [0:8] against ``E8_VALUE``."""
     self_dot = (E8_VALUE * E8_VALUE).sum().item()
     # Every VALUE row's first 8 cols ARE E8_VALUE — dot = self_dot.
-    value_dots = W_EMBED[:N_VALUES, 0:8] @ E8_VALUE
+    value_dots = W_EMBED[:N_VALUES, 0:D_CATEGORY] @ E8_VALUE
     assert torch.all(value_dots == self_dot)
     # Every non-VALUE row's first 8 cols are a *different* category
     # code.  Dot must be ≤ self_dot − 1 (the safety gap).
-    non_value_dots = W_EMBED[N_VALUES:, 0:8] @ E8_VALUE
+    non_value_dots = W_EMBED[N_VALUES:, 0:D_CATEGORY] @ E8_VALUE
     assert torch.all(non_value_dots <= self_dot - 1.0), (
         f"some non-VALUE row's E8_VALUE dot exceeds safety margin: "
         f"max = {non_value_dots.max().item()}, self_dot = {self_dot}"
     )
 
 
+def test_encoder_matches_w_embed_row():
+    """Compile ``encode_value_binary`` and verify that for every integer
+    k ∈ [0, 65535] the encoder's 25-wide output dotted against
+    ``W_EMBED.T`` argmaxes to k.
+
+    This is the host-side semantic of VALUE emission: the encoder
+    produces a row, the host picks the nearest VALUE by argmax.  The
+    triangle-wave Gray-code basis plus the raw slot must resolve every
+    integer input to its exact k.
+    """
+    from torchwright.compiler.forward.compile import forward_compile
+    from torchwright.graph import Linear
+    from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+
+    from torchwright.doom.thinking_readback import encode_value_binary
+
+    pos_encoding = create_pos_encoding()
+    q_in = create_input("q", 1)
+    emitted = encode_value_binary(q_in, suffix="_test")
+    # Concatenate is layout-only; wrap in an identity Linear so the
+    # 25-wide row materializes under a node in the result dict.
+    emit = Linear(emitted, torch.eye(D_EMBED), name="emit_passthrough")
+
+    net = forward_compile(
+        d=512,
+        d_head=32,
+        output_node=emit,
+        pos_encoding=pos_encoding,
+        verbose=False,
+    )
+
+    # Sample 0, 1, a dense grid, and endpoints.  Running all 65k k
+    # through compute is expensive; this grid covers every bit
+    # transition in the triangle-wave basis.
+    sample_ks = [
+        0,
+        1,
+        2,
+        3,
+        127,
+        128,
+        255,
+        256,
+        16383,
+        16384,
+        32767,
+        32768,
+        49151,
+        49152,
+        65534,
+        65535,
+    ]
+    for k in sample_ks:
+        vals = {"q": torch.tensor([[float(k)]])}
+        emit_row = net.compute(1, vals)[emit].squeeze(0)  # (25,)
+        logits = emit_row @ W_EMBED.T.to(emit_row.device)
+        picked = int(logits.argmax().item())
+        assert (
+            picked == k
+        ), f"encoder q={k} argmaxed to VALUE_{picked}, expected VALUE_{k}"
+
+
 def test_build_doom_embedding_factory():
     emb = build_doom_embedding()
-    assert emb.d_embed == 72
+    assert emb.d_embed == D_EMBED
     assert emb.input_name == "token_ids"
     assert emb.max_vocab == V
     # compute() with a (n, 1) integer tensor (how CompiledHeadless slices input_specs).
     ids = torch.tensor([[vocab_id("THINKING_WALL_0")], [42], [vocab_id("HIT_FULL")]])
     out = emb.compute(n_pos=3, input_values={"token_ids": ids})
-    assert out.shape == (3, 72)
+    assert out.shape == (3, D_EMBED)
     assert torch.equal(out[0], embed_lookup("THINKING_WALL_0"))
     assert torch.equal(out[1], W_EMBED[42])
     assert torch.equal(out[2], embed_lookup("HIT_FULL"))

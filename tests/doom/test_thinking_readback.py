@@ -60,17 +60,13 @@ def _decode_payload_linear(name: str) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the same (weights, bias) as ``_decode_payload_to_float``.
 
     Kept local so the test file doesn't depend on a private helper.
+    The raw slot stores ``(2k + 1) / 131072`` — the shifted encoder
+    grid.  Decoding: ``value = lo + (raw * 65536 - 0.5) * LSB``.
     """
     lo, hi = VALUE_RANGE_BY_NAME[name]
-    inv_scale = (hi - lo) / 65535.0
-    weights = torch.zeros(64, 1)
-    for i in range(16):
-        weights[0 * 16 + i, 0] = i * 4096.0
-        weights[1 * 16 + i, 0] = i * 256.0
-        weights[2 * 16 + i, 0] = i * 16.0
-        weights[3 * 16 + i, 0] = float(i)
-    weights = weights * inv_scale
-    bias = torch.tensor([lo])
+    lsb = (hi - lo) / 65535.0
+    weights = torch.tensor([[65536.0 * lsb]])
+    bias = torch.tensor([lo - 0.5 * lsb])
     return weights, bias
 
 
@@ -175,7 +171,7 @@ def test_emit_integer_roundtrip_bsp_rank():
     int_in = create_input("int_val", 1)
     emitted = emit_integer_value_embedding(int_in, max_int=7, name="BSP_RANK")
 
-    payload = extract_from(emitted, D_EMBED, 8, 64, "payload")
+    payload = extract_from(emitted, D_EMBED, 8, 1, "payload")
     weights, bias = _decode_payload_linear("BSP_RANK")
     decoded = Linear(payload, weights, bias, name="decode_back")
 
@@ -437,7 +433,7 @@ def test_readback_empty_cache_does_not_crash():
         prev_id_slots_in, len(IDENTIFIER_NAMES), slot_cross_a, 1, "prev_slot_empty"
     )
     is_X_value = bool_all_true([is_value_category, _compare(prev_slot_i_01, 0.5)])
-    payload = extract_from(embedding_leaf, D_EMBED, 8, 64, "payload_empty")
+    payload = extract_from(embedding_leaf, D_EMBED, 8, 1, "payload_empty")
     matched_payload = attend_most_recent_matching(
         pos_encoding=pos_encoding,
         query_vector=create_literal_value(torch.tensor([1.0]), name="q1_empty"),

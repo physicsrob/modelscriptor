@@ -282,7 +282,11 @@ def _compare_output_type(true_level: float, false_level: float) -> NodeValueType
 
 
 def compare(
-    inp: Node, thresh: float, true_level: float = 1.0, false_level: float = -1.0
+    inp: Node,
+    thresh: float,
+    true_level: float = 1.0,
+    false_level: float = -1.0,
+    sharpness: float | None = None,
 ) -> Node:
     """
     Compare input with threshold and return boolean valued node (1.0 for true, -1.0 for false)
@@ -292,7 +296,14 @@ def compare(
         thresh: Threshold to use.
         true_level: Value to return if inp is greater than thresh.
         false_level: Value to return if inp is less than thresh.
-
+        sharpness: Override for the ramp sharpness.  Saturation requires
+            ``(inp - thresh) * sharpness >= 1``, so the ramp width is
+            ``1/sharpness`` in input units.  ``None`` (default) uses the
+            module-level ``step_sharpness``.  Use a large override when
+            the caller knows the closest non-matching input sits very
+            near ``thresh`` (e.g. triangle-wave bit extraction where the
+            feature is only ~7.6e-6 away from 0.5 at the critical input
+            values).
 
     Returns:
         Node: Node with a value of true_level if inp is greater than thresh, false_level otherwise.
@@ -305,15 +316,15 @@ def compare(
 
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
+    s = step_sharpness if sharpness is None else sharpness
+
     # We need 2 MLP entries, we'll use the equation:
     # y= (true_level-false_level) * [
-    #   max(step_sharpness*x - step_sharpness*thresh, 0) - max(step_sharpness*x - step_sharpness*thresh - 1, 0)
+    #   max(s*x - s*thresh, 0) - max(s*x - s*thresh - 1, 0)
     # ] + false_level
 
-    input_proj = torch.tensor([[step_sharpness], [step_sharpness]])
-    input_bias = torch.tensor(
-        [-step_sharpness * thresh, -step_sharpness * thresh - 1.0]
-    )
+    input_proj = torch.tensor([[s], [s]])
+    input_bias = torch.tensor([-s * thresh, -s * thresh - 1.0])
     output_proj = torch.tensor([[true_level - false_level], [false_level - true_level]])
     output_bias = false_level * torch.ones(1)
 

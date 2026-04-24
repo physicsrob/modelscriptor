@@ -2,8 +2,8 @@
 
 Phase A Part 1: every autoregressive step consumes and emits a single
 token ID. The host feeds ``token_ids`` as a 1-wide input slot; the
-graph looks the ID up in ``W_EMBED`` to produce a 72-wide residual
-leaf. On the output side, the 72-wide output slice is projected
+graph looks the ID up in ``W_EMBED`` to produce a 25-wide residual
+leaf. On the output side, the 25-wide output slice is projected
 through ``W_EMBED.T`` and argmaxed to pick the next ID.
 
 Vocabulary layout (Phase B Part 1 widens per-wall identifiers 13→17
@@ -18,21 +18,25 @@ by adding T_STAR_L / T_STAR_R / COL_A / COL_B intermediate slots):
 
 Total ``V = 65575``.
 
-Embedding layout (``d_embed = 72``):
+Embedding layout (``d_embed = 25``):
 
   cols [ 0 :  8] — E8 category code (distinct per category name)
-  cols [ 8 : 24] — one_hot(h3), bits 12..15 of VALUE payload
-  cols [24 : 40] — one_hot(h2), bits  8..11
-  cols [40 : 56] — one_hot(h1), bits  4..7
-  cols [56 : 72] — one_hot(h0), bits  0..3
+  cols [ 8 :  9] — raw slot: k / 65535 for VALUE_k, else 0
+  cols [ 9 : 25] — 16-wide ±1 Gray code of k for VALUE_k, else 0
 
-The payload columns are zero for non-VALUE rows. All 65,536 VALUE
-rows share a single ``E8_VALUE`` category code; their payload
-columns distinguish them via a 4+4+4+4 factored one-hot.
+The raw slot and Gray-code columns are zero for non-VALUE rows. All
+65,536 VALUE rows share a single ``E8_VALUE`` category code; they are
+distinguished by the raw slot (dense, gives a monotone cue) and the
+Gray-code payload (±1 per bit, Hamming 1 for adjacent k). On the
+emit side the encoder produces a 25-wide row directly; argmax against
+``W_EMBED.T`` picks the nearest VALUE_k. On the readback side the
+consumer extracts the 1-wide raw slot only and applies a scalar
+dequantize affine.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List
 
 import torch
@@ -40,14 +44,13 @@ import torch
 from torchwright.graph.embedding import Embedding
 from torchwright.graph.spherical_codes import index_to_vector
 
-D_EMBED: int = 72
 D_CATEGORY: int = 8
-N_HEX_DIGITS: int = 4
-HEX_WIDTH: int = 16  # one-hot over 16 values per hex digit
-assert D_CATEGORY + N_HEX_DIGITS * HEX_WIDTH == D_EMBED
+D_RAW_SLOT: int = 1
+D_GRAY_PAYLOAD: int = 16
+D_EMBED: int = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
+assert D_EMBED == 25
 
-N_VALUES: int = 1 << (N_HEX_DIGITS * 4)  # 65,536
-assert N_VALUES == HEX_WIDTH**N_HEX_DIGITS
+N_VALUES: int = 65536  # 2**16 VALUE IDs
 
 
 # ---------------------------------------------------------------------------
@@ -199,34 +202,111 @@ DOOM_VOCAB: List[str] = _build_vocab_list()
 
 
 # ---------------------------------------------------------------------------
+# Gray-code payload helper
+#
+# The VALUE_k row stores the 16-wide ±1 bit pattern the emit-side
+# triangle-wave encoder produces at x = k/65535.  That pattern is a
+# Gray-like code — every 65,536 patterns are unique and every adjacent
+# ``k, k+1`` pair differs in exactly one bit — but it is *not* the
+# canonical reflected-binary Gray code (``k XOR (k >> 1)``).  The
+# flip points of ``compare(T_m(x), 0.5)`` sit on a ``1/(4m)`` grid in
+# x, while reflected-binary Gray bits flip on a uniform integer grid
+# in k; the two grids don't align at integer k values, so the two
+# codes differ.
+#
+# Adjacent k differ in exactly one bit → adjacent rows have Hamming
+# distance 1 → Gray-payload dot 14 instead of 16.  Together with the
+# raw slot (at most 1 self-dot, ≤1 for cross) and the shared 8-wide
+# E8_VALUE prefix (self-dot 1600), this gives a margin of ≥ 1.75
+# between any VALUE_k self-dot and any other VALUE row's cross-dot
+# (worst case at raw ≈ 0.5).  Host-side argmax against ``W_EMBED.T``
+# resolves every VALUE emit to the nearest k.
+# ---------------------------------------------------------------------------
+
+
+# The triangle-wave encoder evaluates on a shifted grid ``x_k = (2k + 1)
+# / 131072`` instead of ``k / 65535`` for two reasons:
+#
+# 1. All the arithmetic is exact in float32 — ``2k + 1`` and ``131072 =
+#    2^17`` have small powers of two as factors, and ``m * x_k`` always
+#    lands on a ``2^-17`` grid with no rounding.
+# 2. Integer ``k`` never lands on a triangle-wave crossing.  For every
+#    m ∈ {1, 2, 4, ..., 16384}, the minimum ``|T_m(x_k) - 0.5|`` across
+#    k = 0..65535 is ``2^(e - 16)`` where ``m = 2^e`` — ranging from
+#    ``1.5e-5`` (bit 1) up to ``0.25`` (bit 15).  No float32 rounding
+#    puts the feature on the 0.5 line.
+#
+# Using ``k / 65535`` as input caused ~65 specific k values to land
+# exactly on 0.5 in float32 (T_16384 rounded to 0.5), making compare
+# ambiguous at those k.
+_X_SHIFT_SCALE: float = 1.0 / 131072.0
+_X_SHIFT_BIAS: float = 1.0 / 131072.0
+
+
+def _shifted_x(k: int) -> float:
+    """Return the float32 value of ``(2k + 1) / 131072`` used by the encoder."""
+    return (2 * k + 1) * _X_SHIFT_SCALE
+
+
+def gray_code_16(k: int) -> torch.Tensor:
+    """Return the 16-wide ±1 bit pattern the triangle-wave encoder
+    produces at the shifted input ``x = (2k + 1) / 131072``.
+
+    Bit 0 is ``sign(x - 0.5)`` (one flip across the range — bit 0
+    changes from -1 to +1 at k = 32767 → 32768).  Bit ``i`` for
+    ``i ≥ 1`` is ``sign(T_{2^(i-1)}(x) - 0.5)``, where ``T_m(x) =
+    1 - |2·frac(m·x) - 1|`` is the triangle wave with ``m`` peaks in
+    ``[0, 1]``.  Bit 15 (T_16384) flips 32768 times across k = 0..65535.
+
+    This is a valid Gray-like code (65,536 unique patterns, adjacent-k
+    Hamming distance 1) but not the canonical reflected-binary Gray
+    code — the triangle-wave crossings sit on a ``1/(4m)`` grid in x
+    while reflected-binary Gray flips on a uniform integer grid in k,
+    and the two grids don't align at integer k values.
+    """
+    assert 0 <= k < N_VALUES, f"gray_code_16 out of range: {k}"
+    # Compute in float32 so the result bit-exactly matches what the
+    # compiled encoder produces in float32.
+    x = torch.tensor(_shifted_x(k), dtype=torch.float32).item()
+    bits = torch.empty(D_GRAY_PAYLOAD, dtype=torch.float32)
+    # Bit 0: raw x vs 0.5 (the MSB-like slowest bit).
+    bits[0] = 1.0 if x > 0.5 else -1.0
+    # Bits 1..15: compare T_{2^(i-1)}(x) to 0.5.
+    for i in range(1, D_GRAY_PAYLOAD):
+        m = 1 << (i - 1)
+        y = m * x
+        y_frac = y - math.floor(y)
+        feature = 1.0 - abs(2.0 * y_frac - 1.0)
+        bits[i] = 1.0 if feature > 0.5 else -1.0
+    return bits
+
+
+# ---------------------------------------------------------------------------
 # W_EMBED construction
 # ---------------------------------------------------------------------------
 
 
 def _build_w_embed() -> torch.Tensor:
-    """Construct the (V, 72) embedding matrix.
+    """Construct the (V, 25) embedding matrix.
 
-    Rows 0..65535 (VALUE) share the ``E8_VALUE`` category code and
-    distinguish themselves via a 4+4+4+4 factored one-hot of the
-    16-bit payload.
+    Rows 0..65535 (VALUE) share the ``E8_VALUE`` category code in
+    cols [0:8], carry ``(2k + 1) / 131072`` in col 8 (the raw slot —
+    shifted so it exactly matches the encoder's ``x`` at integer k),
+    and the ±1 Gray-like code of ``k`` in cols [9:25].
 
     Rows 65536..V-1 (non-VALUE) carry a distinct category code per
-    row and zeros in the payload columns.
+    row in cols [0:8] and zeros in cols [8:25].
     """
     w = torch.zeros((V, D_EMBED), dtype=torch.float32)
 
     e8_value = _category_code("VALUE")
+    raw_col = D_CATEGORY
+    gray_start = D_CATEGORY + D_RAW_SLOT  # 9
 
-    # VALUE rows.  Each ID's 16 bits decompose into 4 hex digits
-    # (h3..h0).  Each digit is one-hot-encoded into a 16-wide block.
-    value_block_starts = [D_CATEGORY + i * HEX_WIDTH for i in range(N_HEX_DIGITS)]
     for vid in range(N_VALUES):
         w[vid, 0:D_CATEGORY] = e8_value
-        for digit_idx in range(N_HEX_DIGITS):
-            shift = (N_HEX_DIGITS - 1 - digit_idx) * 4  # h3 is most significant
-            digit = (vid >> shift) & 0xF
-            col = value_block_starts[digit_idx] + digit
-            w[vid, col] = 1.0
+        w[vid, raw_col] = _shifted_x(vid)
+        w[vid, gray_start : gray_start + D_GRAY_PAYLOAD] = gray_code_16(vid)
 
     # Non-VALUE rows: only the category code is non-zero.
     _write_category_row(w, "THINKING_WALL_", start_id=_THINKING_WALL_BASE, count=8)
@@ -279,10 +359,10 @@ assert len(IDENTIFIER_NAMES) == 20
 # For integer-valued ranges (BSP_RANK 0..7; 0/1 booleans for
 # IS_RENDERABLE / HIT_*; 0..255 for RESOLVED_ANGLE), the identifier
 # step emits a specific VALUE_k row directly rather than going through
-# the generic quantize → factored-one-hot encoder; the (lo, hi)
-# entries here still describe the conceptual range so the readback
-# helper decodes VALUE_k back to the correct float via a single
-# Linear.
+# the generic quantize → Gray-code encoder; the (lo, hi) entries here
+# still describe the conceptual range so the readback helper decodes
+# VALUE_k back to the correct float via a single Linear on the raw
+# slot.
 VALUE_RANGE_BY_NAME: Dict[str, tuple[float, float]] = {
     "BSP_RANK": (0.0, 7.0),
     "IS_RENDERABLE": (0.0, 1.0),
@@ -327,7 +407,7 @@ def value_id(n: int) -> int:
 
 
 def embed_lookup(name: str) -> torch.Tensor:
-    """Return the 72-wide ``W_EMBED`` row for a named token."""
+    """Return the 25-wide ``W_EMBED`` row for a named token."""
     return W_EMBED[vocab_id(name)]
 
 

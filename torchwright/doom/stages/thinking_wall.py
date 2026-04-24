@@ -114,7 +114,7 @@ from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.thinking_readback import (
     ThinkingReadback,
     build_thinking_readback,
-    factor_q_to_embedding,
+    encode_value_binary,
 )
 from torchwright.ops.quantization import DEFAULT_N_LEVELS
 
@@ -692,14 +692,14 @@ def build_thinking_wall(
         hit_y_or = clamp(hit_y_or, 0.0, 1.0)
 
     # ---------------------------------------------------------------------
-    # Per-slot quantize → select-q → factor-once.
+    # Per-slot quantize → select-q → encode-once.
     #
     # Each identifier slot quantizes its computed float into a 1-wide
     # ``q ∈ [0, 65535]`` using the slot's design-doc (lo, hi) range.
     # We then sum-cond-gate to pick the active slot's q (exactly one is
     # +1 at any identifier position; sum collapses to the active one).
-    # The expensive ``thermometer_floor_div`` cascade + ``in_range`` × 4
-    # in :func:`factor_q_to_embedding` runs **once** per position on the
+    # The triangle-wave cascade + 16 parallel compares in
+    # :func:`encode_value_binary` runs **once** per position on the
     # selected q rather than 20 times across all slots.
     # ---------------------------------------------------------------------
     with annotate("thinking_wall/normalize_per_slot"):
@@ -752,7 +752,7 @@ def build_thinking_wall(
         # for the factor stage.  No more gates after this — the scale
         # is a plain Linear.
         q_selected = multiply_const(n_selected, float(DEFAULT_N_LEVELS - 1))
-        emit = factor_q_to_embedding(q_selected, suffix="_id_emit")
+        emit = encode_value_binary(q_selected, suffix="_id_emit")
         # Gate to zero at non-identifier positions.  At non-firing
         # positions ``q_selected = 0`` and the factor produces
         # ``W_EMBED[VALUE_0]``; the gate cleanly suppresses that so
