@@ -416,42 +416,44 @@ def _content_attend_thinking_value(
     query_raw = Concatenate([one_literal, query_wall_onehot])
     query_gated = cond_gate(consumer_gate, query_raw)
 
-    payload = extract_from(
-        embedding, D_EMBED, 8, D_EMBED - 8, f"render_{name.lower()}_payload"
+    # Narrow the attention's value slot to the 1-wide raw slot — the
+    # readback needs the dequantized scalar, not the full Gray-code
+    # payload.  Saves V-width per head on this content-match attention.
+    from torchwright.doom.embedding import D_CATEGORY, D_RAW_SLOT
+
+    raw_slot = extract_from(
+        embedding,
+        D_EMBED,
+        D_CATEGORY,
+        D_RAW_SLOT,
+        f"render_{name.lower()}_raw",
     )
-    gated_payload = cond_gate(is_name_value, payload)
+    gated_raw = cond_gate(is_name_value, raw_slot)
 
     # Content match-gain sized for ~1000-position causal windows.  Same
     # regime as the thinking-phase prev-id attention (12000 for
     # 20-wide slot keys).  Dot on match is 2 (one type + one
     # wall-index match); on non-match ≤ 1.  ``12000·(2-1)`` = 12000
     # logit gap, which resolves softmax to ≥ 0.999 concentration.
-    matched_payload = attend_most_recent_matching(
+    matched_raw = attend_most_recent_matching(
         pos_encoding=pos_encoding,
         query_vector=query_gated,
         key_vector=composite_key,
-        value=gated_payload,
+        value=gated_raw,
         match_gain=12000.0,
     )
 
-    # Decode 4+4+4+4 one-hots → dequantized float.
+    # Decode the shifted raw slot (2k+1)/131072 → dequantized float via
+    # a single scalar affine.  See thinking_readback._decode_payload_to_float
+    # for the half-LSB-offset math.
     from torchwright.ops.quantization import DEFAULT_N_LEVELS
     from torchwright.graph.asserts import assert_in_range
 
     lo, hi = VALUE_RANGE_BY_NAME[name]
-    inv_scale = (hi - lo) / (DEFAULT_N_LEVELS - 1)
-    _hex_block = 16
-    weights = torch.zeros(D_EMBED - 8, 1)
-    for i in range(_hex_block):
-        weights[0 * _hex_block + i, 0] = i * 4096.0
-        weights[1 * _hex_block + i, 0] = i * 256.0
-        weights[2 * _hex_block + i, 0] = i * 16.0
-        weights[3 * _hex_block + i, 0] = float(i)
-    weights = weights * inv_scale
-    bias = torch.tensor([lo])
-    decoded = Linear(
-        matched_payload, weights, bias, name=f"render_decode_{name.lower()}"
-    )
+    lsb = (hi - lo) / (DEFAULT_N_LEVELS - 1)
+    weights = torch.tensor([[65536.0 * lsb]])
+    bias = torch.tensor([lo - 0.5 * lsb])
+    decoded = Linear(matched_raw, weights, bias, name=f"render_decode_{name.lower()}")
     return assert_in_range(decoded, lo, hi)
 
 

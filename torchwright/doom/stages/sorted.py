@@ -438,13 +438,18 @@ def _read_vis_lo_for_this_wall(
         query_raw = Concatenate([one_literal, query_wall_onehot])
         query_gated = cond_gate(is_sort_result_value, query_raw)
 
-    # 4. Value-side: the 64-wide VALUE payload of thinking VIS_LO
-    # positions.  Gate by is_vis_lo_value to zero elsewhere.
+    # 4. Value-side: the 1-wide raw slot of thinking VIS_LO positions.
+    # Gate by is_vis_lo_value to zero elsewhere.  Narrowing from the
+    # old 17-wide (E8_VALUE + Gray) payload to just the raw slot is
+    # the Phase B Part 3 encoding win — a single scalar flows through
+    # the attention's V head and decodes via one scalar affine.
     with annotate("sort/vis_lo_value_gate"):
-        vis_lo_payload = extract_from(
-            kv.embedding, D_EMBED, 8, D_EMBED - 8, "sort_vis_lo_payload"
+        from torchwright.doom.embedding import D_CATEGORY, D_RAW_SLOT
+
+        vis_lo_raw = extract_from(
+            kv.embedding, D_EMBED, D_CATEGORY, D_RAW_SLOT, "sort_vis_lo_raw"
         )
-        gated_payload = cond_gate(is_vis_lo_value, vis_lo_payload)
+        gated_payload = cond_gate(is_vis_lo_value, vis_lo_raw)
 
     # 5. Attention + Linear decode.
     with annotate("sort/vis_lo_attention"):
@@ -472,8 +477,7 @@ def _read_vis_lo_for_this_wall(
 
 
 def _decode_local_value_to_float(embedding: Node, name: str) -> Node:
-    """Decode the local position's 64-wide VALUE payload to a
-    dequantized float.
+    """Decode the local position's 1-wide raw slot to a dequantized float.
 
     Same decode Linear as
     :func:`torchwright.doom.thinking_readback._decode_payload_to_float`,
@@ -481,33 +485,32 @@ def _decode_local_value_to_float(embedding: Node, name: str) -> Node:
     a prior one.  Useful when the caller has already been placed at the
     position whose payload carries the value (e.g., SORT_RESULT VALUE
     decoding its own emitted wall_index).
+
+    Raw slot layout: cols [D_CATEGORY : D_CATEGORY + D_RAW_SLOT] carries
+    ``(2k + 1) / 131072`` for VALUE_k.  See
+    :func:`torchwright.doom.thinking_readback._decode_payload_to_float`
+    for the half-LSB-offset decode math.
     """
-    payload = extract_from(embedding, D_EMBED, 8, D_EMBED - 8, f"sort_local_{name}")
-    return _decode_value_payload_to_float(payload, name)
+    from torchwright.doom.embedding import D_CATEGORY, D_RAW_SLOT
+
+    raw = extract_from(embedding, D_EMBED, D_CATEGORY, D_RAW_SLOT, f"sort_local_{name}")
+    return _decode_value_payload_to_float(raw, name)
 
 
 def _decode_value_payload_to_float(payload: Node, name: str) -> Node:
-    """Decode a 64-wide VALUE payload (4×16 one-hots) to dequantized float.
+    """Decode a 1-wide raw slot to a dequantized float.
 
-    Duplicate of
+    Mirrors
     :func:`torchwright.doom.thinking_readback._decode_payload_to_float`
-    local to the SORTED stage to avoid import-coupling on a private
-    symbol.  If this grows, promote to a shared helper.
+    (local copy so ``sorted.py`` doesn't import the private helper).
+    ``payload`` carries ``(2k + 1) / 131072`` for VALUE_k.
     """
     from torchwright.ops.quantization import DEFAULT_N_LEVELS
 
     lo, hi = VALUE_RANGE_BY_NAME[name]
-    inv_scale = (hi - lo) / (DEFAULT_N_LEVELS - 1)
-    _hex_block = 16
-
-    weights = torch.zeros(D_EMBED - 8, 1)
-    for i in range(_hex_block):
-        weights[0 * _hex_block + i, 0] = i * 4096.0
-        weights[1 * _hex_block + i, 0] = i * 256.0
-        weights[2 * _hex_block + i, 0] = i * 16.0
-        weights[3 * _hex_block + i, 0] = float(i)
-    weights = weights * inv_scale
-    bias = torch.tensor([lo])
+    lsb = (hi - lo) / (DEFAULT_N_LEVELS - 1)
+    weights = torch.tensor([[65536.0 * lsb]])
+    bias = torch.tensor([lo - 0.5 * lsb])
 
     decoded = Linear(payload, weights, bias, name=f"sort_decode_{name}")
     return assert_in_range(decoded, lo, hi)
