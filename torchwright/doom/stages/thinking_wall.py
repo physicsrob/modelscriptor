@@ -1,9 +1,12 @@
 """THINKING_WALL stage: per-wall thinking-phase state machine with a
-full 16-identifier cascade plus 3 RESOLVED identifiers at the frame
-boundary.
+full 20-identifier cascade (17 per-wall + 3 RESOLVED at the frame
+boundary).
 
-Phase A Part 3 — every per-wall identifier emits a real computed value.
-Wire format per wall (27 steps, unchanged from Part 2):
+Phase B Part 1 — the per-wall cascade splits the deep T/VIS math into
+four new intermediate slots (T_STAR_L/R and COL_A/B) whose values flow
+back to T_LO/T_HI/VIS_LO/VIS_HI through the KV cache.  This shallows
+the per-step critical path from ~58 ops (13-slot cascade) to ~34 ops
+(17-slot cascade).  Wire format per wall (35 steps):
 
     [THINKING_WALL_N]
       [BSP_RANK]         v(bsp_rank)      # integer 0..7
@@ -12,16 +15,23 @@ Wire format per wall (27 steps, unchanged from Part 2):
       [DOT_A]            v(dot_a)         # forward projection, [-40, 40]
       [CROSS_B]          v(cross_b)
       [DOT_B]            v(dot_b)
+      [T_STAR_L]         v(t_star_L)      # left-plane clip, [-2, 2]
+      [T_STAR_R]         v(t_star_R)
       [T_LO]             v(t_lo)          # clip parameter, [0, 1]
       [T_HI]             v(t_hi)
+      [COL_A]            v(col_a)         # endpoint-A column, [-2, 122]
+      [COL_B]            v(col_b)
       [VIS_LO]           v(vis_lo)        # screen col, [-2, 122]
       [VIS_HI]           v(vis_hi)
-      [HIT_FULL]         v(hit_full)      # 0 / 1
-      [HIT_X]            v(hit_x)         # 0 / 1
-      [HIT_Y]            v(hit_y)         # 0 / 1
+      [HIT_FULL]         v(hit_full_running_or) # 0 / 1, running OR
+      [HIT_X]            v(hit_x_running_or)
+      [HIT_Y]            v(hit_y_running_or)
 
-RESOLVED chain (last wall's HIT_Y value → frame boundary) still stubs
-as ``VALUE_0`` — real math lands in Part 4.
+HIT_FULL/HIT_X/HIT_Y emit the OR of this wall's flag with the previous
+HIT_* value read from the KV cache — by the time wall 7's HIT_* fires,
+each value is the global OR across all walls.  Wall 0 reads zero from
+the empty cache (OR identity).  Part 3 wires RESOLVED to consume the
+global HIT_* from wall 7 via ``get_value_after_last``.
 
 Two classes of identifier computation:
 
@@ -29,9 +39,9 @@ Two classes of identifier computation:
   from first principles using the attended wall geometry, the BSP
   side-P vector, and the player's pre-collision pose.  Math is ported
   from ``wall.py`` 1:1.
-* **Derived values** (T_LO/T_HI, VIS_LO/VIS_HI): read CROSS/DOT/T from
-  the KV cache via :class:`ThinkingReadback` at layer 0 of the own
-  step, then apply the ported clip / projection math.  VIS gates on a
+* **Derived values** (T_STAR_L/R, T_LO/T_HI, COL_A/B, VIS_LO/VIS_HI):
+  read CROSS/DOT/T/COL from the KV cache via :class:`ThinkingReadback`
+  and apply the ported clip / projection math.  VIS gates on a
   locally-computed is_renderable (recomputed here rather than read via
   readback — the recompute is shallower than the round-trip through
   an attention hop + dequantize).
@@ -120,8 +130,12 @@ _SLOT_CROSS_A = IDENTIFIER_NAMES.index("CROSS_A")
 _SLOT_DOT_A = IDENTIFIER_NAMES.index("DOT_A")
 _SLOT_CROSS_B = IDENTIFIER_NAMES.index("CROSS_B")
 _SLOT_DOT_B = IDENTIFIER_NAMES.index("DOT_B")
+_SLOT_T_STAR_L = IDENTIFIER_NAMES.index("T_STAR_L")
+_SLOT_T_STAR_R = IDENTIFIER_NAMES.index("T_STAR_R")
 _SLOT_T_LO = IDENTIFIER_NAMES.index("T_LO")
 _SLOT_T_HI = IDENTIFIER_NAMES.index("T_HI")
+_SLOT_COL_A = IDENTIFIER_NAMES.index("COL_A")
+_SLOT_COL_B = IDENTIFIER_NAMES.index("COL_B")
 _SLOT_VIS_LO = IDENTIFIER_NAMES.index("VIS_LO")
 _SLOT_VIS_HI = IDENTIFIER_NAMES.index("VIS_HI")
 _SLOT_HIT_FULL = IDENTIFIER_NAMES.index("HIT_FULL")
@@ -141,9 +155,13 @@ _VALUE_SUCCESSOR_BY_SLOT = {
     _SLOT_CROSS_A: "DOT_A",
     _SLOT_DOT_A: "CROSS_B",
     _SLOT_CROSS_B: "DOT_B",
-    _SLOT_DOT_B: "T_LO",
+    _SLOT_DOT_B: "T_STAR_L",
+    _SLOT_T_STAR_L: "T_STAR_R",
+    _SLOT_T_STAR_R: "T_LO",
     _SLOT_T_LO: "T_HI",
-    _SLOT_T_HI: "VIS_LO",
+    _SLOT_T_HI: "COL_A",
+    _SLOT_COL_A: "COL_B",
+    _SLOT_COL_B: "VIS_LO",
     _SLOT_VIS_LO: "VIS_HI",
     _SLOT_VIS_HI: "HIT_FULL",
     _SLOT_HIT_FULL: "HIT_X",
@@ -287,8 +305,8 @@ def build_thinking_wall(
         "thinking_wall vocabulary defines 8 markers (THINKING_WALL_0..7); "
         f"max_walls={max_walls} would need additional vocabulary entries."
     )
-    assert len(is_identifier_by_slot) == len(IDENTIFIER_NAMES) == 16, (
-        f"expected 16 per-slot identifier detectors, got "
+    assert len(is_identifier_by_slot) == len(IDENTIFIER_NAMES) == 20, (
+        f"expected 20 per-slot identifier detectors, got "
         f"{len(is_identifier_by_slot)}"
     )
     is_thinking_wall_n = is_thinking_wall_n[:max_walls]
@@ -489,37 +507,189 @@ def build_thinking_wall(
         # without adding runtime error on well-formed inputs.
         bsp_rank = clamp(bsp_rank, 0.0, 7.0)
 
-    with annotate("thinking_wall/t_and_vis"):
-        # T_LO/T_HI and VIS_LO/VIS_HI share FOV-cone clip intermediates
-        # (f_L_a/b, f_R_a/b, per-plane t contribs).  Compute once and
-        # emit each of the 4 values at its own identifier step.  All
-        # four derived values read CROSS_A, DOT_A, CROSS_B, DOT_B from
-        # the KV cache — the shared attention heads per-name, cached
-        # inside ``ThinkingReadback``, make the 4-way readback cost
-        # one attention per distinct name (not per consumer).
+    # ---------------------------------------------------------------------
+    # Phase B Part 1 slot-split: the deep T/VIS chain gets carved into
+    # four new intermediate slots (T_STAR_L/R for plane-crossings, COL_A/B
+    # for atan-projected endpoint columns).  Each downstream slot reads
+    # its upstream intermediates from the KV cache via ``get_value_after_last``
+    # instead of recomputing them in-step.
+    #
+    # Shared FOV-edge evaluations: both T_STAR and T_LO/T_HI/COL paths
+    # need ``f_L_a, f_L_b, f_R_a, f_R_b``.  Compute once and share (the
+    # compiler will materialize them once per position).  CROSS_A/DOT_A/
+    # CROSS_B/DOT_B come from the prior identifier VALUE positions in
+    # the same wall; readback's per-name attention cache dedupes.
+    # ---------------------------------------------------------------------
+    with annotate("thinking_wall/fov_edges"):
         ca_kv = readback.get_value_after_last("CROSS_A")
         da_kv = readback.get_value_after_last("DOT_A")
         cb_kv = readback.get_value_after_last("CROSS_B")
         db_kv = readback.get_value_after_last("DOT_B")
-        t_lo, t_hi, vis_lo, vis_hi = _compute_clip_and_project(
-            ca_kv,
-            da_kv,
-            cb_kv,
-            db_kv,
-            is_renderable,
-            config=config,
-            cross_dot_max=40.0,
+
+        W = config.screen_width
+        fov = config.fov_columns
+        fov_rad = float(fov) * math.pi / 128.0
+        half_fov_rad = fov_rad / 2.0
+        sin_hf = math.sin(half_fov_rad)
+        cos_hf = math.cos(half_fov_rad)
+
+        # f_*(p) = sin(½·fov)·dot(p) ∓ cos(½·fov)·cross(p).  Inside cone
+        # iff both f_L ≥ 0 and f_R ≥ 0.
+        f_L_a = add_scaled_nodes(sin_hf, da_kv, -cos_hf, ca_kv)
+        f_L_b = add_scaled_nodes(sin_hf, db_kv, -cos_hf, cb_kv)
+        f_R_a = add_scaled_nodes(sin_hf, da_kv, cos_hf, ca_kv)
+        f_R_b = add_scaled_nodes(sin_hf, db_kv, cos_hf, cb_kv)
+
+        cross_dot_max = 40.0  # wire-format readback range, ±CROSS/DOT max
+        max_f_mag = (sin_hf + cos_hf) * cross_dot_max
+        max_denom = 2.0 * max_f_mag
+
+    with annotate("thinking_wall/t_star"):
+        # Raw plane-crossing parameter per plane.  ``t* = f_a / (f_a − f_b)``
+        # computed as ``reciprocal → multiply_2d`` with sign fix-up.  The
+        # emitted value gets clamped to the wire-format [-2, 2] range so the
+        # quantize affine's declared output stays tight; for well-formed
+        # geometry the in-range t* is in (0, 1).
+        t_star_L = _compute_t_star(
+            f_L_a, f_L_b, max_denom=max_denom, max_f_mag=max_f_mag, suffix="L"
         )
-        # Clamp into the wire-format range so each quantize's input
-        # value_type is tight.  Without the clamp, the natural
-        # value_types from the select / cond_gate chain above inflate
-        # by M·c_tol at every link, eventually overshooting the
-        # quantize's declared output ``[0, 65535]`` assert.
+        t_star_R = _compute_t_star(
+            f_R_a, f_R_b, max_denom=max_denom, max_f_mag=max_f_mag, suffix="R"
+        )
+        t_star_L = clamp(t_star_L, -2.0, 2.0)
+        t_star_R = clamp(t_star_R, -2.0, 2.0)
+
+    with annotate("thinking_wall/t_lo_hi"):
+        # T_LO / T_HI become shallow consumers: read T_STAR_L/R from KV,
+        # apply a_inside / b_inside select, aggregate with max(0, ...) /
+        # min(1, ...).  ``a_inside`` is compare(f_L_a, 0) — a single op
+        # on top of the shared f_L_a node.
+        tsl_kv = readback.get_value_after_last("T_STAR_L")
+        tsr_kv = readback.get_value_after_last("T_STAR_R")
+
+        zero_lit = create_literal_value(torch.tensor([0.0]), name="tw_tlo_zero")
+        one_lit = create_literal_value(torch.tensor([1.0]), name="tw_tlo_one")
+
+        a_inside_L = compare(f_L_a, 0.0)
+        a_inside_R = compare(f_R_a, 0.0)
+        b_inside_L = compare(f_L_b, 0.0)
+        b_inside_R = compare(f_R_b, 0.0)
+
+        # Per-plane t_lo / t_hi contribs: if the relevant endpoint is inside
+        # the plane, contribute the identity (0 for lo, 1 for hi); else the
+        # KV-read t_star.
+        t_lo_contrib_L = select(a_inside_L, zero_lit, tsl_kv, c_tol=_VIS_C_TOL)
+        t_lo_contrib_R = select(a_inside_R, zero_lit, tsr_kv, c_tol=_VIS_C_TOL)
+        t_hi_contrib_L = select(b_inside_L, one_lit, tsl_kv, c_tol=_VIS_C_TOL)
+        t_hi_contrib_R = select(b_inside_R, one_lit, tsr_kv, c_tol=_VIS_C_TOL)
+
+        t_lo = max_node(zero_lit, max_node(t_lo_contrib_L, t_lo_contrib_R))
+        t_hi = min_node(one_lit, min_node(t_hi_contrib_L, t_hi_contrib_R))
         t_lo = clamp(t_lo, 0.0, 1.0)
         t_hi = clamp(t_hi, 0.0, 1.0)
+
+    with annotate("thinking_wall/col"):
+        # COL_A / COL_B: atan-projected interior column + FOV-boundary
+        # column when the endpoint is outside the cone.  The boundary
+        # side (col=0 vs col=W) is decided by which plane's clip wins —
+        # derived from the same t_lo_contrib / t_hi_contrib nodes T_LO/T_HI
+        # already computed (shared, single compiled materialisation).
         vis_lo_bound_hi = float(VALUE_RANGE_BY_NAME["VIS_LO"][1])
+        W_lit = create_literal_value(torch.tensor([float(W)]), name="tw_col_W")
+
+        col_A_interior = _endpoint_to_column(ca_kv, da_kv, W=W, fov=fov, suffix="tw_a")
+        col_B_interior = _endpoint_to_column(cb_kv, db_kv, W=W, fov=fov, suffix="tw_b")
+
+        a_clipped_on_L = compare(
+            multiply_const(subtract(t_lo_contrib_L, t_lo_contrib_R), _T_COMPARE_SCALE),
+            0.0,
+        )
+        b_clipped_on_L = compare(
+            multiply_const(subtract(t_hi_contrib_R, t_hi_contrib_L), _T_COMPARE_SCALE),
+            0.0,
+        )
+        col_A_boundary = select(a_clipped_on_L, W_lit, zero_lit, c_tol=_VIS_C_TOL)
+        col_B_boundary = select(b_clipped_on_L, W_lit, zero_lit, c_tol=_VIS_C_TOL)
+        col_A = select(
+            a_inside_L,
+            select(a_inside_R, col_A_interior, col_A_boundary, c_tol=_VIS_C_TOL),
+            col_A_boundary,
+            c_tol=_VIS_C_TOL,
+        )
+        col_B = select(
+            b_inside_L,
+            select(b_inside_R, col_B_interior, col_B_boundary, c_tol=_VIS_C_TOL),
+            col_B_boundary,
+            c_tol=_VIS_C_TOL,
+        )
+        col_A = clamp(col_A, -2.0, vis_lo_bound_hi)
+        col_B = clamp(col_B, -2.0, vis_lo_bound_hi)
+
+    with annotate("thinking_wall/vis"):
+        # VIS_LO / VIS_HI become shallow: read COL_A/B and T_LO/T_HI from
+        # KV; is_empty from comparing T_LO vs T_HI; apply sentinel + gate.
+        ca_col_kv = readback.get_value_after_last("COL_A")
+        cb_col_kv = readback.get_value_after_last("COL_B")
+        tlo_kv = readback.get_value_after_last("T_LO")
+        thi_kv = readback.get_value_after_last("T_HI")
+
+        is_empty = compare(
+            multiply_const(subtract(tlo_kv, thi_kv), _T_COMPARE_SCALE), 0.0
+        )
+        vis_lo_visible = min_node(ca_col_kv, cb_col_kv)
+        vis_hi_visible = max_node(ca_col_kv, cb_col_kv)
+
+        sentinel = create_literal_value(
+            torch.tensor([float(W + 2)]), name="tw_vis_sentinel"
+        )
+        vis_lo_raw = select(is_empty, sentinel, vis_lo_visible, c_tol=_VIS_C_TOL)
+        vis_hi_raw = select(is_empty, sentinel, vis_hi_visible, c_tol=_VIS_C_TOL)
+
+        vis_lo = cond_gate(is_renderable, vis_lo_raw, c_tol=_VIS_C_TOL)
+        vis_hi = cond_gate(is_renderable, vis_hi_raw, c_tol=_VIS_C_TOL)
         vis_lo = clamp(vis_lo, -2.0, vis_lo_bound_hi)
         vis_hi = clamp(vis_hi, -2.0, vis_lo_bound_hi)
+
+    # ---------------------------------------------------------------------
+    # Phase B Part 1: HIT_* running-OR accumulator.  Each wall's HIT_*
+    # emits the OR of this wall's local flag with every prior wall's
+    # HIT_* — by the time wall 7 fires, each of the three HIT_* values
+    # is the global aggregate across all walls.  The previous value
+    # comes from ``get_value_after_last("HIT_*")``; at wall 0 the cache
+    # is empty, so we gate the readback to 0 using ``current_wall_index``.
+    # OR over [0, 1] inputs is ``max`` (saturating).  Part 3 will wire
+    # RESOLVED to consume the wall-7 global aggregate via a single
+    # readback, replacing the current cross-position attend_mean_where
+    # aggregation.
+    # ---------------------------------------------------------------------
+    with annotate("thinking_wall/hit_running_or"):
+        # is_not_wall_zero: +1 at walls 1..7, −1 at wall 0.  ``current_wall_index``
+        # is a clean integer in [0, max_walls-1] coming out of
+        # ``find_current_wall``; compare at 0.5 gives a crisp ±1.
+        is_not_wall_zero = compare(current_wall_index, 0.5)
+
+        # Pass ``assert_hardness_gt=None`` so the runtime softmax-hardness
+        # assert (used in ``debug=True`` forwards) is skipped — at wall 0
+        # the cache is empty and the attention degrades to pure recency,
+        # which may or may not concentrate above 0.99 at long context
+        # lengths.  The cond_gate below zeroes the garbage out so
+        # correctness doesn't depend on the empty-cache payload.
+        hf_prev_raw = readback.get_value_after_last("HIT_FULL", assert_hardness_gt=None)
+        hx_prev_raw = readback.get_value_after_last("HIT_X", assert_hardness_gt=None)
+        hy_prev_raw = readback.get_value_after_last("HIT_Y", assert_hardness_gt=None)
+        hf_prev = cond_gate(is_not_wall_zero, hf_prev_raw, c_tol=_VIS_C_TOL)
+        hx_prev = cond_gate(is_not_wall_zero, hx_prev_raw, c_tol=_VIS_C_TOL)
+        hy_prev = cond_gate(is_not_wall_zero, hy_prev_raw, c_tol=_VIS_C_TOL)
+
+        # OR over {0, 1} inputs is ``max`` — and max of two ``[0, 1]``
+        # values stays in ``[0, 1]``, so no clamp needed.  ``bool_to_01``
+        # maps ±1 → 0/1 for the locally-computed flag.
+        hit_full_or = max_node(bool_to_01(hit_full), hf_prev)
+        hit_x_or = max_node(bool_to_01(hit_x), hx_prev)
+        hit_y_or = max_node(bool_to_01(hit_y), hy_prev)
+        hit_full_or = clamp(hit_full_or, 0.0, 1.0)
+        hit_x_or = clamp(hit_x_or, 0.0, 1.0)
+        hit_y_or = clamp(hit_y_or, 0.0, 1.0)
 
     # ---------------------------------------------------------------------
     # Per-slot quantize → select-q → factor-once.
@@ -528,10 +698,9 @@ def build_thinking_wall(
     # ``q ∈ [0, 65535]`` using the slot's design-doc (lo, hi) range.
     # We then sum-cond-gate to pick the active slot's q (exactly one is
     # +1 at any identifier position; sum collapses to the active one).
-    # The expensive ``thermometer_floor_div`` × 3 + ``in_range`` × 4
-    # cascade in :func:`factor_q_to_embedding` runs **once** per
-    # position on the selected q rather than 16 times across all slots
-    # — drops the residual peak from ~1100 cols to ~80 cols.
+    # The expensive ``thermometer_floor_div`` cascade + ``in_range`` × 4
+    # in :func:`factor_q_to_embedding` runs **once** per position on the
+    # selected q rather than 20 times across all slots.
     # ---------------------------------------------------------------------
     with annotate("thinking_wall/normalize_per_slot"):
         # Each per-wall value gets normalized to ``[0, 1]`` using its
@@ -552,13 +721,17 @@ def build_thinking_wall(
             _SLOT_DOT_A: _norm(dot_a, "DOT_A"),
             _SLOT_CROSS_B: _norm(cross_b, "CROSS_B"),
             _SLOT_DOT_B: _norm(dot_b, "DOT_B"),
+            _SLOT_T_STAR_L: _norm(t_star_L, "T_STAR_L"),
+            _SLOT_T_STAR_R: _norm(t_star_R, "T_STAR_R"),
             _SLOT_T_LO: _norm(t_lo, "T_LO"),
             _SLOT_T_HI: _norm(t_hi, "T_HI"),
+            _SLOT_COL_A: _norm(col_A, "COL_A"),
+            _SLOT_COL_B: _norm(col_B, "COL_B"),
             _SLOT_VIS_LO: _norm(vis_lo, "VIS_LO"),
             _SLOT_VIS_HI: _norm(vis_hi, "VIS_HI"),
-            _SLOT_HIT_FULL: _norm(bool_to_01(hit_full), "HIT_FULL"),
-            _SLOT_HIT_X: _norm(bool_to_01(hit_x), "HIT_X"),
-            _SLOT_HIT_Y: _norm(bool_to_01(hit_y), "HIT_Y"),
+            _SLOT_HIT_FULL: _norm(hit_full_or, "HIT_FULL"),
+            _SLOT_HIT_X: _norm(hit_x_or, "HIT_X"),
+            _SLOT_HIT_Y: _norm(hit_y_or, "HIT_Y"),
             _SLOT_RESOLVED_X: _norm(resolved_x, "RESOLVED_X"),
             _SLOT_RESOLVED_Y: _norm(resolved_y, "RESOLVED_Y"),
             _SLOT_RESOLVED_ANGLE: _norm(resolved_angle, "RESOLVED_ANGLE"),
@@ -791,129 +964,29 @@ def _compute_bsp_and_renderable(
 
 # ---------------------------------------------------------------------------
 # Derived-value helpers (ported from wall._compute_visibility_columns).
-# Split into two stages so T_LO/T_HI can emit before VIS needs them.
+# Phase B Part 1 splits the chain into four new intermediate slots
+# (T_STAR_L/R, COL_A/B) so T_LO/T_HI/VIS_LO/VIS_HI become shallow
+# KV-cache consumers.
 # ---------------------------------------------------------------------------
 
 
-def _compute_clip_and_project(
-    cross_a: Node,
-    dot_a: Node,
-    cross_b: Node,
-    dot_b: Node,
-    is_renderable: Node,
-    *,
-    config: RenderConfig,
-    cross_dot_max: float,
-):
-    """T_LO / T_HI / VIS_LO / VIS_HI in one pass.
-
-    Shares FOV-cone-clip intermediates (``f_L_a/b``, ``f_R_a/b``,
-    per-plane ``(t_lo_contrib, t_hi_contrib)``) between the
-    T-parameter aggregation and the VIS projection's clip-side
-    decision.  Matches ``wall._compute_visibility_columns`` 1:1 in
-    structure — the split into separate emit steps happens at the
-    caller, not here.
-
-    T_LO / T_HI appear in the VIS-empty check (``t_lo > t_hi``) and
-    the clip-side decisions (``a_clipped_on_L``, ``b_clipped_on_L``)
-    derive from the *same* ``t_lo_L/R`` / ``t_hi_L/R`` nodes T_LO/T_HI
-    do, so there is no round-trip through the KV cache — every shared
-    intermediate is computed once.
-
-    is_renderable is the locally-computed flag (not a KV-cache
-    readback) — gating with the fresh value avoids routing a boolean
-    through a readback round-trip.
-    """
-    W = config.screen_width
-    fov = config.fov_columns
-    fov_rad = float(fov) * math.pi / 128.0
-    half_fov_rad = fov_rad / 2.0
-    sin_hf = math.sin(half_fov_rad)
-    cos_hf = math.cos(half_fov_rad)
-
-    # FOV-boundary evaluations at both endpoints.
-    f_L_a = add_scaled_nodes(sin_hf, dot_a, -cos_hf, cross_a)
-    f_L_b = add_scaled_nodes(sin_hf, dot_b, -cos_hf, cross_b)
-    f_R_a = add_scaled_nodes(sin_hf, dot_a, cos_hf, cross_a)
-    f_R_b = add_scaled_nodes(sin_hf, dot_b, cos_hf, cross_b)
-
-    # Size reciprocal / multiply_2d grids by the readback cross/dot
-    # range (the design-doc CROSS_A/DOT_A nominal), not ``max_coord``.
-    # In wall.py these were sized from ``max_coord`` because cross/dot
-    # came from locally-rotated ``max_coord``-bounded geometry; here
-    # they come from the KV-cache readback with the wider wire-format
-    # range (±40 per design doc).
-    max_f_mag = (sin_hf + cos_hf) * cross_dot_max
-    max_denom = 2.0 * max_f_mag
-
-    t_lo_L, t_hi_L = _plane_clip_contribs(
-        f_L_a, f_L_b, max_denom=max_denom, max_f_mag=max_f_mag, suffix="tw_L"
-    )
-    t_lo_R, t_hi_R = _plane_clip_contribs(
-        f_R_a, f_R_b, max_denom=max_denom, max_f_mag=max_f_mag, suffix="tw_R"
-    )
-
-    zero_lit = create_literal_value(torch.tensor([0.0]), name="tw_t_zero")
-    one_lit = create_literal_value(torch.tensor([1.0]), name="tw_t_one")
-    W_lit = create_literal_value(torch.tensor([float(W)]), name="tw_col_W")
-
-    t_lo = max_node(max_node(zero_lit, t_lo_L), t_lo_R)
-    t_hi = min_node(min_node(one_lit, t_hi_L), t_hi_R)
-
-    is_empty = compare(multiply_const(subtract(t_lo, t_hi), _T_COMPARE_SCALE), 0.0)
-
-    col_A_interior = _endpoint_to_column(cross_a, dot_a, W=W, fov=fov, suffix="tw_a")
-    col_B_interior = _endpoint_to_column(cross_b, dot_b, W=W, fov=fov, suffix="tw_b")
-
-    a_inside_L = compare(f_L_a, 0.0)
-    a_inside_R = compare(f_R_a, 0.0)
-    a_clipped_on_L = compare(
-        multiply_const(subtract(t_lo_L, t_lo_R), _T_COMPARE_SCALE), 0.0
-    )
-    col_A_boundary = select(a_clipped_on_L, W_lit, zero_lit, c_tol=_VIS_C_TOL)
-    col_A = select(
-        a_inside_L,
-        select(a_inside_R, col_A_interior, col_A_boundary, c_tol=_VIS_C_TOL),
-        col_A_boundary,
-        c_tol=_VIS_C_TOL,
-    )
-
-    b_inside_L = compare(f_L_b, 0.0)
-    b_inside_R = compare(f_R_b, 0.0)
-    b_clipped_on_L = compare(
-        multiply_const(subtract(t_hi_R, t_hi_L), _T_COMPARE_SCALE), 0.0
-    )
-    col_B_boundary = select(b_clipped_on_L, W_lit, zero_lit, c_tol=_VIS_C_TOL)
-    col_B = select(
-        b_inside_L,
-        select(b_inside_R, col_B_interior, col_B_boundary, c_tol=_VIS_C_TOL),
-        col_B_boundary,
-        c_tol=_VIS_C_TOL,
-    )
-
-    vis_lo_visible = min_node(col_A, col_B)
-    vis_hi_visible = max_node(col_A, col_B)
-
-    sentinel = create_literal_value(
-        torch.tensor([float(W + 2)]), name="tw_vis_sentinel"
-    )
-    vis_lo_raw = select(is_empty, sentinel, vis_lo_visible, c_tol=_VIS_C_TOL)
-    vis_hi_raw = select(is_empty, sentinel, vis_hi_visible, c_tol=_VIS_C_TOL)
-
-    vis_lo = cond_gate(is_renderable, vis_lo_raw, c_tol=_VIS_C_TOL)
-    vis_hi = cond_gate(is_renderable, vis_hi_raw, c_tol=_VIS_C_TOL)
-    return t_lo, t_hi, vis_lo, vis_hi
-
-
-def _plane_clip_contribs(
+def _compute_t_star(
     f_a: Node,
     f_b: Node,
     *,
     max_denom: float,
     max_f_mag: float,
     suffix: str,
-):
-    """Per-plane clip contrib — ported from ``wall._plane_clip_contribs``."""
+) -> Node:
+    """Raw plane-crossing parameter ``t* = f_a / (f_a − f_b)``.
+
+    Computes ``reciprocal(|denom|) × f_a`` with a sign-fix select, the
+    same decomposition used by the original ``_plane_clip_contribs`` —
+    but without the ``a_inside`` / ``b_inside`` select applied on top.
+    Callers (``T_LO`` / ``T_HI`` emit paths) apply that select
+    themselves using ``f_L_a`` / ``f_R_a`` / ``f_L_b`` / ``f_R_b`` read
+    from the KV cache alongside ``t_star``.
+    """
     denom = subtract(f_a, f_b)
     denom_pos = compare(denom, 0.0)
     denom_abs = clamp(abs_node(denom), 0.1, max_denom)
@@ -932,15 +1005,7 @@ def _plane_clip_contribs(
     )
     t_star_neg = multiply_const(t_star_pos, -1.0)
     t_star = select(denom_pos, t_star_pos, t_star_neg, c_tol=_VIS_C_TOL)
-
-    zero_lit = create_literal_value(torch.tensor([0.0]), name=f"tw_tzero_{suffix}")
-    one_lit = create_literal_value(torch.tensor([1.0]), name=f"tw_tone_{suffix}")
-    a_inside = compare(f_a, 0.0)
-    b_inside = compare(f_b, 0.0)
-
-    t_lo_contrib = select(a_inside, zero_lit, t_star, c_tol=_VIS_C_TOL)
-    t_hi_contrib = select(b_inside, one_lit, t_star, c_tol=_VIS_C_TOL)
-    return t_lo_contrib, t_hi_contrib
+    return t_star
 
 
 def _endpoint_to_column(

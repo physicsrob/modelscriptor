@@ -43,32 +43,40 @@ _TRIG = generate_trig_table()
 _MOVE_SPEED = 0.3
 _TURN_SPEED = 4
 
-# Thinking phase layout per wall (Part 2, 27 autoregressive steps):
+# Thinking phase layout per wall (Phase B Part 1, 35 autoregressive steps):
 #
 #   step+0:  marker          (THINKING_WALL_N)
-#   step+1:  BSP_RANK_ID     step+2:  VALUE (stub = VALUE_0)
-#   step+3:  IS_RENDERABLE_ID step+4:  VALUE (stub)
-#   step+5:  CROSS_A_ID       step+6:  VALUE (stub)
-#   step+7:  DOT_A_ID         step+8:  VALUE (stub)
-#   step+9:  CROSS_B_ID       step+10: VALUE (stub)
-#   step+11: DOT_B_ID         step+12: VALUE (stub)
-#   step+13: T_LO_ID          step+14: VALUE (stub)
-#   step+15: T_HI_ID          step+16: VALUE (stub)
-#   step+17: VIS_LO_ID        step+18: VALUE (stub)
-#   step+19: VIS_HI_ID        step+20: VALUE (stub)
-#   step+21: HIT_FULL_ID      step+22: VALUE (hit_full ∈ {0, 1})
-#   step+23: HIT_X_ID         step+24: VALUE (hit_x ∈ {0, 1})
-#   step+25: HIT_Y_ID         step+26: VALUE (hit_y ∈ {0, 1})
+#   step+1:  BSP_RANK_ID     step+2:  VALUE
+#   step+3:  IS_RENDERABLE_ID step+4:  VALUE
+#   step+5:  CROSS_A_ID       step+6:  VALUE
+#   step+7:  DOT_A_ID         step+8:  VALUE
+#   step+9:  CROSS_B_ID       step+10: VALUE
+#   step+11: DOT_B_ID         step+12: VALUE
+#   step+13: T_STAR_L_ID      step+14: VALUE
+#   step+15: T_STAR_R_ID      step+16: VALUE
+#   step+17: T_LO_ID          step+18: VALUE
+#   step+19: T_HI_ID          step+20: VALUE
+#   step+21: COL_A_ID         step+22: VALUE
+#   step+23: COL_B_ID         step+24: VALUE
+#   step+25: VIS_LO_ID        step+26: VALUE
+#   step+27: VIS_HI_ID        step+28: VALUE
+#   step+29: HIT_FULL_ID      step+30: VALUE (running OR ∈ {0, 1})
+#   step+31: HIT_X_ID         step+32: VALUE (running OR ∈ {0, 1})
+#   step+33: HIT_Y_ID         step+34: VALUE (running OR ∈ {0, 1})
+#
+# Phase B Part 1: HIT_* values are running-OR accumulators — each
+# wall's HIT_* is the OR of this wall's flag with every prior wall's
+# HIT_*.  Wall 7's HIT_* is the global aggregate.
 #
 # After the last wall's HIT_Y value, the RESOLVED chain runs:
-#   +0: RESOLVED_X_ID   +1: VALUE (stub)
-#   +2: RESOLVED_Y_ID   +3: VALUE (stub)
-#   +4: RESOLVED_ANGLE_ID +5: VALUE (stub)
+#   +0: RESOLVED_X_ID   +1: VALUE
+#   +2: RESOLVED_Y_ID   +3: VALUE
+#   +4: RESOLVED_ANGLE_ID +5: VALUE
 #   +6: SORTED_WALL (hand-off)
-_STEPS_PER_WALL = 27
-_HF_OFFSET = 22
-_HX_OFFSET = 24
-_HY_OFFSET = 26
+_STEPS_PER_WALL = 35
+_HF_OFFSET = 30
+_HX_OFFSET = 32
+_HY_OFFSET = 34
 
 _RESOLVED_BASE_OFFSET = 0  # from the first post-HIT_Y-of-last-wall step
 _RESOLVED_X_OFFSET = 0
@@ -256,10 +264,10 @@ class TestThinkingWallDualPath:
     def _check_wall_hits(self, run, segs, px, py, angle, inp_kw):
         """Run a frame and verify per-wall HIT_*/HIT_X/HIT_Y match reference.
 
-        Phase A Part 3: HIT_* booleans are now uniform-quantized into
-        the (0, 1) range like every other VALUE — false → VALUE_0,
-        true → VALUE_65535.  Convert wire-format ID back to 0/1 by
-        comparing against the half-range.
+        Phase B Part 1: each wall's HIT_* emits the running OR across
+        walls 0..i — the reference is also an accumulating OR.  Wire-
+        format VALUE is 0 → VALUE_0, 1 → VALUE_65535; recover via a
+        half-range threshold.
         """
         _, _, trace, inputs = run(px, py, angle, **inp_kw)
         vx, vy = _player_velocity(angle, inputs)
@@ -271,21 +279,27 @@ class TestThinkingWallDualPath:
         )
 
         mismatches = []
+        running_hf = 0
+        running_hx = 0
+        running_hy = 0
         for i, seg in enumerate(segs):
-            ref_hf, ref_hx, ref_hy = _ref_hits(seg, px, py, vx, vy)
+            local_hf, local_hx, local_hy = _ref_hits(seg, px, py, vx, vy)
+            running_hf = running_hf | local_hf
+            running_hx = running_hx | local_hx
+            running_hy = running_hy | local_hy
             base = i * _STEPS_PER_WALL
-            # Wire-format VALUE for a 0/1 boolean: 0 → VALUE_0,
-            # 1 → VALUE_65535.  Recover the bool by thresholding.
             comp_hf = 1 if int(log[base + _HF_OFFSET]) > 32767 else 0
             comp_hx = 1 if int(log[base + _HX_OFFSET]) > 32767 else 0
             comp_hy = 1 if int(log[base + _HY_OFFSET]) > 32767 else 0
             for name, ref, comp in [
-                ("HIT_FULL", ref_hf, comp_hf),
-                ("HIT_X", ref_hx, comp_hx),
-                ("HIT_Y", ref_hy, comp_hy),
+                ("HIT_FULL", running_hf, comp_hf),
+                ("HIT_X", running_hx, comp_hx),
+                ("HIT_Y", running_hy, comp_hy),
             ]:
                 if ref != comp:
-                    mismatches.append(f"wall {i} {name}: ref={ref}, compiled={comp}")
+                    mismatches.append(
+                        f"wall {i} {name}: ref(running OR)={ref}, compiled={comp}"
+                    )
         assert not mismatches, (
             f"Thinking-token HIT_* disagrees with reference at "
             f"(px={px}, py={py}, angle={angle}, inputs={inp_kw}):\n"
@@ -329,29 +343,31 @@ class TestThinkingWallDualPath:
         self._check_wall_hits(run, segs, px, py, angle, inp)
 
     def test_full_sequence_trace(self, run, scene):
-        """Walk the full Part-3 thinking sequence, asserting the exact
-        token ID at every autoregressive position.
+        """Walk the full Phase B Part 1 thinking sequence, asserting the
+        exact token ID at every autoregressive position.
 
         Positions covered:
           * 8 marker positions (one per wall; host injects wall 0).
-          * 8 × 13 = 104 identifier positions.
-          * 8 × 10 = 80 per-wall VALUE positions for the 10 base /
-            derived value types (BSP_RANK, IS_RENDERABLE, CROSS/DOT,
-            T_LO/T_HI, VIS_LO/VIS_HI) — checked as ints in
-            ``[0, 65535]``; per-value dual-path checks land in
-            dedicated tests.
-          * 8 × 3 = 24 HIT_* VALUE positions (booleans encoded as
-            ``VALUE_0`` for false / ``VALUE_65535`` for true under
-            uniform 16-bit quantization).
+          * 8 × 17 = 136 identifier positions.
+          * 8 × 14 = 112 per-wall VALUE positions for the non-HIT
+            values (BSP_RANK, IS_RENDERABLE, CROSS/DOT, T_STAR_L/R,
+            T_LO/T_HI, COL_A/B, VIS_LO/HI) — checked as ints in
+            ``[0, 65535]``; per-value dual-path checks live separately.
+          * 8 × 3 = 24 HIT_* VALUE positions (running-OR booleans,
+            encoded as ``VALUE_0`` for false / ``VALUE_65535`` for
+            true under uniform 16-bit quantization).
           * 3 RESOLVED identifier positions.
           * 3 RESOLVED VALUE positions (range-checked only — per-value
             dual-path checks land in the pipeline tests).
           * 1 SORTED_WALL hand-off position.
 
-        The HIT_* values are additionally checked against the pure-
+        The HIT_* values are compared against the running-OR pure-
         Python reference for the subset-walls.
         """
         max_walls = 8  # matches the compile_game fixture
+        n_per_wall_ids = 17  # BSP_RANK..HIT_Y
+        n_per_wall_non_hit_ids = 14  # BSP_RANK..VIS_HI (no HIT_*)
+
         # A scenario with at least one real hit so the HIT_*-value
         # assertions exercise both 0 and 1 emissions.
         px, py, angle, inp_kw = 4.9, 0.0, 0, {"forward": True}
@@ -391,13 +407,13 @@ class TestThinkingWallDualPath:
         def _check_bool_value(pos, ref_bool, label):
             """Assert the ID is the uniform-quantized boolean encoding.
 
-            Phase A Part 3: booleans are emitted as VALUE_0 (false) /
-            VALUE_65535 (true) under uniform 16-bit quantization.  The
-            factor cascade has ≤1-LSB drift on GPU FP, so the actual
-            argmaxed VALUE can land one integer off (VALUE_65534 still
-            reads back as ≈1.0 via dequantize, which is correct).  The
-            test thresholds the wire value at the half-range to
-            recover the intended boolean.
+            Booleans are emitted as VALUE_0 (false) / VALUE_65535 (true)
+            under uniform 16-bit quantization.  The factor cascade has
+            ≤1-LSB drift on GPU FP, so the actual argmaxed VALUE can
+            land one integer off (VALUE_65534 still reads back as
+            ≈1.0 via dequantize, which is correct).  The test thresholds
+            the wire value at the half-range to recover the intended
+            boolean.
             """
             actual = int(log[pos])
             recovered_bool = actual > 32767
@@ -409,6 +425,9 @@ class TestThinkingWallDualPath:
                 )
 
         # --- Per-wall assertions (all 8 walls). ---
+        running_hf = 0
+        running_hx = 0
+        running_hy = 0
         for wall_i in range(max_walls):
             base = wall_i * _STEPS_PER_WALL
 
@@ -419,10 +438,8 @@ class TestThinkingWallDualPath:
                 f"wall{wall_i} marker",
             )
 
-            # 13 identifier positions at base + (1, 3, 5, ..., 25).
-            # They follow IDENTIFIER_NAMES order for the first 13 entries
-            # (RESOLVED_* are handled after the last wall).
-            for slot in range(13):
+            # 17 identifier positions at base + (1, 3, 5, ..., 33).
+            for slot in range(n_per_wall_ids):
                 pos = base + 1 + 2 * slot
                 _check(
                     pos,
@@ -430,28 +447,36 @@ class TestThinkingWallDualPath:
                     f"wall{wall_i} identifier {IDENTIFIER_NAMES[slot]}",
                 )
 
-            # 10 base/derived VALUE positions (BSP_RANK..VIS_HI).  Range
-            # check only — per-value dual-path tests live separately.
-            for slot in range(10):
+            # 14 non-HIT base/derived VALUE positions.  Range check only.
+            for slot in range(n_per_wall_non_hit_ids):
                 pos = base + 2 + 2 * slot
                 _check_value_range(
                     pos,
                     f"wall{wall_i} VALUE for {IDENTIFIER_NAMES[slot]}",
                 )
 
-            # HIT_* VALUEs: compare against the pure-Python reference for
-            # the subset walls; phantom walls just need a valid VALUE ID
-            # in {0, 65535} since the hit math ran on degenerate inputs.
+            # HIT_* VALUEs: running-OR reference across subset walls.
+            # Phantom walls' local hit math runs on degenerate inputs;
+            # include them in the running OR only if the subset's walls
+            # have explicit segments.  Since the box-room fixture's
+            # segs cover wall_i ∈ [0, 4), phantom walls at wall_i ∈
+            # [4, 8) don't contribute a known reference — their running
+            # OR is whatever is in the KV cache plus whatever the
+            # phantom wall's local hit computes.  Check range-only for
+            # phantoms.
             if wall_i < len(segs):
-                ref_hf, ref_hx, ref_hy = _ref_hits(segs[wall_i], px, py, vx, vy)
+                local_hf, local_hx, local_hy = _ref_hits(segs[wall_i], px, py, vx, vy)
+                running_hf = running_hf | local_hf
+                running_hx = running_hx | local_hx
+                running_hy = running_hy | local_hy
                 _check_bool_value(
-                    base + _HF_OFFSET, bool(ref_hf), f"wall{wall_i} VALUE HIT_FULL"
+                    base + _HF_OFFSET, bool(running_hf), f"wall{wall_i} HIT_FULL"
                 )
                 _check_bool_value(
-                    base + _HX_OFFSET, bool(ref_hx), f"wall{wall_i} VALUE HIT_X"
+                    base + _HX_OFFSET, bool(running_hx), f"wall{wall_i} HIT_X"
                 )
                 _check_bool_value(
-                    base + _HY_OFFSET, bool(ref_hy), f"wall{wall_i} VALUE HIT_Y"
+                    base + _HY_OFFSET, bool(running_hy), f"wall{wall_i} HIT_Y"
                 )
             else:
                 for offset, lbl in [

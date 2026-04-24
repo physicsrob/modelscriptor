@@ -121,18 +121,24 @@ def factor_q_to_embedding(q: Node, suffix: str = "") -> Node:
     even when many candidate values are computed per position; only the
     selected ``q`` flows in.
 
-    Depth: ~4 MLP sublayers (clamp → 3-deep digit cascade → in_range ×
-    4 in parallel; ``bool_to_01`` is a free affine fused into the
-    Concatenate).
+    **Phase B Part 1 — hi/lo split.**  Split ``q`` into hi/lo bytes
+    ``q_hi = q // 256`` and ``q_lo = q - q_hi * 256`` first, then
+    extract the two hex digits of each byte.  The two ``// 16`` digit
+    extractions run in parallel off ``q_hi`` and ``q_lo`` — two serial
+    ``thermometer_floor_div`` calls instead of three.
+
+    Depth: ~3 MLP sublayers of digit cascade (clamp → q_hi → h3 ∥ h1
+    → in_range × 4 in parallel).
 
     Args:
         q: 1-wide float node holding a near-integer value in
             ``[0, 65535]``.  Far-from-integer inputs hit
-            ``thermometer_floor_div`` ramp zones at ``k*4096 - 0.5`` /
-            ``k*256 - 0.5`` / ``k*16 - 0.5``; at those boundaries two
-            adjacent slots in one block soften to ~0.5 each and the
-            host's argmax against ``W_EMBED.T`` picks the nearer
-            neighbour (≤1 LSB error in the recovered float).
+            ``thermometer_floor_div`` ramp zones at ``k * divisor - 0.5``
+            (``divisor`` is 256 for the hi/lo split and 16 for the
+            inner digit extraction); at those boundaries two adjacent
+            slots in one block soften to ~0.5 each and the host's
+            argmax against ``W_EMBED.T`` picks the nearer neighbour
+            (≤1 LSB error in the recovered float).
         suffix: Used to namespace the literal nodes built inside.
 
     Returns:
@@ -141,18 +147,19 @@ def factor_q_to_embedding(q: Node, suffix: str = "") -> Node:
     """
     q_clamped = clamp(q, 0.0, float(DEFAULT_N_LEVELS - 1))
 
-    # Peel off 4 hex digits.  ``thermometer_floor_div`` places ramps at
-    # ``k * divisor - 0.5`` — integer-valued inputs (what ``q`` is, up
-    # to one LSB of quantize drift) land cleanly in the flat zones
-    # between ramps.
-    h3 = thermometer_floor_div(q_clamped, 4096, DEFAULT_N_LEVELS - 1)
-    r3 = subtract(q_clamped, multiply_const(h3, 4096.0))
+    # Split ``q`` into hi/lo bytes.  ``q_hi = q // 256`` is the serial
+    # dependency; ``q_lo`` is a pure affine on (q_clamped, q_hi).
+    q_hi = thermometer_floor_div(q_clamped, 256, DEFAULT_N_LEVELS - 1)
+    q_lo = subtract(q_clamped, multiply_const(q_hi, 256.0))
 
-    h2 = thermometer_floor_div(r3, 256, 4095)
-    r2 = subtract(r3, multiply_const(h2, 256.0))
-
-    h1 = thermometer_floor_div(r2, 16, 255)
-    h0 = subtract(r2, multiply_const(h1, 16.0))
+    # Per-byte digit extraction runs in parallel: h3/h2 from q_hi,
+    # h1/h0 from q_lo.  Each byte needs a single ``// 16`` — the two
+    # ``thermometer_floor_div`` calls share an MLP layer instead of
+    # chaining.
+    h3 = thermometer_floor_div(q_hi, 16, 255)
+    h2 = subtract(q_hi, multiply_const(h3, 16.0))
+    h1 = thermometer_floor_div(q_lo, 16, 255)
+    h0 = subtract(q_lo, multiply_const(h1, 16.0))
 
     # 16-wide one-hot per digit: ``in_range(d, d+1, 16)`` fires slot
     # ``round(d)``; ``bool_to_01`` converts the ±1 result to 0/1.
@@ -290,21 +297,30 @@ class ThinkingReadback:
             torch.tensor([1.0]), name="readback_q1"
         )
 
-    def get_value_after_last(self, name: str) -> Node:
+    def get_value_after_last(
+        self, name: str, *, assert_hardness_gt: float | None = 0.99
+    ) -> Node:
         """Return the dequantized float for the most recent matching VALUE.
 
-        ``name`` must be one of the 16 entries in ``IDENTIFIER_NAMES``.
+        ``name`` must be one of the 20 entries in ``IDENTIFIER_NAMES``.
         The returned Node is 1-wide with value range
         ``VALUE_RANGE_BY_NAME[name]``.
 
         **Undefined when the referenced identifier has no prior
-        instance in the causal window.**  At every Phase-A call site
-        the consuming step is downstream of the producing step in the
-        same frame, so the cache always contains the referenced
-        identifier by the time a consumer fires.
+        instance in the causal window.**  Most Phase-A call sites
+        place the consuming step downstream of the producing step in
+        the same frame, so the cache always contains the referenced
+        identifier by the time a consumer fires.  Phase B's running-OR
+        HIT_* consumers fire at every wall including wall 0; the
+        caller must gate the result accordingly and may pass
+        ``assert_hardness_gt=None`` to skip the runtime softmax-hardness
+        check at positions where the cache might legitimately be empty.
 
         Caches per-name: the first call builds the flag + attention +
-        Linear; subsequent calls reuse those nodes.
+        Linear; subsequent calls reuse those nodes.  The
+        ``assert_hardness_gt`` argument only affects the first call —
+        cache hits return the original node regardless of the
+        requested threshold.
         """
         if name in self._cache:
             return self._cache[name]
@@ -351,7 +367,7 @@ class ThinkingReadback:
             key_vector=is_X_value,
             value=payload,
             match_gain=_READBACK_MATCH_GAIN,
-            assert_hardness_gt=0.99,
+            assert_hardness_gt=assert_hardness_gt,
         )
 
         # 3. Decode 4+4+4+4 one-hots back to the float value via a

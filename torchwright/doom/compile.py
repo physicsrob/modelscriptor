@@ -535,11 +535,11 @@ def step_frame(
 
     prev = _next_inputs_from_overflow(first_thinking_id, overflow_after_pa)
 
-    # Thinking phase budget (Part 4): per wall, 1 marker + 13 identifiers
-    # + 13 values = 27 steps.  After the last wall, 3 RESOLVED identifiers
-    # + 3 RESOLVED values = 6 steps.  Total = max_walls * 27 + 6, plus a
+    # Thinking phase budget (Phase B Part 1): per wall, 1 marker + 17 identifiers
+    # + 17 values = 35 steps.  After the last wall, 3 RESOLVED identifiers
+    # + 3 RESOLVED values = 6 steps.  Total = max_walls * 35 + 6, plus a
     # small safety margin.
-    n_thinking = max_walls * 27 + 6 + 4
+    n_thinking = max_walls * 35 + 6 + 4
     max_steps = n_thinking + N * (W * (H // cs + 1) + 1) + 10
     total_steps = 0
     prev_wc = 0.0
@@ -630,22 +630,18 @@ def step_frame(
         trace.token_id_log = token_id_log
 
     # Read post-collision (x, y) and post-turn angle from the RESOLVED
-    # thinking tokens.  Under Part 4 the graph emits RESOLVED_X /
-    # RESOLVED_Y / RESOLVED_ANGLE as VALUE tokens in the thinking
-    # stream; the host dequantizes them back to floats using each
-    # identifier's (lo, hi) range.  Thinking phase layout: per wall
-    # offsets 0..26 = 1 marker + 13 id-value pairs; after all walls,
-    # offsets 0..5 of the RESOLVED tail = [X_ID, X_VAL, Y_ID, Y_VAL,
-    # ANGLE_ID, ANGLE_VAL].  So the VALUE positions land at
-    # ``max_walls * 27 + {1, 3, 5}``.
+    # thinking tokens.  Phase B Part 1: per wall, 1 marker + 17 id-value
+    # pairs = 35 steps; after all walls, offsets 0..5 of the RESOLVED
+    # tail = [X_ID, X_VAL, Y_ID, Y_VAL, ANGLE_ID, ANGLE_VAL].  So the
+    # VALUE positions land at ``max_walls * 35 + {1, 3, 5}``.
     def _dequant(token_id: int, name: str) -> float:
         lo, hi = VALUE_RANGE_BY_NAME[name]
         q = max(0, min(N_VALUES - 1, int(token_id)))
         return lo + q * (hi - lo) / float(N_VALUES - 1)
 
-    resolved_x_offset = max_walls * 27 + 1
-    resolved_y_offset = max_walls * 27 + 3
-    resolved_angle_offset = max_walls * 27 + 5
+    resolved_x_offset = max_walls * 35 + 1
+    resolved_y_offset = max_walls * 35 + 3
+    resolved_angle_offset = max_walls * 35 + 5
 
     if len(token_id_log) > resolved_angle_offset:
         resolved_x = _dequant(token_id_log[resolved_x_offset], "RESOLVED_X")

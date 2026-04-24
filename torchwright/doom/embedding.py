@@ -6,17 +6,17 @@ graph looks the ID up in ``W_EMBED`` to produce a 72-wide residual
 leaf. On the output side, the 72-wide output slice is projected
 through ``W_EMBED.T`` and argmaxed to pick the next ID.
 
-Vocabulary layout matches ``docs/phase_a_plan.md`` §"Vocabulary ID
-ranges" verbatim:
+Vocabulary layout (Phase B Part 1 widens per-wall identifiers 13→17
+by adding T_STAR_L / T_STAR_R / COL_A / COL_B intermediate slots):
 
   |      0 .. 65535 | VALUE (quantized 16-bit integers)          |
   |  65536 .. 65543 | THINKING_WALL markers 0..7                 |
-  |  65544 .. 65556 | Per-wall identifiers (BSP_RANK..HIT_Y)     |
-  |  65557 .. 65559 | RESOLVED identifiers (X / Y / ANGLE)       |
-  |  65560 .. 65562 | Decode tokens (SORTED_WALL, RENDER, DONE)  |
-  |  65563 .. 65570 | Prompt-position categories                 |
+  |  65544 .. 65560 | Per-wall identifiers (BSP_RANK..HIT_Y)     |
+  |  65561 .. 65563 | RESOLVED identifiers (X / Y / ANGLE)       |
+  |  65564 .. 65566 | Decode tokens (SORTED_WALL, RENDER, DONE)  |
+  |  65567 .. 65574 | Prompt-position categories                 |
 
-Total ``V = 65571``.
+Total ``V = 65575``.
 
 Embedding layout (``d_embed = 72``):
 
@@ -66,15 +66,19 @@ _CATEGORY_INDEX: Dict[str, int] = {
     "VALUE": 261,
     # THINKING_WALL markers: one category code per marker.
     **{f"THINKING_WALL_{i}": 250 + i for i in range(8)},
-    # Per-wall identifiers (13).  HIT_FULL/X/Y keep their M4 indices.
+    # Per-wall identifiers (17).  HIT_FULL/X/Y keep their M4 indices.
     "BSP_RANK": 270,
     "IS_RENDERABLE": 271,
     "CROSS_A": 272,
     "DOT_A": 273,
     "CROSS_B": 274,
     "DOT_B": 275,
+    "T_STAR_L": 284,
+    "T_STAR_R": 285,
     "T_LO": 276,
     "T_HI": 277,
+    "COL_A": 286,
+    "COL_B": 287,
     "VIS_LO": 278,
     "VIS_HI": 279,
     "HIT_FULL": 258,
@@ -120,21 +124,25 @@ _PER_WALL_IDENTIFIERS: List[str] = [
     "DOT_A",
     "CROSS_B",
     "DOT_B",
+    "T_STAR_L",
+    "T_STAR_R",
     "T_LO",
     "T_HI",
+    "COL_A",
+    "COL_B",
     "VIS_LO",
     "VIS_HI",
     "HIT_FULL",
     "HIT_X",
     "HIT_Y",
 ]
-_PER_WALL_BASE = _THINKING_WALL_BASE + 8  # 65544 .. 65556
+_PER_WALL_BASE = _THINKING_WALL_BASE + 8  # 65544 .. 65560
 
 _RESOLVED_IDENTIFIERS: List[str] = ["RESOLVED_X", "RESOLVED_Y", "RESOLVED_ANGLE"]
-_RESOLVED_BASE = _PER_WALL_BASE + len(_PER_WALL_IDENTIFIERS)  # 65557 .. 65559
+_RESOLVED_BASE = _PER_WALL_BASE + len(_PER_WALL_IDENTIFIERS)  # 65561 .. 65563
 
 _DECODE_TOKENS: List[str] = ["SORTED_WALL", "RENDER", "DONE"]
-_DECODE_BASE = _RESOLVED_BASE + len(_RESOLVED_IDENTIFIERS)  # 65560 .. 65562
+_DECODE_BASE = _RESOLVED_BASE + len(_RESOLVED_IDENTIFIERS)  # 65564 .. 65566
 
 _PROMPT_TOKENS: List[str] = [
     "INPUT",
@@ -146,10 +154,10 @@ _PROMPT_TOKENS: List[str] = [
     "PLAYER_Y",
     "PLAYER_ANGLE",
 ]
-_PROMPT_BASE = _DECODE_BASE + len(_DECODE_TOKENS)  # 65563 .. 65570
+_PROMPT_BASE = _DECODE_BASE + len(_DECODE_TOKENS)  # 65567 .. 65574
 
-V: int = _PROMPT_BASE + len(_PROMPT_TOKENS)  # 65571
-assert V == 65571, f"Vocabulary size mismatch: got {V}, expected 65571"
+V: int = _PROMPT_BASE + len(_PROMPT_TOKENS)  # 65575
+assert V == 65575, f"Vocabulary size mismatch: got {V}, expected 65575"
 
 
 def _build_id_map() -> Dict[str, int]:
@@ -250,15 +258,15 @@ assert W_EMBED.shape == (V, D_EMBED)
 # ---------------------------------------------------------------------------
 
 
-# Ordered list of the 16 identifier names that the thinking-phase state
-# machine walks per wall (13 per-wall) plus per-frame (3 RESOLVED).  The
+# Ordered list of the 20 identifier names that the thinking-phase state
+# machine walks per wall (17 per-wall) plus per-frame (3 RESOLVED).  The
 # ordering is the cascade order: each entry at index ``i`` is the
 # identifier emitted at the VALUE step whose most recent identifier was
 # the entry at index ``i - 1``.  The ``thinking_wall`` stage and
-# ``_detect_token_types`` both iterate this list to build the 16-wide
+# ``_detect_token_types`` both iterate this list to build the 20-wide
 # slot machinery.
 IDENTIFIER_NAMES: List[str] = list(_PER_WALL_IDENTIFIERS) + list(_RESOLVED_IDENTIFIERS)
-assert len(IDENTIFIER_NAMES) == 16
+assert len(IDENTIFIER_NAMES) == 20
 
 
 # Float range of every identifier's VALUE payload.  The producing
@@ -282,8 +290,12 @@ VALUE_RANGE_BY_NAME: Dict[str, tuple[float, float]] = {
     "DOT_A": (-40.0, 40.0),
     "CROSS_B": (-40.0, 40.0),
     "DOT_B": (-40.0, 40.0),
+    "T_STAR_L": (-2.0, 2.0),
+    "T_STAR_R": (-2.0, 2.0),
     "T_LO": (0.0, 1.0),
     "T_HI": (0.0, 1.0),
+    "COL_A": (-2.0, 122.0),
+    "COL_B": (-2.0, 122.0),
     "VIS_LO": (-2.0, 122.0),
     "VIS_HI": (-2.0, 122.0),
     "HIT_FULL": (0.0, 1.0),

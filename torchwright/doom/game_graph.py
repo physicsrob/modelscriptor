@@ -486,8 +486,8 @@ def _detect_token_types(embedding: Node) -> Dict[str, Any]:
     category code (for the category-only ``is_thinking_value`` — all
     65,536 VALUE rows share this 8-wide prefix).
 
-    Per-identifier detectors (Part 2): one detector per entry in
-    ``IDENTIFIER_NAMES`` (16 total — 13 per-wall + 3 RESOLVED).  Both a
+    Per-identifier detectors: one detector per entry in
+    ``IDENTIFIER_NAMES`` (20 total — 17 per-wall + 3 RESOLVED).  Both a
     dict-keyed convenience form (``is_bsp_rank_id``, ``is_hit_full_id``,
     ``is_resolved_x_id``, …) and an ordered ``is_identifier_by_slot``
     list are exposed; the thinking-wall stage indexes by slot while
@@ -511,7 +511,7 @@ def _detect_token_types(embedding: Node) -> Dict[str, Any]:
                 E8_VALUE,
             ),
         }
-        # Per-identifier detectors (16 total).  Built in IDENTIFIER_NAMES
+        # Per-identifier detectors (20 total).  Built in IDENTIFIER_NAMES
         # order; both indexed (by slot) and keyed (by name) for downstream
         # convenience.
         is_identifier_by_slot = [
