@@ -45,8 +45,10 @@ from torchwright.ops.arithmetic_ops import (
     ceil_int,
     clamp,
     compare,
+    exp,
     floor_int,
     linear_bin_index,
+    log,
     low_rank_2d,
     max as max_op,
     min as min_op,
@@ -367,6 +369,24 @@ def _distributions() -> Dict[str, InputDistribution]:
             0.1,
             50.0,
         ),
+        "log_4decades_001_100": _uniform_1d(
+            "log_4decades_001_100",
+            "log(x) over [0.01, 100] — 4 decades, geometric BP grid with "
+            "256 breakpoints (`ratio ≈ 1.0367`). Stresses float32 matmul "
+            "accumulation across the full BP set at the high end of the "
+            "range, where ~all ReLUs are active.",
+            0.01,
+            100.0,
+        ),
+        "exp_pm5": _uniform_1d(
+            "exp_pm5",
+            "exp(x) over [-5, 5] — output spans [exp(-5), exp(5)] ≈ "
+            "[0.0067, 148.4], the natural pairing for log over [0.01, 100]. "
+            "Uniform 256-BP grid (`Δx ≈ 0.0392`); per-cell relative-error "
+            "bound is `(Δx)²/8 ≈ 1.9e-4`.",
+            -5.0,
+            5.0,
+        ),
         "parabola_0_10_step1": _uniform_1d(
             "parabola_0_10_step1",
             "f(x)=x² on [0, 10] with integer breakpoints — probes generic "
@@ -603,6 +623,43 @@ def _target_ops() -> List[TargetOp]:
                 "reciprocal graph whose `(min_value, max_value, step)` matches "
                 "its production callsite: `(0.3, 200.0, 1.0)` for "
                 "`doom_reciprocal_wall` (`torchwright/doom/stages/wall.py:431`)."
+            ),
+        ),
+        TargetOp(
+            name="log",
+            module=_ARITH,
+            source_file=_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: log(
+                nodes["x"], min_value=0.01, max_value=100.0, n_breakpoints=256
+            ),
+            reference_fn=lambda inputs: torch.log(inputs["x"]),
+            distribution_names=("log_4decades_001_100",),
+            notes=(
+                "Natural log via piecewise-linear interpolation with "
+                "geometric breakpoint spacing. Per-cell linear-interp bound "
+                "is `(ratio-1)²/8`, but the empirical end-to-end error is "
+                "dominated by float32 matmul accumulation across ~256 "
+                "active ReLUs at the high end of the range. Pairs with "
+                "`exp` for log-space arithmetic chains."
+            ),
+        ),
+        TargetOp(
+            name="exp",
+            module=_ARITH,
+            source_file=_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: exp(
+                nodes["x"], min_value=-5.0, max_value=5.0, n_breakpoints=256
+            ),
+            reference_fn=lambda inputs: torch.exp(inputs["x"]),
+            distribution_names=("exp_pm5",),
+            notes=(
+                "Natural exponential via piecewise-linear interpolation "
+                "with uniform breakpoint spacing. Constant relative output "
+                "error per cell `(Δx)²/8` because `d²exp/dx² = exp`. "
+                "Pairs with `log` to implement `A·B = exp(log A + log B)` "
+                "and `A/B = exp(log A − log B)` in log-space chains."
             ),
         ),
         TargetOp(

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "commit": "a1a9f85",
-  "measured_at": "2026-04-24",
+  "commit": "29e6d5e",
+  "measured_at": "2026-04-25",
   "ops": [
     {
       "name": "abs",
@@ -224,6 +224,28 @@
       ]
     },
     {
+      "name": "exp",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Natural exponential via piecewise-linear interpolation with uniform breakpoint spacing. Constant relative output error per cell `(Δx)²/8` because `d²exp/dx² = exp`. Pairs with `log` to implement `A·B = exp(log A + log B)` and `A/B = exp(log A − log B)` in log-space chains.",
+      "distributions": [
+        {
+          "name": "exp_pm5",
+          "description": "exp(x) over [-5, 5] — output spans [exp(-5), exp(5)] ≈ [0.0067, 148.4], the natural pairing for log over [0.01, 100]. Uniform 256-BP grid (`Δx ≈ 0.0392`); per-cell relative-error bound is `(Δx)²/8 ≈ 1.9e-4`.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0279694,
+          "mean_abs_error": 0.00171612,
+          "p99_abs_error": 0.0209377,
+          "max_rel_error": 0.00019238,
+          "mean_rel_error": 0.000120446,
+          "p99_rel_error": 0.000192204,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 4.98001
+          }
+        }
+      ]
+    },
+    {
       "name": "floor_int",
       "module": "torchwright.ops.arithmetic_ops",
       "notes": "Staircase with ramp width `1/step_sharpness` directly below each integer. Inputs near integer boundaries land in the ramp zone and produce interpolated values; callers with integer-ish inputs should use `thermometer_floor_div` instead, whose ramps sit at half-integer thresholds.",
@@ -280,6 +302,28 @@
             "x": 59.9995,
             "x_min": 0.0,
             "x_max": 64.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "log",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Natural log via piecewise-linear interpolation with geometric breakpoint spacing. Per-cell linear-interp bound is `(ratio-1)²/8`, but the empirical end-to-end error is dominated by float32 matmul accumulation across ~256 active ReLUs at the high end of the range. Pairs with `exp` for log-space arithmetic chains.",
+      "distributions": [
+        {
+          "name": "log_4decades_001_100",
+          "description": "log(x) over [0.01, 100] — 4 decades, geometric BP grid with 256 breakpoints (`ratio ≈ 1.0367`). Stresses float32 matmul accumulation across the full BP set at the high end of the range, where ~all ReLUs are active.",
+          "n_samples": 4096,
+          "max_abs_error": 0.00481176,
+          "mean_abs_error": 0.00064981,
+          "p99_abs_error": 0.0028347,
+          "max_rel_error": 0.00531085,
+          "mean_rel_error": 0.000171651,
+          "p99_rel_error": 0.000677215,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 94.5104
           }
         }
       ]
@@ -450,33 +494,33 @@
       "distributions": [
         {
           "name": "doom_diff_trig",
-          "description": "wall-geometry product over DIFF_BP × TRIG_BP — mirrors the `sort_ey_cos`/`sort_ex_sin` family of calls at `torchwright/doom/stages/thinking_wall.py:1115` and neighbours.",
+          "description": "wall-geometry product over DIFF_BP × TRIG_BP — mirrors the `sort_ey_cos`/`sort_ex_sin` family of calls at `torchwright/doom/stages/wall.py:263` and neighbours.",
           "n_samples": 4096,
-          "max_abs_error": 19.4435,
-          "mean_abs_error": 2.4831,
-          "p99_abs_error": 14.6437,
-          "max_rel_error": 7.28308,
-          "mean_rel_error": 0.258401,
-          "p99_rel_error": 0.951387,
+          "max_abs_error": 7.77784,
+          "mean_abs_error": 1.30067,
+          "p99_abs_error": 6.54323,
+          "max_rel_error": 0.601363,
+          "mean_rel_error": 0.117966,
+          "p99_rel_error": 0.35001,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "a": -22.2222,
-            "b": 1.0
+            "a": 22.2222,
+            "b": -1.0
           }
         },
         {
           "name": "doom_diff_vel",
-          "description": "collision product over DIFF_BP × VEL_BP — mirrors the `p_dx_ey`/`p_dy_ex` family at `torchwright/doom/stages/thinking_wall.py:1014`.",
+          "description": "collision product over DIFF_BP × VEL_BP — mirrors the `p_dx_ey`/`p_dy_ex` family at `torchwright/doom/stages/wall.py:205`.",
           "n_samples": 4096,
-          "max_abs_error": 13.561,
-          "mean_abs_error": 1.75111,
-          "p99_abs_error": 10.3046,
-          "max_rel_error": 10.3557,
-          "mean_rel_error": 0.278079,
-          "p99_rel_error": 1.29805,
+          "max_abs_error": 5.44453,
+          "mean_abs_error": 0.93746,
+          "p99_abs_error": 4.72484,
+          "max_rel_error": 0.602409,
+          "mean_rel_error": 0.123235,
+          "p99_rel_error": 0.35002,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "a": -22.2222,
+            "a": 22.2222,
             "b": -0.7
           }
         }

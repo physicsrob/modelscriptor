@@ -14,6 +14,8 @@ from torchwright.ops.arithmetic_ops import (
     square,
     multiply_integers,
     reciprocal,
+    log,
+    exp,
     floor_int,
     ceil_int,
     signed_multiply,
@@ -352,6 +354,217 @@ def test_reciprocal_small_min_value():
             f"reciprocal(min=0.1): 1/{v} = {expected:.4f}, "
             f"got {result.item():.4f} (rel_err={rel_err:.1%})"
         )
+
+
+def test_log_endpoints_near_exact():
+    """log(min) and log(max) match closed-form values within FP slack.
+
+    The endpoints are pinned via ``breakpoints[0] = min_value`` and
+    ``breakpoints[-1] = max_value``, so there's no interpolation error
+    at the ends — only float32 representation of the breakpoint and
+    accumulated matmul rounding.
+    """
+    import math
+
+    x = create_input("x", 1)
+    lo, hi = 0.01, 100.0
+    f = log(x, min_value=lo, max_value=hi, n_breakpoints=256)
+
+    for v in [lo, hi]:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        expected = math.log(v)
+        # Accumulated matmul rounding across ~256 active ReLUs at the
+        # high end is the dominant term here, not interpolation.
+        assert abs(result.item() - expected) < 3e-3, (
+            f"log({v}) = {expected:.6f}, got {result.item():.6f}"
+        )
+
+
+def test_log_accuracy_4_decades():
+    """log over [0.01, 100] (4 decades) with 256 BPs has bounded abs error.
+
+    The geometric BP grid has ``ratio ≈ 1.0367``, so the per-cell
+    linear-interpolation bound is ``(ratio-1)²/8 ≈ 1.7e-4``.  The
+    observed end-to-end error is dominated by float32 matmul
+    accumulation across ~256 active ReLUs at the high end of the
+    range, which empirically tops out near 2e-3.
+    """
+    import math
+
+    x = create_input("x", 1)
+    f = log(x, min_value=0.01, max_value=100.0, n_breakpoints=256)
+
+    # Sample a mix of near-breakpoint and interior values across decades.
+    test_values = [0.012, 0.05, 0.1, 0.317, 1.0, 2.71828, 10.0, 33.3, 99.0]
+    worst = 0.0
+    for v in test_values:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        expected = math.log(v)
+        err = abs(result.item() - expected)
+        worst = max(worst, err)
+        assert err < 3e-3, (
+            f"log({v}) = {expected:.6f}, got {result.item():.6f} (abs_err={err:.2e})"
+        )
+
+
+def test_log_accuracy_2_decades():
+    """log over [0.1, 10] (2 decades) with 256 BPs is much tighter.
+
+    With a 2-decade range, ``ratio ≈ 1.0182`` — interpolation error
+    drops 4× and accumulator depth halves, so we expect <5e-4 absolute
+    error on log values that themselves span [-2.3, 2.3].
+    """
+    import math
+
+    x = create_input("x", 1)
+    f = log(x, min_value=0.1, max_value=10.0, n_breakpoints=256)
+
+    test_values = [0.11, 0.3, 0.7, 1.0, 1.5, 3.0, 5.5, 9.5]
+    for v in test_values:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        expected = math.log(v)
+        err = abs(result.item() - expected)
+        assert err < 5e-4, (
+            f"log({v}) = {expected:.6f}, got {result.item():.6f} (abs_err={err:.2e})"
+        )
+
+
+def test_exp_exact_at_breakpoints():
+    """exp(x) is interpolation-free at the breakpoint values."""
+    import math
+
+    x = create_input("x", 1)
+    lo, hi, n = -5.0, 5.0, 256
+    f = exp(x, min_value=lo, max_value=hi, n_breakpoints=n)
+
+    step = (hi - lo) / (n - 1)
+    for k in [0, 1, n // 4, n // 2, n - 2, n - 1]:
+        v = lo + k * step if k != n - 1 else hi
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        expected = math.exp(v)
+        # Relative tolerance because exp spans many orders of magnitude.
+        rel_err = abs(result.item() - expected) / expected
+        assert rel_err < 1e-4, (
+            f"exp({v:.4f}) = {expected:.6f}, got {result.item():.6f} "
+            f"(rel_err={rel_err:.2e})"
+        )
+
+
+def test_exp_relative_error():
+    """exp over [-5, 5] with 256 BPs has bounded relative error.
+
+    Theoretical bound for uniform BPs is ~(Δx)²/8 per cell.  With
+    Δx ≈ 0.0392, that's ~1.9e-4.  Allow 1e-3 for FP slack.
+    """
+    import math
+
+    x = create_input("x", 1)
+    f = exp(x, min_value=-5.0, max_value=5.0, n_breakpoints=256)
+
+    test_values = [-4.7, -2.3, -1.0, 0.0, 0.5, 1.7, 3.14, 4.9]
+    for v in test_values:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        expected = math.exp(v)
+        rel_err = abs(result.item() - expected) / expected
+        assert rel_err < 1e-3, (
+            f"exp({v}) = {expected:.6f}, got {result.item():.6f} "
+            f"(rel_err={rel_err:.2e})"
+        )
+
+
+def test_exp_log_roundtrip():
+    """exp(log(x)) ≈ x — the foundational identity for log-space chains."""
+    from torchwright.ops.inout_nodes import create_input as _ci
+
+    x = _ci("x", 1)
+    log_x = log(x, min_value=0.01, max_value=100.0, n_breakpoints=256)
+    # exp's input range covers log([0.01, 100]) = [-4.605, 4.605].
+    out = exp(log_x, min_value=-4.7, max_value=4.7, n_breakpoints=256)
+
+    test_values = [0.02, 0.1, 0.5, 1.0, 2.0, 7.5, 30.0, 80.0]
+    for v in test_values:
+        result = out.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        rel_err = abs(result.item() - v) / v
+        # Two PWL stages compound — bound at 1% (each contributes <0.1%).
+        assert rel_err < 1e-2, (
+            f"exp(log({v})) = {v}, got {result.item():.6f} "
+            f"(rel_err={rel_err:.2e})"
+        )
+
+
+def test_log_exp_multiplication():
+    """exp(log(a) + log(b)) ≈ a*b — the headline use case for log-space ops.
+
+    Demonstrates that an end-to-end multiply via log/exp lands within
+    a couple percent of the true product across operands spanning two
+    decades.
+    """
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    log_a = log(a, min_value=0.01, max_value=100.0, n_breakpoints=256)
+    log_b = log(b, min_value=0.01, max_value=100.0, n_breakpoints=256)
+    # log(a) + log(b) ranges over [2·log(0.01), 2·log(100)] = [-9.21, 9.21].
+    from torchwright.ops.arithmetic_ops import add
+
+    log_ab = add(log_a, log_b)
+    out = exp(log_ab, min_value=-9.3, max_value=9.3, n_breakpoints=256)
+
+    test_pairs = [
+        (0.05, 0.5),
+        (0.5, 2.0),
+        (1.0, 1.0),
+        (3.0, 7.0),
+        (10.0, 0.1),
+        (50.0, 1.5),
+        (80.0, 0.8),
+    ]
+    for av, bv in test_pairs:
+        result = out.compute(
+            n_pos=1,
+            input_values={
+                "a": torch.tensor([[av]]),
+                "b": torch.tensor([[bv]]),
+            },
+        )
+        expected = av * bv
+        rel_err = abs(result.item() - expected) / expected
+        # Three PWL stages (log, log, exp) compound — bound at 2%.
+        assert rel_err < 2e-2, (
+            f"exp(log({av})+log({bv})) = {expected}, "
+            f"got {result.item():.6f} (rel_err={rel_err:.2e})"
+        )
+
+
+def test_log_clamps_outside_range():
+    """log clamps to endpoint values outside [min_value, max_value]."""
+    import math
+
+    x = create_input("x", 1)
+    f = log(x, min_value=0.1, max_value=10.0, n_breakpoints=128)
+
+    # Below min: clamp to log(min)
+    result = f.compute(n_pos=1, input_values={"x": torch.tensor([[0.05]])})
+    assert abs(result.item() - math.log(0.1)) < 1e-3
+    # Above max: clamp to log(max)
+    result = f.compute(n_pos=1, input_values={"x": torch.tensor([[20.0]])})
+    assert abs(result.item() - math.log(10.0)) < 1e-3
+
+
+def test_exp_clamps_outside_range():
+    """exp clamps to endpoint values outside [min_value, max_value]."""
+    import math
+
+    x = create_input("x", 1)
+    f = exp(x, min_value=-2.0, max_value=2.0, n_breakpoints=128)
+
+    # Below min: clamp to exp(min)
+    result = f.compute(n_pos=1, input_values={"x": torch.tensor([[-5.0]])})
+    rel_err = abs(result.item() - math.exp(-2.0)) / math.exp(-2.0)
+    assert rel_err < 1e-3
+    # Above max: clamp to exp(max)
+    result = f.compute(n_pos=1, input_values={"x": torch.tensor([[5.0]])})
+    rel_err = abs(result.item() - math.exp(2.0)) / math.exp(2.0)
+    assert rel_err < 1e-3
 
 
 def test_floor_int():

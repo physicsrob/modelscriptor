@@ -56,7 +56,7 @@ def bool_any_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit a1a9f85. See docs/numerical_noise.md.
+       measured at commit 29e6d5e. See docs/numerical_noise.md.
     """
     # Strategy:
     # Convert all the values to 1.0 if they're > 0.0 and 0.0 otherwise
@@ -84,7 +84,7 @@ def bool_all_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit a1a9f85. See docs/numerical_noise.md.
+       measured at commit 29e6d5e. See docs/numerical_noise.md.
     """
     return compare(
         sum_nodes(inp_list),
@@ -107,7 +107,7 @@ def bool_not(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit a1a9f85. See docs/numerical_noise.md.
+       measured at commit 29e6d5e. See docs/numerical_noise.md.
     """
     return compare(inp, thresh=0.0, true_level=-1.0, false_level=1.0)
 
@@ -115,32 +115,6 @@ def bool_not(inp: Node) -> Node:
 def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     """
     Compares a node's value to a vector tensor.
-
-    Saturates on BOTH sides — output is clamped to ±1 regardless of input
-    magnitude.  An inflated match (``inp ≈ k·vector`` with ``k > 1``) still
-    produces exactly +1 instead of the raw ``2·(k−1)·(vector @ vector) + 1``
-    that the single-ReLU form used to emit.  That robustness is essential
-    in autoregressive contexts: a token embedding fed back through the host
-    from one step's output to the next step's input can accumulate small
-    residual-stream noise and arrive with slightly inflated magnitude.  The
-    single-ReLU form amplified that inflation linearly (a 3% magnitude
-    bump on an E8 code with ``c @ c = 800`` became a cond of ~49 instead
-    of 1), which the downstream select's ``M·cond`` term then blew up
-    catastrophically.  Two-sided saturation absorbs any level of input
-    inflation and lets the feedback loop converge instead of diverge.
-
-    Uses a 2-unit MLP (same sublayer depth as the single-ReLU form):
-
-      hidden[0] = inp @ vector + 1/speed - vector @ vector
-      hidden[1] = inp @ vector - vector @ vector
-      y        = 2·speed · (ReLU(hidden[0]) − ReLU(hidden[1])) − 1
-
-    Let ``d = inp @ vector − vector @ vector``.
-
-    - ``d ≥ 0`` (clean or inflated match): both ReLUs active; their gap is
-      exactly ``1/speed``. Output = ``2·speed·(1/speed) − 1 = 1``.
-    - ``d ∈ (−1/speed, 0)`` (transition): linear interpolation from −1 to 1.
-    - ``d ≤ −1/speed`` (clean non-match): both ReLUs zero. Output = −1.
 
     Args:
         inp (Node): The node to be compared.
@@ -152,18 +126,17 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit a1a9f85. See docs/numerical_noise.md.
+       measured at commit 29e6d5e. See docs/numerical_noise.md.
     """
+    # If value1 == c, result is 1
+    # else result is -1
+    # We'll use an MLP:
+    # y = 2.0*speed * max(1.0/speed + c @ value - c @ c, 0) - 1.0
+    # d_hidden = 1
     speed = embedding_step_sharpness
-    c_dot = vector @ vector
-    input_proj = torch.stack([vector, vector], dim=0)  # (2, d)
-    input_bias = torch.stack(
-        [
-            torch.tensor(1.0 / speed) - c_dot,
-            -c_dot,
-        ]
-    )  # (2,)
-    output_proj = torch.tensor([[2.0 * speed], [-2.0 * speed]])  # (2, 1)
+    input_proj = vector.unsqueeze(0)  # We're dotting vector into value
+    input_bias = 1.0 / speed - vector @ vector
+    output_proj = torch.tensor([[2.0 * speed]])
     output_bias = torch.tensor([-1.0])
     result = linear_relu_linear(
         input_node=inp,
@@ -268,7 +241,7 @@ def cond_gate(
     .. noise-footer::
 
        Max error: 0.0009766 abs, 0.3885 rel over 4096 samples;
-       measured at commit a1a9f85. See docs/numerical_noise.md.
+       measured at commit 29e6d5e. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
     d = len(inp)
