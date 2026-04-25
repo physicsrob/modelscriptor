@@ -276,7 +276,12 @@ MLP = "mlp"
 
 
 def routing(node: Node, gm: GraphModel, policy: SchedulingPolicy) -> str:
-    """Static routing decision under the given policy."""
+    """Static routing decision under the given policy.
+
+    Used when `flex_routing=False`: every node has a fixed sublayer.
+    With `flex_routing=True`, only `is_flex(n)` nodes' modes become
+    CP-SAT decision variables; others still use this routing.
+    """
     if isinstance(node, Attn):
         return ATTN
     if isinstance(node, Add):
@@ -292,6 +297,26 @@ def routing(node: Node, gm: GraphModel, policy: SchedulingPolicy) -> str:
             return ATTN
         return MLP
     raise TypeError(f"Unknown schedulable node type: {type(node).__name__}")
+
+
+def is_flex(node: Node, gm: GraphModel) -> bool:
+    """True iff this node's routing is a CP-SAT decision variable
+    when `flex_routing=True`.
+
+    Standalone Linears (not part of any L1->R->L2 chain) can run in
+    attention (heads = ceil(d_input/d_head)) or in MLP bypass (slots
+    = 2 * d_output). The heuristic picks one statically per policy;
+    CP-SAT can pick per-node.
+
+    Chain L1/R/L2 stay locked to MLP — splitting a chain into
+    separate ops would need a different model structure.
+
+    Attn / Add / standalone-ReLU / LiteralValue stay locked because
+    they have only one valid sublayer.
+    """
+    if isinstance(node, Linear) and node not in gm.node_to_chain:
+        return True
+    return False
 
 
 def heads_for(node: Node, d_head: int) -> int:
@@ -361,14 +386,51 @@ def uses_residual(node: Node, gm: GraphModel) -> bool:
 
 
 @dataclass
+class Costs:
+    """Objective weights for the CP-SAT solver.
+
+    Total objective = alpha * n_layers + beta * total_attn_heads +
+                      gamma * total_mlp_bypass_slots
+
+    Defaults: alpha=1, beta=0, gamma=0 — pure layer minimization.
+    Tie-broken arbitrarily; in flex_routing mode CP-SAT picks
+    whatever routing minimizes layers.
+
+    `beta` knob (long-sequence regime). Attention compute scales
+    roughly as O(L^2) per head (QK^T plus softmax-V), MLP compute
+    scales as O(L) per layer. So per-token cost has shape:
+        attn_cost  = total_attn_heads * d_head * L
+        mlp_cost   = n_layers * (full d * d_hidden matmul)
+    For large L, attn dominates and `beta > 0` pushes routing toward
+    MLP bypass. As a rough starting point, beta ≈ L (heads-per-layer
+    of attn become "as expensive" as one layer when L = beta).
+
+    `gamma` knob (MLP bypass slot pressure). Less commonly useful
+    because the per-layer matmul cost is the same whether MLP slots
+    are 1% or 100% used (zero-padded slots still cost the full
+    d * d_hidden multiply). Provided so you can express "I want to
+    push routing toward attn" or "every used slot costs me X" if
+    that maps to your deployment cost model.
+    """
+
+    alpha: int = 1
+    beta: int = 0
+    gamma: int = 0
+
+
+@dataclass
 class SolveResult:
     status_name: str
     n_layers: int
     total_attn_heads: int
+    total_mlp_bypass_slots: int
     objective_value: int
     wall_time: float
     solver_log: str
     node_to_layer: Dict[int, int]
+    node_to_cancel_layer: Dict[int, int]
+    node_to_routing: Dict[int, str]   # final routing (post-solve), per-node
+    flex_routing: bool
     is_optimal: bool
 
 
@@ -422,22 +484,31 @@ def solve(
     d_hidden: int,
     policy: SchedulingPolicy,
     max_layers: int,
-    alpha: int = 1,
-    beta: int = 0,
+    costs: Costs = Costs(),
+    flex_routing: bool = False,
     time_budget_s: float = 60.0,
     hint: Optional[HintSchedule] = None,
     log_search_progress: bool = True,
 ) -> SolveResult:
     """Build and solve the CP-SAT model.
 
-    Objective: minimize alpha * n_layers + beta * total_attn_heads.
-    `(alpha=1, beta=0)` traces the layer-min lower bound;
-    `(alpha=0, beta=1)` traces the heads-min lower bound.
+    Objective: minimize `costs.alpha * n_layers + costs.beta * total_attn_heads
+    + costs.gamma * total_mlp_bypass_slots`.
 
-    Uses CP-SAT cumulative constraints (one IntervalVar per task) for
-    the head, MLP-slot, and residual-column resource bounds. Roughly
-    O(|schedulable|) interval vars instead of O(|schedulable| * max_layers)
-    booleans.
+    `flex_routing=False` (default): every node has a fixed routing per
+    `policy` (matches the heuristic). Layer-min LB is the proven minimum
+    layer count under that policy's routing.
+
+    `flex_routing=True`: each `is_flex(n)` node (standalone Linear) gets
+    a CP-SAT BoolVar choosing ATTN or MLP. The objective drives the
+    routing trade-off — `costs.beta` penalizes attn heads (helpful when
+    sequence length makes attention expensive).
+
+    Cumulative constraints: combined attn-heads + cancel-cols (capacity
+    = n_heads * d_head per layer), MLP slots (capacity = d_hidden),
+    residual columns (capacity = d - input cols). Per-edge dependency
+    is `layer[v] >= layer[u]` if u is attn-routed and v mlp-routed
+    (same-layer attn->mlp ok), otherwise strict.
     """
     n_heads_per_layer = d // d_head
     input_residual = sum(len(n) for n in gm.input_nodes)
@@ -464,10 +535,27 @@ def solve(
         model.Add(layer_var[c.l1.node_id] == layer_var[c.relu.node_id])
         model.Add(layer_var[c.relu.node_id] == layer_var[c.l2.node_id])
 
+    # ---- Routing: is_attn[n] BoolVar (or fixed literal) per node ----
+    # is_attn[n] == 1 means the node runs in the attention sublayer at
+    # its layer; is_attn[n] == 0 means it runs in MLP. For non-flex
+    # nodes (or when flex_routing=False), the value is pinned.
+    is_attn: Dict[int, cp_model.IntVar] = {}
+    for n in gm.schedulable:
+        if flex_routing and is_flex(n, gm):
+            v = model.NewBoolVar(f"is_attn_n{n.node_id}")
+        else:
+            # Non-flex: hard-pin via a constant-domain bool.
+            r = routing(n, gm, policy)
+            v = model.NewBoolVar(f"is_attn_n{n.node_id}_pinned")
+            if r == ATTN:
+                model.Add(v == 1)
+            else:
+                model.Add(v == 0)
+        is_attn[n.node_id] = v
+
     # ---- Dependency constraints ----
-    # If u is attn-routed and v is mlp-routed, v can read u in the same
-    # layer (attn writes before mlp reads). Otherwise v's layer must be
-    # strictly greater than u's.
+    # Edge u->v: same-layer ok iff u is_attn AND v is mlp (i.e., NOT v is_attn).
+    # Otherwise layer[v] > layer[u].
     input_ids = {n.node_id for n in gm.input_nodes}
     for u, v in gm.edges:
         if u.node_id in input_ids:
@@ -478,18 +566,18 @@ def solve(
             and gm.node_to_chain[u] is gm.node_to_chain[v]
         ):
             continue
-        ru = routing(u, gm, policy)
-        rv = routing(v, gm, policy)
-        if ru == ATTN and rv == MLP:
-            model.Add(layer_var[v.node_id] >= layer_var[u.node_id])
-        else:
-            model.Add(layer_var[v.node_id] > layer_var[u.node_id])
+        u_attn = is_attn[u.node_id]
+        v_attn = is_attn[v.node_id]
+        # same_layer_ok = u_attn AND (NOT v_attn)
+        same_ok = model.NewBoolVar(f"so_n{u.node_id}_n{v.node_id}")
+        model.AddBoolAnd([u_attn, v_attn.Not()]).OnlyEnforceIf(same_ok)
+        model.AddBoolOr([u_attn.Not(), v_attn]).OnlyEnforceIf(same_ok.Not())
+        model.Add(layer_var[v.node_id] >= layer_var[u.node_id]).OnlyEnforceIf(same_ok)
+        model.Add(
+            layer_var[v.node_id] >= layer_var[u.node_id] + 1
+        ).OnlyEnforceIf(same_ok.Not())
 
     # ---- Cancel layer per schedulable node ----
-    # cancel_layer[n] in [layer[n] + 1, max_layers]. max_layers = sentinel
-    # "never freed." For pinned nodes (inputs, output, terminal-Concatenate
-    # leaf), force cancel_layer = max_layers so the residual cumulative
-    # keeps their cols reserved through the whole compile.
     cancel_layer: Dict[int, cp_model.IntVar] = {}
     for n in gm.schedulable:
         cl = model.NewIntVar(0, max_layers, f"cl_n{n.node_id}")
@@ -501,7 +589,6 @@ def solve(
         keep_forever = False
         for c in gm.consumers_eff.get(n, set()):
             if isinstance(c, Concatenate):
-                # Terminal Concatenate (output cone): keep alive forever.
                 model.Add(cl == max_layers)
                 keep_forever = True
                 break
@@ -510,24 +597,20 @@ def solve(
         if keep_forever:
             continue
 
-    # ---- Cumulative: combined attn heads + cancel cols ----
-    # Capacity = n_heads_per_layer * d_head ("col equivalents" per layer).
-    # Each attn op takes heads_for(n) * d_head col-equivalents at its layer.
-    # Each cancel takes len(n) col-equivalents at its cancel_layer.
-    # Relaxation: cancel cost is fractional (cols / d_head heads) instead
-    # of ceil. Slightly optimistic; documented in the module docstring.
+    # ---- Combined attn-heads + cancel-cols cumulative ----
+    # Per-node attn interval is OPTIONAL (gated by is_attn[n]) when the
+    # node could run in either sublayer; for pinned nodes, the bool is
+    # constant and CP-SAT presolve drops the unreachable branch.
     attn_intervals: List = []
     attn_demands: List[int] = []
     for n in gm.schedulable:
-        if routing(n, gm, policy) != ATTN:
-            continue
         h = heads_for(n, d_head)
         if h <= 0:
             continue
         end = model.NewIntVar(1, max_layers, f"aend_n{n.node_id}")
         model.Add(end == layer_var[n.node_id] + 1)
-        iv = model.NewIntervalVar(
-            layer_var[n.node_id], 1, end, f"aiv_n{n.node_id}"
+        iv = model.NewOptionalIntervalVar(
+            layer_var[n.node_id], 1, end, is_attn[n.node_id], f"aiv_n{n.node_id}"
         )
         attn_intervals.append(iv)
         attn_demands.append(h * d_head)
@@ -537,9 +620,6 @@ def solve(
     for n in gm.schedulable:
         if n in gm.pinned_nodes:
             continue
-        # Cancel happens at cancel_layer (one layer wide). For pinned-style
-        # never-freed nodes, cancel_layer == max_layers so the interval sits
-        # past the makespan and contributes nothing inside [0, makespan).
         c_end = model.NewIntVar(1, max_layers + 1, f"cend_n{n.node_id}")
         model.Add(c_end == cancel_layer[n.node_id] + 1)
         iv = model.NewIntervalVar(
@@ -555,19 +635,20 @@ def solve(
             n_heads_per_layer * d_head,
         )
 
-    # ---- Cumulative: MLP slots ----
+    # ---- MLP slots cumulative ----
+    # For flex nodes, MLP demand is gated by NOT(is_attn).
+    # Chain composites and standalone ReLUs are always MLP-routed.
     mlp_intervals: List = []
     mlp_demands: List[int] = []
     for n in gm.schedulable:
-        if routing(n, gm, policy) != MLP:
-            continue
         s = slots_for(n, gm)
         if s <= 0:
             continue
         end = model.NewIntVar(1, max_layers, f"mend_n{n.node_id}")
         model.Add(end == layer_var[n.node_id] + 1)
-        iv = model.NewIntervalVar(
-            layer_var[n.node_id], 1, end, f"miv_n{n.node_id}"
+        # is_mlp = NOT is_attn
+        iv = model.NewOptionalIntervalVar(
+            layer_var[n.node_id], 1, end, is_attn[n.node_id].Not(), f"miv_n{n.node_id}"
         )
         mlp_intervals.append(iv)
         mlp_demands.append(s)
@@ -582,9 +663,9 @@ def solve(
     if mlp_intervals:
         model.AddCumulative(mlp_intervals, mlp_demands, d_hidden)
 
-    # ---- Cumulative: residual columns ----
-    # Each residual-using node owns len(n) cols from layer[n] to
-    # cancel_layer[n] (half-open in cumulative semantics).
+    # ---- Residual cumulative ----
+    # uses_residual is a static fact (chain.exclusive, etc.), so no
+    # routing dependence here.
     residual_nodes = [n for n in gm.schedulable if uses_residual(n, gm)]
     resid_intervals: List = []
     resid_demands: List[int] = []
@@ -602,18 +683,51 @@ def solve(
     if resid_intervals:
         model.AddCumulative(resid_intervals, resid_demands, available_residual)
 
-    # ---- Total attn heads, for the heads-objective term ----
-    # sum over all attn ops of heads_for(n). Each attn node's heads count is
-    # constant per node, so sum is just sum(heads_for(n)) — but we need a
-    # CP-SAT variable for the objective. (No per-layer aggregation needed
-    # since heads_for is fixed per node.)
-    fixed_heads_total = 0
+    # ---- Aggregate counters for the objective ----
+    # total_attn_heads = sum over attn-routed nodes of heads_for(n).
+    # total_mlp_bypass_slots = sum over (flex && mlp-routed) of 2*d_output.
+    # (Chain composite slots are constant; standalone ReLU slots are constant.
+    # Only the FLEX choice contributes to the objective term.)
+    attn_term: List = []
+    mlp_bypass_term: List = []
+    fixed_attn_heads = 0
     for n in gm.schedulable:
-        if routing(n, gm, policy) == ATTN:
-            fixed_heads_total += heads_for(n, d_head)
+        h = heads_for(n, d_head)
+        if h == 0:
+            continue
+        if flex_routing and is_flex(n, gm):
+            attn_term.append(h * is_attn[n.node_id])
+        else:
+            r = routing(n, gm, policy)
+            if r == ATTN:
+                fixed_attn_heads += h
     total_attn_heads = model.NewIntVar(
-        fixed_heads_total, fixed_heads_total, "total_attn_heads"
+        0, fixed_attn_heads + sum(heads_for(n, d_head) for n in gm.schedulable),
+        "total_attn_heads",
     )
+    if attn_term:
+        model.Add(total_attn_heads == fixed_attn_heads + sum(attn_term))
+    else:
+        model.Add(total_attn_heads == fixed_attn_heads)
+
+    fixed_mlp_bypass = 0
+    for n in gm.schedulable:
+        if not is_flex(n, gm):
+            continue
+        if flex_routing:
+            mlp_bypass_term.append((2 * n.d_output) * is_attn[n.node_id].Not())
+        else:
+            r = routing(n, gm, policy)
+            if r == MLP:
+                fixed_mlp_bypass += 2 * n.d_output
+    total_mlp_bypass = model.NewIntVar(
+        0, fixed_mlp_bypass + sum(2 * n.d_output for n in gm.schedulable if is_flex(n, gm)),
+        "total_mlp_bypass",
+    )
+    if mlp_bypass_term:
+        model.Add(total_mlp_bypass == fixed_mlp_bypass + sum(mlp_bypass_term))
+    else:
+        model.Add(total_mlp_bypass == fixed_mlp_bypass)
 
     # ---- Objective ----
     makespan_layer = model.NewIntVar(0, max_layers, "makespan_layer")
@@ -626,9 +740,13 @@ def solve(
     n_layers_var = model.NewIntVar(0, max_layers + 1, "n_layers")
     model.Add(n_layers_var == makespan_layer + 1)
 
-    if alpha == 0 and beta == 0:
-        raise ValueError("alpha=0 and beta=0 — no objective.")
-    model.Minimize(alpha * n_layers_var + beta * total_attn_heads)
+    if costs.alpha == 0 and costs.beta == 0 and costs.gamma == 0:
+        raise ValueError("alpha=beta=gamma=0 — no objective.")
+    model.Minimize(
+        costs.alpha * n_layers_var
+        + costs.beta * total_attn_heads
+        + costs.gamma * total_mlp_bypass
+    )
 
     # ---- Hint ----
     if hint is not None:
@@ -666,25 +784,37 @@ def solve(
     elapsed = time.perf_counter() - t0
 
     node_to_layer: Dict[int, int] = {}
+    node_to_cancel_layer: Dict[int, int] = {}
+    node_to_routing: Dict[int, str] = {}
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         for n in gm.schedulable:
             node_to_layer[n.node_id] = solver.Value(layer_var[n.node_id])
+            node_to_cancel_layer[n.node_id] = solver.Value(cancel_layer[n.node_id])
+            node_to_routing[n.node_id] = (
+                ATTN if solver.Value(is_attn[n.node_id]) else MLP
+            )
         n_layers = solver.Value(n_layers_var)
         total_heads = solver.Value(total_attn_heads)
+        total_bypass = solver.Value(total_mlp_bypass)
         obj = int(solver.ObjectiveValue())
     else:
         n_layers = -1
         total_heads = -1
+        total_bypass = -1
         obj = -1
 
     return SolveResult(
         status_name=solver.StatusName(status),
         n_layers=n_layers,
         total_attn_heads=total_heads,
+        total_mlp_bypass_slots=total_bypass,
         objective_value=obj,
         wall_time=elapsed,
         solver_log="\n".join(log_buf),
         node_to_layer=node_to_layer,
+        node_to_cancel_layer=node_to_cancel_layer,
+        node_to_routing=node_to_routing,
+        flex_routing=flex_routing,
         is_optimal=status == cp_model.OPTIMAL,
     )
 
@@ -748,8 +878,8 @@ def synthetic_check() -> None:
         d_hidden=64,
         policy=LEGACY_POLICY,
         max_layers=10,
-        alpha=1,
-        beta=0,
+        costs=Costs(alpha=1, beta=0),
+        flex_routing=False,
         time_budget_s=30.0,
         hint=None,
         log_search_progress=False,
@@ -832,7 +962,11 @@ def build_doom_model() -> Tuple[GraphModel, int, int, int]:
     return gm, d_head, d, d_hidden
 
 
-def doom_run(time_budget_s: float, max_layers: int) -> None:
+def doom_run(
+    time_budget_s: float,
+    max_layers: int,
+    pareto_betas: Optional[List[int]] = None,
+) -> None:
     print("=" * 70)
     print("FULL DOOM HEADLESS RUN")
     print("=" * 70)
@@ -861,14 +995,14 @@ def doom_run(time_budget_s: float, max_layers: int) -> None:
         flush=True,
     )
 
-    # Layer-min runs, one per policy mode (the standalone-Linear routing
-    # is what the policy controls).
+    # ---- Static-routing layer-min (one per policy) ----
+    static_results = []
     for policy_name, policy, hint in [
         ("legacy (local=always)", LEGACY_POLICY, legacy_hint),
         ("default (local=never)", SchedulingPolicy(), default_hint),
     ]:
         print()
-        print(f"--- Layer-min CP-SAT, policy={policy_name} ---", flush=True)
+        print(f"--- Layer-min CP-SAT, policy={policy_name} (static routing) ---", flush=True)
         res = solve(
             gm,
             d=d,
@@ -876,11 +1010,11 @@ def doom_run(time_budget_s: float, max_layers: int) -> None:
             d_hidden=d_hidden,
             policy=policy,
             max_layers=max_layers,
-            alpha=1,
-            beta=0,
+            costs=Costs(alpha=1, beta=0),
+            flex_routing=False,
             time_budget_s=time_budget_s,
             hint=hint,
-            log_search_progress=True,
+            log_search_progress=False,
         )
         print(
             f"  status: {res.status_name}, "
@@ -890,6 +1024,68 @@ def doom_run(time_budget_s: float, max_layers: int) -> None:
             flush=True,
         )
         print(f"  vs. heuristic: {hint.n_layers} layers", flush=True)
+        static_results.append((policy_name, res, hint.n_layers))
+
+    # ---- Flex-routing Pareto sweep ----
+    # Default sweep: beta = 0, 1, 10, 100, 1000.
+    # beta=0 -> pure layer-min (CP-SAT picks routing freely);
+    # beta=1000 -> push routing strongly toward MLP.
+    if pareto_betas is None:
+        pareto_betas = [0, 1, 10, 100, 1000]
+
+    print()
+    print("=" * 70)
+    print("FLEX-ROUTING PARETO SWEEP")
+    print("Objective: alpha=1 * n_layers + beta * total_attn_heads")
+    print("=" * 70)
+
+    pareto_results: List[Tuple[int, "SolveResult"]] = []
+    # Use the better of the two static hints for warm-starting flex.
+    flex_hint = legacy_hint if legacy_hint.n_layers <= default_hint.n_layers else default_hint
+    for beta in pareto_betas:
+        print()
+        print(f"--- beta={beta} (flex routing) ---", flush=True)
+        res = solve(
+            gm,
+            d=d,
+            d_head=d_head,
+            d_hidden=d_hidden,
+            policy=LEGACY_POLICY,  # only used for non-flex pinning; ignored when flex_routing=True
+            max_layers=max_layers,
+            costs=Costs(alpha=1, beta=beta),
+            flex_routing=True,
+            time_budget_s=time_budget_s,
+            hint=flex_hint,
+            log_search_progress=False,
+        )
+        print(
+            f"  status: {res.status_name}, "
+            f"n_layers={res.n_layers}, "
+            f"total_attn_heads={res.total_attn_heads}, "
+            f"wall={res.wall_time:.1f}s",
+            flush=True,
+        )
+        pareto_results.append((beta, res))
+
+    # ---- Summary table ----
+    print()
+    print("=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print()
+    print("Static routing (per heuristic policy):")
+    print(f"  {'policy':<24} {'heuristic':>10} {'CP-SAT LB':>10} {'attn heads':>11}")
+    for name, res, h_layers in static_results:
+        print(f"  {name:<24} {h_layers:>10} {res.n_layers:>10} {res.total_attn_heads:>11}")
+    print()
+    print("Flex routing Pareto sweep (CP-SAT picks per-Linear routing):")
+    print(f"  {'beta':>6} {'n_layers':>10} {'attn_heads':>11} {'mlp_bypass_slots':>18}")
+    for beta, res in pareto_results:
+        opt_marker = "" if res.is_optimal else " (FEASIBLE)"
+        print(
+            f"  {beta:>6} {res.n_layers:>10} {res.total_attn_heads:>11} "
+            f"{res.total_mlp_bypass_slots:>18}{opt_marker}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -916,14 +1112,25 @@ def main() -> None:
         default=60,
         help="Search horizon in layers (default 60).",
     )
+    parser.add_argument(
+        "--pareto-betas",
+        type=str,
+        default=None,
+        help="Comma-separated beta values for the Pareto sweep "
+        "(default: 0,1,10,100,1000).",
+    )
     args = parser.parse_args()
 
     if args.synthetic:
         synthetic_check()
         return
 
+    pareto_betas = None
+    if args.pareto_betas:
+        pareto_betas = [int(b) for b in args.pareto_betas.split(",")]
+
     synthetic_check()
-    doom_run(args.time_budget, args.max_layers)
+    doom_run(args.time_budget, args.max_layers, pareto_betas=pareto_betas)
 
 
 if __name__ == "__main__":
