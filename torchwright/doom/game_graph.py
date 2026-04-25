@@ -34,8 +34,13 @@ from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_pos_encoding,
 )
-from torchwright.ops.logic_ops import bool_any_true, equals_vector
-from torchwright.ops.map_select import select
+from torchwright.ops.logic_ops import (
+    bool_all_true,
+    bool_any_true,
+    bool_not,
+    equals_vector,
+)
+from torchwright.ops.map_select import select, switch
 from torchwright.reference_renderer.types import RenderConfig
 
 from torchwright.doom.embedding import (
@@ -628,9 +633,6 @@ def _assemble_output(
     """
     with annotate("output"):
         zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
-        zero_embedding = create_literal_value(
-            torch.zeros(D_EMBED), name="zero_embedding"
-        )
         zero_pixels = create_literal_value(
             torch.zeros(chunk_size * 3),
             name="zero_pixels",
@@ -707,43 +709,54 @@ def _assemble_output(
         type_thinking_wall_0 = create_literal_value(
             embed_lookup("THINKING_WALL_0"), name="out_type_thinking_wall_0"
         )
-        # Phase B Part 2 cascade priority:
-        #   1. SORT_RESULT id       → SORTED's factored VALUE(wall_index)
-        #   2. SORT_RESULT VALUE    → embed("RENDER")
-        #   3. is_thinking_active   → thinking_wall's cascade (markers,
-        #                             thinking identifiers, thinking VALUEs;
-        #                             is_any_identifier / is_thinking_value
-        #                             fire at SORT_RESULT too, so the two
-        #                             SORT_RESULT branches must come first)
-        #   4. SORTED_WALL marker   → embed("SORT_RESULT")
-        #   5. RENDER               → render_out.render_next_type
-        #   6. PLAYER_ANGLE         → embed("THINKING_WALL_0") (hand-off
-        #                             into the thinking phase)
-        #   7. everything else      → don't-care zero embedding
-        out_next_token_embedding = select(
-            token_flags["is_sort_result_id"],
-            sorted_out.sort_result_next_embedding,
-            select(
-                is_sort_result_value,
-                sorted_out.value_next_embedding,
-                select(
-                    thinking_wall_out.is_thinking_active,
-                    thinking_wall_out.next_token_embedding,
-                    select(
-                        token_flags["is_sorted"],
-                        sorted_out.marker_next_embedding,
-                        select(
-                            token_flags["is_render"],
-                            render_out.render_next_type,
-                            select(
-                                token_flags["is_player_angle"],
-                                type_thinking_wall_0,
-                                zero_embedding,
-                            ),
-                        ),
-                    ),
+        # Phase D Part 2: flat switch over six mutually-exclusive
+        # branches.  is_thinking_active overlaps the two SORT_RESULT
+        # branches (is_any_identifier / is_thinking_value fire at
+        # SORT_RESULT too), so we trim it to the disjoint slice.  The
+        # other four conditions (is_sorted, is_render, is_player_angle,
+        # plus the implicit "none of the above → zero default") are
+        # already mutually exclusive.
+        #
+        # Branches:
+        #   SORT_RESULT id    → SORTED's factored VALUE(wall_index)
+        #   SORT_RESULT VALUE → embed("RENDER")
+        #   thinking-active   → thinking_wall's cascade output
+        #     (excluding SORT_RESULT positions)
+        #   SORTED_WALL       → embed("SORT_RESULT")
+        #   RENDER            → render_out.render_next_type
+        #   PLAYER_ANGLE      → embed("THINKING_WALL_0")
+        # Default (no condition true): cond_gates all output zero,
+        # sum is the zero embedding.
+        is_thinking_active_excl_sort_result = bool_all_true(
+            [
+                thinking_wall_out.is_thinking_active,
+                bool_not(
+                    bool_any_true(
+                        [
+                            token_flags["is_sort_result_id"],
+                            is_sort_result_value,
+                        ]
+                    )
                 ),
-            ),
+            ]
+        )
+        out_next_token_embedding = switch(
+            [
+                token_flags["is_sort_result_id"],
+                is_sort_result_value,
+                is_thinking_active_excl_sort_result,
+                token_flags["is_sorted"],
+                token_flags["is_render"],
+                token_flags["is_player_angle"],
+            ],
+            [
+                sorted_out.sort_result_next_embedding,
+                sorted_out.value_next_embedding,
+                thinking_wall_out.next_token_embedding,
+                sorted_out.marker_next_embedding,
+                render_out.render_next_type,
+                type_thinking_wall_0,
+            ],
         )
 
         out_pixels = select(token_flags["is_render"], render_out.pixels, zero_pixels)
