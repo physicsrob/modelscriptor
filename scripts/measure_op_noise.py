@@ -371,12 +371,25 @@ def _distributions() -> Dict[str, InputDistribution]:
         ),
         "log_4decades_001_100": _uniform_1d(
             "log_4decades_001_100",
-            "log(x) over [0.01, 100] — 4 decades, geometric BP grid with "
-            "256 breakpoints (`ratio ≈ 1.0367`). Stresses float32 matmul "
-            "accumulation across the full BP set at the high end of the "
-            "range, where ~all ReLUs are active.",
+            "log(x) over [0.01, 100] — 4 decades. With per-decade "
+            "sectioning (default), each section's pre-cancellation "
+            "magnitude is bounded by `section_factor=10`, so float32 "
+            "ULP noise is ~1.2e-6 per section. The dominant residual "
+            "error comes from the multiply_2d blending grid in routing.",
             0.01,
             100.0,
+        ),
+        "log_6decades_wide": _uniform_1d(
+            "log_6decades_wide",
+            "log(x) over [0.01, 30000] — 6 decades. Stresses the "
+            "sectioning path: a single-section piecewise log over this "
+            "range fails outright (cancellation floor `(x_max/x_min) · "
+            "2⁻²³ ≈ 0.36 absolute, observed worst ~1.0 abs). Sectioning "
+            "drops the floor to ~5e-3 absolute, dominated by "
+            "compare-cancellation noise at large `x` propagating "
+            "through multiply_2d blending.",
+            0.01,
+            30000.0,
         ),
         "exp_pm5": _uniform_1d(
             "exp_pm5",
@@ -634,14 +647,26 @@ def _target_ops() -> List[TargetOp]:
                 nodes["x"], min_value=0.01, max_value=100.0, n_breakpoints=256
             ),
             reference_fn=lambda inputs: torch.log(inputs["x"]),
-            distribution_names=("log_4decades_001_100",),
+            distribution_names=(
+                "log_4decades_001_100",
+                "log_6decades_wide",
+            ),
+            build_graphs_per_distribution={
+                "log_6decades_wide": lambda nodes: log(
+                    nodes["x"],
+                    min_value=0.01,
+                    max_value=30000.0,
+                    n_breakpoints=256,
+                ),
+            },
             notes=(
-                "Natural log via piecewise-linear interpolation with "
-                "geometric breakpoint spacing. Per-cell linear-interp bound "
-                "is `(ratio-1)²/8`, but the empirical end-to-end error is "
-                "dominated by float32 matmul accumulation across ~256 "
-                "active ReLUs at the high end of the range. Pairs with "
-                "`exp` for log-space arithmetic chains."
+                "Natural log via per-section piecewise-linear "
+                "interpolation. The op auto-sections the input range "
+                "geometrically by `section_factor=10` (default decades) "
+                "and routes via thermometer compare + multiply_2d "
+                "blending, so float32 cancellation is bounded by "
+                "section width regardless of overall input range. Pairs "
+                "with `exp` for log-space arithmetic chains."
             ),
         ),
         TargetOp(

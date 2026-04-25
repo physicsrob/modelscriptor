@@ -265,7 +265,7 @@ def abs(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     return relu_add(inp, negate(inp))
 
@@ -300,7 +300,7 @@ def compare(
     .. noise-footer::
 
        Max error: 1.998 abs, 1.998 rel over 8192 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
 
     assert len(inp) == 1, "Input must be a 1D scalar node"
@@ -360,7 +360,7 @@ def min(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     diff = subtract(inp1, inp2)
@@ -384,7 +384,7 @@ def max(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     diff = subtract(inp1, inp2)
@@ -453,7 +453,7 @@ def piecewise_linear(
     .. noise-footer::
 
        Max error: 0.25 abs, 231.1 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
@@ -597,7 +597,7 @@ def piecewise_linear_2d(
     .. noise-footer::
 
        Max error: 7.778 abs, 0.6024 rel over 8192 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -921,7 +921,7 @@ def multiply_2d(
     .. noise-footer::
 
        Max error: 0.0625 abs, 2.15 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -1073,7 +1073,7 @@ def low_rank_2d(
     .. noise-footer::
 
        Max error: 0.0651 abs, 0.3314 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -1201,7 +1201,7 @@ def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) ->
     .. noise-footer::
 
        Max error: 0.25 abs, 231.1 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value > 0, "max_value must be positive"
@@ -1241,7 +1241,7 @@ def square_signed(
     .. noise-footer::
 
        Max error: 0.25 abs, 276.7 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_abs > 0, "max_abs must be positive"
@@ -1293,7 +1293,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = max_value // divisor
@@ -1343,7 +1343,7 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert divisor > 0, "divisor must be positive"
@@ -1459,7 +1459,7 @@ def linear_bin_index(
     .. noise-footer::
 
        Max error: 1 abs, 0.9854 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(x) == 1, "x must be a 1D scalar node"
     assert len(x_min) == 1, "x_min must be a 1D scalar node"
@@ -1556,7 +1556,7 @@ def clamp(inp: Node, lo: float, hi: float) -> Node:
     .. noise-footer::
 
        Max error: 1.907e-06 abs, 0.0002899 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert hi > lo, "hi must exceed lo"
@@ -1602,7 +1602,7 @@ def reciprocal(
     .. noise-footer::
 
        Max error: 0.0009137 abs, 0.1686 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert min_value > 0, "min_value must be positive"
@@ -1619,33 +1619,134 @@ def reciprocal(
     )
 
 
+def _log_single(
+    inp: Node,
+    min_value: float,
+    max_value: float,
+    n_breakpoints: int,
+    d_max: int,
+    name: str = "log_section",
+) -> Node:
+    """Single-section piecewise-linear log over ``[min_value, max_value]``.
+
+    Geometric breakpoint spacing. Used both as the fallback path of
+    :func:`log` (for ranges that fit in one section) and as each
+    section's interior approximation in the sectioned path.
+    """
+    import math as _math
+
+    ratio = (max_value / min_value) ** (1.0 / (n_breakpoints - 1))
+    breakpoints = [min_value * (ratio**k) for k in range(n_breakpoints)]
+    breakpoints[0] = min_value
+    breakpoints[-1] = max_value
+    return piecewise_linear(
+        inp, breakpoints, lambda x: _math.log(x), d_max=d_max, name=name
+    )
+
+
+_LOG_BOUNDARY_SHARPNESS = 10.0
+"""Step-sharpness for :func:`log`'s section-routing compares.
+
+Trade-off here is between **ramp width** (``1/sharpness`` in input
+units, drives the section-overlap requirement) and **compare-output
+cancellation noise** (``sharpness · x_max · 2⁻²³``, since the compare
+realises a 0→1 step as ``ReLU(s·(x-t)) - ReLU(s·(x-t) - 1)`` whose
+two terms grow with ``s·x_max``).
+
+At ``sharpness=10`` and ``x_max≈3·10⁴``, cancellation magnitude is
+``3·10⁵`` so output noise is ``~0.04`` absolute — manageable with
+the widened ``_LOG_COMPARE_ATOL`` below. Higher sharpness narrows
+the ramp but explodes cancellation noise; lower sharpness widens
+the ramp past where multiply_2d blending stays accurate.
+"""
+
+_LOG_COMPARE_ATOL = 0.1
+"""Tolerance on ``_log_compare_01``'s value-range assertion.
+
+Float32 cancellation in ``ReLU(s·(x-t)) - ReLU(s·(x-t) - 1)`` at
+extreme ``x`` can push the output as far as ``±0.07`` outside the
+nominal ``[0, 1]`` range. ``0.1`` gives a safety margin without
+masking real bugs.
+"""
+
+
+def _log_compare_01(inp: Node, thresh: float) -> Node:
+    """0/1 thermometer compare for :func:`log`'s section routing.
+
+    Inline ``linear_relu_linear`` (rather than calling :func:`compare`)
+    so we can attach a widened value-range assertion that accommodates
+    the float32 cancellation noise at extreme ``x``. Same structure
+    as ``compare``: two ReLUs realise a 0→1 ramp of width
+    ``1/_LOG_BOUNDARY_SHARPNESS`` starting at ``thresh``.
+    """
+    s = _LOG_BOUNDARY_SHARPNESS
+    input_proj = torch.tensor([[s], [s]])
+    input_bias = torch.tensor([-s * float(thresh), -s * float(thresh) - 1.0])
+    output_proj = torch.tensor([[1.0], [-1.0]])
+    output_bias = torch.tensor([0.0])
+    result = linear_relu_linear(
+        input_node=inp,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=output_bias,
+        name="log_cmp",
+    )
+    return assert_matches_value_type(
+        result,
+        NodeValueType(value_range=Range(0.0, 1.0)),
+        atol=_LOG_COMPARE_ATOL,
+    )
+
+
 def log(
     inp: Node,
     min_value: float,
     max_value: float,
     n_breakpoints: int = 256,
+    section_factor: float = 10.0,
     d_max: int = 1024,
 ) -> Node:
-    """Natural log of a positive scalar via piecewise-linear interpolation.
+    """Natural log of a positive scalar via per-section piecewise-linear.
 
-    Uses **geometric** breakpoint spacing.  The second derivative of
-    ``log(x)`` is ``-1/x²``, so the linear-interpolation error between
-    two breakpoints ``[x_i, x_{i+1}]`` scales with ``(Δx / x)²``.  Equal
-    spacing in log-space (``x_{i+1} = ratio · x_i``) makes that ratio
-    constant across the whole range, giving roughly uniform absolute
-    error in the log output (equivalently, uniform relative error in the
-    underlying ``x``).
+    The naïve single-section piecewise-linear log accumulates
+    ``slope[0] · x_max ≈ x_max / x_min`` in pre-cancellation magnitude
+    at the right end of its range, hitting a float32 cancellation
+    floor of ``(x_max/x_min) · 2⁻²³``. For ``x_max/x_min > ~10⁴`` this
+    exceeds typical noise budgets — and adding more breakpoints makes
+    it *worse* by lengthening the cancellation chain.
 
-    With ``n_breakpoints = 256`` over a range that spans a factor of
-    100 (``ratio ≈ 1.018``), the worst-case absolute error in the
-    log output is ``(ratio - 1)² / 8 ≈ 4·10⁻⁵``.
+    This implementation sections the input range geometrically by
+    ``section_factor`` (default decades), computes one piecewise-
+    linear log per section in parallel, and routes via thermometer
+    compare plus :func:`multiply_2d` blending. Each section's pre-
+    cancellation magnitude is bounded by its own ``B_{i+1}/B_i =
+    section_factor``, so the per-section precision floor is
+    ``section_factor · 2⁻²³`` — independent of the overall range.
+
+    **Routing detail.** Section ``i``'s piecewise-linear is extended
+    by ``1/_LOG_BOUNDARY_SHARPNESS`` past its right boundary so that
+    when an input lands in the ramp zone of the boundary compare,
+    both adjacent sections compute ``log(x)`` correctly (not clamped).
+    The 0/1 thermometer indicators (telescoping differences) sum to 1
+    by construction, so :func:`multiply_2d` blending gives the linear
+    interpolation between two correct values at boundaries — i.e.,
+    still the correct value.
+
+    For ranges that fit in one section
+    (``x_max/x_min <= section_factor``), falls through to a single
+    :func:`piecewise_linear` with no routing overhead.
 
     Args:
         inp: 1D scalar node with value in ``[min_value, max_value]``.
         min_value: Lower bound on input (must be > 0).
         max_value: Upper bound on input (must exceed ``min_value``).
-        n_breakpoints: Number of breakpoints (default 256).  Must be
-            >= 2.
+        n_breakpoints: Approximate total breakpoint budget. Distributed
+            across sections in the sectioned path; sets BP density in
+            the single-section path. Default 256.
+        section_factor: Geometric width of each section (default 10).
+            Smaller factor means more sections — tighter precision per
+            section, more total neurons.
         d_max: Maximum neurons per MLP sublayer.
 
     Returns:
@@ -1653,8 +1754,8 @@ def log(
 
     .. noise-footer::
 
-       Max error: 0.004812 abs, 0.005311 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       Max error: 0.003026 abs, 0.003721 rel over 8192 samples;
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     import math as _math
 
@@ -1662,14 +1763,101 @@ def log(
     assert min_value > 0, "min_value must be positive"
     assert max_value > min_value, "max_value must exceed min_value"
     assert n_breakpoints >= 2, "need >= 2 breakpoints"
+    assert section_factor > 1.0, "section_factor must be > 1"
 
-    ratio = (max_value / min_value) ** (1.0 / (n_breakpoints - 1))
-    breakpoints = [min_value * (ratio**k) for k in range(n_breakpoints)]
-    breakpoints[0] = min_value
-    breakpoints[-1] = max_value
+    log_ratio = _math.log(max_value / min_value)
+    log_factor = _math.log(section_factor)
+    n_sections = builtins.max(int(_math.ceil(log_ratio / log_factor)), 1)
 
-    return piecewise_linear(
-        inp, breakpoints, lambda x: _math.log(x), d_max=d_max, name="log"
+    if n_sections == 1:
+        return _log_single(
+            inp, min_value, max_value, n_breakpoints, d_max, name="log"
+        )
+
+    # Geometric section endpoints.
+    section_ratio = (max_value / min_value) ** (1.0 / n_sections)
+    endpoints = [min_value * (section_ratio**i) for i in range(n_sections + 1)]
+    endpoints[0] = min_value
+    endpoints[-1] = max_value
+
+    # Per-section breakpoint count: distribute the budget but keep a
+    # floor so each section is well-resolved with many sections.
+    n_bp_per_section = builtins.max(n_breakpoints // n_sections, 16)
+
+    # Section overlap on the right side: extend each section's PWL
+    # past its boundary by the ramp width of the routing compare. At
+    # an input in the ramp zone, both adjacent sections then produce
+    # log(x) correctly rather than the clamped boundary value.
+    ramp_width = 1.0 / _LOG_BOUNDARY_SHARPNESS
+
+    # Parallel section logs. We unwrap each section's value-range
+    # Assert: its declared range (e.g. ``[log(B_i), log(B_{i+1})]``)
+    # is exceeded by ~1e-3 absolute when the PWL is evaluated far
+    # outside its section (float32 cancellation in the slope-delta
+    # sum at large ``x``), but those out-of-section values are routed
+    # to weight≈0 via the indicator gating below. The global value
+    # range is re-asserted on the final sum.
+    section_logs = []
+    for i in range(n_sections):
+        bp_lo = endpoints[i]
+        bp_hi = endpoints[i + 1] + (
+            ramp_width if i < n_sections - 1 else 0.0
+        )
+        sec = _log_single(
+            inp, bp_lo, bp_hi, n_bp_per_section, d_max, name=f"log_sec_{i}"
+        )
+        # piecewise_linear with clamp=True wraps in assert_matches_value_type;
+        # the wrapped node is `sec.inputs[0]`.
+        section_logs.append(sec.inputs[0])
+
+    # Thermometer compares against interior boundaries (0/1 outputs).
+    is_above = [
+        _log_compare_01(inp, endpoints[k + 1])
+        for k in range(n_sections - 1)
+    ]
+
+    # 0/1 indicators via thermometer differences. Sum to 1 by
+    # telescoping (including in ramp zones where adjacent indicators
+    # are non-{0,1} but sum to 1).
+    from torchwright.ops.inout_nodes import create_literal_value
+
+    one_lit = create_literal_value(torch.tensor([1.0]), name="log_one_lit")
+    indicators = []
+    indicators.append(subtract(one_lit, is_above[0]))
+    for i in range(1, n_sections - 1):
+        indicators.append(subtract(is_above[i - 1], is_above[i]))
+    indicators.append(is_above[-1])
+
+    # multiply_2d blending: indicator (∈[0,1]) × section_log. At a
+    # fuzzy boundary, sum = 0.5·log(B) + 0.5·log(B) = log(B).
+    log_min = _math.log(min_value)
+    log_max = _math.log(max_value)
+    max_abs_log = builtins.max(builtins.abs(log_min), builtins.abs(log_max))
+
+    # Indicator nominal range is [0, 1] but noisy in compare-cancellation
+    # zones (extreme x). Widen multiply_2d's first-axis range so the
+    # blending op still sees its inputs as valid.
+    weight_lo = -_LOG_COMPARE_ATOL * 2
+    weight_hi = 1.0 + _LOG_COMPARE_ATOL * 2
+    weighted = []
+    for i in range(n_sections):
+        weighted.append(
+            multiply_2d(
+                indicators[i],
+                section_logs[i],
+                max_abs1=weight_hi,
+                max_abs2=max_abs_log,
+                min1=weight_lo,
+                step1=0.05,
+                step2=0.5,
+                d_max=d_max,
+                name=f"log_sec_blend_{i}",
+            )
+        )
+
+    result = sum_nodes(weighted)
+    return assert_matches_value_type(
+        result, NodeValueType(value_range=Range(log_min, log_max))
     )
 
 
@@ -1708,7 +1896,7 @@ def exp(
     .. noise-footer::
 
        Max error: 0.02797 abs, 0.0001924 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     import math as _math
 
@@ -1767,7 +1955,7 @@ def floor_int(
     .. noise-footer::
 
        Max error: 0.9993 abs, 0.953 rel over 8192 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
@@ -1818,7 +2006,7 @@ def ceil_int(inp: Node, min_value: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     return negate(floor_int(negate(inp), -max_value, -min_value))
@@ -1869,7 +2057,7 @@ def multiply_integers(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
     assert len(inp1) == 1, "Input must be a 1D scalar node"
@@ -1961,7 +2149,7 @@ def signed_multiply(
     .. noise-footer::
 
        Max error: 0.06248 abs, 2.15 rel over 4096 samples;
-       measured at commit 1450cad. See docs/numerical_noise.md.
+       measured at commit 7f76640. See docs/numerical_noise.md.
     """
     assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
     assert len(inp1) == 1, "Input must be a 1D scalar node"

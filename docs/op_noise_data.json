@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "commit": "1450cad",
+  "commit": "7f76640",
   "measured_at": "2026-04-25",
   "ops": [
     {
@@ -309,21 +309,36 @@
     {
       "name": "log",
       "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Natural log via piecewise-linear interpolation with geometric breakpoint spacing. Per-cell linear-interp bound is `(ratio-1)²/8`, but the empirical end-to-end error is dominated by float32 matmul accumulation across ~256 active ReLUs at the high end of the range. Pairs with `exp` for log-space arithmetic chains.",
+      "notes": "Natural log via per-section piecewise-linear interpolation. The op auto-sections the input range geometrically by `section_factor=10` (default decades) and routes via thermometer compare + multiply_2d blending, so float32 cancellation is bounded by section width regardless of overall input range. Pairs with `exp` for log-space arithmetic chains.",
       "distributions": [
         {
           "name": "log_4decades_001_100",
-          "description": "log(x) over [0.01, 100] — 4 decades, geometric BP grid with 256 breakpoints (`ratio ≈ 1.0367`). Stresses float32 matmul accumulation across the full BP set at the high end of the range, where ~all ReLUs are active.",
+          "description": "log(x) over [0.01, 100] — 4 decades. With per-decade sectioning (default), each section's pre-cancellation magnitude is bounded by `section_factor=10`, so float32 ULP noise is ~1.2e-6 per section. The dominant residual error comes from the multiply_2d blending grid in routing.",
           "n_samples": 4096,
-          "max_abs_error": 0.00481176,
-          "mean_abs_error": 0.00064981,
-          "p99_abs_error": 0.0028347,
-          "max_rel_error": 0.00531085,
-          "mean_rel_error": 0.000171651,
-          "p99_rel_error": 0.000677215,
+          "max_abs_error": 0.000247002,
+          "mean_abs_error": 0.000112631,
+          "p99_abs_error": 0.000169402,
+          "max_rel_error": 0.00372105,
+          "mean_rel_error": 4.25736e-05,
+          "p99_rel_error": 0.000264624,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "x": 94.5104
+            "x": 0.0179683
+          }
+        },
+        {
+          "name": "log_6decades_wide",
+          "description": "log(x) over [0.01, 30000] — 6 decades. Stresses the sectioning path: a single-section piecewise log over this range fails outright (cancellation floor `(x_max/x_min) · 2⁻²³ ≈ 0.36 absolute, observed worst ~1.0 abs). Sectioning drops the floor to ~5e-3 absolute, dominated by compare-cancellation noise at large `x` propagating through multiply_2d blending.",
+          "n_samples": 4096,
+          "max_abs_error": 0.00302601,
+          "mean_abs_error": 0.00152333,
+          "p99_abs_error": 0.00279808,
+          "max_rel_error": 0.00114918,
+          "mean_rel_error": 0.000169692,
+          "p99_rel_error": 0.000399339,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 27070.5
           }
         }
       ]
@@ -494,7 +509,7 @@
       "distributions": [
         {
           "name": "doom_diff_trig",
-          "description": "wall-geometry product over DIFF_BP × TRIG_BP — mirrors the `sort_ey_cos`/`sort_ex_sin` family of calls at `torchwright/doom/stages/thinking_wall.py:1115` and neighbours.",
+          "description": "wall-geometry product over DIFF_BP × TRIG_BP — mirrors the `sort_ey_cos`/`sort_ex_sin` family of calls at `torchwright/doom/stages/wall.py:263` and neighbours.",
           "n_samples": 4096,
           "max_abs_error": 7.77784,
           "mean_abs_error": 1.30067,
@@ -510,7 +525,7 @@
         },
         {
           "name": "doom_diff_vel",
-          "description": "collision product over DIFF_BP × VEL_BP — mirrors the `p_dx_ey`/`p_dy_ex` family at `torchwright/doom/stages/thinking_wall.py:1014`.",
+          "description": "collision product over DIFF_BP × VEL_BP — mirrors the `p_dx_ey`/`p_dy_ex` family at `torchwright/doom/stages/wall.py:205`.",
           "n_samples": 4096,
           "max_abs_error": 5.44453,
           "mean_abs_error": 0.93746,
