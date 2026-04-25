@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "commit": "7f76640",
+  "commit": "88de128",
   "measured_at": "2026-04-25",
   "ops": [
     {
@@ -339,6 +339,28 @@
           "rel_valid_samples": 4096,
           "worst_input": {
             "x": 27070.5
+          }
+        }
+      ]
+    },
+    {
+      "name": "log_abs",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Fused `log(clamp(|x|, min_abs, max_abs))` for signed input. Single-piecewise V-shape over signed `x` for `max_abs/min_abs ≤ 10⁴` (1 sublayer); falls back to `abs + sectioned log` for wider ratios (3 sublayers). Pairs with `exp` and Linear addition for log-domain multiplication of a signed by a positive value.",
+      "distributions": [
+        {
+          "name": "log_abs_3decades_pm100",
+          "description": "log_abs(x) for x ∈ [-100, 100] with min_abs=0.1, max_abs=100 (3 decades on |x|). Signed log-uniform |x| samples plus a V-bottom grid concentrated in [-0.2, 0.2] to stress the flat-zone transition at ±min_abs. Single-piecewise path (ratio 1000 < single-piecewise threshold).",
+          "n_samples": 4096,
+          "max_abs_error": 0.000699043,
+          "mean_abs_error": 0.000252403,
+          "p99_abs_error": 0.000462079,
+          "max_rel_error": 0.142801,
+          "mean_rel_error": 0.000631795,
+          "p99_rel_error": 0.00778941,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 87.1548
           }
         }
       ]

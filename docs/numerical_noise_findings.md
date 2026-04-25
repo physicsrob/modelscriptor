@@ -169,6 +169,41 @@ comparisons replacing `_T_COMPARE_SCALE = 100` in
 matching `doom_*` distribution mirroring its production input range,
 and extend the call-site table below.
 
+### `log_abs` fuses `abs + log` into one sublayer for typical ranges
+
+`log_abs(x, min_abs, max_abs)` ≈ `log(clamp(|x|, min_abs, max_abs))` for
+signed `x`. Even-symmetric V-shape with a flat bottom at `log(min_abs)`
+over `[-min_abs, +min_abs]`, clamped to `log(max_abs)` outside
+`[-max_abs, +max_abs]`. Pairs with `exp` and Linear addition for
+log-domain multiplication of a signed by a positive value (e.g.
+`coord · inv_scale` in DOOM coordinate normalization).
+
+The implementation has two paths driven by the input dynamic range:
+
+* `max_abs/min_abs ≤ 10⁴` (typical case, including the default
+  `[0.1, 100]`): single piecewise_linear over signed `x` with V-shape
+  breakpoints. **1 MLP sublayer.** Saves 2 sublayers vs the explicit
+  `abs + sectioned_log` composition.
+* Wider ratios: falls back to `abs(x) → log(...)`. **3 sublayers**, at
+  parity with the explicit composition.
+
+The single-path's float32 floor comes from V-spike contributions at
+`±min_abs` (where the slope-delta encoding has a `1/min_abs`-magnitude
+delta turning the log curve on/off). At extreme `x`, those spikes
+contribute `~max_abs/min_abs` magnitude to the matmul partial sum, with
+ULP-level noise scaling proportionally. The 10⁴ ratio threshold caps
+this floor at ~1.2e-3 absolute, comfortably inside the noise budget.
+
+**Measured (`log_abs_3decades_pm100`, default 256 BPs):**
+
+* `max_abs = 7.0e-4` (under 1e-3 target).
+* `mean_abs = 2.5e-4` (over the 1e-4 soft target, under 5e-4 hard
+  ceiling — interpolation-bound; raise `n_breakpoints` to tighten).
+* `max_rel = 0.14` — expected, samples near `|x| = min_abs` produce
+  outputs near `log(min_abs) = -2.3` so a small absolute drift gives
+  a misleading "relative" number. Same near-output-zero pathology as
+  `square` and `multiply_2d`. Score on absolute error, not relative.
+
 ### Known gap: reciprocal sorted callsite blocked on op-math
 
 `doom_reciprocal_sorted` is defined in `scripts/measure_op_noise.py` but

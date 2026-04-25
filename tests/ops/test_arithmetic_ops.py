@@ -15,6 +15,7 @@ from torchwright.ops.arithmetic_ops import (
     multiply_integers,
     reciprocal,
     log,
+    log_abs,
     exp,
     floor_int,
     ceil_int,
@@ -470,6 +471,227 @@ def test_log_extreme_range_7_decades():
         err = abs(result.item() - expected)
         assert err < 1e-2, (
             f"log({v}) = {expected:.6f}, got {result.item():.6f} (abs_err={err:.2e})"
+        )
+
+
+def _log_abs_ref(x: float, min_abs: float, max_abs: float) -> float:
+    """Math reference: log(clamp(|x|, min_abs, max_abs))."""
+    import math
+
+    return math.log(min(max(abs(x), min_abs), max_abs))
+
+
+def test_log_abs_v_bottom_at_zero():
+    """x = 0 lands in the flat V-bottom: output = log(min_abs)."""
+    import math
+
+    x = create_input("x", 1)
+    f = log_abs(x, min_abs=0.1, max_abs=100.0)
+    result = f.compute(n_pos=1, input_values={"x": torch.tensor([[0.0]])})
+    expected = math.log(0.1)
+    assert abs(result.item() - expected) < 1e-3, (
+        f"log_abs(0) = {expected:.6f}, got {result.item():.6f}"
+    )
+
+
+def test_log_abs_flat_zone():
+    """|x| <= min_abs is flat at log(min_abs)."""
+    import math
+
+    x = create_input("x", 1)
+    min_abs, max_abs = 0.1, 100.0
+    f = log_abs(x, min_abs=min_abs, max_abs=max_abs)
+    expected = math.log(min_abs)
+
+    # Inside the flat zone (|x| < min_abs).
+    for v in [-min_abs / 2, -min_abs / 4, 0.0, min_abs / 4, min_abs / 2]:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        assert abs(result.item() - expected) < 1e-3, (
+            f"log_abs({v}) flat-zone: expected {expected:.6f}, "
+            f"got {result.item():.6f}"
+        )
+
+
+def test_log_abs_at_min_abs_boundary():
+    """At |x| = min_abs (the V-bottom edge), output = log(min_abs)."""
+    import math
+
+    x = create_input("x", 1)
+    min_abs, max_abs = 0.1, 100.0
+    f = log_abs(x, min_abs=min_abs, max_abs=max_abs)
+    expected = math.log(min_abs)
+
+    for v in [-min_abs, min_abs]:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        assert abs(result.item() - expected) < 1e-3, (
+            f"log_abs({v}) boundary: expected {expected:.6f}, "
+            f"got {result.item():.6f}"
+        )
+
+
+def test_log_abs_just_past_flat_zone():
+    """At |x| = 2*min_abs, output ≈ log(2*min_abs) — out of flat zone."""
+    import math
+
+    x = create_input("x", 1)
+    min_abs, max_abs = 0.1, 100.0
+    f = log_abs(x, min_abs=min_abs, max_abs=max_abs)
+    expected = math.log(2 * min_abs)
+
+    for v in [-2 * min_abs, 2 * min_abs]:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        # Tighter tolerance — inside the active log-curve region.
+        assert abs(result.item() - expected) < 1e-3, (
+            f"log_abs({v}) past-flat: expected {expected:.6f}, "
+            f"got {result.item():.6f}"
+        )
+
+
+def test_log_abs_at_max_abs_boundary():
+    """At |x| = max_abs, output = log(max_abs)."""
+    import math
+
+    x = create_input("x", 1)
+    min_abs, max_abs = 0.1, 100.0
+    f = log_abs(x, min_abs=min_abs, max_abs=max_abs)
+    expected = math.log(max_abs)
+
+    for v in [-max_abs, max_abs]:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        assert abs(result.item() - expected) < 1e-3, (
+            f"log_abs({v}) max boundary: expected {expected:.6f}, "
+            f"got {result.item():.6f}"
+        )
+
+
+def test_log_abs_clamps_outside_max():
+    """|x| > max_abs clamps to log(max_abs)."""
+    import math
+
+    x = create_input("x", 1)
+    min_abs, max_abs = 0.1, 100.0
+    f = log_abs(x, min_abs=min_abs, max_abs=max_abs)
+    expected = math.log(max_abs)
+
+    for v in [-2 * max_abs, -1.5 * max_abs, 1.5 * max_abs, 2 * max_abs]:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        assert abs(result.item() - expected) < 1e-3, (
+            f"log_abs({v}) clamp: expected {expected:.6f}, "
+            f"got {result.item():.6f}"
+        )
+
+
+def test_log_abs_symmetry():
+    """log_abs(x) ≈ log_abs(-x) by construction (mirrored breakpoints).
+
+    The breakpoint set and per-vertex values are exactly symmetric
+    around 0, but the matmul accumulates ReLU contributions in a fixed
+    order, so the FP output isn't bit-exact symmetric — left and right
+    arm ReLUs sum into the same accumulator with different cancellation
+    patterns. The residual asymmetry is at the float32 ULP scale of the
+    partial sum (the V-spike contributions reach ~10³ in magnitude, so
+    accumulator ULP is ~10⁻⁴ but mostly correlates between ±x; observed
+    asymmetry is ~10⁻⁵). Well below the 1e-3 absolute precision target.
+    """
+    x = create_input("x", 1)
+    f = log_abs(x, min_abs=0.1, max_abs=100.0)
+
+    for v in [0.05, 0.1, 0.5, 1.0, 7.3, 50.0, 99.0, 150.0]:
+        pos = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        neg = f.compute(n_pos=1, input_values={"x": torch.tensor([[-v]])})
+        assert abs(pos.item() - neg.item()) < 5e-4, (
+            f"log_abs({v}) = {pos.item():.7f} vs log_abs(-{v}) = "
+            f"{neg.item():.7f} (asymmetry {abs(pos.item() - neg.item()):.2e})"
+        )
+
+
+def test_log_abs_precision_signed_distribution():
+    """Worst-case error across signed log-uniform |x| distribution.
+
+    Mirrors the spec's measurement protocol: |x| log-uniform on
+    [min_abs, max_abs], sign uniform ±, plus structured grid points
+    near 0 and near ±min_abs to stress the V-bottom transition.
+    Targets:
+      - max abs error < 1e-3 (soft) / < 5e-3 (hard ceiling)
+      - mean abs error < 1e-4 (soft) / < 5e-4 (hard ceiling)
+    """
+    import math
+
+    x = create_input("x", 1)
+    min_abs, max_abs = 0.1, 100.0
+    f = log_abs(x, min_abs=min_abs, max_abs=max_abs)
+
+    gen = torch.Generator().manual_seed(0)
+    n_random = 1024
+    # Log-uniform |x| in [min_abs, max_abs].
+    log_lo = math.log(min_abs)
+    log_hi = math.log(max_abs)
+    u = torch.rand(n_random, generator=gen)
+    abs_x = torch.exp(log_lo + u * (log_hi - log_lo))
+    signs = (
+        torch.randint(0, 2, (n_random,), generator=gen).to(torch.float32) * 2.0
+        - 1.0
+    )
+    random_xs = (signs * abs_x).tolist()
+
+    # Structured grid concentrating near the V-bottom.
+    structured = [0.0]
+    for v in [
+        min_abs * 0.1,
+        min_abs * 0.5,
+        min_abs * 0.9,
+        min_abs,
+        min_abs * 1.1,
+        min_abs * 1.5,
+        min_abs * 2.0,
+    ]:
+        structured.extend([-v, v])
+    structured.extend([-max_abs, max_abs, -max_abs * 0.5, max_abs * 0.5])
+
+    test_xs = random_xs + structured
+
+    abs_errs = []
+    worst = 0.0
+    worst_v = None
+    for v in test_xs:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        expected = _log_abs_ref(v, min_abs, max_abs)
+        err = abs(result.item() - expected)
+        abs_errs.append(err)
+        if err > worst:
+            worst = err
+            worst_v = v
+
+    mean_err = sum(abs_errs) / len(abs_errs)
+    # Hard-ceiling assertions — fail loud if precision regresses.
+    assert worst < 5e-3, (
+        f"max abs error {worst:.2e} (worst at x={worst_v}) exceeds 5e-3"
+    )
+    assert mean_err < 5e-4, f"mean abs error {mean_err:.2e} exceeds 5e-4"
+
+
+def test_log_abs_wide_range_fallback():
+    """For ratios > 10⁴, log_abs falls back to abs+sectioned-log.
+
+    Verifies the fallback path produces correct values across the wider
+    range. Precision target: 1e-2 absolute (looser than the single path,
+    matching the sectioned log floor at 6+ decades).
+    """
+    import math
+
+    x = create_input("x", 1)
+    # Triggers the wide-range fallback (ratio = 6e6 > 10⁴).
+    min_abs, max_abs = 0.005, 30000.0
+    f = log_abs(x, min_abs=min_abs, max_abs=max_abs)
+
+    test_values = [-29000.0, -100.0, -1.0, -0.01, 0.0, 0.01, 1.0, 100.0, 29000.0]
+    for v in test_values:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        expected = _log_abs_ref(v, min_abs, max_abs)
+        err = abs(result.item() - expected)
+        assert err < 1e-2, (
+            f"log_abs({v}) wide: expected {expected:.6f}, "
+            f"got {result.item():.6f} (abs_err={err:.2e})"
         )
 
 
