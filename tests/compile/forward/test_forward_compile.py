@@ -32,8 +32,17 @@ D = 256
 D_HEAD = 16
 
 
-def _verify(output_node, n_pos, input_values, pos_encoding=None, max_layers=100):
-    """Compile and verify output matches node.compute()."""
+def _verify(
+    output_node, n_pos, input_values, pos_encoding=None, max_layers=100,
+    use_cpsat=True,
+):
+    """Compile and verify output matches node.compute().
+
+    ``use_cpsat`` defaults to True (the production default).  Tests that
+    exercise graph patterns the CP-SAT model treats as preconditions
+    (e.g., ``Concatenate``-input ``Add`` nodes — see
+    ``docs/cpsat_scheduler.md`` §3) opt out with ``use_cpsat=False``.
+    """
     net = forward_compile(
         d=D,
         d_head=D_HEAD,
@@ -41,6 +50,7 @@ def _verify(output_node, n_pos, input_values, pos_encoding=None, max_layers=100)
         pos_encoding=pos_encoding,
         verbose=False,
         max_layers=max_layers,
+        use_cpsat=use_cpsat,
     )
     assert net.residual_assignment is not None
 
@@ -317,14 +327,19 @@ def test_compile_relu_add():
 
 
 def test_compile_multiple_concats():
-    """Shared constants across multiple concat -> add paths."""
+    """Shared constants across multiple concat -> add paths.
+
+    The graph has ``Concatenate``-input ``Add`` nodes — a CP-SAT model
+    precondition (``docs/cpsat_scheduler.md`` §3 Model preconditions),
+    so this test pins the heuristic scheduler.
+    """
     c1 = create_literal_value(torch.tensor([1.0]))
     c2 = create_literal_value(torch.tensor([1.0]))
     c3 = create_literal_value(torch.tensor([1.0]))
     add1 = add(concat([c1, c2]), create_literal_value(torch.tensor([2.0, 2.0])))
     add2 = add(concat([c1, c3]), create_literal_value(torch.tensor([2.0, 2.0])))
     out = add(add1, add2)
-    _verify(out, n_pos=1, input_values={})
+    _verify(out, n_pos=1, input_values={}, use_cpsat=False)
 
 
 def test_compile_switch():

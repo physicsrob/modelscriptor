@@ -52,6 +52,7 @@ def test_admission_completes_on_sibling_graph():
         verbose=False,
         device=None,
         admission_control=True,
+        use_cpsat=False,
     )
     assert len(gated.layers) > 0
 
@@ -69,6 +70,7 @@ def test_admission_preserves_correctness_simple():
         verbose=False,
         device=None,
         admission_control=True,
+        use_cpsat=False,
     )
 
     # Forward computation should pass inputs through unchanged.
@@ -119,6 +121,7 @@ def test_admission_on_narrow_graph_is_noop():
         verbose=False,
         device=None,
         admission_control=True,
+        use_cpsat=False,
     )
     assert len(gated.layers) == len(baseline.layers)
 
@@ -158,6 +161,7 @@ def test_correctness_on_sibling_chain_graph():
         admission_control=True,
         admission_min_chains=3,
         admission_min_peak_width=16,
+        use_cpsat=False,
     )
 
     # Both compilations should produce the same output for the same

@@ -13,9 +13,16 @@ import torch
 
 from torchwright.compiler.device import get_device
 from torchwright.compiler.residual_assignment import ResidualAssignment
+from torchwright.compiler.forward.cpsat_scheduler import (
+    Costs,
+    solve_schedule,
+)
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
-from torchwright.compiler.forward.scheduler import LayerScheduler
+from torchwright.compiler.forward.scheduler import (
+    DirectedLayerScheduler,
+    LayerScheduler,
+)
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.forward.sibling_clusters import (
     SiblingClusterAnalyzer,
@@ -226,6 +233,11 @@ def forward_compile(
     admission_min_chains: int = 4,
     admission_min_peak_width: int = 32,
     policy: Optional[SchedulingPolicy] = None,
+    use_cpsat: bool = True,
+    cpsat_costs: Costs = Costs(),
+    cpsat_flex_routing: bool = True,
+    cpsat_time_budget_s: float = 60.0,
+    cpsat_allow_suboptimal: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -254,6 +266,24 @@ def forward_compile(
             transfers each output's value to the specified target columns
             via delta: target += (output - target). This enables overlaid
             I/O where output replaces input in-place.
+        use_cpsat: When True (default), run the CP-SAT solver in
+            ``cpsat_scheduler.py`` to produce an optimal placement and
+            replay it via :class:`DirectedLayerScheduler`.  When False,
+            use the heuristic :class:`LayerScheduler` directly.  See
+            ``docs/cpsat_scheduler.md`` for the architecture.
+        cpsat_costs: Objective weights for CP-SAT.  Defaults to
+            ``Costs()`` (alpha=1, beta=0, gamma=0 — pure layer
+            minimization).  Ignored when ``use_cpsat=False``.
+        cpsat_flex_routing: When True (default), CP-SAT picks
+            attention vs MLP-bypass for each standalone ``Linear``.
+            When False, ``policy.local_in_attention`` pins routing.
+            Ignored when ``use_cpsat=False``.
+        cpsat_time_budget_s: Per-solve wall-clock cap for CP-SAT.
+            Ignored when ``use_cpsat=False``.
+        cpsat_allow_suboptimal: When False (default), raise if CP-SAT
+            cannot prove optimality within the budget.  When True,
+            accept a feasible-but-not-proven-optimal schedule.
+            Ignored when ``use_cpsat=False``.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -356,17 +386,68 @@ def forward_compile(
         if cols_to_reserve:
             residual_map.reserve(cols_to_reserve)
 
-    scheduler = LayerScheduler(
-        graph,
-        d,
-        d_head,
-        pos_encoding,
-        d_hidden=d_hidden,
-        clusters=clusters,
-        admission_budget_fraction=admission_budget_fraction,
-        policy=policy,
-        pinned_nodes=overlay_pinned_inputs,
-    )
+    if use_cpsat:
+        # Architecture doc §3 marks admission_control as a model
+        # precondition; the CP-SAT cumulative does not represent the
+        # sibling-cluster admission constraint, so a solver-feasible
+        # schedule may not be replayable.  Surface this explicitly
+        # rather than producing a corrupted compile.
+        if admission_control:
+            raise RuntimeError(
+                "use_cpsat=True is incompatible with admission_control=True "
+                "(see docs/cpsat_scheduler.md §3 Model preconditions).  "
+                "Pass use_cpsat=False to keep admission control."
+            )
+        if verbose:
+            print(
+                f"  CP-SAT solver: costs={cpsat_costs}, "
+                f"flex_routing={cpsat_flex_routing}, "
+                f"time_budget_s={cpsat_time_budget_s}"
+            )
+        t_solve_start = time.perf_counter()
+        assignment = solve_schedule(
+            output_node,
+            pos_encoding,
+            d=d,
+            d_head=d_head,
+            d_hidden=d_hidden,
+            costs=cpsat_costs,
+            flex_routing=cpsat_flex_routing,
+            time_budget_s=cpsat_time_budget_s,
+            max_layers=max_layers,
+            allow_suboptimal=cpsat_allow_suboptimal,
+            policy=policy,
+        )
+        if verbose:
+            solve_time = time.perf_counter() - t_solve_start
+            print(
+                f"  CP-SAT solved in {solve_time:.2f}s: "
+                f"n_layers={assignment.n_layers}"
+            )
+        scheduler = DirectedLayerScheduler(
+            graph,
+            d,
+            d_head,
+            pos_encoding,
+            assignment=assignment,
+            d_hidden=d_hidden,
+            clusters=clusters,
+            admission_budget_fraction=admission_budget_fraction,
+            policy=policy,
+            pinned_nodes=overlay_pinned_inputs,
+        )
+    else:
+        scheduler = LayerScheduler(
+            graph,
+            d,
+            d_head,
+            pos_encoding,
+            d_hidden=d_hidden,
+            clusters=clusters,
+            admission_budget_fraction=admission_budget_fraction,
+            policy=policy,
+            pinned_nodes=overlay_pinned_inputs,
+        )
 
     # Save input indices before scheduling (scheduling may free/reassign them)
     input_indices: dict[Node, list[int]] = {
@@ -419,6 +500,8 @@ def forward_compile(
 
         t_layer_start = time.perf_counter()
         layer = net.add_layer(append=True)
+        if use_cpsat:
+            scheduler.set_current_layer(i)
         t_schedule_start = time.perf_counter()
         attn_ops, mlp_ops, biased_linears = scheduler.schedule_layer(
             residual_map, computed
