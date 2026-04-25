@@ -28,18 +28,30 @@ app = modal.App("torchwright-test", image=IMAGE)
 _HEAVY_FILES = [
     "tests/doom/test_rollout.py",
     "tests/doom/test_frame_match.py",
+    "tests/doom/test_affine_bounds.py",
 ]
 
-_MEDIUM_FILES = [
-    "tests/debug/test_probe.py",
-    "tests/doom/test_parametric_intersection.py",
-    "tests/doom/test_render_graph_precision.py",
+# Each inner list becomes one container.  Splitting medium files across
+# multiple groups keeps any single shard from dominating wall time.
+_MEDIUM_FILE_GROUPS: list[list[str]] = [
+    [
+        "tests/debug/test_probe.py",
+        "tests/doom/test_parametric_intersection.py",
+        "tests/doom/test_render_graph_precision.py",
+    ],
+    [
+        "tests/doom/test_wad_maps.py",
+        "tests/compile/forward/test_sort_digits.py",
+        "tests/ops/test_resampling_primitives.py",
+    ],
 ]
+
+_ALL_NAMED_FILES = _HEAVY_FILES + [f for g in _MEDIUM_FILE_GROUPS for f in g]
 
 SHARDS = [
     *_HEAVY_FILES,
-    " ".join(_MEDIUM_FILES),
-    "tests " + " ".join(f"--ignore={f}" for f in _HEAVY_FILES + _MEDIUM_FILES),
+    *(" ".join(group) for group in _MEDIUM_FILE_GROUPS),
+    "tests " + " ".join(f"--ignore={f}" for f in _ALL_NAMED_FILES),
 ]
 
 

@@ -360,15 +360,22 @@ def _run_reference_eval(doom_graph, px, py, angle):
     return cache
 
 
-@pytest.fixture(scope="module")
-def doom_graph_eval(doom_graph):
-    """Single-pose eval for backward compatibility with non-parameterized tests."""
-    cache = _run_reference_eval(doom_graph, px=0.0, py=0.0, angle=45.0)
-    return {
-        "all_nodes": doom_graph["all_nodes"],
-        "cache": cache,
-        "tainted": doom_graph["tainted"],
-    }
+@pytest.fixture(
+    scope="module",
+    params=_CANONICAL_POSES,
+    ids=lambda p: f"{p[0]}-{p[1]}-{p[2]}",
+)
+def pose_eval(doom_graph, request):
+    """Run reference_eval once per pose; share the cache across tests.
+
+    Three tests (test_all_nodes_within_bounds, test_bound_coverage,
+    test_gate_coverage) each iterate over the same 7 canonical poses.
+    Without sharing, that's 21 reference_eval calls on the full graph.
+    Module-scoped parametrization collapses it to 7.
+    """
+    px, py, angle = request.param
+    cache = _run_reference_eval(doom_graph, px, py, angle)
+    return {"px": px, "py": py, "angle": angle, "cache": cache}
 
 
 # ---------------------------------------------------------------------------
@@ -423,9 +430,9 @@ class TestAffineBoundSoundness:
     Nodes tainted by known input-range mismatches are excluded.
     """
 
-    @pytest.mark.parametrize("px,py,angle", _CANONICAL_POSES)
-    def test_all_nodes_within_bounds(self, doom_graph, px, py, angle):
-        cache = _run_reference_eval(doom_graph, px, py, angle)
+    def test_all_nodes_within_bounds(self, doom_graph, pose_eval):
+        cache = pose_eval["cache"]
+        px, py, angle = pose_eval["px"], pose_eval["py"], pose_eval["angle"]
         checked, violations = _check_soundness(
             doom_graph["all_nodes"], cache, doom_graph["tainted"]
         )
@@ -497,10 +504,10 @@ class TestAffineBoundTightness:
             wide_nodes[:30]
         )
 
-    @pytest.mark.parametrize("px,py,angle", _CANONICAL_POSES)
-    def test_bound_coverage(self, doom_graph, px, py, angle):
+    def test_bound_coverage(self, doom_graph, pose_eval):
         """Affine bounds should not be wildly wider than observed values."""
-        cache = _run_reference_eval(doom_graph, px, py, angle)
+        cache = pose_eval["cache"]
+        px, py, angle = pose_eval["px"], pose_eval["py"], pose_eval["angle"]
         all_nodes = doom_graph["all_nodes"]
         tainted = doom_graph["tainted"]
 
@@ -537,12 +544,12 @@ class TestAffineBoundTightness:
             f"{MAX_P90}x at pose ({px}, {py}, {angle})"
         )
 
-    @pytest.mark.parametrize("px,py,angle", _CANONICAL_POSES)
-    def test_gate_coverage(self, doom_graph, px, py, angle):
+    def test_gate_coverage(self, doom_graph, pose_eval):
         """Gate M values should not be wildly larger than needed."""
         from torchwright.graph.linear import Linear
 
-        cache = _run_reference_eval(doom_graph, px, py, angle)
+        cache = pose_eval["cache"]
+        px, py, angle = pose_eval["px"], pose_eval["py"], pose_eval["angle"]
         all_nodes = doom_graph["all_nodes"]
 
         MIN_OBSERVED_ABS = 0.01
