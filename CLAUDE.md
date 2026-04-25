@@ -201,7 +201,9 @@ file its own GPU so compilations run in parallel.
 
 - `_HEAVY_FILES` — test files with large `compile_game()` calls get their
   own container.
-- `_MEDIUM_FILES` — other GPU test files grouped into one container.
+- `_MEDIUM_FILE_GROUPS` — list of file lists; each inner list shares one
+  container.  Multiple medium groups keep no single shard from
+  dominating wall time.
 - Everything else goes into a catch-all shard automatically.
 
 **When you add new tests:**
@@ -209,7 +211,8 @@ file its own GPU so compilations run in parallel.
 - New test files anywhere under `tests/` are picked up by the catch-all
   shard automatically.  No config changes needed.
 - If a new file calls `compile_game(d=2048)` and is slow enough to warrant
-  its own container, add it to `_HEAVY_FILES` or `_MEDIUM_FILES`.
+  its own container, add it to `_HEAVY_FILES` or one of the
+  `_MEDIUM_FILE_GROUPS`.
 
 **When using `FILE=`**, sharding is bypassed — the file runs in a single
 container.  `-k` filters passed via `ARGS=` are applied to every shard.
