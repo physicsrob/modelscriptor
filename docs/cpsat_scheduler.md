@@ -225,25 +225,39 @@ the op consumes if scheduled in the attention sublayer:
 `⌈d_output/d_head⌉` for `Add` (the optimistic free-add cost — see
 *Model preconditions* below).
 
-**Attention budget — heads plus cancel columns combined.** Capacity
-`n_heads_per_layer · d_head` per layer.
+**Attention budget — heads plus cancel columns plus dirty-allocation
+columns, all combined.** Capacity `n_heads_per_layer · d_head` per
+layer.
 
 - For each node `n` with attention cost `heads_for(n) > 0`: an
   optional unit-width interval at `layer_var[n]` gated by
   `is_attn[n]`. Demand `heads_for(n) · d_head` (the column footprint
   of those heads).
-- For each non-pinned schedulable node `n`: a unit-width cancel
-  interval at `cancel_layer[n]`. Demand `len(n)` columns.
+- For each non-pinned residual-using schedulable node `n`: a
+  unit-width DEATH-layer cancel interval at `cancel_layer[n]`,
+  demand `len(n)` columns.
+- For each non-pinned residual-using schedulable node `n`: a
+  unit-width BIRTH-layer dirty interval at `layer_var[n]`, demand
+  `len(n)` columns. The heuristic combines DEATH-layer dead-node
+  cancels and BIRTH-layer dirty-allocation cancels into one batched
+  `AttnHeadOp("cancel", ...)` per layer, so they share the
+  attention head budget.
 
-The combined-column form `H_a · d_head + cancel_cols ≤ n_heads ·
-d_head` is mathematically equivalent to the heuristic's per-layer
-`H_a + ⌈cancel_cols/d_head⌉ ≤ n_heads`. Both `H_a` and `n_heads` are
-non-negative integers, and `d_head > 0`. Forward: from `H_a · d_head +
-cancel_cols ≤ n_heads · d_head`, divide by `d_head` and use the fact
-that `(n_heads − H_a)` is an integer to conclude
-`⌈cancel_cols/d_head⌉ ≤ n_heads − H_a`. Reverse: from
-`H_a + ⌈cancel_cols/d_head⌉ ≤ n_heads`, multiply by `d_head` and use
-`cancel_cols ≤ ⌈cancel_cols/d_head⌉ · d_head`.
+The combined-column form `H_a · d_head + cancel_cols + dirty_cols
+≤ n_heads · d_head` is mathematically equivalent to the heuristic's
+per-layer `H_a + ⌈(cancel_cols + dirty_cols)/d_head⌉ ≤ n_heads`. Both
+`H_a` and `n_heads` are non-negative integers, and `d_head > 0`.
+Forward: from `H_a · d_head + (cancel_cols + dirty_cols) ≤ n_heads
+· d_head`, divide by `d_head` and use the fact that
+`(n_heads − H_a)` is an integer to conclude
+`⌈(cancel_cols + dirty_cols)/d_head⌉ ≤ n_heads − H_a`. Reverse: from
+`H_a + ⌈(cancel_cols + dirty_cols)/d_head⌉ ≤ n_heads`, multiply by
+`d_head` and use `cancel_cols + dirty_cols ≤
+⌈(cancel_cols + dirty_cols)/d_head⌉ · d_head`.
+
+The DEATH and BIRTH terms only run for residual-using nodes —
+chain-internal exclusive `L1` and chain-internal `ReLU` live in MLP
+hidden slots, not residual, so they have no columns to cancel.
 
 **MLP slot budget.** Capacity `d_hidden` per layer.
 

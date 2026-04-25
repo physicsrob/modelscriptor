@@ -445,6 +445,7 @@ def solve_schedule(
     allow_suboptimal: bool = False,
     hint_layers: Optional[Dict[int, int]] = None,
     policy: Optional[SchedulingPolicy] = None,
+    reserve_heads: int = 0,
 ) -> ScheduleAssignment:
     """Build and solve the CP-SAT scheduling model.
 
@@ -470,6 +471,11 @@ def solve_schedule(
         hint_layers: optional warm-start mapping `node_id -> layer`.
         policy: only consulted when `flex_routing=False`. Defaults to
             `LEGACY_POLICY`.
+        reserve_heads: per-layer attention-head budget reserved
+            beyond the modeled compute + cancel + dirty terms.
+            Defaults to 0 since the dirty-column cumulative covers the
+            BIRTH-layer cancel cost.  Raise it for graphs whose
+            attention heads are saturated by ops outside the model.
 
     Raises `RuntimeError` on `INFEASIBLE`, time-out without a feasible
     solution, or `FEASIBLE` when `allow_suboptimal=False`. Raises also
@@ -490,6 +496,7 @@ def solve_schedule(
         hint_layers=hint_layers,
         policy=policy,
         log_search_progress=False,
+        reserve_heads=reserve_heads,
     )
     if assignment is None:
         raise RuntimeError(
@@ -520,6 +527,7 @@ def _solve_full(
     hint_layers: Optional[Dict[int, int]] = None,
     policy: Optional[SchedulingPolicy] = None,
     log_search_progress: bool = False,
+    reserve_heads: int = 0,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Internal solve that returns both the assignment and the solver stats.
 
@@ -668,8 +676,17 @@ def _solve_full(
 
     cancel_intervals: List = []
     cancel_demands: List[int] = []
+    dirty_intervals: List = []
+    dirty_demands: List[int] = []
     for n in gm.schedulable:
         if n in gm.pinned_nodes:
+            continue
+        if not uses_residual(n, gm):
+            # Chain-internal exclusive L1 and chain-internal ReLU live
+            # in MLP hidden slots, never in the residual stream — no
+            # columns to cancel.  Skipping prevents the cumulative from
+            # over-counting on graphs with wide chain hidden widths
+            # (e.g. d_hidden_chain > n_heads_per_layer * d_head).
             continue
         c_end = model.NewIntVar(1, max_layers + 1, f"cend_n{n.node_id}")
         model.Add(c_end == cancel_layer[n.node_id] + 1)
@@ -679,11 +696,33 @@ def _solve_full(
         cancel_intervals.append(iv)
         cancel_demands.append(len(n))
 
-    if attn_intervals or cancel_intervals:
+        # Birth-layer dirty-column cancel: when n is allocated at
+        # `layer_var[n]`, its `len(n)` columns are dirty until the
+        # heuristic batches them into the layer's cancel op.  The
+        # heuristic combines DEATH-layer cancels and BIRTH-layer dirty
+        # cancels into one batched ``AttnHeadOp("cancel", ...)`` per
+        # layer, so they share the attention head budget.  The
+        # ``cancel_intervals`` cumulative term above only models the
+        # DEATH layer; this term adds the BIRTH layer.
+        d_end = model.NewIntVar(1, max_layers, f"dend_n{n.node_id}")
+        model.Add(d_end == layer_var[n.node_id] + 1)
+        d_iv = model.NewIntervalVar(
+            layer_var[n.node_id], 1, d_end, f"div_n{n.node_id}"
+        )
+        dirty_intervals.append(d_iv)
+        dirty_demands.append(len(n))
+
+    # Reserve attention-head capacity beyond the modeled BIRTH+DEATH
+    # cancel costs.  Defaults to 0 since the dirty-interval term above
+    # already accounts for the BIRTH layer; raise it to add a safety
+    # margin for graphs whose attention heads are saturated by ops
+    # outside the model (e.g. bias writes folded into deferred Linears).
+    effective_capacity = max(0, n_heads_per_layer - reserve_heads) * d_head
+    if attn_intervals or cancel_intervals or dirty_intervals:
         model.AddCumulative(
-            attn_intervals + cancel_intervals,
-            attn_demands + cancel_demands,
-            n_heads_per_layer * d_head,
+            attn_intervals + cancel_intervals + dirty_intervals,
+            attn_demands + cancel_demands + dirty_demands,
+            effective_capacity,
         )
 
     # ---- MLP slots cumulative ----
