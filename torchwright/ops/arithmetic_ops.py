@@ -265,7 +265,7 @@ def abs(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     return relu_add(inp, negate(inp))
 
@@ -300,7 +300,7 @@ def compare(
     .. noise-footer::
 
        Max error: 1.998 abs, 1.998 rel over 8192 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
 
     assert len(inp) == 1, "Input must be a 1D scalar node"
@@ -360,7 +360,7 @@ def min(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     diff = subtract(inp1, inp2)
@@ -384,7 +384,7 @@ def max(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     diff = subtract(inp1, inp2)
@@ -453,7 +453,7 @@ def piecewise_linear(
     .. noise-footer::
 
        Max error: 0.25 abs, 231.1 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
@@ -597,7 +597,7 @@ def piecewise_linear_2d(
     .. noise-footer::
 
        Max error: 7.778 abs, 0.6024 rel over 8192 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -921,7 +921,7 @@ def multiply_2d(
     .. noise-footer::
 
        Max error: 0.0625 abs, 2.15 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -1073,7 +1073,7 @@ def low_rank_2d(
     .. noise-footer::
 
        Max error: 0.0651 abs, 0.3314 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -1201,7 +1201,7 @@ def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) ->
     .. noise-footer::
 
        Max error: 0.25 abs, 231.1 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value > 0, "max_value must be positive"
@@ -1241,7 +1241,7 @@ def square_signed(
     .. noise-footer::
 
        Max error: 0.25 abs, 276.7 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_abs > 0, "max_abs must be positive"
@@ -1293,7 +1293,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = max_value // divisor
@@ -1343,7 +1343,7 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert divisor > 0, "divisor must be positive"
@@ -1459,7 +1459,7 @@ def linear_bin_index(
     .. noise-footer::
 
        Max error: 1 abs, 0.9854 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(x) == 1, "x must be a 1D scalar node"
     assert len(x_min) == 1, "x_min must be a 1D scalar node"
@@ -1556,7 +1556,7 @@ def clamp(inp: Node, lo: float, hi: float) -> Node:
     .. noise-footer::
 
        Max error: 1.907e-06 abs, 0.0002899 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert hi > lo, "hi must exceed lo"
@@ -1602,7 +1602,7 @@ def reciprocal(
     .. noise-footer::
 
        Max error: 0.0009137 abs, 0.1686 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert min_value > 0, "min_value must be positive"
@@ -1755,7 +1755,7 @@ def log(
     .. noise-footer::
 
        Max error: 0.003026 abs, 0.003721 rel over 8192 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     import math as _math
 
@@ -1896,7 +1896,7 @@ def exp(
     .. noise-footer::
 
        Max error: 0.02797 abs, 0.0001924 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     import math as _math
 
@@ -1910,6 +1910,133 @@ def exp(
 
     return piecewise_linear(
         inp, breakpoints, lambda x: _math.exp(x), d_max=d_max, name="exp"
+    )
+
+
+_LOG_ABS_SINGLE_RATIO_THRESHOLD = 1e4
+"""Above this ``max_abs/min_abs`` ratio, single-piecewise :func:`log_abs`'s
+float32 cancellation floor exceeds ~1.2e-3 absolute. Use the abs+sectioned
+log fallback above this threshold (3 sublayers but precision bounded by
+section width)."""
+
+
+def _log_abs_single(
+    inp: Node,
+    min_abs: float,
+    max_abs: float,
+    n_breakpoints: int,
+    d_max: int,
+) -> Node:
+    """Single-sublayer V-shape ``log|·|`` via :func:`piecewise_linear` over
+    signed ``x``.
+
+    Breakpoints are placed at ``[-max_abs, ..., -min_abs, min_abs, ...,
+    max_abs]`` with geometric spacing on each arm. The flat V-bottom is
+    represented implicitly: between the consecutive breakpoints
+    ``-min_abs`` and ``+min_abs`` (no BP between), :func:`piecewise_linear`
+    interpolates linearly — and both endpoints have value ``log(min_abs)``,
+    so the interpolation is constant. Outside ``±max_abs``, :func:`piecewise_linear`'s
+    default ``clamp=True`` holds the value at ``log(max_abs)``.
+    """
+    import math as _math
+
+    n_arm = builtins.max(n_breakpoints // 2, 8)
+
+    # Right arm: geometric BPs from min_abs to max_abs.
+    ratio = (max_abs / min_abs) ** (1.0 / (n_arm - 1))
+    right_arm = [min_abs * (ratio**k) for k in range(n_arm)]
+    right_arm[0] = min_abs
+    right_arm[-1] = max_abs
+
+    # Left arm: mirror around 0 (so breakpoints stay strictly ascending
+    # when concatenated).
+    left_arm = [-v for v in reversed(right_arm)]
+
+    breakpoints = left_arm + right_arm  # length 2 * n_arm
+
+    def _fn(v: float) -> float:
+        a = _builtin_abs(v)
+        clamped = builtins.max(min_abs, builtins.min(max_abs, a))
+        return _math.log(clamped)
+
+    return piecewise_linear(
+        inp, breakpoints, _fn, d_max=d_max, name="log_abs"
+    )
+
+
+def log_abs(
+    inp: Node,
+    min_abs: float = 0.1,
+    max_abs: float = 100.0,
+    n_breakpoints: int = 256,
+    section_factor: float = 10.0,
+    d_max: int = 1024,
+) -> Node:
+    """``log(clamp(|x|, min_abs, max_abs))`` for signed ``x``.
+
+    Even-symmetric, V-shaped with a flat bottom at ``log(min_abs)`` over
+    ``[-min_abs, +min_abs]``, and clamped to ``log(max_abs)`` outside
+    ``[-max_abs, +max_abs]``. Pairs with :func:`exp` and Linear addition
+    for log-domain multiplication of a signed by a positive value (e.g.
+    ``coord · inv_scale`` in DOOM normalization). Saves the explicit
+    ``abs`` + ``log`` layering by treating the V-shaped ``log|x|`` as a
+    single piecewise op.
+
+    **Implementation paths.**
+
+    * For ratios ``max_abs/min_abs ≤ 10⁴`` (the typical case, including
+      the default 3-decade ``[0.1, 100]``): a single piecewise_linear
+      over signed ``x`` with V-shape breakpoints. Cost: **1 MLP
+      sublayer.** The V-spikes at ``±min_abs`` (where the log slope
+      transitions to/from the flat zone) each contribute roughly
+      ``(max_abs/min_abs) · log_slope_jump`` magnitude to the matmul
+      partial sum at extreme ``x`` — but with the threshold at 10⁴ that
+      magnitude stays under ~10³, giving float32 ULP ~1.2e-4 absolute.
+    * For wider ratios: compose ``log(abs(x), ..., section_factor=...)``
+      with the sectioned :func:`log` op. Cost: **3 MLP sublayers** (1 for
+      ``abs``, 2 for sectioned ``log``) — at parity with the explicit
+      ``abs`` + ``log`` composition this op fuses below the threshold.
+
+    Args:
+        inp: 1D scalar node (signed).
+        min_abs: Lower clamp on ``|x|`` (must be > 0). Below ``|x| = min_abs``
+            the output is constant ``log(min_abs)``.
+        max_abs: Upper clamp on ``|x|`` (must exceed ``min_abs``). Above
+            ``|x| = max_abs`` the output is constant ``log(max_abs)``.
+        n_breakpoints: Approximate total breakpoint budget (default 256).
+            Distributed roughly evenly across the two arms in the single-
+            piecewise path; passed through to :func:`log` in the fallback.
+        section_factor: Geometric section width used by the wide-range
+            fallback's :func:`log` (default 10). Mirrors :func:`log`'s knob
+            for API consistency; unused on the single-piecewise path.
+        d_max: Maximum neurons per MLP sublayer.
+
+    Returns:
+        1D scalar node containing ``log(clamp(|x|, min_abs, max_abs))``.
+
+    .. noise-footer::
+
+       Max error: 0.000699 abs, 0.1428 rel over 4096 samples;
+       measured at commit 88de128. See docs/numerical_noise.md.
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    assert min_abs > 0, "min_abs must be positive"
+    assert max_abs > min_abs, "max_abs must exceed min_abs"
+    assert n_breakpoints >= 4, "need >= 4 breakpoints (>= 2 per arm)"
+    assert section_factor > 1.0, "section_factor must be > 1"
+
+    if max_abs / min_abs <= _LOG_ABS_SINGLE_RATIO_THRESHOLD:
+        return _log_abs_single(inp, min_abs, max_abs, n_breakpoints, d_max)
+
+    # Wide-range fallback: abs + sectioned log = 3 sublayers.
+    abs_x = abs(inp)
+    return log(
+        abs_x,
+        min_value=min_abs,
+        max_value=max_abs,
+        n_breakpoints=n_breakpoints,
+        section_factor=section_factor,
+        d_max=d_max,
     )
 
 
@@ -1955,7 +2082,7 @@ def floor_int(
     .. noise-footer::
 
        Max error: 0.9993 abs, 0.953 rel over 8192 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
@@ -2006,7 +2133,7 @@ def ceil_int(inp: Node, min_value: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     return negate(floor_int(negate(inp), -max_value, -min_value))
@@ -2057,7 +2184,7 @@ def multiply_integers(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
     assert len(inp1) == 1, "Input must be a 1D scalar node"
@@ -2149,7 +2276,7 @@ def signed_multiply(
     .. noise-footer::
 
        Max error: 0.06248 abs, 2.15 rel over 4096 samples;
-       measured at commit 7f76640. See docs/numerical_noise.md.
+       measured at commit 88de128. See docs/numerical_noise.md.
     """
     assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
     assert len(inp1) == 1, "Input must be a 1D scalar node"

@@ -11,6 +11,7 @@ from torchwright.ops.arithmetic_ops import (
     exp,
     linear_bin_index,
     log,
+    log_abs,
     low_rank_2d,
     max,
     min,
