@@ -302,6 +302,7 @@ def encode_value_binary(q: Node, suffix: str = "") -> Node:
     # readback, and a non-zero predicted K would bias host argmax
     # monotonically toward larger k.  Gray's Hamming-1 margin (≥2)
     # drives the argmax to the right VALUE_k row.
+    k_zero = create_literal_value(torch.tensor([0.0]), name=f"encode_K_zero{suffix}")
     # Phase D Part 1: type-tag block matches the VALUE row pattern in
     # W_EMBED — slot one-hot all −1, is_any_identifier −1,
     # is_value_category +1.  Argmax against W_EMBED.T still picks the
