@@ -2,10 +2,26 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from torchwright.compiler.components.component import Component
 from torchwright.graph import PosEncoding
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL  # kept for compat
+
+# F.scaled_dot_product_attention's default backend on A100 with fp32
+# inputs is EFFICIENT_ATTENTION, which on some inputs perturbs V by
+# 1 fp32 mantissa-LSB in the away-from-zero direction.  Trigger
+# condition is mantissa-pattern-dependent (not a clean magnitude or
+# bit-position rule) and not explained by TF32 / fp16 / bf16 rounding.
+# The MATH backend matches manual softmax+matmul exactly.
+#
+# Why it matters here: cancel heads (V=identity, O=-identity) rely on
+# attn_out + skip = 0 algebraically.  A 1-LSB perturbation at q≈22855
+# leaves a ~1/512 leak in the residual column, which propagates through
+# the encoder and flips Gray-code bits at boundary q values — see
+# tests/doom/test_thinking_readback.py::test_emit_continuous_roundtrip.
+# Same shape applies to compute_linear (Linear emulated as self-attn).
+_SDPA_BACKEND = [SDPBackend.MATH]
 
 
 class AttnLayerComponent(Component):
@@ -50,15 +66,16 @@ class AttnLayerComponent(Component):
         # 1/sqrt(d_head) rescaling).  is_causal=True applies the standard
         # upper-triangular mask for causal prefill.
         # Shape: (n_heads, n_pos, d_head) → unsqueeze batch → squeeze back.
-        weighted = F.scaled_dot_product_attention(
-            Q.unsqueeze(0),
-            K.unsqueeze(0),
-            V.unsqueeze(0),
-            is_causal=True,
-            scale=1.0,
-        ).squeeze(
-            0
-        )  # (n_heads, n_pos, d_head)
+        with sdpa_kernel(_SDPA_BACKEND):
+            weighted = F.scaled_dot_product_attention(
+                Q.unsqueeze(0),
+                K.unsqueeze(0),
+                V.unsqueeze(0),
+                is_causal=True,
+                scale=1.0,
+            ).squeeze(
+                0
+            )  # (n_heads, n_pos, d_head)
 
         output = torch.einsum("hpk,hkd->pd", weighted, self.output_matrix)
         return output
@@ -97,15 +114,16 @@ class AttnLayerComponent(Component):
         #                   the past relative to Q; no future positions to mask.
         # scale=1.0 preserves the raw dot-product magnitudes that all attention
         # weights were compiled against (no 1/sqrt(d_head) rescaling).
-        weighted = F.scaled_dot_product_attention(
-            Q.unsqueeze(0),
-            K.unsqueeze(0),
-            V.unsqueeze(0),
-            is_causal=(n_new == n_total),
-            scale=1.0,
-        ).squeeze(
-            0
-        )  # (n_heads, n_new, d_head)
+        with sdpa_kernel(_SDPA_BACKEND):
+            weighted = F.scaled_dot_product_attention(
+                Q.unsqueeze(0),
+                K.unsqueeze(0),
+                V.unsqueeze(0),
+                is_causal=(n_new == n_total),
+                scale=1.0,
+            ).squeeze(
+                0
+            )  # (n_heads, n_new, d_head)
 
         output = torch.einsum("hpk,hkd->pd", weighted, self.output_matrix)
 
