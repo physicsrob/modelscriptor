@@ -6,5 +6,5 @@ __pycache__
 *.onnx
 *.gif
 *.vocab.json
-.claude/
+.claude/worktrees/
 .python-version
