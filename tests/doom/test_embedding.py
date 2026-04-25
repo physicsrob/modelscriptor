@@ -37,7 +37,7 @@ def test_vocab_size_matches_plan():
     assert V == 65576
     assert len(DOOM_VOCAB) == V
     assert W_EMBED.shape == (V, D_EMBED)
-    assert D_EMBED == 27
+    assert D_EMBED == 49
 
 
 def test_id_ranges():
@@ -87,7 +87,14 @@ def test_value_id_helper_identity():
 
 
 def test_value_row_layout():
-    """Verify the [E8 | raw | gray] layout for a spot-check VALUE row."""
+    """Verify the [E8 | raw | gray | type-tag] layout for a spot-check VALUE row."""
+    from torchwright.doom.embedding import (
+        D_SLOT_ONEHOT,
+        _IS_ANY_ID_COL,
+        _IS_VALUE_CATEGORY_COL,
+        _SLOT_ONEHOT_START,
+    )
+
     vid = 0x1234  # = 4660
     row = W_EMBED[vid]
     # Category: E8_VALUE in cols [0:8].
@@ -102,6 +109,13 @@ def test_value_row_layout():
     # Gray-code payload at cols [9:25] equals the independent gray_code_16(vid).
     gray_start = D_CATEGORY + D_RAW_SLOT
     assert torch.equal(row[gray_start : gray_start + D_GRAY_PAYLOAD], gray_code_16(vid))
+    # Phase D Part 1 type-tag block: VALUE rows have all −1 in the
+    # slot one-hot, −1 in is_any_identifier, +1 in is_value_category.
+    assert torch.all(
+        row[_SLOT_ONEHOT_START : _SLOT_ONEHOT_START + D_SLOT_ONEHOT] == -1.0
+    )
+    assert row[_IS_ANY_ID_COL].item() == -1.0
+    assert row[_IS_VALUE_CATEGORY_COL].item() == 1.0
 
 
 def test_value_row_gray_code_properties():
@@ -137,45 +151,159 @@ def test_value_row_gray_code_properties():
 
 
 def test_non_value_row_has_zero_payload():
-    """Non-VALUE rows zero out cols [8:D_EMBED] — only the E8 code is set."""
-    non_value_rows = W_EMBED[N_VALUES:, D_CATEGORY:D_EMBED]
-    assert torch.all(non_value_rows == 0)
+    """Non-VALUE rows zero out cols [8:26] — the raw slot, Gray-code
+    payload, and K are zero.  The Phase D Part 1 type-tag block at
+    cols [26:49] carries other flags and is checked separately."""
+    payload_end = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD  # 25 — before K
+    non_value_payload = W_EMBED[N_VALUES:, D_CATEGORY:payload_end]
+    assert torch.all(non_value_payload == 0)
+    # K column should also be 0 for non-VALUE rows (col [25:26]).
+    from torchwright.doom.embedding import D_K_SLOT
+
+    k_block = W_EMBED[N_VALUES:, payload_end : payload_end + D_K_SLOT]
+    assert torch.all(k_block == 0)
 
 
-def test_int_slot_columns_for_small_k():
-    """Phase C Part 2: K col holds k, K_NS col holds -k² for k ≤ MAX_INT_K."""
-    from torchwright.doom.embedding import D_K_NS_SLOT, D_K_SLOT, MAX_INT_K
+def test_slot_onehot_correctness():
+    """Phase D Part 1: each IDENTIFIER row at slot ``i`` has +1 at the
+    matching slot column and −1 at the other 20.  Non-identifier rows
+    (VALUE, markers, decode, prompt) carry all −1."""
+    from torchwright.doom.embedding import (
+        D_SLOT_ONEHOT,
+        IDENTIFIER_NAMES,
+        _SLOT_ONEHOT_START,
+    )
+
+    block = W_EMBED[:, _SLOT_ONEHOT_START : _SLOT_ONEHOT_START + D_SLOT_ONEHOT]
+    # Every entry is ±1.
+    assert torch.all((block == 1.0) | (block == -1.0))
+
+    # Identifier rows: exactly one +1 at the matching slot.
+    for i, name in enumerate(IDENTIFIER_NAMES):
+        row = W_EMBED[vocab_id(name)]
+        slot_block = row[_SLOT_ONEHOT_START : _SLOT_ONEHOT_START + D_SLOT_ONEHOT]
+        assert slot_block[i].item() == 1.0, (
+            f"identifier {name!r} at slot {i}: expected +1, got {slot_block[i]}"
+        )
+        # Other 20 columns are −1.
+        n_neg = (slot_block == -1.0).sum().item()
+        assert n_neg == 20, f"identifier {name!r}: {n_neg} −1 entries, expected 20"
+
+    # Non-identifier rows: all 21 cols are −1.  Sample VALUE, markers,
+    # decode, prompt categories.
+    non_id_names = [
+        "VALUE_0",
+        "VALUE_42",
+        "VALUE_65535",
+        "THINKING_WALL_0",
+        "THINKING_WALL_7",
+        "SORTED_WALL",
+        "RENDER",
+        "DONE",
+        "INPUT",
+        "PLAYER_X",
+        "PLAYER_ANGLE",
+    ]
+    for name in non_id_names:
+        row = W_EMBED[vocab_id(name)]
+        slot_block = row[_SLOT_ONEHOT_START : _SLOT_ONEHOT_START + D_SLOT_ONEHOT]
+        assert torch.all(
+            slot_block == -1.0
+        ), f"non-identifier {name!r} has unexpected +1 in slot one-hot"
+
+
+def test_is_any_identifier_correctness():
+    """Phase D Part 1: is_any_identifier column is +1 at the 21
+    IDENTIFIER_NAMES rows, −1 at every other row."""
+    from torchwright.doom.embedding import IDENTIFIER_NAMES, _IS_ANY_ID_COL
+
+    col = W_EMBED[:, _IS_ANY_ID_COL]
+    assert torch.all((col == 1.0) | (col == -1.0))
+    pos_ids = (col == 1.0).nonzero(as_tuple=True)[0].tolist()
+    expected_ids = sorted(vocab_id(n) for n in IDENTIFIER_NAMES)
+    assert sorted(pos_ids) == expected_ids
+
+
+def test_is_value_category_correctness():
+    """Phase D Part 1: is_value_category column is +1 at the 65,536
+    VALUE rows, −1 at every other row."""
+    from torchwright.doom.embedding import _IS_VALUE_CATEGORY_COL
+
+    col = W_EMBED[:, _IS_VALUE_CATEGORY_COL]
+    assert torch.all((col == 1.0) | (col == -1.0))
+    # First N_VALUES rows are VALUE.
+    assert torch.all(col[:N_VALUES] == 1.0)
+    assert torch.all(col[N_VALUES:] == -1.0)
+
+
+def test_argmax_separation_with_typetag():
+    """Phase D Part 1: adding the 23 ±1 type-tag cols increases the
+    argmax margin between distinct categories — self-dot grows by 23,
+    cross-dot between distinct categories grows by at most 23 − 4 = 19
+    (because at least one type-tag column has opposite sign).  Net
+    margin increases by at least 4.
+
+    Verifies the predicted-target argmax against ``W_EMBED.T`` still
+    picks the right row for representative non-VALUE categories."""
+    check_names = [
+        "INPUT",
+        "WALL",
+        "EOS",
+        "TEX_COL",
+        "BSP_NODE",
+        "SORTED_WALL",
+        "RENDER",
+        "PLAYER_X",
+        "BSP_RANK",
+        "RESOLVED_X",
+        "SORT_RESULT",
+        "HIT_FULL",
+        "HIT_X",
+        "HIT_Y",
+        *[f"THINKING_WALL_{i}" for i in range(8)],
+    ]
+    for name in check_names:
+        target = embed_lookup(name)
+        target_id = vocab_id(name)
+        scores = W_EMBED @ target
+        assert int(scores.argmax().item()) == target_id, (
+            f"argmax for {name!r} picked vocab id "
+            f"{int(scores.argmax().item())}, expected {target_id}"
+        )
+
+
+def test_int_slot_column_for_small_k():
+    """Phase C Part 2: K col holds k for k ≤ MAX_INT_K, zero above."""
+    from torchwright.doom.embedding import D_K_SLOT, MAX_INT_K
 
     k_col_start = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
-    k_ns_col_start = k_col_start + D_K_SLOT
-    assert D_K_SLOT == 1 and D_K_NS_SLOT == 1
+    assert D_K_SLOT == 1
 
-    # In the int range: K = k, K_NS = -k².
+    # In the int range: K = k.
     for k in [0, 1, 2, 3, 7, 100, MAX_INT_K]:
         assert W_EMBED[k, k_col_start].item() == float(k)
-        assert W_EMBED[k, k_ns_col_start].item() == -float(k * k)
 
     # Just above the cap: zero.
     for k in [MAX_INT_K + 1, MAX_INT_K + 100, N_VALUES - 1]:
         assert W_EMBED[k, k_col_start].item() == 0.0
-        assert W_EMBED[k, k_ns_col_start].item() == 0.0
 
 
 def test_int_slot_argmax_peak_at_target():
-    """A predicted embedding writing [E8|raw|gray|2*k_target|1] argmaxes
-    to VALUE_(k_target).  Verifies the quadratic-equality identity drives
-    argmax to the right row across the full int-slot range."""
-    from torchwright.doom.embedding import D_K_NS_SLOT, D_K_SLOT, MAX_INT_K
+    """A predicted embedding holding the W_EMBED row's E8/raw/gray cols
+    with the K column held at 0 still argmaxes to VALUE_(k_target).
+    Verifies gray's Hamming-1 margin alone drives the host argmax to
+    the right row across the full int-slot range — no K_NS quadratic
+    needed."""
+    from torchwright.doom.embedding import D_K_SLOT, MAX_INT_K
 
     k_col_start = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
-    k_ns_col_start = k_col_start + D_K_SLOT
 
     for k_target in [0, 1, 3, 7, 100, MAX_INT_K]:
         # Build the predicted embedding: E8/raw/gray copied from
-        # W_EMBED row, then K=2*k_target, K_NS=1.
+        # W_EMBED row, K column held at 0 (the producer-side override
+        # done by emit_integer_value_embedding).
         predicted = W_EMBED[k_target].clone()
-        predicted[k_col_start] = 2.0 * k_target
-        predicted[k_ns_col_start : k_ns_col_start + D_K_NS_SLOT] = 1.0
+        predicted[k_col_start : k_col_start + D_K_SLOT] = 0.0
 
         # Argmax over all rows.
         scores = W_EMBED @ predicted
@@ -294,13 +422,16 @@ def test_category_only_value_detector():
 
 def test_encoder_matches_w_embed_row():
     """Compile ``encode_value_binary`` and verify that for every integer
-    k ∈ [0, 65535] the encoder's 25-wide output dotted against
+    k ∈ [0, 65535] the encoder's D_EMBED-wide output dotted against
     ``W_EMBED.T`` argmaxes to k.
 
     This is the host-side semantic of VALUE emission: the encoder
     produces a row, the host picks the nearest VALUE by argmax.  The
     triangle-wave Gray-code basis plus the raw slot must resolve every
-    integer input to its exact k.
+    integer input to its exact k.  The Phase D Part 1 type-tag tail
+    (slot one-hot all −1, is_any_id −1, is_value_category +1) matches
+    every VALUE row exactly, so it adds a constant offset across the
+    VALUE block and doesn't shift the argmax.
     """
     from torchwright.compiler.forward.compile import forward_compile
     from torchwright.graph import Linear
@@ -312,7 +443,7 @@ def test_encoder_matches_w_embed_row():
     q_in = create_input("q", 1)
     emitted = encode_value_binary(q_in, suffix="_test")
     # Concatenate is layout-only; wrap in an identity Linear so the
-    # 25-wide row materializes under a node in the result dict.
+    # D_EMBED-wide row materializes under a node in the result dict.
     emit = Linear(emitted, torch.eye(D_EMBED), name="emit_passthrough")
 
     net = forward_compile(

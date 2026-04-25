@@ -1,4 +1,4 @@
-"""Codec between thinking-token values and 27-wide VALUE embeddings.
+"""Codec between thinking-token values and 26-wide VALUE embeddings.
 
 Two sides of the same boundary, with separate wire formats for
 continuous floats and small-cardinality integers:
@@ -6,7 +6,7 @@ continuous floats and small-cardinality integers:
 * **Emit** (producer): a per-wall identifier step computes a value and
   one of :func:`emit_continuous_value_embedding`,
   :func:`emit_integer_value_embedding`,
-  :func:`emit_boolean_value_embedding` produces the 27-wide row the
+  :func:`emit_boolean_value_embedding` produces the 26-wide row the
   host argmaxes against ``W_EMBED.T`` to pick the next VALUE token ID.
 * **Readback** (consumer): a later thinking step needs a prior value
   from the KV cache and :class:`ThinkingReadback` runs a single
@@ -32,17 +32,16 @@ shifted encoder grid), and a 16-wide ±1 Gray code of ``k`` in cols
 where ``N_VALUES = 65536``.  Host-side uint16 rounding happens between
 the two and contributes one LSB per quantization boundary.
 
-Integer (Phase C Part 2): cols [25:27] of every VALUE row carry
-``[K = k, K_NS = -k²]`` for ``k ≤ MAX_INT_K`` (zero elsewhere).
-:func:`emit_integer_value_embedding` and
-:func:`emit_boolean_value_embedding` *override* these two columns
-with ``[K = 2·k_target, K_NS = 1]`` in the predicted embedding,
-giving an argmax score contribution of
-``2·k_target·k − k²`` that peaks exactly at ``k = k_target`` (margin
-1 to adjacent k, plus the existing gray-code margin of 2).
-:meth:`ThinkingReadback.get_int_after_last` reads the K column
+Integer (Phase C Part 2): col 25 of every VALUE row carries ``K = k``
+for ``k ≤ MAX_INT_K`` (zero elsewhere).
+:meth:`ThinkingReadback.get_int_after_last` reads that column
 directly via attention — the matched value IS the integer, no
-dequantize affine, no W_consumer amplification.  See
+dequantize affine, no W_consumer amplification.  Producers
+(:func:`emit_integer_value_embedding`,
+:func:`emit_boolean_value_embedding`) leave the K column at 0 in the
+predicted embedding; gray's Hamming-1 margin (≥2) drives host argmax
+to VALUE_k_target, and any non-zero predicted K would bias argmax
+monotonically toward larger k.  See
 ``docs/phase_c_part2_int_slot_embedding.md`` for the full design and
 the integer-emit round-trip bug it fixes.
 
@@ -52,11 +51,11 @@ Depth accounting for the emit path (continuous value):
     L1 triangle PL  1 MLP sublayer (9-channel output)
     L2 triangle PL  1 MLP sublayer (7-channel output, off T_128 of L1)
     compare × 16    1 MLP sublayer (parallel)
-    K, K_NS append  0 layers (literal zeros, fused)
+    K append        0 layers (literal zero, fused)
 
 ≈3 MLP sublayers after the value is computed.  Integer / boolean
 emits are ~2 layers (one-hot ``in_range`` + Linear row lookup; the
-K/K_NS override is ``multiply_const`` + literal, both fold).
+trailing K=0 literal folds).
 
 Readback depth:
 
@@ -93,9 +92,11 @@ from torchwright.doom.embedding import (
     D_CATEGORY,
     D_EMBED,
     D_GRAY_PAYLOAD,
-    D_K_NS_SLOT,
+    D_IS_ANY_ID,
+    D_IS_VALUE_CATEGORY,
     D_K_SLOT,
     D_RAW_SLOT,
+    D_SLOT_ONEHOT,
     E8_VALUE,
     IDENTIFIER_NAMES,
     MAX_INT_K,
@@ -122,27 +123,24 @@ __all__ = [
 # Cols [0:D_CATEGORY] are the E8_VALUE category code shared across all
 # VALUE rows.  The raw slot (col D_CATEGORY) carries the normalized
 # value; the 16-wide Gray-code payload sits immediately after it.
-# Phase C Part 2: cols [25:26] hold K = k for VALUE_k with k ≤
-# MAX_INT_K (else 0); cols [26:27] hold K_NS = -k² (else 0).
+# Phase C Part 2: col 25 holds K = k for VALUE_k with k ≤ MAX_INT_K
+# (else 0).
 _RAW_SLOT_START = D_CATEGORY
 _GRAY_START = D_CATEGORY + D_RAW_SLOT
 _K_SLOT_START = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
-_K_NS_SLOT_START = _K_SLOT_START + D_K_SLOT
 assert _RAW_SLOT_START == 8
 assert _GRAY_START == 9
 assert _K_SLOT_START == 25
-assert _K_NS_SLOT_START == 26
 assert D_GRAY_PAYLOAD == 16
 
 # Identifier names that should round-trip through the K column rather
 # than the raw + decode path.  Today this is only SORT_RESULT — its
-# producer (``emit_integer_value_embedding``) writes the K/K_NS
-# override and its consumer (RENDER's wall_index readback, SORTED's
-# local wall_index decode) reads K directly.  Other small-int names
-# (BSP_RANK, IS_RENDERABLE, HIT_*) currently round-trip correctly
-# through the continuous emit path (encode_value_binary +
-# raw-slot + decode) — they could migrate later if a hot-path
-# consumer pays the decode cost, but they're not broken today.
+# consumer (RENDER's wall_index readback, SORTED's local wall_index
+# decode) reads K directly.  Other small-int names (BSP_RANK,
+# IS_RENDERABLE, HIT_*) currently round-trip correctly through the
+# continuous emit path (encode_value_binary + raw-slot + decode) —
+# they could migrate later if a hot-path consumer pays the decode
+# cost, but they're not broken today.
 INT_IDENTIFIER_NAMES: set[str] = {"SORT_RESULT"}
 
 # Match-gain for the readback's ``attend_most_recent_matching``.  Same
@@ -233,8 +231,8 @@ def encode_value_binary(q: Node, suffix: str = "") -> Node:
             inside.
 
     Returns:
-        25-wide embedding node — the row the host argmaxes against
-        ``W_EMBED.T`` to pick the next VALUE token ID.
+        ``D_EMBED``-wide embedding node — the row the host argmaxes
+        against ``W_EMBED.T`` to pick the next VALUE token ID.
     """
     q_clamped = clamp(q, 0.0, float(DEFAULT_N_LEVELS - 1))
     # Shifted grid: x = (2q + 1) / 131072. Both 2/131072 = 2^-16 and
@@ -300,15 +298,38 @@ def encode_value_binary(q: Node, suffix: str = "") -> Node:
         bits.append(compare(feat, 0.5, sharpness=_BIT_COMPARE_SHARPNESS))
 
     e8_cat = create_literal_value(E8_VALUE, name=f"e8_value_cat{suffix}")
-    # Phase C Part 2: continuous emits don't activate the K/K_NS
-    # mechanism (their target k > MAX_INT_K, so the W_EMBED row's K
-    # and K_NS columns are 0).  Predicted K=0, K_NS=0 contributes 0
-    # to argmax — same behavior as before D_EMBED grew by 2.
+    # Predicted K=0: continuous emits don't carry an integer for
+    # readback, and a non-zero predicted K would bias host argmax
+    # monotonically toward larger k.  Gray's Hamming-1 margin (≥2)
+    # drives the argmax to the right VALUE_k row.
     k_zero = create_literal_value(torch.tensor([0.0]), name=f"encode_K_zero{suffix}")
-    k_ns_zero = create_literal_value(
-        torch.tensor([0.0]), name=f"encode_K_NS_zero{suffix}"
+    # Phase D Part 1: type-tag block matches the VALUE row pattern in
+    # W_EMBED — slot one-hot all −1, is_any_identifier −1,
+    # is_value_category +1.  Argmax against W_EMBED.T still picks the
+    # closest VALUE row; the type-tag dot is constant across the VALUE
+    # block (slot one-hot self-dot 21 + is_any_id self-dot 1 +
+    # is_value_cat self-dot 1 = 23), so the existing E8/raw/gray/K
+    # argmax shape is preserved.
+    slot_onehot_neg = create_literal_value(
+        -torch.ones(D_SLOT_ONEHOT), name=f"encode_slot_onehot{suffix}"
     )
-    return Concatenate([e8_cat, x, *bits, k_zero, k_ns_zero])
+    is_any_id_neg = create_literal_value(
+        -torch.ones(D_IS_ANY_ID), name=f"encode_is_any_id{suffix}"
+    )
+    is_value_cat_pos = create_literal_value(
+        torch.ones(D_IS_VALUE_CATEGORY), name=f"encode_is_value_cat{suffix}"
+    )
+    return Concatenate(
+        [
+            e8_cat,
+            x,
+            *bits,
+            k_zero,
+            slot_onehot_neg,
+            is_any_id_neg,
+            is_value_cat_pos,
+        ]
+    )
 
 
 def emit_continuous_value_embedding(
@@ -335,30 +356,29 @@ def emit_integer_value_embedding(
 
     Used for identifiers whose value is a small-cardinality integer
     (today: SORT_RESULT carrying wall_index 0..max_walls-1).  ``max_int``
-    must be ≤ ``MAX_INT_K`` so the K/K_NS columns are populated for
-    every reachable VALUE row.
+    must be ≤ ``MAX_INT_K`` so the K column is populated for every
+    reachable VALUE row.
 
-    Phase C Part 2 design: the predicted embedding's E8/raw/gray columns
-    come from a one-hot lookup over ``W_EMBED[VALUE_0..VALUE_{max_int}]``
-    (preserves the existing argmax discrimination via gray Hamming
-    distance).  The K and K_NS columns are *overridden* with the
-    quadratic-equality pattern ``[2·integer_value, 1]``: for any target
-    ``k_target``, the K/K_NS contribution to score(VALUE_k) is
-    ``2·k_target·k − k²``, peaking at ``k = k_target`` with margin 1
-    to adjacent k.  Total argmax margin (gray + K/K_NS) is 3 — same
-    shape as the prior 25-wide design but with K/K_NS as the primary
-    integer discriminator.
+    Design: the predicted embedding's E8/raw/gray columns come from a
+    one-hot lookup over ``W_EMBED[VALUE_0..VALUE_{max_int}]``; gray's
+    Hamming-1 margin (≥2) drives the host argmax to VALUE_k_target.
+    The K column in the predicted embedding is held at 0 — a non-zero
+    predicted K would dot against W_EMBED rows' ``K=k`` and bias
+    argmax monotonically toward the largest k.  The K column on the
+    *W_EMBED row side* still holds ``k`` for k ≤ MAX_INT_K, which the
+    consumer reads via :meth:`ThinkingReadback.get_int_after_last`
+    (attention V = K_column).
 
-    The override fixes a latent round-trip bug in the prior design: a
-    pure row-lookup put ``raw = (2·k_target+1)/131072`` in the predicted
-    embedding, which the consumer's ``_decode_payload_to_float``
-    (calibrated for the *continuous* emit's quantization) decoded to
-    ``≈ k_target / 9362``, not ``k_target``.  See
+    Fixes a latent round-trip bug in the prior raw-slot design: a
+    one-hot row lookup put ``raw = (2·k_target+1)/131072`` in the
+    predicted embedding, which the consumer's continuous-path
+    ``_decode_payload_to_float`` decoded to ``≈ k_target / 9362``, not
+    ``k_target``.  Routing readback through the K column bypasses that
+    calibration mismatch entirely.  See
     ``docs/phase_c_part2_int_slot_embedding.md``.
 
     Depth: 2 MLP sublayers (``in_range`` builds the one-hot; the row
-    lookup is a single Linear; ``multiply_const`` and ``Concatenate``
-    are layout/Linear and fold).
+    lookup is a single Linear; the trailing K=0 literal folds).
 
     Args:
         integer_value: 1-wide float node whose value is an integer in
@@ -370,22 +390,19 @@ def emit_integer_value_embedding(
     Returns:
         ``D_EMBED``-wide embedding node.
     """
-    from torchwright.ops.arithmetic_ops import add_const, multiply_const
-
     assert max_int <= MAX_INT_K, (
         f"emit_integer_value_embedding: max_int={max_int} exceeds "
-        f"MAX_INT_K={MAX_INT_K}; the K/K_NS argmax mechanism only "
+        f"MAX_INT_K={MAX_INT_K}; the K-column readback path only "
         f"covers VALUE rows up to MAX_INT_K.  Either widen MAX_INT_K "
-        f"in embedding.py (mind the float32 precision tradeoff) or "
-        f"emit via the continuous path."
+        f"in embedding.py or emit via the continuous path."
     )
 
     n = max_int + 1
     onehot = bool_to_01(in_range(integer_value, add_const(integer_value, 1.0), n))
 
     # Build E8/raw/gray columns from VALUE_0..VALUE_max_int rows.  Slice
-    # off the K and K_NS columns from each row — those will be overridden
-    # below with the quadratic-equality pattern.
+    # off the K column from each row — the predicted K is held at 0
+    # below to avoid biasing host argmax toward larger k.
     base_cols = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD  # 25
     rows_base = torch.stack(
         [embed_lookup(f"VALUE_{k}")[:base_cols] for k in range(n)], dim=0
@@ -397,13 +414,28 @@ def emit_integer_value_embedding(
         name=f"emit_int_base_{name}",
     )
 
-    # K column = 2·integer_value, K_NS column = 1.  The compiler folds
-    # the multiply_const + literal into the next consumer.
-    two_k = multiply_const(integer_value, 2.0)
-    one_lit = create_literal_value(
-        torch.tensor([1.0]), name=f"emit_int_kns_{name}"
+    # Predicted K = 0.  W_EMBED rows hold K=k literally; a non-zero
+    # predicted K would dot against that and bias argmax monotonically
+    # in k.  Gray's Hamming-1 margin already picks VALUE_k_target.
+    k_zero = create_literal_value(
+        torch.tensor([0.0]), name=f"emit_int_k_{name}"
     )
-    return Concatenate([base, two_k, one_lit])
+    # Phase D Part 1: type-tag block matches the VALUE row pattern in
+    # W_EMBED — slot one-hot all −1, is_any_identifier −1,
+    # is_value_category +1.  These literals fold into the next
+    # consumer.
+    slot_onehot_neg = create_literal_value(
+        -torch.ones(D_SLOT_ONEHOT), name=f"emit_int_slot_onehot_{name}"
+    )
+    is_any_id_neg = create_literal_value(
+        -torch.ones(D_IS_ANY_ID), name=f"emit_int_is_any_id_{name}"
+    )
+    is_value_cat_pos = create_literal_value(
+        torch.ones(D_IS_VALUE_CATEGORY), name=f"emit_int_is_value_cat_{name}"
+    )
+    return Concatenate(
+        [base, k_zero, slot_onehot_neg, is_any_id_neg, is_value_cat_pos]
+    )
 
 
 def emit_boolean_value_embedding(
@@ -414,15 +446,14 @@ def emit_boolean_value_embedding(
 
     +1 → predicted ``VALUE_1``, -1 → predicted ``VALUE_0``.
 
-    Phase C Part 2: the E8/raw/gray columns blend ``W_EMBED[VALUE_0]``
-    and ``W_EMBED[VALUE_1]``'s first 25 cols (cond_gate on the ±1
-    bool — same pattern thinking_wall.py uses for HIT_* emission).
-    The K and K_NS columns are overridden with the quadratic-equality
-    pattern: ``K = bool_value + 1`` (= 2 for true, 0 for false, =
-    ``2·k_target``), ``K_NS = 1``.
+    The E8/raw/gray columns blend ``W_EMBED[VALUE_0]`` and
+    ``W_EMBED[VALUE_1]``'s first 25 cols (cond_gate on the ±1 bool —
+    same pattern thinking_wall.py uses for HIT_* emission).  The K
+    column is held at 0; gray's Hamming-1 margin drives host argmax
+    to the right VALUE row.
 
     Depth: 1 MLP sublayer (the ``cond_gate`` on the 25-wide delta);
-    ``add_const`` and the literal fold into the next consumer.
+    the trailing K=0 literal folds.
 
     Args:
         bool_value: 1-wide node with value in ``{-1, +1}``.
@@ -438,19 +469,30 @@ def emit_boolean_value_embedding(
     e_value_1 = create_literal_value(
         embed_lookup("VALUE_1")[:base_cols], name=f"e_v1_{name}"
     )
-    from torchwright.ops.arithmetic_ops import add_const, sum_nodes
+    from torchwright.ops.arithmetic_ops import sum_nodes
     from torchwright.ops.logic_ops import cond_gate
 
     delta = subtract(e_value_1, e_value_0)
     base = sum_nodes([e_value_0, cond_gate(bool_value, delta)])
 
-    # K = 2·k_target.  bool_value ∈ {-1, +1}; k_target = (bool+1)/2 ∈
-    # {0, 1}; 2·k_target = bool + 1.
-    two_k = add_const(bool_value, 1.0)
-    one_lit = create_literal_value(
-        torch.tensor([1.0]), name=f"emit_bool_kns_{name}"
+    k_zero = create_literal_value(
+        torch.tensor([0.0]), name=f"emit_bool_k_{name}"
     )
-    return Concatenate([base, two_k, one_lit])
+    # Phase D Part 1: type-tag block matches the VALUE row pattern in
+    # W_EMBED — slot one-hot all −1, is_any_identifier −1,
+    # is_value_category +1.
+    slot_onehot_neg = create_literal_value(
+        -torch.ones(D_SLOT_ONEHOT), name=f"emit_bool_slot_onehot_{name}"
+    )
+    is_any_id_neg = create_literal_value(
+        -torch.ones(D_IS_ANY_ID), name=f"emit_bool_is_any_id_{name}"
+    )
+    is_value_cat_pos = create_literal_value(
+        torch.ones(D_IS_VALUE_CATEGORY), name=f"emit_bool_is_value_cat_{name}"
+    )
+    return Concatenate(
+        [base, k_zero, slot_onehot_neg, is_any_id_neg, is_value_cat_pos]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -512,14 +554,16 @@ class ThinkingReadback:
                 f"unknown identifier {name!r}; must be one of {IDENTIFIER_NAMES}"
             )
         slot = IDENTIFIER_NAMES.index(name)
-        prev_slot_i_01 = extract_from(
+        # Phase D Part 1: prev_id_slots' V is the ±1 slot one-hot
+        # column block from W_EMBED, so the extract is already the
+        # ±1 bool that bool_all_true expects — no compare(0.5) needed.
+        prev_slot_i_bool = extract_from(
             self._ctx.prev_id_slots,
             len(IDENTIFIER_NAMES),
             slot,
             1,
             f"readback_prev_slot_{name}",
         )
-        prev_slot_i_bool = compare(prev_slot_i_01, 0.5)
         indicator = bool_all_true([self._ctx.is_value_category, prev_slot_i_bool])
         self._indicator_cache[name] = indicator
         return indicator

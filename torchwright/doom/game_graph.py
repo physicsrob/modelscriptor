@@ -34,18 +34,26 @@ from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_pos_encoding,
 )
-from torchwright.ops.logic_ops import bool_any_true, equals_vector
-from torchwright.ops.map_select import select
+from torchwright.ops.logic_ops import (
+    bool_all_true,
+    bool_any_true,
+    bool_not,
+    equals_vector,
+)
+from torchwright.ops.map_select import select, switch
 from torchwright.reference_renderer.types import RenderConfig
 
 from torchwright.doom.embedding import (
     D_EMBED,
-    E8_VALUE,
     IDENTIFIER_NAMES,
     V,
+    _IS_ANY_ID_COL,
+    _IS_VALUE_CATEGORY_COL,
+    _SLOT_ONEHOT_START,
     build_doom_embedding,
     embed_lookup,
 )
+from torchwright.graph.asserts import assert_in_range
 from torchwright.doom.graph_constants import TEX_E8_OFFSET
 
 __all__ = [
@@ -507,10 +515,14 @@ def _create_inputs(
 def _detect_token_types(embedding: Node) -> Dict[str, Any]:
     """Derive per-type boolean flags from the 72-wide embedding leaf.
 
-    Every detector is an ``equals_vector`` against a fixed ``W_EMBED``
-    row (for specific-ID categories) or against the ``E8_VALUE``
-    category code (for the category-only ``is_thinking_value`` — all
-    65,536 VALUE rows share this 8-wide prefix).
+    Most detectors are ``equals_vector`` against a fixed ``W_EMBED`` row
+    (for specific-ID categories).  Three flags — ``is_thinking_value``,
+    ``is_identifier_by_slot[i]``, ``is_any_identifier`` — read directly
+    from the type-tag block in W_EMBED added in Phase D Part 1; those
+    columns hold ±1 for "this row is in category X" and an
+    :func:`extract_from` is the bool itself, no compare needed.  This
+    drops the 4-5 layers the readback chain previously spent building
+    these flags from the E8 prefix.
 
     Per-identifier detectors: one detector per entry in
     ``IDENTIFIER_NAMES`` (21 total — 17 per-wall + 3 RESOLVED + 1
@@ -532,22 +544,54 @@ def _detect_token_types(embedding: Node) -> Dict[str, Any]:
             "is_player_x": equals_vector(embedding, embed_lookup("PLAYER_X")),
             "is_player_y": equals_vector(embedding, embed_lookup("PLAYER_Y")),
             "is_player_angle": equals_vector(embedding, embed_lookup("PLAYER_ANGLE")),
-            # Category-only: any VALUE token (cols [0:8] == E8_VALUE).
-            "is_thinking_value": equals_vector(
-                extract_from(embedding, D_EMBED, 0, 8, "value_category_cols"),
-                E8_VALUE,
+            # Phase D Part 1: type-tag column extracts.  The is_value_category
+            # column in W_EMBED is +1 at every VALUE row, −1 elsewhere — the
+            # extract IS the ±1 bool.  ``assert_in_range`` tightens the
+            # value_type to ±1 so downstream cond_gate/bool_all_true
+            # don't inflate based on the embedding leaf's unknown
+            # value_type.
+            "is_thinking_value": assert_in_range(
+                extract_from(
+                    embedding, D_EMBED, _IS_VALUE_CATEGORY_COL, 1, "is_thinking_value"
+                ),
+                -1.0,
+                1.0,
             ),
         }
         # Per-identifier detectors (21 total).  Built in IDENTIFIER_NAMES
         # order; both indexed (by slot) and keyed (by name) for downstream
-        # convenience.
+        # convenience.  Phase D Part 1: each slot's column in the W_EMBED
+        # type-tag block is +1 only at the matching IDENTIFIER row, −1
+        # elsewhere — the extract IS the per-slot ±1 bool that
+        # ``cond_gate`` and ``bool_all_true`` consumers expect, with no
+        # additional MLP sublayer.  ``assert_in_range`` tightens the
+        # value_type to ±1.
         is_identifier_by_slot = [
-            equals_vector(embedding, embed_lookup(name)) for name in IDENTIFIER_NAMES
+            assert_in_range(
+                extract_from(
+                    embedding,
+                    D_EMBED,
+                    _SLOT_ONEHOT_START + i,
+                    1,
+                    f"is_id_slot_{name}",
+                ),
+                -1.0,
+                1.0,
+            )
+            for i, name in enumerate(IDENTIFIER_NAMES)
         ]
         flags["is_identifier_by_slot"] = is_identifier_by_slot
         for name, detector in zip(IDENTIFIER_NAMES, is_identifier_by_slot):
             flags[f"is_{name.lower()}_id"] = detector
-        flags["is_any_identifier"] = bool_any_true(is_identifier_by_slot)
+        # Phase D Part 1: is_any_identifier is its own column in
+        # W_EMBED — +1 at the 21 IDENTIFIER rows, −1 elsewhere.
+        flags["is_any_identifier"] = assert_in_range(
+            extract_from(
+                embedding, D_EMBED, _IS_ANY_ID_COL, 1, "is_any_identifier"
+            ),
+            -1.0,
+            1.0,
+        )
         # Per-marker detectors (8 walls).  is_thinking_wall_marker is the
         # OR — used as the validity signal in the value step's "find
         # current wall_index" attention.
@@ -606,9 +650,6 @@ def _assemble_output(
     """
     with annotate("output"):
         zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
-        zero_embedding = create_literal_value(
-            torch.zeros(D_EMBED), name="zero_embedding"
-        )
         zero_pixels = create_literal_value(
             torch.zeros(chunk_size * 3),
             name="zero_pixels",
@@ -685,43 +726,54 @@ def _assemble_output(
         type_thinking_wall_0 = create_literal_value(
             embed_lookup("THINKING_WALL_0"), name="out_type_thinking_wall_0"
         )
-        # Phase B Part 2 cascade priority:
-        #   1. SORT_RESULT id       → SORTED's factored VALUE(wall_index)
-        #   2. SORT_RESULT VALUE    → embed("RENDER")
-        #   3. is_thinking_active   → thinking_wall's cascade (markers,
-        #                             thinking identifiers, thinking VALUEs;
-        #                             is_any_identifier / is_thinking_value
-        #                             fire at SORT_RESULT too, so the two
-        #                             SORT_RESULT branches must come first)
-        #   4. SORTED_WALL marker   → embed("SORT_RESULT")
-        #   5. RENDER               → render_out.render_next_type
-        #   6. PLAYER_ANGLE         → embed("THINKING_WALL_0") (hand-off
-        #                             into the thinking phase)
-        #   7. everything else      → don't-care zero embedding
-        out_next_token_embedding = select(
-            token_flags["is_sort_result_id"],
-            sorted_out.sort_result_next_embedding,
-            select(
-                is_sort_result_value,
-                sorted_out.value_next_embedding,
-                select(
-                    thinking_wall_out.is_thinking_active,
-                    thinking_wall_out.next_token_embedding,
-                    select(
-                        token_flags["is_sorted"],
-                        sorted_out.marker_next_embedding,
-                        select(
-                            token_flags["is_render"],
-                            render_out.render_next_type,
-                            select(
-                                token_flags["is_player_angle"],
-                                type_thinking_wall_0,
-                                zero_embedding,
-                            ),
-                        ),
-                    ),
+        # Phase D Part 2: flat switch over six mutually-exclusive
+        # branches.  is_thinking_active overlaps the two SORT_RESULT
+        # branches (is_any_identifier / is_thinking_value fire at
+        # SORT_RESULT too), so we trim it to the disjoint slice.  The
+        # other four conditions (is_sorted, is_render, is_player_angle,
+        # plus the implicit "none of the above → zero default") are
+        # already mutually exclusive.
+        #
+        # Branches:
+        #   SORT_RESULT id    → SORTED's factored VALUE(wall_index)
+        #   SORT_RESULT VALUE → embed("RENDER")
+        #   thinking-active   → thinking_wall's cascade output
+        #     (excluding SORT_RESULT positions)
+        #   SORTED_WALL       → embed("SORT_RESULT")
+        #   RENDER            → render_out.render_next_type
+        #   PLAYER_ANGLE      → embed("THINKING_WALL_0")
+        # Default (no condition true): cond_gates all output zero,
+        # sum is the zero embedding.
+        is_thinking_active_excl_sort_result = bool_all_true(
+            [
+                thinking_wall_out.is_thinking_active,
+                bool_not(
+                    bool_any_true(
+                        [
+                            token_flags["is_sort_result_id"],
+                            is_sort_result_value,
+                        ]
+                    )
                 ),
-            ),
+            ]
+        )
+        out_next_token_embedding = switch(
+            [
+                token_flags["is_sort_result_id"],
+                is_sort_result_value,
+                is_thinking_active_excl_sort_result,
+                token_flags["is_sorted"],
+                token_flags["is_render"],
+                token_flags["is_player_angle"],
+            ],
+            [
+                sorted_out.sort_result_next_embedding,
+                sorted_out.value_next_embedding,
+                thinking_wall_out.next_token_embedding,
+                sorted_out.marker_next_embedding,
+                render_out.render_next_type,
+                type_thinking_wall_0,
+            ],
         )
 
         out_pixels = select(token_flags["is_render"], render_out.pixels, zero_pixels)

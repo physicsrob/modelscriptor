@@ -28,11 +28,9 @@ import torch
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph import Linear
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
-from torchwright.ops.logic_ops import equals_vector
 
 from torchwright.doom.embedding import (
     D_EMBED,
-    E8_VALUE,
     IDENTIFIER_NAMES,
     VALUE_RANGE_BY_NAME,
     W_EMBED,
@@ -207,62 +205,40 @@ def test_emit_integer_roundtrip_bsp_rank():
         ), f"BSP_RANK integer emit at k={k}: got {out}, expected {expected}"
 
 
-def test_emit_integer_roundtrip_via_k_column():
-    """Phase C Part 2: emit_integer_value_embedding's K column carries
-    ``2·k_target``.  Extracting K and dividing by 2 round-trips to the
-    original integer exactly (within float32 ulp).
+def test_emit_integer_argmax_picks_target():
+    """emit_integer_value_embedding's predicted embedding argmaxes
+    against ``W_EMBED.T`` to ``VALUE_k_target``.
 
-    This is the new correct round-trip path that fixes the bug
-    documented in test_emit_integer_roundtrip_bsp_rank above.  Used by
-    SORT_RESULT in production: SORTED's local
-    ``_decode_local_value_to_float`` and RENDER's
-    ``readback.get_value_after_last("SORT_RESULT")`` both consume this
-    K column directly, no decode Linear.
+    This is the production round-trip path: the producer emits a 26-wide
+    predicted embedding, the host argmaxes it against W_EMBED, and the
+    next step's input embedding is the picked W_EMBED row whose K column
+    holds k literally for downstream readback (no decode Linear).  Gray's
+    Hamming-1 margin alone (≥2) drives argmax to the right row — the
+    predicted K is held at 0 to avoid biasing argmax toward larger k.
     """
-    from torchwright.doom.embedding import D_K_SLOT, MAX_INT_K
-    from torchwright.ops.arithmetic_ops import multiply_const
+    from torchwright.doom.embedding import MAX_INT_K
 
     pos_encoding = create_pos_encoding()
     int_in = create_input("int_val", 1)
     emitted = emit_integer_value_embedding(int_in, max_int=7, name="SORT_RESULT")
-
-    # Extract the K column (col 25) — holds 2·k_target.
-    k_col_start = 8 + 1 + 16  # D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
-    two_k = extract_from(emitted, D_EMBED, k_col_start, D_K_SLOT, "two_k")
-    # Divide by 2 to recover k_target.
-    recovered = multiply_const(two_k, 0.5)
+    emit_node = Linear(emitted, torch.eye(D_EMBED), name="emit_passthrough_int")
 
     net = forward_compile(
         d=_D,
         d_head=_D_HEAD,
-        output_node=recovered,
+        output_node=emit_node,
         pos_encoding=pos_encoding,
         verbose=False,
     )
 
     for k in range(8):
         vals = {"int_val": torch.tensor([[float(k)]])}
-        out = net.compute(1, vals)[recovered].squeeze().item()
-        assert abs(out - k) < 1e-5, (
-            f"SORT_RESULT integer emit at k={k}: got {out}, expected {k} "
-            f"(K column path)"
-        )
-
-    # Also verify the K_NS column is the constant 1.
-    from torchwright.doom.embedding import D_K_NS_SLOT
-
-    k_ns_node = extract_from(
-        emitted, D_EMBED, k_col_start + D_K_SLOT, D_K_NS_SLOT, "k_ns"
-    )
-    net2 = forward_compile(
-        d=_D, d_head=_D_HEAD, output_node=k_ns_node,
-        pos_encoding=pos_encoding, verbose=False,
-    )
-    for k in range(8):
-        vals = {"int_val": torch.tensor([[float(k)]])}
-        out = net2.compute(1, vals)[k_ns_node].squeeze().item()
-        assert abs(out - 1.0) < 1e-5, (
-            f"SORT_RESULT K_NS column at k={k}: got {out}, expected 1.0"
+        emit_row = net.compute(1, vals)[emit_node].squeeze(0)  # (D_EMBED,)
+        # Host-side argmax against W_EMBED.T picks the predicted VALUE_k.
+        logits = emit_row @ W_EMBED.T.to(emit_row.device)  # (V,)
+        argmax_id = int(logits.argmax().item())
+        assert argmax_id == k, (
+            f"SORT_RESULT integer emit at k={k}: argmax picked VALUE_{argmax_id}"
         )
 
     # Sanity: the documented MAX_INT_K covers what we actually use.
@@ -286,13 +262,15 @@ def _build_readback_graph(names: list[str]):
     """
     from torchwright.graph import Concatenate
 
+    from torchwright.doom.embedding import _IS_VALUE_CATEGORY_COL
+
     pos_encoding = create_pos_encoding()
 
     embedding_leaf = build_doom_embedding(input_name="token_ids")
     prev_id_slots = create_input("prev_id_slots", len(IDENTIFIER_NAMES))
-    is_value_category = equals_vector(
-        extract_from(embedding_leaf, D_EMBED, 0, 8, "val_cat_cols"),
-        E8_VALUE,
+    # Phase D Part 1: is_value_category is a direct ±1 column in W_EMBED.
+    is_value_category = extract_from(
+        embedding_leaf, D_EMBED, _IS_VALUE_CATEGORY_COL, 1, "val_cat_col"
     )
 
     readback = build_thinking_readback(
@@ -350,7 +328,11 @@ def test_readback_independence_multiple_identifiers():
             [vocab_id("PLAYER_X")],
         ]
     )
-    prev_id_slots = torch.zeros(5, len(IDENTIFIER_NAMES))
+    # Phase D Part 1: prev_id_slots is ±1 (the V from the readback's
+    # attend_most_recent_matching is the ±1 slot one-hot block in
+    # W_EMBED — +1 at the active slot, −1 elsewhere).  Initialize
+    # with all −1 and stamp +1 at the active slot per position.
+    prev_id_slots = -torch.ones(5, len(IDENTIFIER_NAMES))
     prev_id_slots[1, slot_cross_a] = 1.0  # at VALUE after CROSS_A
     prev_id_slots[2, slot_cross_a] = 1.0  # at T_LO, prev was CROSS_A
     prev_id_slots[3, slot_t_lo] = 1.0  # at VALUE after T_LO
@@ -397,7 +379,11 @@ def test_readback_picks_most_recent_cross_a():
             [vocab_id("PLAYER_Y")],
         ]
     )
-    prev_id_slots = torch.zeros(5, len(IDENTIFIER_NAMES))
+    # Phase D Part 1: prev_id_slots is ±1 (the V from the readback's
+    # attend_most_recent_matching is the ±1 slot one-hot block in
+    # W_EMBED — +1 at the active slot, −1 elsewhere).  Initialize
+    # with all −1 and stamp +1 at the active slot per position.
+    prev_id_slots = -torch.ones(5, len(IDENTIFIER_NAMES))
     prev_id_slots[1, slot_cross_a] = 1.0
     prev_id_slots[2, slot_cross_a] = 1.0
     prev_id_slots[3, slot_cross_a] = 1.0
@@ -440,7 +426,8 @@ def test_readback_attention_hardness_passes():
             [vocab_id("PLAYER_X")],
         ]
     )
-    prev_id_slots = torch.zeros(3, len(IDENTIFIER_NAMES))
+    # Phase D Part 1: prev_id_slots is ±1.
+    prev_id_slots = -torch.ones(3, len(IDENTIFIER_NAMES))
     prev_id_slots[1, slot_cross_a] = 1.0
     prev_id_slots[2, slot_cross_a] = 1.0
 
@@ -476,32 +463,35 @@ def test_readback_empty_cache_does_not_crash():
             [vocab_id("PLAYER_Y")],
         ]
     )
-    prev_id_slots = torch.zeros(2, len(IDENTIFIER_NAMES))
+    # Phase D Part 1: prev_id_slots is ±1 (all −1 here — no
+    # identifier ever ran).
+    prev_id_slots = -torch.ones(2, len(IDENTIFIER_NAMES))
 
     # We skip the hardness assertion by not asking for it here.  The
     # production readback asserts hardness > 0.99 and callers must
     # ensure a prior instance exists in the window — this test just
     # documents the empty-cache behaviour.
     from torchwright.graph.pos_encoding import PosEncoding  # noqa: F401
+    from torchwright.doom.embedding import _IS_VALUE_CATEGORY_COL
     from torchwright.doom.thinking_readback import _decode_payload_to_float
     from torchwright.ops.attention_ops import attend_most_recent_matching
-    from torchwright.ops.arithmetic_ops import compare as _compare
     from torchwright.ops.logic_ops import bool_all_true
     from torchwright.ops.inout_nodes import create_literal_value
 
     pos_encoding = create_pos_encoding()
     embedding_leaf = build_doom_embedding(input_name="token_ids")
     prev_id_slots_in = create_input("prev_id_slots", len(IDENTIFIER_NAMES))
-    is_value_category = equals_vector(
-        extract_from(embedding_leaf, D_EMBED, 0, 8, "val_cat_cols"),
-        E8_VALUE,
+    # Phase D Part 1: is_value_category is a direct ±1 column extract.
+    is_value_category = extract_from(
+        embedding_leaf, D_EMBED, _IS_VALUE_CATEGORY_COL, 1, "val_cat_col"
     )
 
     slot_cross_a = IDENTIFIER_NAMES.index("CROSS_A")
-    prev_slot_i_01 = extract_from(
+    # Phase D Part 1: prev_id_slots is ±1, so the extract is the bool.
+    prev_slot_i_bool = extract_from(
         prev_id_slots_in, len(IDENTIFIER_NAMES), slot_cross_a, 1, "prev_slot_empty"
     )
-    is_X_value = bool_all_true([is_value_category, _compare(prev_slot_i_01, 0.5)])
+    is_X_value = bool_all_true([is_value_category, prev_slot_i_bool])
     payload = extract_from(embedding_leaf, D_EMBED, 8, 1, "payload_empty")
     matched_payload = attend_most_recent_matching(
         pos_encoding=pos_encoding,

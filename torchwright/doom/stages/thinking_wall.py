@@ -102,8 +102,10 @@ import math
 
 from torchwright.doom.embedding import (
     D_EMBED,
+    D_SLOT_ONEHOT,
     IDENTIFIER_NAMES,
     VALUE_RANGE_BY_NAME,
+    _SLOT_ONEHOT_START,
     embed_lookup,
 )
 from torchwright.doom.graph_constants import (
@@ -382,27 +384,48 @@ def build_thinking_wall(
         )
 
     # ---------------------------------------------------------------------
-    # Attention hop 2 (Part 2 mechanism): most-recent-identifier slot
-    # one-hot.  Stored as a 16-wide cond_gate(is_X_id, 1) at every
-    # identifier position; read at VALUE positions via
-    # attend_most_recent_matching against is_any_identifier.
+    # Attention hop 2: most-recent-identifier slot one-hot.  Phase D
+    # Part 1: V is the slot one-hot column block in W_EMBED — at each
+    # IDENTIFIER row col ``_SLOT_ONEHOT_START + slot`` is +1 and the
+    # other 20 cols are −1; non-identifier rows carry all −1.  The
+    # extract folds into the V projection, so this attention has no
+    # pre-computation other than the embedding leaf itself, dropping
+    # the cond_gate + Concat + cond_gate chain that previously built
+    # this V at depth 4.  ±1 storage matches the per-position
+    # ``is_identifier_by_slot[i]`` extract semantics (same column),
+    # so the same column does double duty as the per-position bool and
+    # the cross-position prev-id V.  Downstream Linears that previously
+    # took {0, 1} input have weights/bias adjusted to handle ±1 input
+    # (see ``static_next_at_value`` in :func:`_compute_next_token_embedding`).
     # ---------------------------------------------------------------------
     with annotate("thinking_wall/find_prev_identifier"):
-        slot_onehot_at_id = Concatenate(
-            [
-                cond_gate(is_identifier_by_slot[i], query_const_1)
-                for i in range(len(IDENTIFIER_NAMES))
-            ]
+        slot_onehot_raw = extract_from(
+            embedding,
+            D_EMBED,
+            _SLOT_ONEHOT_START,
+            D_SLOT_ONEHOT,
+            "tw_slot_onehot",
         )
-        slot_onehot_gated = cond_gate(is_any_identifier, slot_onehot_at_id)
-        prev_slot_onehot = attend_most_recent_matching(
+        # Tighten V's value_type to ±1 (the embedding leaf's value_type
+        # is unknown; without this declaration downstream consumers see
+        # an inflated bound and the cond_gate noise scales with that
+        # bound, masking the actual ±1 V values).
+        slot_onehot = assert_in_range(slot_onehot_raw, -1.0, 1.0)
+        prev_slot_onehot_raw = attend_most_recent_matching(
             pos_encoding=pos_encoding,
             query_vector=query_const_1,
             key_vector=is_any_identifier,
-            value=slot_onehot_gated,
+            value=slot_onehot,
             match_gain=12000.0,
             assert_hardness_gt=0.99,
         )
+        # Tighten the value_type to [-1, 1].  The V is ±1 cleanly from
+        # W_EMBED and the attention is hard (assert_hardness_gt above),
+        # but the compiler's value_range analyzer doesn't know that
+        # without an explicit declaration — without this, downstream
+        # cond_gate.M would inflate from 1 to whatever the embedding
+        # leaf's broad value_type allows.
+        prev_slot_onehot = assert_in_range(prev_slot_onehot_raw, -1.0, 1.0)
 
     # ---------------------------------------------------------------------
     # Phase C Part 3: derive the quadratic-equality K channels for
@@ -1355,13 +1378,21 @@ def _compute_next_token_embedding(
     marker_contribution = cond_gate(is_thinking_wall_marker, e_bsp_rank)
 
     # ---- Value step: emit successor token. ----
+    # Phase D Part 1: prev_slot_onehot is now ±1 (the V from the
+    # readback attention is the slot one-hot column block in W_EMBED,
+    # which carries +1 at the active slot and −1 elsewhere).  The
+    # original Linear was designed for {0, 1} input
+    # (output = ``next_after_slot[active_slot]``).  Substituting
+    # ``y = (x + 1) / 2`` bakes the {0, 1} ↔ ±1 conversion into the
+    # Linear's weights/bias — pure parameter shift, no extra ops, no
+    # extra layers.
     next_after_slot = torch.zeros(len(IDENTIFIER_NAMES), D_EMBED)
     for slot, name in _VALUE_SUCCESSOR_BY_SLOT.items():
         next_after_slot[slot] = embed_lookup(name)
     static_next_at_value = Linear(
         prev_slot_onehot,
-        next_after_slot,
-        torch.zeros(D_EMBED),
+        next_after_slot / 2.0,
+        next_after_slot.sum(dim=0) / 2.0,
         name="next_at_value_static",
     )
 
@@ -1382,10 +1413,11 @@ def _compute_next_token_embedding(
     is_last_wall = compare(current_wall_index, float(max_walls) - 1.5)
     hy_successor = select(is_last_wall, e_resolved_x, next_marker_embed)
 
-    prev_was_hy_01 = extract_from(
+    # Phase D Part 1: prev_slot_onehot is ±1, so the extract at the
+    # HIT_Y slot is already the ±1 bool — no compare(0.5) needed.
+    prev_was_hy_bool = extract_from(
         prev_slot_onehot, len(IDENTIFIER_NAMES), _SLOT_HIT_Y, 1, "prev_was_hy"
     )
-    prev_was_hy_bool = compare(prev_was_hy_01, 0.5)
     hy_contribution = cond_gate(prev_was_hy_bool, hy_successor)
 
     next_at_value_total = sum_nodes([static_next_at_value, hy_contribution])
