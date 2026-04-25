@@ -212,3 +212,49 @@ def test_cpsat_costs_beta_routes_more_to_mlp():
     expected = out.compute(2, inputs)
     torch.testing.assert_close(out_alpha, expected, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(out_beta, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_cpsat_assume_zero_init_compiles():
+    """``assume_zero_init=True`` lets the model and heuristic skip
+    BIRTH-layer dirty cancels.  The compiled module must still produce
+    correct output when the runtime zero-initialises the residual
+    stream — which ``HeadlessTransformer.compute()`` always does.
+    """
+    out, inputs = _build_branchy()
+    net = forward_compile(
+        d=D,
+        d_head=D_HEAD,
+        output_node=out,
+        verbose=False,
+        use_cpsat=True,
+        assume_zero_init=True,
+    )
+    actual = net.compute(2, inputs)[out].cpu()
+    expected = out.compute(2, inputs)
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_cpsat_warm_start_layer_count_no_worse():
+    """Warm-start must not produce a worse schedule than the heuristic.
+
+    ``forward_compile`` runs a schedule-only heuristic pass before
+    invoking CP-SAT and feeds the result as ``hint_layers``.  Because
+    the hint is feasible, CP-SAT can always match it; with
+    ``cpsat_costs.alpha=1`` (the default) it tries to beat it.
+    """
+    out, inputs = _build_branchy()
+    net_heur = forward_compile(
+        d=D,
+        d_head=D_HEAD,
+        output_node=out,
+        verbose=False,
+        use_cpsat=False,
+    )
+    net_cpsat = forward_compile(
+        d=D,
+        d_head=D_HEAD,
+        output_node=out,
+        verbose=False,
+        use_cpsat=True,
+    )
+    assert len(net_cpsat.layers) <= len(net_heur.layers)

@@ -5,6 +5,7 @@ Produces a HeadlessTransformer that can compute the output node's value
 given input values.
 """
 
+import copy
 import os
 import time
 from typing import Callable, Optional, Set
@@ -238,6 +239,7 @@ def forward_compile(
     cpsat_flex_routing: bool = True,
     cpsat_time_budget_s: float = 60.0,
     cpsat_allow_suboptimal: bool = False,
+    assume_zero_init: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -284,6 +286,15 @@ def forward_compile(
             cannot prove optimality within the budget.  When True,
             accept a feasible-but-not-proven-optimal schedule.
             Ignored when ``use_cpsat=False``.
+        assume_zero_init: When True, the compile assumes the runtime
+            zero-initialises the residual stream (the contract met by
+            ``HeadlessTransformer.get_input_res_stream``) and skips
+            BIRTH-layer dirty-column cancels for fresh allocations on
+            the initially-free pool.  Compiles produced this way are
+            ~D/d_head fewer attention heads but break under callers
+            that pass a non-zero residual stream to ``forward()``
+            directly.  Defaults to False — the conservative behaviour
+            from commit cf4af42.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -320,14 +331,25 @@ def forward_compile(
     residual_map = ResidualStreamMap(d)
     residual_map.allocate(pos_encoding)
     # pos_encoding + input_nodes are populated by get_input_res_stream at
-    # forward-time, so those cols are guaranteed clean on entry.  Every
-    # other col is dirty until a cancel op clears it.
+    # forward-time, so those cols are guaranteed clean on entry.
     residual_map.mark_clean(residual_map.get_indices(pos_encoding))
     for node in input_nodes:
         if node is pos_encoding:
             continue
         residual_map.allocate(node)
         residual_map.mark_clean(residual_map.get_indices(node))
+    # When the caller asserts the runtime zero-initialises the residual
+    # stream (the contract `HeadlessTransformer.get_input_res_stream`
+    # already provides), the initially-free pool holds zero on entry —
+    # not garbage — so mark it clean and the heuristic skips the
+    # BIRTH-layer dirty cancel that would otherwise zero each column
+    # before its first additive write.  Subsequent recycled columns
+    # return to the clean pool via the cancel ops the heuristic already
+    # emits at node death.  Default-off because commit cf4af42 made the
+    # compiler defensive against non-zero callers and we don't reverse
+    # that without an explicit opt-in.
+    if assume_zero_init:
+        residual_map.mark_clean(set(residual_map._free))
     computed = set(input_nodes)
 
     # Static sibling-cluster analysis for admission control.  When
@@ -398,12 +420,74 @@ def forward_compile(
                 "(see docs/cpsat_scheduler.md §3 Model preconditions).  "
                 "Pass use_cpsat=False to keep admission control."
             )
+
+        # Warm-start: run the heuristic scheduler to convergence on a
+        # cloned residual_map / computed set, capturing each schedulable
+        # node's layer.  CP-SAT consumes the result via `hint_layers`;
+        # a known-feasible incumbent dramatically shrinks the time the
+        # solver needs to find any feasible schedule.  We use the
+        # scheduler in schedule-only mode (no weight writes) to avoid
+        # paying the full compile cost twice.
+        t_hint_start = time.perf_counter()
+        hint_rmap = copy.deepcopy(residual_map)
+        hint_computed = set(computed)
+        hint_scheduler = LayerScheduler(
+            graph,
+            d,
+            d_head,
+            pos_encoding,
+            d_hidden=d_hidden,
+            clusters=clusters,
+            admission_budget_fraction=admission_budget_fraction,
+            policy=policy,
+            pinned_nodes=overlay_pinned_inputs,
+        )
+        hint_layers: dict = {}
+        for hi in range(max_layers):
+            if output_node in hint_computed:
+                break
+            prev_hint = set(hint_computed)
+            try:
+                attn_ops, mlp_ops, _ = hint_scheduler.schedule_layer(
+                    hint_rmap, hint_computed
+                )
+            except RuntimeError:
+                # Heuristic deadlocked / no progress.  Drop the hint
+                # and let CP-SAT cold-start.
+                hint_layers = {}
+                break
+            for node in graph.get_all_nodes():
+                if isinstance(node, Concatenate) and node not in hint_computed:
+                    if all(
+                        leaf in hint_computed
+                        for leaf in flatten_concat_nodes([node])
+                    ):
+                        hint_computed.add(node)
+            for n in hint_computed - prev_hint:
+                hint_layers[n.node_id] = hi
+            if not attn_ops and not mlp_ops:
+                break
+        hint_n_layers = max(hint_layers.values()) + 1 if hint_layers else 0
         if verbose:
+            hint_time = time.perf_counter() - t_hint_start
+            print(
+                f"  Heuristic warm-start: {hint_n_layers} layers "
+                f"({hint_time:.2f}s)"
+            )
             print(
                 f"  CP-SAT solver: costs={cpsat_costs}, "
                 f"flex_routing={cpsat_flex_routing}, "
                 f"time_budget_s={cpsat_time_budget_s}"
             )
+
+        # Use the heuristic's layer count as the search horizon (with
+        # one slack layer) when it's tighter than the user-supplied
+        # max_layers.  CP-SAT's variable domain shrinks accordingly,
+        # which is a big win for graphs where max_layers >> n_layers.
+        solver_max_layers = max_layers
+        if hint_n_layers > 0:
+            solver_max_layers = min(max_layers, hint_n_layers + 1)
+
         t_solve_start = time.perf_counter()
         assignment = solve_schedule(
             output_node,
@@ -414,9 +498,11 @@ def forward_compile(
             costs=cpsat_costs,
             flex_routing=cpsat_flex_routing,
             time_budget_s=cpsat_time_budget_s,
-            max_layers=max_layers,
+            max_layers=solver_max_layers,
             allow_suboptimal=cpsat_allow_suboptimal,
             policy=policy,
+            assume_zero_init=assume_zero_init,
+            hint_layers=hint_layers if hint_layers else None,
         )
         if verbose:
             solve_time = time.perf_counter() - t_solve_start

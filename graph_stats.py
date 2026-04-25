@@ -1045,6 +1045,31 @@ def main():
         action="store_true",
         help="Build with render_pixels=False (skip the RENDER texture sub-graph)",
     )
+    parser.add_argument(
+        "--cpsat-time-budget",
+        type=float,
+        default=300.0,
+        help="Per-solve CP-SAT wall-clock cap in seconds (default 300).",
+    )
+    parser.add_argument(
+        "--no-cpsat",
+        action="store_true",
+        help="Use the heuristic LayerScheduler instead of CP-SAT.",
+    )
+    parser.add_argument(
+        "--cpsat-allow-suboptimal",
+        action="store_true",
+        help="Accept feasible-but-not-proven-optimal CP-SAT schedules.",
+    )
+    parser.add_argument(
+        "--assume-zero-init",
+        action="store_true",
+        help=(
+            "Assume the runtime zero-initialises the residual stream "
+            "(the contract HeadlessTransformer.get_input_res_stream "
+            "already meets) and skip BIRTH-layer dirty-column cancels."
+        ),
+    )
     args = parser.parse_args()
 
     if args.scene == "box":
@@ -1130,12 +1155,16 @@ def main():
         d_head,
         output,
         pos,
-        verbose=False,
+        verbose=True,
         max_layers=400,
         d_hidden=d_hidden,
         device=None,
         on_node_scheduled=_track,
         policy=LEGACY_POLICY if args.legacy_policy else None,
+        use_cpsat=not args.no_cpsat,
+        cpsat_time_budget_s=args.cpsat_time_budget,
+        cpsat_allow_suboptimal=args.cpsat_allow_suboptimal,
+        assume_zero_init=args.assume_zero_init,
     )
     n_layers = max(node_to_layer.values()) + 1 if node_to_layer else 0
 

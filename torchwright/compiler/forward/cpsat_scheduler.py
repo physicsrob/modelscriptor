@@ -446,6 +446,7 @@ def solve_schedule(
     hint_layers: Optional[Dict[int, int]] = None,
     policy: Optional[SchedulingPolicy] = None,
     reserve_heads: int = 0,
+    assume_zero_init: bool = False,
 ) -> ScheduleAssignment:
     """Build and solve the CP-SAT scheduling model.
 
@@ -473,9 +474,16 @@ def solve_schedule(
             `LEGACY_POLICY`.
         reserve_heads: per-layer attention-head budget reserved
             beyond the modeled compute + cancel + dirty terms.
-            Defaults to 0 since the dirty-column cumulative covers the
-            BIRTH-layer cancel cost.  Raise it for graphs whose
-            attention heads are saturated by ops outside the model.
+            Defaults to 0.  Raise it for graphs whose attention heads
+            are saturated by ops outside the model.
+        assume_zero_init: if True, the model assumes the runtime
+            zero-initialises the residual stream (so the heuristic
+            emits no BIRTH-layer dirty-column cancels for fresh
+            allocations on the initially-free pool).  Pair this with
+            ``forward_compile(assume_zero_init=True)`` so the heuristic
+            and CP-SAT model agree.  Defaults to False — the
+            conservative model that mirrors the heuristic's defensive
+            cancellation behaviour from commit cf4af42.
 
     Raises `RuntimeError` on `INFEASIBLE`, time-out without a feasible
     solution, or `FEASIBLE` when `allow_suboptimal=False`. Raises also
@@ -497,6 +505,7 @@ def solve_schedule(
         policy=policy,
         log_search_progress=False,
         reserve_heads=reserve_heads,
+        assume_zero_init=assume_zero_init,
     )
     if assignment is None:
         raise RuntimeError(
@@ -528,6 +537,7 @@ def _solve_full(
     policy: Optional[SchedulingPolicy] = None,
     log_search_progress: bool = False,
     reserve_heads: int = 0,
+    assume_zero_init: bool = False,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Internal solve that returns both the assignment and the solver stats.
 
@@ -696,14 +706,20 @@ def _solve_full(
         cancel_intervals.append(iv)
         cancel_demands.append(len(n))
 
-        # Birth-layer dirty-column cancel: when n is allocated at
-        # `layer_var[n]`, its `len(n)` columns are dirty until the
-        # heuristic batches them into the layer's cancel op.  The
-        # heuristic combines DEATH-layer cancels and BIRTH-layer dirty
-        # cancels into one batched ``AttnHeadOp("cancel", ...)`` per
-        # layer, so they share the attention head budget.  The
-        # ``cancel_intervals`` cumulative term above only models the
-        # DEATH layer; this term adds the BIRTH layer.
+        # Birth-layer dirty-column cancel.  When `assume_zero_init` is
+        # False (the default, mirroring the heuristic's defensive
+        # behaviour from commit cf4af42), every fresh allocation pays
+        # a cancel head to clear the column's prior value before its
+        # additive write.  When True, the runtime is contracted to
+        # zero-initialise the residual stream and the heuristic skips
+        # these cancels — so we skip them in the model too.
+        # `Add` is always exempt: under the model precondition (no
+        # `Concatenate`-input `Add`) the heuristic always reaches the
+        # `Add` via the free-add path, reusing the dead addend's
+        # already-allocated columns — no fresh allocation, no dirty
+        # bits to clear.
+        if assume_zero_init or isinstance(n, Add):
+            continue
         d_end = model.NewIntVar(1, max_layers, f"dend_n{n.node_id}")
         model.Add(d_end == layer_var[n.node_id] + 1)
         d_iv = model.NewIntervalVar(
@@ -712,11 +728,9 @@ def _solve_full(
         dirty_intervals.append(d_iv)
         dirty_demands.append(len(n))
 
-    # Reserve attention-head capacity beyond the modeled BIRTH+DEATH
-    # cancel costs.  Defaults to 0 since the dirty-interval term above
-    # already accounts for the BIRTH layer; raise it to add a safety
-    # margin for graphs whose attention heads are saturated by ops
-    # outside the model (e.g. bias writes folded into deferred Linears).
+    # `reserve_heads` is a safety knob for graphs whose attention
+    # heads are saturated by ops outside the model (e.g. bias writes
+    # folded into deferred Linears); default 0.
     effective_capacity = max(0, n_heads_per_layer - reserve_heads) * d_head
     if attn_intervals or cancel_intervals or dirty_intervals:
         model.AddCumulative(
