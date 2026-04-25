@@ -107,6 +107,44 @@ numbers in `numerical_noise.md` at e.g. `compare_near_thresh_0` (abs
 op. Read ramp-zone distribution rows as "here is how the ramp looks,"
 not as "here is an error budget."
 
+### `exp` hits its theoretical relative-error bound; `log` is dominated by float32 accumulation
+
+The new `log`/`exp` ops are designed as a paired primitive for log-space
+arithmetic (e.g., `A·B = exp(log A + log B)`, `A/B = exp(log A − log B)`)
+and the noise numbers cleanly separate two distinct error regimes.
+
+**`exp` (uniform 256-BP grid over `[-5, 5]`)** measures
+`max_rel_error = 1.92e-4`, identical to the theoretical per-cell bound
+`(Δx)² / 8 = (10/255)² / 8 ≈ 1.92e-4`. Uniform breakpoints on `exp`
+deliver constant relative output error by construction (since
+`d²exp/dx² = exp(x)` cancels against the function value), and the
+measurement confirms float32 noise is small enough not to blur this. This
+is the cleanest "design matches measurement" entry in the table.
+
+**`log` (geometric 256-BP grid over `[0.01, 100]`)** measures
+`max_abs_error = 4.8e-3`, vs the per-cell linear-interpolation bound of
+`(ratio - 1)² / 8 ≈ 1.7e-4` — roughly **28×** worse than the
+interpolation theory predicts. The gap is float32 matmul accumulation:
+the output at the high-x end of the range sums contributions from ~all
+256 active ReLUs, and the worst-case absolute error compounds with the
+breakpoint count. Callers that compose `log` into longer chains (e.g.
+`exp(log A + log B)`) inherit this 4.8e-3 absolute error in log-space,
+which translates to ~0.5% relative error in the underlying `x`.
+
+**`log`'s relative-error tail (max `5.3e-3`, mean `1.7e-4`)** is also
+sensitive to inputs near `x = 1` where `log(x) → 0` — same near-zero
+pathology as `square` and `multiply_2d`. Use absolute, not relative,
+log-space tolerances when the input distribution can land near 1.
+
+**Not yet wired into DOOM.** These ops are candidates for the log-space
+reformulations discussed in the broader log-space analysis (a robust
+`atan2` via `atan(exp(log|cross| − log|dot|))`, wall-height as
+`exp(log H − log|num_t| + log|den/cos|)`, sign-and-log-magnitude
+comparisons replacing `_T_COMPARE_SCALE = 100` in
+`torchwright/doom/stages/wall.py`). When a callsite lands, add a
+matching `doom_*` distribution mirroring its production input range, and
+extend the call-site table below.
+
 ### Known gap: reciprocal sorted callsite blocked on op-math
 
 `doom_reciprocal_sorted` is defined in `scripts/measure_op_noise.py` but

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "commit": "507741d",
-  "measured_at": "2026-04-21",
+  "commit": "29e6d5e",
+  "measured_at": "2026-04-25",
   "ops": [
     {
       "name": "abs",
@@ -224,6 +224,28 @@
       ]
     },
     {
+      "name": "exp",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Natural exponential via piecewise-linear interpolation with uniform breakpoint spacing. Constant relative output error per cell `(Δx)²/8` because `d²exp/dx² = exp`. Pairs with `log` to implement `A·B = exp(log A + log B)` and `A/B = exp(log A − log B)` in log-space chains.",
+      "distributions": [
+        {
+          "name": "exp_pm5",
+          "description": "exp(x) over [-5, 5] — output spans [exp(-5), exp(5)] ≈ [0.0067, 148.4], the natural pairing for log over [0.01, 100]. Uniform 256-BP grid (`Δx ≈ 0.0392`); per-cell relative-error bound is `(Δx)²/8 ≈ 1.9e-4`.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0279694,
+          "mean_abs_error": 0.00171612,
+          "p99_abs_error": 0.0209377,
+          "max_rel_error": 0.00019238,
+          "mean_rel_error": 0.000120446,
+          "p99_rel_error": 0.000192204,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 4.98001
+          }
+        }
+      ]
+    },
+    {
       "name": "floor_int",
       "module": "torchwright.ops.arithmetic_ops",
       "notes": "Staircase with ramp width `1/step_sharpness` directly below each integer. Inputs near integer boundaries land in the ramp zone and produce interpolated values; callers with integer-ish inputs should use `thermometer_floor_div` instead, whose ramps sit at half-integer thresholds.",
@@ -232,12 +254,12 @@
           "name": "floor_near_boundary_10",
           "description": "Samples within ±1/step_sharpness of integer k=5 — stresses the ramp zone where `floor_int` interpolates.",
           "n_samples": 4096,
-          "max_abs_error": 0.999283,
+          "max_abs_error": 0.999268,
           "mean_abs_error": 0.128753,
-          "p99_abs_error": 0.970371,
-          "max_rel_error": 0.249821,
+          "p99_abs_error": 0.970386,
+          "max_rel_error": 0.249817,
           "mean_rel_error": 0.0321882,
-          "p99_rel_error": 0.242593,
+          "p99_rel_error": 0.242596,
           "rel_valid_samples": 4096,
           "worst_input": {
             "x": 4.99993
@@ -247,12 +269,12 @@
           "name": "floor_uniform_neg5_10",
           "description": "Uniform continuous samples on [-5, 10] — most land in flat zones; measures baseline `floor_int` accuracy.",
           "n_samples": 4096,
-          "max_abs_error": 0.998161,
-          "mean_abs_error": 0.0465447,
+          "max_abs_error": 0.998169,
+          "mean_abs_error": 0.0465452,
           "p99_abs_error": 0.895853,
           "max_rel_error": 0.953022,
-          "mean_rel_error": 0.0184897,
-          "p99_rel_error": 0.461096,
+          "mean_rel_error": 0.0184898,
+          "p99_rel_error": 0.46109,
           "rel_valid_samples": 3828,
           "worst_input": {
             "x": 5.99982
@@ -270,16 +292,38 @@
           "description": "16-bin quantisation of x ∈ [0, 64] with x_min=0, x_max=64 — mirrors texture-column bucketing in the RENDER stage.",
           "n_samples": 4096,
           "max_abs_error": 1.0,
-          "mean_abs_error": 0.0747671,
-          "p99_abs_error": 0.921875,
-          "max_rel_error": 1.0,
-          "mean_rel_error": 0.0152883,
-          "p99_rel_error": 0.246094,
+          "mean_abs_error": 0.0630863,
+          "p99_abs_error": 0.6875,
+          "max_rel_error": 0.985352,
+          "mean_rel_error": 0.0133874,
+          "p99_rel_error": 0.224121,
           "rel_valid_samples": 3715,
           "worst_input": {
-            "x": 7.99831,
+            "x": 59.9995,
             "x_min": 0.0,
             "x_max": 64.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "log",
+      "module": "torchwright.ops.arithmetic_ops",
+      "notes": "Natural log via piecewise-linear interpolation with geometric breakpoint spacing. Per-cell linear-interp bound is `(ratio-1)²/8`, but the empirical end-to-end error is dominated by float32 matmul accumulation across ~256 active ReLUs at the high end of the range. Pairs with `exp` for log-space arithmetic chains.",
+      "distributions": [
+        {
+          "name": "log_4decades_001_100",
+          "description": "log(x) over [0.01, 100] — 4 decades, geometric BP grid with 256 breakpoints (`ratio ≈ 1.0367`). Stresses float32 matmul accumulation across the full BP set at the high end of the range, where ~all ReLUs are active.",
+          "n_samples": 4096,
+          "max_abs_error": 0.00481176,
+          "mean_abs_error": 0.00064981,
+          "p99_abs_error": 0.0028347,
+          "max_rel_error": 0.00531085,
+          "mean_rel_error": 0.000171651,
+          "p99_rel_error": 0.000677215,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 94.5104
           }
         }
       ]
@@ -293,15 +337,15 @@
           "name": "doom_atan_cross_dot",
           "description": "atan2(cross/dot) over [-2, 2] × [0.5, 10] on non-uniform grid — mirrors the `atan_front_*` callsite at `torchwright/doom/stages/sorted.py:549` (rank-3 SVD).",
           "n_samples": 4096,
-          "max_abs_error": 0.0651014,
+          "max_abs_error": 0.0651017,
           "mean_abs_error": 0.0158553,
-          "p99_abs_error": 0.0574395,
-          "max_rel_error": 0.331315,
-          "mean_rel_error": 0.0803216,
-          "p99_rel_error": 0.217156,
+          "p99_abs_error": 0.0574396,
+          "max_rel_error": 0.33142,
+          "mean_rel_error": 0.0803217,
+          "p99_rel_error": 0.217151,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "a": -2.0,
+            "a": 2.0,
             "b": 3.36508
           }
         }
@@ -384,15 +428,15 @@
           "name": "multiply_uniform_pm10",
           "description": "a·b over [-10, 10]² with step=1 — generic uniform product grid; analytical bound `step1*step2/4 = 0.25`.",
           "n_samples": 4096,
-          "max_abs_error": 0.0624921,
-          "mean_abs_error": 0.0201983,
-          "p99_abs_error": 0.0584729,
-          "max_rel_error": 2.15015,
-          "mean_rel_error": 0.0072932,
-          "p99_rel_error": 0.0661772,
+          "max_abs_error": 0.0624998,
+          "mean_abs_error": 0.0201988,
+          "p99_abs_error": 0.0584654,
+          "max_rel_error": 2.15046,
+          "mean_rel_error": 0.00729335,
+          "p99_rel_error": 0.0661755,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "a": 1.74603,
+            "a": -1.74603,
             "b": -1.74603
           }
         }
@@ -430,7 +474,7 @@
           "name": "parabola_0_10_step1",
           "description": "f(x)=x² on [0, 10] with integer breakpoints — probes generic `piecewise_linear` precision between grid points.",
           "n_samples": 4096,
-          "max_abs_error": 0.250004,
+          "max_abs_error": 0.250008,
           "mean_abs_error": 0.163799,
           "p99_abs_error": 0.249977,
           "max_rel_error": 231.114,
@@ -438,7 +482,7 @@
           "p99_rel_error": 11.396,
           "rel_valid_samples": 4094,
           "worst_input": {
-            "x": 6.49947
+            "x": 8.49967
           }
         }
       ]
@@ -452,12 +496,12 @@
           "name": "doom_diff_trig",
           "description": "wall-geometry product over DIFF_BP × TRIG_BP — mirrors the `sort_ey_cos`/`sort_ex_sin` family of calls at `torchwright/doom/stages/wall.py:263` and neighbours.",
           "n_samples": 4096,
-          "max_abs_error": 7.77785,
+          "max_abs_error": 7.77784,
           "mean_abs_error": 1.30067,
           "p99_abs_error": 6.54323,
-          "max_rel_error": 0.60163,
-          "mean_rel_error": 0.117967,
-          "p99_rel_error": 0.350006,
+          "max_rel_error": 0.601363,
+          "mean_rel_error": 0.117966,
+          "p99_rel_error": 0.35001,
           "rel_valid_samples": 4096,
           "worst_input": {
             "a": 22.2222,
@@ -469,11 +513,11 @@
           "description": "collision product over DIFF_BP × VEL_BP — mirrors the `p_dx_ey`/`p_dy_ex` family at `torchwright/doom/stages/wall.py:205`.",
           "n_samples": 4096,
           "max_abs_error": 5.44453,
-          "mean_abs_error": 0.937458,
+          "mean_abs_error": 0.93746,
           "p99_abs_error": 4.72484,
-          "max_rel_error": 0.601709,
-          "mean_rel_error": 0.123236,
-          "p99_rel_error": 0.350014,
+          "max_rel_error": 0.602409,
+          "mean_rel_error": 0.123235,
+          "p99_rel_error": 0.35002,
           "rel_valid_samples": 4096,
           "worst_input": {
             "a": 22.2222,
@@ -491,15 +535,15 @@
           "name": "doom_reciprocal_wall",
           "description": "1/x over [0.3, 200.0], step=1.0 — mirrors the `inv_abs_num_t` callsite at `torchwright/doom/stages/wall.py:339`.",
           "n_samples": 4096,
-          "max_abs_error": 0.000824451,
-          "mean_abs_error": 0.000113957,
-          "p99_abs_error": 0.000477473,
-          "max_rel_error": 0.136051,
-          "mean_rel_error": 0.0144352,
-          "p99_rel_error": 0.078974,
+          "max_abs_error": 0.000913722,
+          "mean_abs_error": 0.000126387,
+          "p99_abs_error": 0.000580514,
+          "max_rel_error": 0.16856,
+          "mean_rel_error": 0.0164945,
+          "p99_rel_error": 0.102703,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "x": 0.315914
+            "x": 160.06
           }
         }
       ]
@@ -514,7 +558,7 @@
           "description": "a·b over [-10, 10]² via polarization identity, step=1.0 — analytical bound `step × (max_abs1 + max_abs2) / 4 = 5.0` absolute, much smaller relative.",
           "n_samples": 4096,
           "max_abs_error": 0.062484,
-          "mean_abs_error": 0.0201976,
+          "mean_abs_error": 0.0201977,
           "p99_abs_error": 0.0584545,
           "max_rel_error": 2.15001,
           "mean_rel_error": 0.00729324,
@@ -536,7 +580,7 @@
           "name": "square_unsigned_0_10",
           "description": "x² over [0, 10] with step=1.0 — exact at integers, worst error at half-integers.",
           "n_samples": 4096,
-          "max_abs_error": 0.250004,
+          "max_abs_error": 0.250008,
           "mean_abs_error": 0.163799,
           "p99_abs_error": 0.249977,
           "max_rel_error": 231.114,
@@ -544,7 +588,7 @@
           "p99_rel_error": 11.396,
           "rel_valid_samples": 4094,
           "worst_input": {
-            "x": 6.49947
+            "x": 8.49967
           }
         }
       ]
@@ -558,15 +602,15 @@
           "name": "square_signed_pm10",
           "description": "x² over [-10, 10] with step=1.0 — covers the negative half the unsigned variant cannot reach.",
           "n_samples": 4096,
-          "max_abs_error": 0.250023,
+          "max_abs_error": 0.25005,
           "mean_abs_error": 0.163952,
           "p99_abs_error": 0.249971,
           "max_rel_error": 276.695,
-          "mean_rel_error": 0.748596,
-          "p99_rel_error": 13.238,
+          "mean_rel_error": 0.748853,
+          "p99_rel_error": 13.2382,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "x": 9.49681
+            "x": 7.50228
           }
         }
       ]
