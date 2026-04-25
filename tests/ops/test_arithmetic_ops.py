@@ -407,6 +407,72 @@ def test_log_accuracy_4_decades():
         )
 
 
+def test_log_wide_range_6_decades():
+    """log over [0.01, 30000] (6 decades) — the case that fails for naïve PWL.
+
+    Without sectioning, partial-sum cancellation in the slope-delta
+    representation hits float32 ULP at ``(x_max/x_min) · 2⁻²³ ≈ 0.36``,
+    multiplied by accumulation factor ~3 giving ~1 absolute. With
+    per-decade sectioning, each section's pre-cancellation magnitude
+    is bounded by its own ``B_{i+1}/B_i = 10``, so the floor drops to
+    ``10 · 2⁻²³ ≈ 1.2e-6`` — six decades of headroom.
+
+    Includes both clean inputs and inputs near section boundaries.
+    """
+    import math
+
+    x = create_input("x", 1)
+    f = log(x, min_value=0.01, max_value=30000.0, n_breakpoints=256)
+
+    # Spread test inputs across all decades, including some near
+    # interior boundaries (0.1, 1, 10, 100, 1000, 10000) to exercise
+    # the multiply_2d blending in ramp zones.
+    test_values = [
+        0.012, 0.05, 0.099, 0.105,  # section 0 + boundary 0.1
+        0.3, 0.95, 1.005,           # section 1 + boundary 1
+        3.0, 9.5, 10.05,            # section 2 + boundary 10
+        50.0, 99.0, 100.5,          # section 3 + boundary 100
+        500.0, 999.0, 1001.0,       # section 4 + boundary 1000
+        5000.0, 9999.0, 10010.0,    # section 5 + boundary 10000
+        20000.0, 29999.0,           # section 6
+    ]
+    worst = 0.0
+    worst_v = None
+    for v in test_values:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        expected = math.log(v)
+        err = abs(result.item() - expected)
+        if err > worst:
+            worst = err
+            worst_v = v
+        # 1e-2 absolute is generous — the design floor is ~1e-5;
+        # blending in narrow ramp zones contributes the dominant noise.
+        assert err < 1e-2, (
+            f"log({v}) = {expected:.6f}, got {result.item():.6f} (abs_err={err:.2e})"
+        )
+
+
+def test_log_extreme_range_7_decades():
+    """log over [0.001, 30000] (7+ decades) — naïve PWL fails by ~9 absolute.
+
+    Demonstrates that the precision floor is now controlled by section
+    width, not overall range.
+    """
+    import math
+
+    x = create_input("x", 1)
+    f = log(x, min_value=0.001, max_value=30000.0, n_breakpoints=256)
+
+    test_values = [0.002, 0.05, 1.0, 100.0, 5000.0, 28000.0]
+    for v in test_values:
+        result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
+        expected = math.log(v)
+        err = abs(result.item() - expected)
+        assert err < 1e-2, (
+            f"log({v}) = {expected:.6f}, got {result.item():.6f} (abs_err={err:.2e})"
+        )
+
+
 def test_log_accuracy_2_decades():
     """log over [0.1, 10] (2 decades) with 256 BPs is much tighter.
 

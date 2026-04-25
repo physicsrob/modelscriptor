@@ -107,43 +107,67 @@ numbers in `numerical_noise.md` at e.g. `compare_near_thresh_0` (abs
 op. Read ramp-zone distribution rows as "here is how the ramp looks,"
 not as "here is an error budget."
 
-### `exp` hits its theoretical relative-error bound; `log` is dominated by float32 accumulation
+### `log` is per-section to escape the wide-range cancellation floor; `exp` hits its theoretical relative-error bound
 
-The new `log`/`exp` ops are designed as a paired primitive for log-space
-arithmetic (e.g., `A·B = exp(log A + log B)`, `A/B = exp(log A − log B)`)
-and the noise numbers cleanly separate two distinct error regimes.
+The `log`/`exp` ops are paired primitives for log-space arithmetic
+(e.g., `A·B = exp(log A + log B)`, `A/B = exp(log A − log B)`).
 
 **`exp` (uniform 256-BP grid over `[-5, 5]`)** measures
 `max_rel_error = 1.92e-4`, identical to the theoretical per-cell bound
-`(Δx)² / 8 = (10/255)² / 8 ≈ 1.92e-4`. Uniform breakpoints on `exp`
-deliver constant relative output error by construction (since
-`d²exp/dx² = exp(x)` cancels against the function value), and the
-measurement confirms float32 noise is small enough not to blur this. This
-is the cleanest "design matches measurement" entry in the table.
+`(Δx)² / 8`. Uniform breakpoints on `exp` deliver constant relative
+output error by construction (since `d²exp/dx² = exp(x)` cancels
+against the function value), and the measurement confirms float32
+noise is small enough not to blur this.
 
-**`log` (geometric 256-BP grid over `[0.01, 100]`)** measures
-`max_abs_error = 4.8e-3`, vs the per-cell linear-interpolation bound of
-`(ratio - 1)² / 8 ≈ 1.7e-4` — roughly **28×** worse than the
-interpolation theory predicts. The gap is float32 matmul accumulation:
-the output at the high-x end of the range sums contributions from ~all
-256 active ReLUs, and the worst-case absolute error compounds with the
-breakpoint count. Callers that compose `log` into longer chains (e.g.
-`exp(log A + log B)`) inherit this 4.8e-3 absolute error in log-space,
-which translates to ~0.5% relative error in the underlying `x`.
+**`log` is sectioned by default.** A naïve single-piecewise log over
+`[x_min, x_max]` has the first ReLU contribute `slope[0] · x_max ≈
+x_max / x_min` in pre-cancellation magnitude at the right end of the
+range, hitting a float32 floor of `(x_max/x_min) · 2⁻²³` on the
+absolute log output. For DOOM-scale ranges (`x_max/x_min ≈ 3·10⁶`)
+this floor is ~0.36 absolute log error — which translates to ~30%
+relative error in the underlying `x` and outright fails the value-
+range assertion. **Increasing breakpoint count makes it worse**, not
+better, by lengthening the cancellation chain (verified empirically:
+N=1024 over [0.01, 30000] gave 3.3 absolute error vs 1.0 at N=256;
+see `scripts/investigate_log_precision.py`).
 
-**`log`'s relative-error tail (max `5.3e-3`, mean `1.7e-4`)** is also
-sensitive to inputs near `x = 1` where `log(x) → 0` — same near-zero
-pathology as `square` and `multiply_2d`. Use absolute, not relative,
-log-space tolerances when the input distribution can land near 1.
+The op auto-sections the input range geometrically by
+`section_factor=10` (default decades), runs one piecewise-linear log
+per section in parallel, and routes via thermometer compare plus
+`multiply_2d` blending. Each section's pre-cancellation magnitude is
+bounded by its own `B_{i+1}/B_i = section_factor`, so the floor drops
+to `section_factor · 2⁻²³ ≈ 1.2e-6` per section — independent of
+overall range. For ranges that fit in one section
+(`x_max/x_min ≤ section_factor`), the op falls through to a single
+`piecewise_linear` with no routing overhead.
 
-**Not yet wired into DOOM.** These ops are candidates for the log-space
-reformulations discussed in the broader log-space analysis (a robust
-`atan2` via `atan(exp(log|cross| − log|dot|))`, wall-height as
+**Measured noise floors:**
+
+* `log_4decades_001_100`: `max_abs = 2.5e-4` (vs 4.8e-3 pre-
+  sectioning — 19× better). `max_rel = 3.7e-3`, dominated by inputs
+  near `x = 1` where `log(x) → 0` (the same near-zero relative-error
+  pathology as `square` and `multiply_2d`).
+* `log_6decades_wide` (`[0.01, 30000]`): `max_abs = 3.0e-3` — usable.
+  Without sectioning the worst-case error is ~1.0 absolute and the
+  value-range assertion fires on most inputs near `x_max`.
+
+**Working rule for callers:**
+
+The dominant residual error in the sectioned path comes from the
+routing's `multiply_2d` blend (worst case ~5e-3 absolute log error
+near section boundaries at extreme `x`). For `x_max/x_min ≤ 10⁵`,
+expect `max_abs_error < 1e-3`; for `x_max/x_min ≤ 10⁷`, expect
+`max_abs_error < 5e-3`. Translate to `x` via
+`rel_err_in_x ≈ abs_err_in_log` (approximate; exact for small errors).
+
+**Not yet wired into DOOM.** These ops are candidates for the log-
+space reformulations discussed in the broader log-space analysis (a
+robust `atan2` via `atan(exp(log|cross| − log|dot|))`, wall-height as
 `exp(log H − log|num_t| + log|den/cos|)`, sign-and-log-magnitude
 comparisons replacing `_T_COMPARE_SCALE = 100` in
 `torchwright/doom/stages/wall.py`). When a callsite lands, add a
-matching `doom_*` distribution mirroring its production input range, and
-extend the call-site table below.
+matching `doom_*` distribution mirroring its production input range,
+and extend the call-site table below.
 
 ### Known gap: reciprocal sorted callsite blocked on op-math
 
