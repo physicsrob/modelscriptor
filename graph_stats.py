@@ -1040,6 +1040,11 @@ def main():
         action="store_true",
         help="Use legacy scheduling (standalone Linears in attention)",
     )
+    parser.add_argument(
+        "--render-pixels-off",
+        action="store_true",
+        help="Build with render_pixels=False (skip the RENDER texture sub-graph)",
+    )
     args = parser.parse_args()
 
     if args.scene == "box":
@@ -1098,6 +1103,7 @@ def main():
         max_walls=max_walls,
         max_coord=max_coord,
         chunk_size=args.chunk_size,
+        render_pixels=not args.render_pixels_off,
     )
     output = graph_io.concat_output()
     print(f"build_game_graph: {_time.perf_counter() - _t0:.1f}s", flush=True)

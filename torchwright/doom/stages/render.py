@@ -195,9 +195,13 @@ def build_render(
     tex_sample_batch_size: int = 8,
     render_pixels: bool = True,
 ) -> RenderTokenOutput:
-    """``render_pixels=False`` skips the texture-coord and texture-attention
-    blocks, feeding zero pixels into ``_chunk_fill``.  The state machine
-    (wall heights, chunk iteration, sort/render handoff) is unchanged."""
+    """``render_pixels=False`` skips every pixel-producing sub-graph:
+    texture-coord, texture-attention, and the per-row chunk-fill
+    (texture sampling + ceiling/floor base + composite).  The output
+    ``pixels`` is a fixed zero literal.  The state machine (wall heights,
+    chunk iteration, sort/render handoff) is unchanged — geometry quantities
+    ``active_start`` and ``chunk_length`` are still computed because they
+    drive ``advance_col`` / ``advance_wall``."""
     H = config.screen_height
     W = config.screen_width
     fov = config.fov_columns
@@ -351,6 +355,7 @@ def build_render(
             chunk_size=cs,
             max_coord=max_coord,
             tex_sample_batch_size=tex_sample_batch_size,
+            render_pixels=render_pixels,
         )
 
     with annotate("render/state_transitions"):
@@ -934,8 +939,15 @@ def _chunk_fill(
     chunk_size: int,
     max_coord: float,
     tex_sample_batch_size: int = 8,
+    render_pixels: bool = True,
 ):
-    """Determine active_start, chunk_length, and paint the chunk's pixels."""
+    """Determine active_start, chunk_length, and paint the chunk's pixels.
+
+    When ``render_pixels=False``, the per-row texture-sampling /
+    composite sub-graph is skipped and ``pixels`` is a fixed zero
+    literal — the geometry (``active_start``, ``chunk_length``) still
+    drives the state machine.
+    """
     H = config.screen_height
     vis_top_render = clamp(wall_top, 0.0, float(H))
     vis_bottom_render = clamp(wall_bottom, 0.0, float(H))
@@ -950,18 +962,24 @@ def _chunk_fill(
         float(chunk_size),
     )
 
-    pixels = _textured_column_fill(
-        wall_top,
-        wall_bottom,
-        wall_height,
-        tex_column_colors,
-        tex_h,
-        config,
-        max_coord=max_coord,
-        patch_row_start=active_start,
-        rows_per_patch=chunk_size,
-        tex_sample_batch_size=tex_sample_batch_size,
-    )
+    if render_pixels:
+        pixels = _textured_column_fill(
+            wall_top,
+            wall_bottom,
+            wall_height,
+            tex_column_colors,
+            tex_h,
+            config,
+            max_coord=max_coord,
+            patch_row_start=active_start,
+            rows_per_patch=chunk_size,
+            tex_sample_batch_size=tex_sample_batch_size,
+        )
+    else:
+        pixels = create_literal_value(
+            torch.zeros(chunk_size * 3),
+            name="pixels_headless",
+        )
     return active_start, chunk_length, pixels
 
 
