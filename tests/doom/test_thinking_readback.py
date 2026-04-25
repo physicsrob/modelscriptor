@@ -205,62 +205,40 @@ def test_emit_integer_roundtrip_bsp_rank():
         ), f"BSP_RANK integer emit at k={k}: got {out}, expected {expected}"
 
 
-def test_emit_integer_roundtrip_via_k_column():
-    """Phase C Part 2: emit_integer_value_embedding's K column carries
-    ``2·k_target``.  Extracting K and dividing by 2 round-trips to the
-    original integer exactly (within float32 ulp).
+def test_emit_integer_argmax_picks_target():
+    """emit_integer_value_embedding's predicted embedding argmaxes
+    against ``W_EMBED.T`` to ``VALUE_k_target``.
 
-    This is the new correct round-trip path that fixes the bug
-    documented in test_emit_integer_roundtrip_bsp_rank above.  Used by
-    SORT_RESULT in production: SORTED's local
-    ``_decode_local_value_to_float`` and RENDER's
-    ``readback.get_value_after_last("SORT_RESULT")`` both consume this
-    K column directly, no decode Linear.
+    This is the production round-trip path: the producer emits a 26-wide
+    predicted embedding, the host argmaxes it against W_EMBED, and the
+    next step's input embedding is the picked W_EMBED row whose K column
+    holds k literally for downstream readback (no decode Linear).  Gray's
+    Hamming-1 margin alone (≥2) drives argmax to the right row — the
+    predicted K is held at 0 to avoid biasing argmax toward larger k.
     """
-    from torchwright.doom.embedding import D_K_SLOT, MAX_INT_K
-    from torchwright.ops.arithmetic_ops import multiply_const
+    from torchwright.doom.embedding import MAX_INT_K
 
     pos_encoding = create_pos_encoding()
     int_in = create_input("int_val", 1)
     emitted = emit_integer_value_embedding(int_in, max_int=7, name="SORT_RESULT")
-
-    # Extract the K column (col 25) — holds 2·k_target.
-    k_col_start = 8 + 1 + 16  # D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
-    two_k = extract_from(emitted, D_EMBED, k_col_start, D_K_SLOT, "two_k")
-    # Divide by 2 to recover k_target.
-    recovered = multiply_const(two_k, 0.5)
+    emit_node = Linear(emitted, torch.eye(D_EMBED), name="emit_passthrough_int")
 
     net = forward_compile(
         d=_D,
         d_head=_D_HEAD,
-        output_node=recovered,
+        output_node=emit_node,
         pos_encoding=pos_encoding,
         verbose=False,
     )
 
     for k in range(8):
         vals = {"int_val": torch.tensor([[float(k)]])}
-        out = net.compute(1, vals)[recovered].squeeze().item()
-        assert abs(out - k) < 1e-5, (
-            f"SORT_RESULT integer emit at k={k}: got {out}, expected {k} "
-            f"(K column path)"
-        )
-
-    # Also verify the K_NS column is the constant 1.
-    from torchwright.doom.embedding import D_K_NS_SLOT
-
-    k_ns_node = extract_from(
-        emitted, D_EMBED, k_col_start + D_K_SLOT, D_K_NS_SLOT, "k_ns"
-    )
-    net2 = forward_compile(
-        d=_D, d_head=_D_HEAD, output_node=k_ns_node,
-        pos_encoding=pos_encoding, verbose=False,
-    )
-    for k in range(8):
-        vals = {"int_val": torch.tensor([[float(k)]])}
-        out = net2.compute(1, vals)[k_ns_node].squeeze().item()
-        assert abs(out - 1.0) < 1e-5, (
-            f"SORT_RESULT K_NS column at k={k}: got {out}, expected 1.0"
+        emit_row = net.compute(1, vals)[emit_node].squeeze(0)  # (D_EMBED,)
+        # Host-side argmax against W_EMBED.T picks the predicted VALUE_k.
+        logits = emit_row @ W_EMBED.T.to(emit_row.device)  # (V,)
+        argmax_id = int(logits.argmax().item())
+        assert argmax_id == k, (
+            f"SORT_RESULT integer emit at k={k}: argmax picked VALUE_{argmax_id}"
         )
 
     # Sanity: the documented MAX_INT_K covers what we actually use.

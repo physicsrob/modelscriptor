@@ -37,7 +37,7 @@ def test_vocab_size_matches_plan():
     assert V == 65576
     assert len(DOOM_VOCAB) == V
     assert W_EMBED.shape == (V, D_EMBED)
-    assert D_EMBED == 50
+    assert D_EMBED == 49
 
 
 def test_id_ranges():
@@ -151,16 +151,16 @@ def test_value_row_gray_code_properties():
 
 
 def test_non_value_row_has_zero_payload():
-    """Non-VALUE rows zero out cols [8:27] — the raw slot, Gray-code
-    payload, K, and K_NS are zero.  The Phase D Part 1 type-tag block
-    at cols [27:50] carries other flags and is checked separately."""
+    """Non-VALUE rows zero out cols [8:26] — the raw slot, Gray-code
+    payload, and K are zero.  The Phase D Part 1 type-tag block at
+    cols [26:49] carries other flags and is checked separately."""
     payload_end = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD  # 25 — before K
     non_value_payload = W_EMBED[N_VALUES:, D_CATEGORY:payload_end]
     assert torch.all(non_value_payload == 0)
-    # K and K_NS columns should also be 0 for non-VALUE rows (cols [25:27]).
-    from torchwright.doom.embedding import D_K_NS_SLOT, D_K_SLOT
+    # K column should also be 0 for non-VALUE rows (col [25:26]).
+    from torchwright.doom.embedding import D_K_SLOT
 
-    k_block = W_EMBED[N_VALUES:, payload_end : payload_end + D_K_SLOT + D_K_NS_SLOT]
+    k_block = W_EMBED[N_VALUES:, payload_end : payload_end + D_K_SLOT]
     assert torch.all(k_block == 0)
 
 
@@ -272,40 +272,38 @@ def test_argmax_separation_with_typetag():
         )
 
 
-def test_int_slot_columns_for_small_k():
-    """Phase C Part 2: K col holds k, K_NS col holds -k² for k ≤ MAX_INT_K."""
-    from torchwright.doom.embedding import D_K_NS_SLOT, D_K_SLOT, MAX_INT_K
+def test_int_slot_column_for_small_k():
+    """Phase C Part 2: K col holds k for k ≤ MAX_INT_K, zero above."""
+    from torchwright.doom.embedding import D_K_SLOT, MAX_INT_K
 
     k_col_start = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
-    k_ns_col_start = k_col_start + D_K_SLOT
-    assert D_K_SLOT == 1 and D_K_NS_SLOT == 1
+    assert D_K_SLOT == 1
 
-    # In the int range: K = k, K_NS = -k².
+    # In the int range: K = k.
     for k in [0, 1, 2, 3, 7, 100, MAX_INT_K]:
         assert W_EMBED[k, k_col_start].item() == float(k)
-        assert W_EMBED[k, k_ns_col_start].item() == -float(k * k)
 
     # Just above the cap: zero.
     for k in [MAX_INT_K + 1, MAX_INT_K + 100, N_VALUES - 1]:
         assert W_EMBED[k, k_col_start].item() == 0.0
-        assert W_EMBED[k, k_ns_col_start].item() == 0.0
 
 
 def test_int_slot_argmax_peak_at_target():
-    """A predicted embedding writing [E8|raw|gray|2*k_target|1] argmaxes
-    to VALUE_(k_target).  Verifies the quadratic-equality identity drives
-    argmax to the right row across the full int-slot range."""
-    from torchwright.doom.embedding import D_K_NS_SLOT, D_K_SLOT, MAX_INT_K
+    """A predicted embedding holding the W_EMBED row's E8/raw/gray cols
+    with the K column held at 0 still argmaxes to VALUE_(k_target).
+    Verifies gray's Hamming-1 margin alone drives the host argmax to
+    the right row across the full int-slot range — no K_NS quadratic
+    needed."""
+    from torchwright.doom.embedding import D_K_SLOT, MAX_INT_K
 
     k_col_start = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
-    k_ns_col_start = k_col_start + D_K_SLOT
 
     for k_target in [0, 1, 3, 7, 100, MAX_INT_K]:
         # Build the predicted embedding: E8/raw/gray copied from
-        # W_EMBED row, then K=2*k_target, K_NS=1.
+        # W_EMBED row, K column held at 0 (the producer-side override
+        # done by emit_integer_value_embedding).
         predicted = W_EMBED[k_target].clone()
-        predicted[k_col_start] = 2.0 * k_target
-        predicted[k_ns_col_start : k_ns_col_start + D_K_NS_SLOT] = 1.0
+        predicted[k_col_start : k_col_start + D_K_SLOT] = 0.0
 
         # Argmax over all rows.
         scores = W_EMBED @ predicted
