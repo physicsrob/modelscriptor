@@ -193,7 +193,11 @@ def build_render(
     max_coord: float,
     max_walls: int,
     tex_sample_batch_size: int = 8,
+    render_pixels: bool = True,
 ) -> RenderTokenOutput:
+    """``render_pixels=False`` skips the texture-coord and texture-attention
+    blocks, feeding zero pixels into ``_chunk_fill``.  The state machine
+    (wall heights, chunk iteration, sort/render handoff) is unchanged."""
     H = config.screen_height
     W = config.screen_width
     fov = config.fov_columns
@@ -301,29 +305,38 @@ def build_render(
             max_coord=max_coord,
         )
 
-    with annotate("render/tex_coord"):
-        tex_col_idx = _compute_texture_column(
-            precomp_D,
-            precomp_E,
-            tan_o,
-            tan_val_bp,
-            abs_den_over_cos,
-            max_coord=max_coord,
-            tex_w=tex_w,
-        )
+    if render_pixels:
+        with annotate("render/tex_coord"):
+            tex_col_idx = _compute_texture_column(
+                precomp_D,
+                precomp_E,
+                tan_o,
+                tan_val_bp,
+                abs_den_over_cos,
+                max_coord=max_coord,
+                tex_w=tex_w,
+            )
 
-    with annotate("render/tex_attention"):
-        tex_column_colors = _attend_to_texture_column(
-            pos_encoding,
-            is_render=is_render,
-            is_tex_col=is_tex_col,
-            fb_tex_id=sel_tex_id,
-            tex_col_idx=tex_col_idx,
-            tc_onehot_01=kv.tc_onehot_01,
-            texture_id_e8=kv.texture_id_e8,
-            tex_pixels=kv.tex_pixels,
-            num_tex=len(textures),
-            tex_w=tex_w,
+        with annotate("render/tex_attention"):
+            tex_column_colors = _attend_to_texture_column(
+                pos_encoding,
+                is_render=is_render,
+                is_tex_col=is_tex_col,
+                fb_tex_id=sel_tex_id,
+                tex_col_idx=tex_col_idx,
+                tc_onehot_01=kv.tc_onehot_01,
+                texture_id_e8=kv.texture_id_e8,
+                tex_pixels=kv.tex_pixels,
+                num_tex=len(textures),
+                tex_w=tex_w,
+            )
+    else:
+        # Headless rollout: feed zero pixels so the chunk fill paints
+        # black walls (host bitblits zeros, full frame ends up
+        # ceiling/floor).  Token-stream tests assert on tokens, not pixels.
+        tex_column_colors = create_literal_value(
+            torch.zeros(tex_h * 3),
+            name="tex_column_colors_headless",
         )
 
     with annotate("render/column_fill"):

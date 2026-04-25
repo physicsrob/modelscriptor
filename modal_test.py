@@ -26,8 +26,8 @@ app = modal.App("torchwright-test", image=IMAGE)
 # New test files are caught by the catch-all shard automatically.
 
 _HEAVY_FILES = [
-    "tests/doom/test_pipeline.py",
-    "tests/doom/test_thinking_wall.py",
+    "tests/doom/test_rollout.py",
+    "tests/doom/test_frame_match.py",
 ]
 
 _MEDIUM_FILES = [

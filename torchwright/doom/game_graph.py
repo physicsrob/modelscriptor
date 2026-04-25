@@ -124,12 +124,19 @@ def build_game_graph(
     chunk_size: int = 20,
     max_bsp_nodes: int = 48,
     tex_sample_batch_size: int = 8,
+    render_pixels: bool = True,
 ) -> Tuple[GameGraphIO, PosEncoding]:
     """Build the walls-as-tokens game graph.
 
     See the module docstring for the per-token-type layout.
     ``max_bsp_nodes`` is the width of the BSP side vector (one slot per
     BSP_NODE token); it bounds how deep × broad the BSP tree can be.
+
+    ``render_pixels`` (default True) controls whether the RENDER stage
+    builds the texture-attention and texture-coordinate sub-graphs.
+    Setting it False produces a "headless" variant that runs the same
+    autoregressive loop but emits zero pixels — used by rollout tests
+    that assert on tokens, not pixels.
     """
     import time as _time
 
@@ -180,10 +187,19 @@ def build_game_graph(
     _mark("input")
 
     # ---------- TEX_COL ----------
-    tex_col_out = build_tex_col(
-        TexColToken(tex_col_input=inputs["tex_col_input"]),
-        tex_w=tex_w,
-    )
+    # When render_pixels=False, the texture path in build_render is
+    # bypassed; substituting a zero one-hot keeps RenderKVInput's slot
+    # filled (the field is unused downstream).
+    if render_pixels:
+        tex_col_out = build_tex_col(
+            TexColToken(tex_col_input=inputs["tex_col_input"]),
+            tex_w=tex_w,
+        )
+        tc_onehot_01 = tex_col_out.tc_onehot_01
+    else:
+        tc_onehot_01 = create_literal_value(
+            torch.zeros(tex_w), name="tc_onehot_01_headless"
+        )
     _mark("tex_col")
 
     # ---------- BSP ----------
@@ -356,7 +372,7 @@ def build_game_graph(
             player_sin=player_out.sin_theta,
             texture_id_e8=inputs["texture_id_e8"],
             tex_pixels=inputs["tex_pixels"],
-            tc_onehot_01=tex_col_out.tc_onehot_01,
+            tc_onehot_01=tc_onehot_01,
             wall_counter=inputs["wall_counter"],
             readback=thinking_wall_out.readback,
             embedding=embedding,
@@ -374,6 +390,7 @@ def build_game_graph(
         max_coord=max_coord,
         max_walls=max_walls,
         tex_sample_batch_size=tex_sample_batch_size,
+        render_pixels=render_pixels,
     )
     _mark("render")
 

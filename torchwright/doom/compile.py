@@ -124,12 +124,19 @@ def compile_game(
     d_hidden: Optional[int] = None,
     max_bsp_nodes: int = 48,
     optimize: bool = True,
+    render_pixels: bool = True,
 ):
     """Compile the game graph to a HeadlessTransformerModule.
 
     Args:
         optimize: Run graph optimization passes (Linear fusion) before
             compilation. Fuses consecutive Linear nodes to reduce layers.
+        render_pixels: When False, skip the texture-attention and
+            texture-coordinate blocks in RENDER (and the TEX_COL prefill
+            in step_frame).  The state machine — chunked column iteration,
+            wall heights, sort/render handoff — is unchanged, so the
+            token stream still exercises the full autoregressive loop.
+            Used by rollout tests that assert on tokens, not pixels.
     """
     graph_io, pos_encoding = build_game_graph(
         config,
@@ -140,6 +147,7 @@ def compile_game(
         turn_speed,
         chunk_size=chunk_size,
         max_bsp_nodes=max_bsp_nodes,
+        render_pixels=render_pixels,
     )
 
     # Run graph optimizations (Linear fusion)
@@ -195,6 +203,7 @@ def compile_game(
             "max_bsp_nodes": max_bsp_nodes,
             "tex_h": tex_h,
             "overflow_names": list(graph_io.overflow_outputs),
+            "render_pixels": render_pixels,
         },
         d_hidden=d_hidden,
         token_id_input_name="token_ids",
@@ -321,6 +330,7 @@ def step_frame(
     max_walls = int(module.metadata.get("max_walls", 8))
     cs = int(module.metadata.get("chunk_size", 20))
     max_bsp_nodes = int(module.metadata.get("max_bsp_nodes", 48))
+    render_pixels = bool(module.metadata.get("render_pixels", True))
 
     if textures is None:
         textures = subset.textures
@@ -389,19 +399,22 @@ def step_frame(
     t0 = time.perf_counter()
     rows: List[dict] = []
 
-    # TEX_COL × (num_tex × tex_w)
-    for tex_idx in range(num_tex):
-        tex_e8 = index_to_vector(tex_idx + TEX_E8_OFFSET)
-        for col in range(tex_w):
-            pixel_data = textures[tex_idx][col].flatten()
-            rows.append(
-                _common(
-                    token_id=vocab_id("TEX_COL"),
-                    texture_id_e8=tex_e8,
-                    tex_col_input=torch.tensor([float(col)]),
-                    tex_pixels=torch.tensor(pixel_data, dtype=torch.float32),
+    # TEX_COL × (num_tex × tex_w) — skipped when render_pixels=False
+    # (the headless graph wires zero literals through the texture path
+    # and TEX_COL prefill positions are unused).
+    if render_pixels:
+        for tex_idx in range(num_tex):
+            tex_e8 = index_to_vector(tex_idx + TEX_E8_OFFSET)
+            for col in range(tex_w):
+                pixel_data = textures[tex_idx][col].flatten()
+                rows.append(
+                    _common(
+                        token_id=vocab_id("TEX_COL"),
+                        texture_id_e8=tex_e8,
+                        tex_col_input=torch.tensor([float(col)]),
+                        tex_pixels=torch.tensor(pixel_data, dtype=torch.float32),
+                    )
                 )
-            )
 
     # INPUT (controls only here)
     rows.append(_common(token_id=vocab_id("INPUT"), **input_kw))
