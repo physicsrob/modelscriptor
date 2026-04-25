@@ -93,9 +93,12 @@ from torchwright.doom.embedding import (
     D_CATEGORY,
     D_EMBED,
     D_GRAY_PAYLOAD,
+    D_IS_ANY_ID,
+    D_IS_VALUE_CATEGORY,
     D_K_NS_SLOT,
     D_K_SLOT,
     D_RAW_SLOT,
+    D_SLOT_ONEHOT,
     E8_VALUE,
     IDENTIFIER_NAMES,
     MAX_INT_K,
@@ -308,7 +311,34 @@ def encode_value_binary(q: Node, suffix: str = "") -> Node:
     k_ns_zero = create_literal_value(
         torch.tensor([0.0]), name=f"encode_K_NS_zero{suffix}"
     )
-    return Concatenate([e8_cat, x, *bits, k_zero, k_ns_zero])
+    # Phase D Part 1: type-tag block matches the VALUE row pattern in
+    # W_EMBED — slot one-hot all −1, is_any_identifier −1,
+    # is_value_category +1.  Argmax against W_EMBED.T still picks the
+    # closest VALUE row; the type-tag dot is constant across the VALUE
+    # block (slot one-hot self-dot 21 + is_any_id self-dot 1 +
+    # is_value_cat self-dot 1 = 23), so the existing E8/raw/gray/K/K_NS
+    # argmax shape is preserved.
+    slot_onehot_neg = create_literal_value(
+        -torch.ones(D_SLOT_ONEHOT), name=f"encode_slot_onehot{suffix}"
+    )
+    is_any_id_neg = create_literal_value(
+        -torch.ones(D_IS_ANY_ID), name=f"encode_is_any_id{suffix}"
+    )
+    is_value_cat_pos = create_literal_value(
+        torch.ones(D_IS_VALUE_CATEGORY), name=f"encode_is_value_cat{suffix}"
+    )
+    return Concatenate(
+        [
+            e8_cat,
+            x,
+            *bits,
+            k_zero,
+            k_ns_zero,
+            slot_onehot_neg,
+            is_any_id_neg,
+            is_value_cat_pos,
+        ]
+    )
 
 
 def emit_continuous_value_embedding(
@@ -403,7 +433,22 @@ def emit_integer_value_embedding(
     one_lit = create_literal_value(
         torch.tensor([1.0]), name=f"emit_int_kns_{name}"
     )
-    return Concatenate([base, two_k, one_lit])
+    # Phase D Part 1: type-tag block matches the VALUE row pattern in
+    # W_EMBED — slot one-hot all −1, is_any_identifier −1,
+    # is_value_category +1.  These literals fold into the next
+    # consumer.
+    slot_onehot_neg = create_literal_value(
+        -torch.ones(D_SLOT_ONEHOT), name=f"emit_int_slot_onehot_{name}"
+    )
+    is_any_id_neg = create_literal_value(
+        -torch.ones(D_IS_ANY_ID), name=f"emit_int_is_any_id_{name}"
+    )
+    is_value_cat_pos = create_literal_value(
+        torch.ones(D_IS_VALUE_CATEGORY), name=f"emit_int_is_value_cat_{name}"
+    )
+    return Concatenate(
+        [base, two_k, one_lit, slot_onehot_neg, is_any_id_neg, is_value_cat_pos]
+    )
 
 
 def emit_boolean_value_embedding(
@@ -450,7 +495,21 @@ def emit_boolean_value_embedding(
     one_lit = create_literal_value(
         torch.tensor([1.0]), name=f"emit_bool_kns_{name}"
     )
-    return Concatenate([base, two_k, one_lit])
+    # Phase D Part 1: type-tag block matches the VALUE row pattern in
+    # W_EMBED — slot one-hot all −1, is_any_identifier −1,
+    # is_value_category +1.
+    slot_onehot_neg = create_literal_value(
+        -torch.ones(D_SLOT_ONEHOT), name=f"emit_bool_slot_onehot_{name}"
+    )
+    is_any_id_neg = create_literal_value(
+        -torch.ones(D_IS_ANY_ID), name=f"emit_bool_is_any_id_{name}"
+    )
+    is_value_cat_pos = create_literal_value(
+        torch.ones(D_IS_VALUE_CATEGORY), name=f"emit_bool_is_value_cat_{name}"
+    )
+    return Concatenate(
+        [base, two_k, one_lit, slot_onehot_neg, is_any_id_neg, is_value_cat_pos]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -512,14 +571,16 @@ class ThinkingReadback:
                 f"unknown identifier {name!r}; must be one of {IDENTIFIER_NAMES}"
             )
         slot = IDENTIFIER_NAMES.index(name)
-        prev_slot_i_01 = extract_from(
+        # Phase D Part 1: prev_id_slots' V is the ±1 slot one-hot
+        # column block from W_EMBED, so the extract is already the
+        # ±1 bool that bool_all_true expects — no compare(0.5) needed.
+        prev_slot_i_bool = extract_from(
             self._ctx.prev_id_slots,
             len(IDENTIFIER_NAMES),
             slot,
             1,
             f"readback_prev_slot_{name}",
         )
-        prev_slot_i_bool = compare(prev_slot_i_01, 0.5)
         indicator = bool_all_true([self._ctx.is_value_category, prev_slot_i_bool])
         self._indicator_cache[name] = indicator
         return indicator

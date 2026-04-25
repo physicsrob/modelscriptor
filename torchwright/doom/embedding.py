@@ -2,8 +2,8 @@
 
 Phase A Part 1: every autoregressive step consumes and emits a single
 token ID. The host feeds ``token_ids`` as a 1-wide input slot; the
-graph looks the ID up in ``W_EMBED`` to produce a 27-wide residual
-leaf. On the output side, the 27-wide output slice is projected
+graph looks the ID up in ``W_EMBED`` to produce a 50-wide residual
+leaf. On the output side, the 50-wide output slice is projected
 through ``W_EMBED.T`` and argmaxed to pick the next ID.
 
 Vocabulary layout (Phase B Part 2 adds SORT_RESULT between RESOLVED
@@ -20,18 +20,38 @@ identifiers, widening them 13→17):
 
 Total ``V = 65576``.
 
-Embedding layout (``d_embed = 27``):
+Embedding layout (``d_embed = 50``):
 
   cols [ 0 :  8] — E8 category code (distinct per category name)
   cols [ 8 :  9] — raw slot: (2k+1)/131072 for VALUE_k, else 0
   cols [ 9 : 25] — 16-wide ±1 Gray code of k for VALUE_k, else 0
   cols [25 : 26] — K slot:    k          for VALUE_k where k ≤ MAX_INT_K, else 0
   cols [26 : 27] — K_NS slot: −k²        for VALUE_k where k ≤ MAX_INT_K, else 0
+  cols [27 : 48] — slot one-hot: ±1 per IDENTIFIER_NAMES entry; +1 at
+                   the row's slot column for an IDENTIFIER row, −1
+                   elsewhere (including non-identifier rows). Stored
+                   as ±1 (not {0, 1}) so a per-position direct extract
+                   IS the ±1 bool that ``cond_gate`` and
+                   ``bool_all_true`` consumers expect. The {0, 1}
+                   semantics the original cond_gate-built V provided
+                   are recovered downstream by adjusting Linear
+                   weights/bias at the one ``Linear(prev_slot_onehot,
+                   next_after_slot, ...)`` consumer.
+  cols [48 : 49] — is_any_identifier: +1 for the 21 IDENTIFIER_NAMES
+                   rows, −1 for everything else
+  cols [49 : 50] — is_value_category: +1 for the 65,536 VALUE rows,
+                   −1 elsewhere
 
 The raw slot and Gray-code columns are zero for non-VALUE rows. All
 65,536 VALUE rows share a single ``E8_VALUE`` category code; they are
 distinguished by the raw slot (dense, gives a monotone cue) and the
 Gray-code payload (±1 per bit, Hamming 1 for adjacent k).
+
+The type-tag block at cols [27:50] (Phase D Part 1) lets the readback
+chain skip the equals_vector + cond_gate + Concat construction that
+otherwise builds these flags at depth 4-5. Storing them as ±1 columns
+in W_EMBED makes them direct extracts at depth 1, dropping the
+critical-path floor for every readback attention.
 
 The K and K_NS columns (Phase C Part 2) carry small-cardinality
 integer identifiers in a form that's directly readable by attention
@@ -73,8 +93,35 @@ D_RAW_SLOT: int = 1
 D_GRAY_PAYLOAD: int = 16
 D_K_SLOT: int = 1
 D_K_NS_SLOT: int = 1
-D_EMBED: int = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD + D_K_SLOT + D_K_NS_SLOT
-assert D_EMBED == 27
+# Phase D Part 1 type-tag block.  D_SLOT_ONEHOT = len(IDENTIFIER_NAMES);
+# the assertion below pins it once IDENTIFIER_NAMES is defined.
+D_SLOT_ONEHOT: int = 21
+D_IS_ANY_ID: int = 1
+D_IS_VALUE_CATEGORY: int = 1
+D_EMBED: int = (
+    D_CATEGORY
+    + D_RAW_SLOT
+    + D_GRAY_PAYLOAD
+    + D_K_SLOT
+    + D_K_NS_SLOT
+    + D_SLOT_ONEHOT
+    + D_IS_ANY_ID
+    + D_IS_VALUE_CATEGORY
+)
+assert D_EMBED == 50
+
+# Column offsets for the Phase D Part 1 type-tag block.  These are
+# imported by callers that need to slice the W_EMBED row directly
+# (game_graph._detect_token_types, thinking_wall.find_prev_identifier,
+# thinking_readback.is_value_of).
+_SLOT_ONEHOT_START: int = (
+    D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD + D_K_SLOT + D_K_NS_SLOT
+)  # 27
+_IS_ANY_ID_COL: int = _SLOT_ONEHOT_START + D_SLOT_ONEHOT  # 48
+_IS_VALUE_CATEGORY_COL: int = _IS_ANY_ID_COL + D_IS_ANY_ID  # 49
+assert _SLOT_ONEHOT_START == 27
+assert _IS_ANY_ID_COL == 48
+assert _IS_VALUE_CATEGORY_COL == 49
 
 N_VALUES: int = 65536  # 2**16 VALUE IDs
 
@@ -348,6 +395,18 @@ def _build_w_embed() -> torch.Tensor:
 
     Rows 65536..V-1 (non-VALUE) carry a distinct category code per
     row in cols [0:8] and zeros in cols [8:27].
+
+    Phase D Part 1 type-tag block at cols [27:50]:
+
+      * cols [27:48] — slot one-hot.  +1 at column ``_SLOT_ONEHOT_START + i``
+        for the IDENTIFIER row at slot ``i``; −1 in every other one of
+        the 21 columns. Non-identifier rows carry all −1.  Stored as
+        ±1 so a per-position direct extract IS the ±1 bool that
+        ``cond_gate`` and ``bool_all_true`` consumers expect.
+      * col [48] — is_any_identifier: +1 for the 21 IDENTIFIER_NAMES
+        rows, −1 elsewhere.
+      * col [49] — is_value_category: +1 for the 65,536 VALUE rows,
+        −1 elsewhere.
     """
     w = torch.zeros((V, D_EMBED), dtype=torch.float32)
 
@@ -357,6 +416,12 @@ def _build_w_embed() -> torch.Tensor:
     k_col = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD  # 25
     k_ns_col = k_col + D_K_SLOT  # 26
 
+    # Type-tag block defaults to −1 everywhere; specific +1 assignments
+    # below mark the rows that carry the corresponding flag.
+    w[:, _SLOT_ONEHOT_START : _SLOT_ONEHOT_START + D_SLOT_ONEHOT] = -1.0
+    w[:, _IS_ANY_ID_COL] = -1.0
+    w[:, _IS_VALUE_CATEGORY_COL] = -1.0
+
     for vid in range(N_VALUES):
         w[vid, 0:D_CATEGORY] = e8_value
         w[vid, raw_col] = _shifted_x(vid)
@@ -364,8 +429,11 @@ def _build_w_embed() -> torch.Tensor:
         if vid <= MAX_INT_K:
             w[vid, k_col] = float(vid)
             w[vid, k_ns_col] = -float(vid * vid)
+        # is_value_category = +1 for every VALUE row (slot one-hot
+        # stays 0; is_any_identifier stays −1, set above).
+        w[vid, _IS_VALUE_CATEGORY_COL] = 1.0
 
-    # Non-VALUE rows: only the category code is non-zero.
+    # Non-VALUE rows: only the category code is non-zero (cols [8:27]).
     _write_category_row(w, "THINKING_WALL_", start_id=_THINKING_WALL_BASE, count=8)
     for offset, name in enumerate(_PER_WALL_IDENTIFIERS):
         w[_PER_WALL_BASE + offset, 0:D_CATEGORY] = _category_code(name)
@@ -377,6 +445,23 @@ def _build_w_embed() -> torch.Tensor:
         w[_DECODE_BASE + offset, 0:D_CATEGORY] = _category_code(name)
     for offset, name in enumerate(_PROMPT_TOKENS):
         w[_PROMPT_BASE + offset, 0:D_CATEGORY] = _category_code(name)
+
+    # Type-tag block for IDENTIFIER rows.  IDENTIFIER_NAMES is built
+    # below this function, so reconstruct the same ordering inline:
+    # 17 per-wall + 3 RESOLVED + 1 SORT_RESULT.
+    _identifier_rows = []
+    for i, name in enumerate(_PER_WALL_IDENTIFIERS):
+        _identifier_rows.append((_PER_WALL_BASE + i, i))
+    base_offset = len(_PER_WALL_IDENTIFIERS)
+    for i, name in enumerate(_RESOLVED_IDENTIFIERS):
+        _identifier_rows.append((_RESOLVED_BASE + i, base_offset + i))
+    base_offset += len(_RESOLVED_IDENTIFIERS)
+    for i, name in enumerate(_SORT_IDENTIFIERS):
+        _identifier_rows.append((_SORT_BASE + i, base_offset + i))
+
+    for row_id, slot in _identifier_rows:
+        w[row_id, _SLOT_ONEHOT_START + slot] = 1.0
+        w[row_id, _IS_ANY_ID_COL] = 1.0
 
     return w
 
@@ -412,6 +497,9 @@ IDENTIFIER_NAMES: List[str] = (
     list(_PER_WALL_IDENTIFIERS) + list(_RESOLVED_IDENTIFIERS) + list(_SORT_IDENTIFIERS)
 )
 assert len(IDENTIFIER_NAMES) == 21
+# The slot-onehot block in W_EMBED has one column per IDENTIFIER_NAMES
+# entry; the constant must match the list length.
+assert D_SLOT_ONEHOT == len(IDENTIFIER_NAMES)
 
 # Subset used by the thinking-phase state machine (``thinking_wall``
 # builds per-slot norm/factor machinery only over these).  SORT_RESULT

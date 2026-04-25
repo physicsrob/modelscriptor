@@ -28,11 +28,9 @@ import torch
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph import Linear
 from torchwright.ops.inout_nodes import create_input, create_pos_encoding
-from torchwright.ops.logic_ops import equals_vector
 
 from torchwright.doom.embedding import (
     D_EMBED,
-    E8_VALUE,
     IDENTIFIER_NAMES,
     VALUE_RANGE_BY_NAME,
     W_EMBED,
@@ -286,13 +284,15 @@ def _build_readback_graph(names: list[str]):
     """
     from torchwright.graph import Concatenate
 
+    from torchwright.doom.embedding import _IS_VALUE_CATEGORY_COL
+
     pos_encoding = create_pos_encoding()
 
     embedding_leaf = build_doom_embedding(input_name="token_ids")
     prev_id_slots = create_input("prev_id_slots", len(IDENTIFIER_NAMES))
-    is_value_category = equals_vector(
-        extract_from(embedding_leaf, D_EMBED, 0, 8, "val_cat_cols"),
-        E8_VALUE,
+    # Phase D Part 1: is_value_category is a direct ±1 column in W_EMBED.
+    is_value_category = extract_from(
+        embedding_leaf, D_EMBED, _IS_VALUE_CATEGORY_COL, 1, "val_cat_col"
     )
 
     readback = build_thinking_readback(
@@ -350,7 +350,11 @@ def test_readback_independence_multiple_identifiers():
             [vocab_id("PLAYER_X")],
         ]
     )
-    prev_id_slots = torch.zeros(5, len(IDENTIFIER_NAMES))
+    # Phase D Part 1: prev_id_slots is ±1 (the V from the readback's
+    # attend_most_recent_matching is the ±1 slot one-hot block in
+    # W_EMBED — +1 at the active slot, −1 elsewhere).  Initialize
+    # with all −1 and stamp +1 at the active slot per position.
+    prev_id_slots = -torch.ones(5, len(IDENTIFIER_NAMES))
     prev_id_slots[1, slot_cross_a] = 1.0  # at VALUE after CROSS_A
     prev_id_slots[2, slot_cross_a] = 1.0  # at T_LO, prev was CROSS_A
     prev_id_slots[3, slot_t_lo] = 1.0  # at VALUE after T_LO
@@ -397,7 +401,11 @@ def test_readback_picks_most_recent_cross_a():
             [vocab_id("PLAYER_Y")],
         ]
     )
-    prev_id_slots = torch.zeros(5, len(IDENTIFIER_NAMES))
+    # Phase D Part 1: prev_id_slots is ±1 (the V from the readback's
+    # attend_most_recent_matching is the ±1 slot one-hot block in
+    # W_EMBED — +1 at the active slot, −1 elsewhere).  Initialize
+    # with all −1 and stamp +1 at the active slot per position.
+    prev_id_slots = -torch.ones(5, len(IDENTIFIER_NAMES))
     prev_id_slots[1, slot_cross_a] = 1.0
     prev_id_slots[2, slot_cross_a] = 1.0
     prev_id_slots[3, slot_cross_a] = 1.0
@@ -440,7 +448,8 @@ def test_readback_attention_hardness_passes():
             [vocab_id("PLAYER_X")],
         ]
     )
-    prev_id_slots = torch.zeros(3, len(IDENTIFIER_NAMES))
+    # Phase D Part 1: prev_id_slots is ±1.
+    prev_id_slots = -torch.ones(3, len(IDENTIFIER_NAMES))
     prev_id_slots[1, slot_cross_a] = 1.0
     prev_id_slots[2, slot_cross_a] = 1.0
 
@@ -476,32 +485,35 @@ def test_readback_empty_cache_does_not_crash():
             [vocab_id("PLAYER_Y")],
         ]
     )
-    prev_id_slots = torch.zeros(2, len(IDENTIFIER_NAMES))
+    # Phase D Part 1: prev_id_slots is ±1 (all −1 here — no
+    # identifier ever ran).
+    prev_id_slots = -torch.ones(2, len(IDENTIFIER_NAMES))
 
     # We skip the hardness assertion by not asking for it here.  The
     # production readback asserts hardness > 0.99 and callers must
     # ensure a prior instance exists in the window — this test just
     # documents the empty-cache behaviour.
     from torchwright.graph.pos_encoding import PosEncoding  # noqa: F401
+    from torchwright.doom.embedding import _IS_VALUE_CATEGORY_COL
     from torchwright.doom.thinking_readback import _decode_payload_to_float
     from torchwright.ops.attention_ops import attend_most_recent_matching
-    from torchwright.ops.arithmetic_ops import compare as _compare
     from torchwright.ops.logic_ops import bool_all_true
     from torchwright.ops.inout_nodes import create_literal_value
 
     pos_encoding = create_pos_encoding()
     embedding_leaf = build_doom_embedding(input_name="token_ids")
     prev_id_slots_in = create_input("prev_id_slots", len(IDENTIFIER_NAMES))
-    is_value_category = equals_vector(
-        extract_from(embedding_leaf, D_EMBED, 0, 8, "val_cat_cols"),
-        E8_VALUE,
+    # Phase D Part 1: is_value_category is a direct ±1 column extract.
+    is_value_category = extract_from(
+        embedding_leaf, D_EMBED, _IS_VALUE_CATEGORY_COL, 1, "val_cat_col"
     )
 
     slot_cross_a = IDENTIFIER_NAMES.index("CROSS_A")
-    prev_slot_i_01 = extract_from(
+    # Phase D Part 1: prev_id_slots is ±1, so the extract is the bool.
+    prev_slot_i_bool = extract_from(
         prev_id_slots_in, len(IDENTIFIER_NAMES), slot_cross_a, 1, "prev_slot_empty"
     )
-    is_X_value = bool_all_true([is_value_category, _compare(prev_slot_i_01, 0.5)])
+    is_X_value = bool_all_true([is_value_category, prev_slot_i_bool])
     payload = extract_from(embedding_leaf, D_EMBED, 8, 1, "payload_empty")
     matched_payload = attend_most_recent_matching(
         pos_encoding=pos_encoding,
