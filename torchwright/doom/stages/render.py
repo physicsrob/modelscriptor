@@ -89,11 +89,9 @@ from torchwright.doom.thinking_readback import ThinkingReadback
 class RenderToken:
     """Three bounded integers — the minimal autoregressive state.
 
-    ``wall_index`` used to live here as a fourth overlaid integer, but
-    Phase A's M3 step moved it into the KV cache: RENDER now reads the
-    current wall index via ``attend_most_recent_matching`` against the
-    most-recent ``E8_SORTED_WALL`` position rather than from an
-    overlaid input slot.
+    ``wall_index`` is not in the overlay: RENDER reads it via
+    ``attend_most_recent_matching`` against the most recent
+    SORT_RESULT VALUE position.
     """
 
     col: Node  # current screen column (0..W)
@@ -133,19 +131,17 @@ class RenderKVInput:
     # (``wall_counter >= max_walls`` → emit DONE).
     wall_counter: Node
 
-    # Phase B Part 2: wall identity + visibility extent come from
-    # thinking-phase VALUE tokens, not from prefill WALL or overlay.
-    # ``readback`` decodes the most recent SORT_RESULT VALUE (for
-    # wall_index) and the (wall-indexed) VIS_HI VALUE (for the
-    # column-range upper bound).
+    # Wall identity + visibility extent come from thinking-phase VALUE
+    # tokens, not from prefill WALL or overlay.  ``readback`` decodes
+    # the most recent SORT_RESULT VALUE (for wall_index) and the
+    # (wall-indexed) VIS_HI VALUE (for the column-range upper bound).
     #
-    # Phase C Part 3: vis_hi_content_attention uses quadratic-equality
-    # match on wall_index — keyed on the
-    # ``value_wall_index_scalar`` / ``value_wall_index_neg_sq``
-    # channels exported by thinking_wall (sentinel-gated to
-    # thinking-VALUE positions).  ``embedding`` is still needed for
-    # the value-side raw-slot extract on the matched VIS_HI VALUE
-    # row.
+    # ``vis_hi_content_attention`` uses quadratic-equality match on
+    # wall_index — keyed on the ``value_wall_index_scalar`` /
+    # ``value_wall_index_neg_sq`` channels exported by thinking_wall
+    # (sentinel-gated to thinking-VALUE positions).  ``embedding`` is
+    # needed for the value-side raw-slot extract on the matched
+    # VIS_HI VALUE row.
     readback: "ThinkingReadback"
     embedding: Node
     value_wall_index_scalar: Node
@@ -157,8 +153,8 @@ class RenderKVInput:
 class RenderTokenOutput:
     """Overlay + overflow outputs at RENDER positions."""
 
-    # 72-wide next-token embedding (goes to _assemble_output as part
-    # of next_token_embedding overflow): embed_lookup("SORTED_WALL")
+    # D_EMBED-wide next-token embedding (goes to _assemble_output as
+    # part of next_token_embedding overflow): embed_lookup("SORTED_WALL")
     # on wall advance, embed_lookup("RENDER") otherwise.
     render_next_type: Node
     next_col: Node
@@ -209,34 +205,29 @@ def build_render(
     cs = chunk_size
 
     with annotate("render/wall_index_readback"):
-        # Phase B Part 2: wall_index rides as a VALUE token emitted by
-        # the SORT_RESULT identifier.  The host echoes that token's id
-        # (VALUE_{wall_index}) back at the next position, where the
-        # embedding lookup places the factored 4+4+4+4 payload in
-        # cols [8:72] at layer 0.  RENDER reads it via
+        # wall_index rides as a VALUE token emitted by the SORT_RESULT
+        # identifier.  The host echoes that token back at the next
+        # position; RENDER reads it via
         # ``attend_most_recent_matching(is_SORT_RESULT_value)`` and
-        # decodes through the readback Linear — no dependency on any
-        # compute chain at the producing position.
+        # decodes through the readback Linear.  ``get_value_after_last``
+        # for SORT_RESULT routes through ``get_int_after_last``, which
+        # reads the K column directly — the matched K value IS the
+        # integer wall_index, with no decode Linear and no W_consumer
+        # amplification.
         #
-        # Phase C Part 1 note: an earlier draft fed the raw slot
-        # (pre-decode) directly into the wall_geom Q-projection to
-        # fold the dequantize Linear into W_Q.  That path needs a
-        # 131072× weight on raw (≈1e-5 to 1e-4), which amplifies the
-        # readback softmax's tail mass into a Q drift large enough to
-        # break ``test_frame_matches_reference_oblique[20]``.  The
-        # dequantized scalar is float-exact at integer k (no W_Q
-        # blow-up) and the decode Linear folds into W_Q like any other
-        # affine — so the depth cost of using the decoded form is just
-        # the readback's Linear, which the scheduler already absorbed
-        # into the next consumer.
+        # Why not feed the raw slot (pre-decode) directly into the
+        # wall_geom Q-projection?  That folds the dequantize Linear
+        # into W_Q at the cost of a 131072× weight on raw (≈1e-5 to
+        # 1e-4), which amplifies the readback softmax's tail mass into
+        # a Q drift large enough to break oblique-pose render tests.
+        # The integer scalar is float-exact at integer k.
         wall_index = kv.readback.get_value_after_last("SORT_RESULT")
 
     with annotate("render/wall_geom_attention"):
-        # Phase C Part 1: quadratic-equality match on the wall_index
-        # integer.  Q = [2·wall_j, 1] folds into W_Q from the readback
-        # scalar; K = [wall_index, -wall_index²] reads two 1-wide WALL
-        # KV channels.  Eliminates the in_range → 8-wide one-hot Q-prep
-        # (was ~5 layers between readback and the old one-hot match).
+        # Quadratic-equality match on the wall_index integer.
+        # Q = [2·wall_j, 1] folds into W_Q from the readback scalar;
+        # K = [wall_index, -wall_index²] reads two 1-wide WALL KV
+        # channels.  No in_range → one-hot Q-prep needed.
         sel_ax, sel_ay, sel_bx, sel_by, sel_tex_id = _attend_wall_geometry_quad(
             is_render=is_render,
             is_wall=is_wall,
@@ -251,19 +242,15 @@ def build_render(
         )
 
     with annotate("render/vis_hi_content_attention"):
-        # Phase B Part 2: vis_hi comes from the thinking VIS_HI VALUE
-        # token for this wall, not from the prefill WALL stage's FOV
-        # clip.  Match against thinking VIS_HI VALUE positions keyed
-        # by ``(identifier=VIS_HI, wall_index)`` and decode the
-        # matched payload back to a scalar.
+        # vis_hi comes from the thinking VIS_HI VALUE token for this
+        # wall.  Match against thinking VIS_HI VALUE positions keyed by
+        # ``(identifier=VIS_HI, wall_index)`` and decode the matched
+        # payload back to a scalar.
         #
-        # Phase C Part 3: keys on wall_index via the same quadratic-
-        # equality trick as wall_geom_attention.  Q at RENDER:
-        # ``[1, 2·wall_index, 1]``; K at thinking VIS_HI VALUE:
+        # Composite quadratic-equality key: Q at RENDER is
+        # ``[1, 2·wall_index, 1]``; K at thinking VIS_HI VALUE is
         # ``[is_vis_hi_value, value_wall_index_scalar,
-        # value_wall_index_neg_sq]``.  Drops the 8-wide one-hot Q
-        # construction the prior form needed (the in_range cascade
-        # is gone — wall_index_clamped suffices).
+        # value_wall_index_neg_sq]``.
         wall_index_clamped = clamp(wall_index, 0.0, float(max_walls - 1))
         sel_vis_hi = _content_attend_thinking_value_quad(
             readback=kv.readback,
@@ -506,7 +493,7 @@ def _content_attend_thinking_value_quad(
     """Read the per-wall ``name``-VALUE payload via quadratic-equality
     content attention keyed by ``(identifier=name, wall_index)``.
 
-    Phase C Part 3 form (replaces the prior 9-wide one-hot match):
+    Composite 3-wide form:
 
         Q at consumer:  [1, 2·wall_index_query, 1]                (3 wide)
         K at name-VALUE: [is_name_value, w_idx, -w_idx²]          (3 wide)
@@ -525,8 +512,7 @@ def _content_attend_thinking_value_quad(
     Args:
         wall_index_query: 1-wide scalar holding the desired wall_index
             (an integer in ``[0, max_walls-1]``).  Typically the
-            decoded SORT_RESULT VALUE — Phase C Part 2 makes this a
-            clean integer.
+            integer SORT_RESULT VALUE recovered from the K column.
     """
     is_name_value = readback.is_value_of(name)
 

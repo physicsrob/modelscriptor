@@ -121,7 +121,7 @@ def test_emit_continuous_roundtrip(name, test_values):
     emitted = emit_continuous_value_embedding(value_in, name)
     # Force the Concatenate to materialize under its own node: a
     # no-op identity Linear wraps it so ``net.compute`` returns the
-    # full 72-wide row.  Concatenate is layout-only and doesn't
+    # full D_EMBED-wide row.  Concatenate is layout-only and doesn't
     # appear in the compute result dict on its own.
     emit_node = Linear(emitted, torch.eye(D_EMBED), name="emit_passthrough")
 
@@ -173,8 +173,8 @@ def test_emit_integer_roundtrip_bsp_rank():
     ``(2k+1)/131072`` and the BSP_RANK-calibrated decode (which expects
     the *continuous* quantization ``q ≈ value · 65535/7``) returns
     ``k · 7/65535`` ≈ 0 instead of k.  This is the round-trip bug the
-    Phase C Part 2 K-column path bypasses; production code uses the
-    continuous emit for BSP_RANK and never goes through here.
+    K-column path bypasses; production code uses the continuous emit
+    for BSP_RANK and never goes through here.
 
     Kept as documentation of the broken raw-slot decode.  The new
     correct round-trip via the K column is exercised by
@@ -268,7 +268,7 @@ def _build_readback_graph(names: list[str]):
 
     embedding_leaf = build_doom_embedding(input_name="token_ids")
     prev_id_slots = create_input("prev_id_slots", len(IDENTIFIER_NAMES))
-    # Phase D Part 1: is_value_category is a direct ±1 column in W_EMBED.
+    # is_value_category is a direct ±1 column in W_EMBED.
     is_value_category = extract_from(
         embedding_leaf, D_EMBED, _IS_VALUE_CATEGORY_COL, 1, "val_cat_col"
     )
@@ -328,7 +328,7 @@ def test_readback_independence_multiple_identifiers():
             [vocab_id("PLAYER_X")],
         ]
     )
-    # Phase D Part 1: prev_id_slots is ±1 (the V from the readback's
+    # prev_id_slots is ±1 (the V from the readback's
     # attend_most_recent_matching is the ±1 slot one-hot block in
     # W_EMBED — +1 at the active slot, −1 elsewhere).  Initialize
     # with all −1 and stamp +1 at the active slot per position.
@@ -379,7 +379,7 @@ def test_readback_picks_most_recent_cross_a():
             [vocab_id("PLAYER_Y")],
         ]
     )
-    # Phase D Part 1: prev_id_slots is ±1 (the V from the readback's
+    # prev_id_slots is ±1 (the V from the readback's
     # attend_most_recent_matching is the ±1 slot one-hot block in
     # W_EMBED — +1 at the active slot, −1 elsewhere).  Initialize
     # with all −1 and stamp +1 at the active slot per position.
@@ -426,7 +426,7 @@ def test_readback_attention_hardness_passes():
             [vocab_id("PLAYER_X")],
         ]
     )
-    # Phase D Part 1: prev_id_slots is ±1.
+    # prev_id_slots is ±1.
     prev_id_slots = -torch.ones(3, len(IDENTIFIER_NAMES))
     prev_id_slots[1, slot_cross_a] = 1.0
     prev_id_slots[2, slot_cross_a] = 1.0
@@ -463,8 +463,7 @@ def test_readback_empty_cache_does_not_crash():
             [vocab_id("PLAYER_Y")],
         ]
     )
-    # Phase D Part 1: prev_id_slots is ±1 (all −1 here — no
-    # identifier ever ran).
+    # prev_id_slots is ±1 (all −1 here — no identifier ever ran).
     prev_id_slots = -torch.ones(2, len(IDENTIFIER_NAMES))
 
     # We skip the hardness assertion by not asking for it here.  The
@@ -481,13 +480,13 @@ def test_readback_empty_cache_does_not_crash():
     pos_encoding = create_pos_encoding()
     embedding_leaf = build_doom_embedding(input_name="token_ids")
     prev_id_slots_in = create_input("prev_id_slots", len(IDENTIFIER_NAMES))
-    # Phase D Part 1: is_value_category is a direct ±1 column extract.
+    # is_value_category is a direct ±1 column extract.
     is_value_category = extract_from(
         embedding_leaf, D_EMBED, _IS_VALUE_CATEGORY_COL, 1, "val_cat_col"
     )
 
     slot_cross_a = IDENTIFIER_NAMES.index("CROSS_A")
-    # Phase D Part 1: prev_id_slots is ±1, so the extract is the bool.
+    # prev_id_slots is ±1, so the extract is the bool.
     prev_slot_i_bool = extract_from(
         prev_id_slots_in, len(IDENTIFIER_NAMES), slot_cross_a, 1, "prev_slot_empty"
     )

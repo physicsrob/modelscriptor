@@ -15,10 +15,10 @@ from torchwright.graph.spherical_codes import index_to_vector
 
 # Texture E8 codes live in a dedicated 8-wide bypass slot (not in the
 # embedding).  Texture i is identified by ``index_to_vector(TEX_E8_OFFSET + i)``.
-# The offset historically sat after the 8-wide semantic token type
-# codes used by the pre-Phase-A overlaid carrier; that carrier is gone
-# (token identity is now a vocab ID in the 72-wide embedding leaf) but
-# the texture-bypass layout is retained unchanged.
+# The offset sits after the 8-wide semantic token-type codes; the
+# texture-bypass layout retains this convention even though token
+# identity now lives in the W_EMBED vocab lookup rather than a separate
+# overlaid carrier.
 TEX_E8_OFFSET = 8
 
 

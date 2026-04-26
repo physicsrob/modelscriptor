@@ -1025,10 +1025,9 @@ def attend_most_recent_matching(
     ``d_pos - 2``.)
 
     Combining content match with a recency tiebreak gives the building
-    block that Phase A thinking tokens use to find data in the KV cache
-    — "most recent token of type X" is exactly this op with ``query``
-    as the target type vector and ``key`` as each token's own type
-    vector.
+    block thinking tokens use to find data in the KV cache — "most
+    recent token of type X" is exactly this op with ``query`` as the
+    target type vector and ``key`` as each token's own type vector.
 
     ``attend_argmax_dot`` does the pure-content-match case but
     soft-averages across tied keys; this primitive adds the recency

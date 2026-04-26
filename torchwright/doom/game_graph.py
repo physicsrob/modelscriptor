@@ -2,9 +2,11 @@
 
 Token sequence per frame:
 
-    TEX_COL×(num_tex × tex_w) → INPUT → BSP_NODE×M → WALL×N →
-    EOS → PLAYER_X → PLAYER_Y → PLAYER_ANGLE →
-    [SORTED_WALL → RENDER×k]×N  (interleaved sort + render)
+    TEX_COL×(num_tex × tex_w) →
+    INPUT → BSP_NODE×M → WALL×N → EOS →
+    PLAYER_X → PLAYER_Y → PLAYER_ANGLE →
+    [THINKING_WALL_n → (id → VALUE)×17]×N → (RESOLVED → VALUE)×3 →
+    [SORTED_WALL → SORT_RESULT → VALUE → RENDER×k]×N
 
 Token carrier: every position consumes a single integer ``token_ids``
 input and produces a single integer ``next_token_id`` via the
@@ -16,8 +18,8 @@ state, texture pixels, overlaid autoregressive state) flow through
 separate residual leaves alongside the embedding.
 
 Every cross-position data dependency flows through attention.  See
-each stage file for per-stage math.  This module does orchestration
-only.
+``docs/doom_graph.md`` for the architectural overview and each stage
+file for per-stage math.  This module does orchestration only.
 """
 
 from dataclasses import dataclass
@@ -93,9 +95,9 @@ class GameGraphIO:
     wall_counter).
 
     ``overflow_outputs`` maps name → output node placed after the
-    input region.  Includes ``next_token_embedding`` (72-wide) which
-    the :class:`CompiledToken` wrapper argmaxes against ``W_EMBED.T``
-    to produce ``next_token_id``.
+    input region.  Includes ``next_token_embedding`` (``D_EMBED``-wide)
+    which the :class:`CompiledToken` wrapper argmaxes against
+    ``W_EMBED.T`` to produce ``next_token_id``.
 
     ``embedding`` is the :class:`Embedding` leaf hand-wired to read
     from ``token_ids`` — callers need it to build the
@@ -168,9 +170,9 @@ def build_game_graph(
         max_bsp_nodes=max_bsp_nodes,
         max_coord=max_coord,
     )
-    # The embedding is the per-position 72-wide residual leaf produced
-    # by looking up ``inputs["token_ids"]`` in ``W_EMBED``.  All
-    # token-type detectors run against this leaf (specific-ID
+    # The embedding is the per-position ``D_EMBED``-wide residual leaf
+    # produced by looking up ``inputs["token_ids"]`` in ``W_EMBED``.
+    # All token-type detectors run against this leaf (specific-ID
     # comparisons or a category-only slice for ``is_thinking_value``).
     embedding = build_doom_embedding(input_name="token_ids")
     tf = _detect_token_types(embedding)
@@ -228,25 +230,23 @@ def build_game_graph(
     _mark("bsp")
 
     # ---------- WALL ----------
-    # Phase B Part 3: prefill WALL is now a thin data carrier.  It
-    # produces the per-wall one-hot used by downstream content
-    # attentions; all collision / BSP / visibility computation has
-    # moved into the thinking phase (running-OR HIT_*, BSP_RANK /
-    # IS_RENDERABLE / VIS_LO / VIS_HI identifier tokens).  Raw
-    # geometry stays host-supplied via ``inputs[...]`` at each WALL
-    # position.
+    # Prefill WALL is a thin data carrier.  It produces the per-wall
+    # ``-wall_index²`` channel used by downstream quadratic-equality
+    # content attentions; all collision / BSP / visibility computation
+    # lives in the thinking phase (running-OR HIT_*, BSP_RANK /
+    # IS_RENDERABLE / VIS_LO / VIS_HI identifier tokens).  Raw geometry
+    # is host-supplied via ``inputs[...]`` at each WALL position.
     wall_out = build_wall(
         wall_index=inputs["wall_index"],
         max_walls=max_walls,
     )
     _mark("wall")
 
-    # EOS stage: gutted in Phase A Part 4.  The EOS token remains in
-    # the prompt as an end-of-prompt marker but performs no graph
-    # computation.  Collision resolution moved to the RESOLVED_X /
-    # RESOLVED_Y identifiers in the thinking phase; the post-turn
-    # angle is carried by INPUT's ``new_angle`` broadcast and emitted
-    # at the RESOLVED_ANGLE identifier step.
+    # EOS: the EOS token is an end-of-prompt marker only — no graph
+    # computation.  Collision resolution lives in the RESOLVED_X /
+    # RESOLVED_Y identifiers in the thinking phase; the post-turn angle
+    # is carried by INPUT's ``new_angle`` broadcast and emitted at the
+    # RESOLVED_ANGLE identifier step.
 
     # ---------- PLAYER ----------
     player_out = build_player(
@@ -263,16 +263,15 @@ def build_game_graph(
     _mark("player")
 
     # ---------- THINKING_WALL ----------
-    # Phase A Part 4: the thinking-wall stage carries the full
-    # identifier state machine, including the 3 RESOLVED slots at the
-    # frame boundary.  Pre-collision player position comes from the
-    # PLAYER broadcast (the host feeds pre-collision game_state to
-    # PLAYER_X / PLAYER_Y).
+    # The thinking-wall stage runs the full identifier state machine,
+    # including the 3 RESOLVED slots at the frame boundary.
+    # Pre-collision player position comes from the PLAYER broadcast
+    # (the host feeds pre-collision game_state to PLAYER_X / PLAYER_Y).
     #
-    # Phase B Part 3: RESOLVED_X/Y now read the running-OR HIT_*
-    # values from the thinking KV cache (each wall's HIT_* token emits
-    # the OR through all prior walls, so wall 7's value is the global
-    # aggregate).  The prefill WALL stage no longer produces collision
+    # RESOLVED_X/Y read the running-OR HIT_* values from the thinking
+    # KV cache (each wall's HIT_* token emits the OR through all prior
+    # walls, so wall 7's value is the global aggregate).  The prefill
+    # WALL stage does not produce collision
     # flags; the kv.hit_* fields are gone from ThinkingWallKVInput.
     thinking_wall_out = build_thinking_wall(
         ThinkingWallKVInput(
@@ -308,18 +307,17 @@ def build_game_graph(
     )
     _mark("thinking_wall")
 
-    # Phase B Part 2: ``is_sort_result_value`` is built via the shared
-    # readback handle (prev_slot_onehot[SORT_RESULT] AND is_thinking_value).
-    # The readback is cheap — one ``extract_from`` + ``bool_all_true``.
+    # ``is_sort_result_value`` is built via the shared readback handle
+    # (prev_slot_onehot[SORT_RESULT] AND is_thinking_value).  The
+    # readback is cheap — one ``extract_from`` + ``bool_all_true``.
     is_sort_result_value = thinking_wall_out.readback.is_value_of("SORT_RESULT")
     _mark("sort_result_value_indicator")
 
     # ---------- SORTED ----------
-    # Phase B Part 2: 3-position pipeline reading BSP ranks + VIS_LO
-    # from thinking-phase KV rather than the prefill WALL payload.
-    # SORTED_WALL emits SORT_RESULT; SORT_RESULT id runs the quadratic
-    # attention and emits VALUE(wall_index); VALUE position reads VIS_LO
-    # via content attention and emits RENDER.
+    # 3-position pipeline reading BSP ranks + VIS_LO from thinking-phase
+    # KV.  SORTED_WALL emits SORT_RESULT; SORT_RESULT id runs the
+    # quadratic attention and emits VALUE(wall_index); VALUE position
+    # reads VIS_LO via content attention and emits RENDER.
     sorted_out = build_sorted(
         SortedToken(
             wall_counter=inputs["wall_counter"],
@@ -345,17 +343,14 @@ def build_game_graph(
     _mark("sorted")
 
     # ---------- RENDER ----------
-    # Phase A Part 4: post-collision (x, y) come from the RESOLVED_X /
-    # RESOLVED_Y thinking tokens via the shared readback helper rather
-    # than the PLAYER broadcast (which is pre-collision now).  cos/sin
-    # still come from PLAYER_ANGLE's broadcast — collision doesn't
-    # change angle.
+    # Post-collision (x, y) come from the RESOLVED_X / RESOLVED_Y
+    # thinking tokens via the shared readback helper.  cos/sin come
+    # from PLAYER_ANGLE's broadcast — collision doesn't change angle.
     #
-    # Phase B Part 2: wall_index + vis_hi also travel via thinking
-    # VALUE tokens — wall_index from the SORT_RESULT VALUE the SORTED
-    # stage just emitted, vis_hi from the thinking VIS_HI VALUE for
-    # this wall (content attention keyed by wall_index).  Neither
-    # depends on the prefill WALL stage's FOV clipping anymore.
+    # wall_index + vis_hi travel via thinking VALUE tokens —
+    # wall_index from the SORT_RESULT VALUE the SORTED stage just
+    # emitted, vis_hi from the thinking VIS_HI VALUE for this wall
+    # (content attention keyed by wall_index).
     resolved_x_readback = thinking_wall_out.readback.get_value_after_last("RESOLVED_X")
     _mark("render/resolved_x_readback")
     resolved_y_readback = thinking_wall_out.readback.get_value_after_last("RESOLVED_Y")
@@ -446,9 +441,9 @@ def _create_inputs(
     """
     inputs: Dict[str, Node] = {}
 
-    # Phase A Part 1: discrete token ID slot (one per position).  The
-    # graph's ``Embedding`` leaf reads this and produces the 72-wide
-    # per-position embedding; detectors run against that.
+    # Discrete token ID slot (one per position).  The graph's
+    # ``Embedding`` leaf reads this and produces the per-position
+    # embedding; detectors run against that.
     inputs["token_ids"] = create_input("token_ids", 1, value_range=(0.0, float(V - 1)))
     inputs["player_x"] = create_input(
         "player_x", 1, value_range=(-max_coord, max_coord)
@@ -498,9 +493,9 @@ def _create_inputs(
     )
 
     # Autoregressive state — 3 bounded integers plus token_type.
-    # Phase A M3: render_wall_index is no longer an overlaid input;
-    # RENDER reads the current wall index via attention to the most
-    # recent SORTED position.
+    # render_wall_index is not an overlaid input: RENDER reads the
+    # current wall index via readback over the most recent SORT_RESULT
+    # VALUE position.
     inputs["wall_counter"] = create_input(
         "wall_counter", 1, value_range=(0.0, float(max_walls))
     )
@@ -513,16 +508,14 @@ def _create_inputs(
 
 
 def _detect_token_types(embedding: Node) -> Dict[str, Any]:
-    """Derive per-type boolean flags from the 72-wide embedding leaf.
+    """Derive per-type boolean flags from the embedding leaf.
 
     Most detectors are ``equals_vector`` against a fixed ``W_EMBED`` row
     (for specific-ID categories).  Three flags — ``is_thinking_value``,
     ``is_identifier_by_slot[i]``, ``is_any_identifier`` — read directly
-    from the type-tag block in W_EMBED added in Phase D Part 1; those
-    columns hold ±1 for "this row is in category X" and an
-    :func:`extract_from` is the bool itself, no compare needed.  This
-    drops the 4-5 layers the readback chain previously spent building
-    these flags from the E8 prefix.
+    from the type-tag block in W_EMBED; those columns hold ±1 for
+    "this row is in category X" and an :func:`extract_from` is the
+    bool itself, with no compare needed.
 
     Per-identifier detectors: one detector per entry in
     ``IDENTIFIER_NAMES`` (21 total — 17 per-wall + 3 RESOLVED + 1
@@ -544,8 +537,8 @@ def _detect_token_types(embedding: Node) -> Dict[str, Any]:
             "is_player_x": equals_vector(embedding, embed_lookup("PLAYER_X")),
             "is_player_y": equals_vector(embedding, embed_lookup("PLAYER_Y")),
             "is_player_angle": equals_vector(embedding, embed_lookup("PLAYER_ANGLE")),
-            # Phase D Part 1: type-tag column extracts.  The is_value_category
-            # column in W_EMBED is +1 at every VALUE row, −1 elsewhere — the
+            # Type-tag column extract.  The is_value_category column
+            # in W_EMBED is +1 at every VALUE row, −1 elsewhere — the
             # extract IS the ±1 bool.  ``assert_in_range`` tightens the
             # value_type to ±1 so downstream cond_gate/bool_all_true
             # don't inflate based on the embedding leaf's unknown
@@ -560,12 +553,11 @@ def _detect_token_types(embedding: Node) -> Dict[str, Any]:
         }
         # Per-identifier detectors (21 total).  Built in IDENTIFIER_NAMES
         # order; both indexed (by slot) and keyed (by name) for downstream
-        # convenience.  Phase D Part 1: each slot's column in the W_EMBED
-        # type-tag block is +1 only at the matching IDENTIFIER row, −1
-        # elsewhere — the extract IS the per-slot ±1 bool that
-        # ``cond_gate`` and ``bool_all_true`` consumers expect, with no
-        # additional MLP sublayer.  ``assert_in_range`` tightens the
-        # value_type to ±1.
+        # convenience.  Each slot's column in the W_EMBED type-tag
+        # block is +1 only at the matching IDENTIFIER row, −1 elsewhere —
+        # the extract IS the per-slot ±1 bool that ``cond_gate`` and
+        # ``bool_all_true`` consumers expect, with no additional MLP
+        # sublayer.  ``assert_in_range`` tightens the value_type to ±1.
         is_identifier_by_slot = [
             assert_in_range(
                 extract_from(
@@ -583,8 +575,8 @@ def _detect_token_types(embedding: Node) -> Dict[str, Any]:
         flags["is_identifier_by_slot"] = is_identifier_by_slot
         for name, detector in zip(IDENTIFIER_NAMES, is_identifier_by_slot):
             flags[f"is_{name.lower()}_id"] = detector
-        # Phase D Part 1: is_any_identifier is its own column in
-        # W_EMBED — +1 at the 21 IDENTIFIER rows, −1 elsewhere.
+        # is_any_identifier has its own column in W_EMBED — +1 at the
+        # 21 IDENTIFIER rows, −1 elsewhere.
         flags["is_any_identifier"] = assert_in_range(
             extract_from(
                 embedding, D_EMBED, _IS_ANY_ID_COL, 1, "is_any_identifier"
@@ -622,8 +614,8 @@ def _assemble_output(
         render_col, render_chunk_k, wall_counter
 
     Overflow outputs (placed after the input region):
-        next_token_embedding (72-wide — CompiledToken argmaxes it to
-        pick the next ``token_ids`` input),
+        next_token_embedding (D_EMBED-wide — CompiledToken argmaxes it
+        to pick the next ``token_ids`` input),
         pixels, col, start, length, done, advance_wall,
         sort_done, sort_wall_index
 
@@ -632,21 +624,18 @@ def _assemble_output(
     loop doesn't need it as input (RENDER gets its wall identity via
     the readback over SORT_RESULT VALUE positions, not via this field).
 
-    Phase A Part 4: the former per-EOS-token overflow outputs for
-    resolved state are gone — collision-resolved state now flows
-    through the RESOLVED_X/Y/ANGLE thinking-token stream, and the
-    host reads it from argmax outputs at known step offsets.  The
-    PLAYER_ANGLE step emits ``THINKING_WALL_0`` as its next-token
-    prediction so the host no longer synthesizes the first thinking
-    token.
+    Collision-resolved state flows through the RESOLVED_X/Y/ANGLE
+    thinking-token stream; the host reads it from argmax outputs at
+    known step offsets.  PLAYER_ANGLE emits ``THINKING_WALL_0`` as its
+    next-token prediction so the autoregressive loop steps directly
+    into the thinking phase.
 
-    Phase B Part 2: the SORT pipeline now spans 3 token positions
-    (SORTED_WALL marker → SORT_RESULT id → SORT_RESULT VALUE).
-    wall_counter increments at the SORT_RESULT id position; render_col
-    and render_chunk_k are seeded at the SORT_RESULT VALUE position.
-    ``sort_vis_hi`` is gone from overflow — RENDER now reads vis_hi
+    The SORT pipeline spans 3 token positions (SORTED_WALL marker →
+    SORT_RESULT id → SORT_RESULT VALUE).  wall_counter increments at
+    the SORT_RESULT id position; render_col and render_chunk_k are
+    seeded at the SORT_RESULT VALUE position.  RENDER reads vis_hi
     directly via content attention on the thinking VIS_HI VALUE
-    token.
+    token, so vis_hi is not in overflow.
     """
     with annotate("output"):
         zero_1 = create_literal_value(torch.tensor([0.0]), name="zero_1")
@@ -656,14 +645,14 @@ def _assemble_output(
         )
         neg_one = create_literal_value(torch.tensor([-1.0]), name="neg_one_out")
 
-        # Phase B Part 2: the SORT pipeline spans 3 positions
-        # (SORTED_WALL marker → SORT_RESULT id → SORT_RESULT VALUE).
-        # render_col / render_chunk_k are seeded at the SORT_RESULT
-        # VALUE position (where vis_lo has just been read via content
-        # attention on the thinking VIS_LO KV); wall_counter
-        # increments at the SORT_RESULT id position (where the
-        # quadratic-equality attention uses the current N to pick the
-        # Nth-rank renderable wall).
+        # The SORT pipeline spans 3 positions (SORTED_WALL marker →
+        # SORT_RESULT id → SORT_RESULT VALUE).  render_col /
+        # render_chunk_k are seeded at the SORT_RESULT VALUE position
+        # (where vis_lo has just been read via content attention on
+        # the thinking VIS_LO KV); wall_counter increments at the
+        # SORT_RESULT id position (where the quadratic-equality
+        # attention uses the current N to pick the Nth-rank renderable
+        # wall).
         out_render_col = select(
             is_sort_result_value,
             sorted_out.vis_lo,
@@ -709,30 +698,26 @@ def _assemble_output(
         )
 
         # --- Next-token embedding ---
-        # Phase A Part 1: every position emits the 72-wide embedding of
-        # the next token the transformer should receive.  Thinking
-        # positions drive the first half of the sequence (marker →
-        # identifier → value → ...); at SORTED positions the next token
-        # is always RENDER; at RENDER positions it's RENDER or
-        # SORTED_WALL depending on wall-advance state.
-        #
-        # Phase A Part 4: PLAYER_ANGLE's step now emits ``THINKING_WALL_0``
-        # as its next-token prediction so the autoregressive loop picks
-        # it up naturally — the host no longer synthesizes the first
-        # thinking token.  Elsewhere (prompt positions before
+        # Every position emits the embedding of the next token the
+        # transformer should receive.  Thinking positions drive the
+        # cascade (marker → identifier → value → ...); SORTED positions
+        # always lead to RENDER; RENDER goes to RENDER or SORTED_WALL
+        # depending on wall-advance state; PLAYER_ANGLE emits
+        # THINKING_WALL_0 so the loop steps into the thinking phase
+        # without a host nudge.  Elsewhere (prompt positions before
         # PLAYER_ANGLE) the emitted value is a don't-care zero — the
         # host never argmaxes these because it feeds the known prompt
         # tokens directly.
         type_thinking_wall_0 = create_literal_value(
             embed_lookup("THINKING_WALL_0"), name="out_type_thinking_wall_0"
         )
-        # Phase D Part 2: flat switch over six mutually-exclusive
-        # branches.  is_thinking_active overlaps the two SORT_RESULT
-        # branches (is_any_identifier / is_thinking_value fire at
-        # SORT_RESULT too), so we trim it to the disjoint slice.  The
-        # other four conditions (is_sorted, is_render, is_player_angle,
-        # plus the implicit "none of the above → zero default") are
-        # already mutually exclusive.
+        # Flat switch over six mutually-exclusive branches.
+        # is_thinking_active overlaps the two SORT_RESULT branches
+        # (is_any_identifier / is_thinking_value fire at SORT_RESULT
+        # too), so we trim it to the disjoint slice.  The other four
+        # conditions (is_sorted, is_render, is_player_angle, plus the
+        # implicit "none of the above → zero default") are already
+        # mutually exclusive.
         #
         # Branches:
         #   SORT_RESULT id    → SORTED's factored VALUE(wall_index)
@@ -785,12 +770,11 @@ def _assemble_output(
             token_flags["is_render"], render_out.advance_wall, neg_one
         )
 
-        # Phase B Part 2: sort_done is produced at SORT_RESULT id (the
-        # position where the quadratic attention resolves the picked
-        # rank and the exhaustion check fires).  sort_vis_hi is no
-        # longer produced — the SORTED stage only reads vis_lo, and
-        # RENDER reads vis_hi directly via content attention on
-        # thinking VIS_HI positions.
+        # sort_done is produced at SORT_RESULT id (the position where
+        # the quadratic attention resolves the picked rank and the
+        # exhaustion check fires).  sort_vis_hi is not produced —
+        # SORTED only reads vis_lo, and RENDER reads vis_hi directly
+        # via content attention on thinking VIS_HI positions.
         out_sort_done = select(
             token_flags["is_sort_result_id"], sorted_out.sort_done, neg_one
         )

@@ -2,11 +2,7 @@
 full 20-identifier cascade (17 per-wall + 3 RESOLVED at the frame
 boundary).
 
-Phase B Part 1 — the per-wall cascade splits the deep T/VIS math into
-four new intermediate slots (T_STAR_L/R and COL_A/B) whose values flow
-back to T_LO/T_HI/VIS_LO/VIS_HI through the KV cache.  This shallows
-the per-step critical path from ~58 ops (13-slot cascade) to ~34 ops
-(17-slot cascade).  Wire format per wall (35 steps):
+Wire format per wall (35 steps):
 
     [THINKING_WALL_N]
       [BSP_RANK]         v(bsp_rank)      # integer 0..7
@@ -27,21 +23,25 @@ the per-step critical path from ~58 ops (13-slot cascade) to ~34 ops
       [HIT_X]            v(hit_x_running_or)
       [HIT_Y]            v(hit_y_running_or)
 
-HIT_FULL/HIT_X/HIT_Y emit the OR of this wall's flag with the previous
-HIT_* value read from the KV cache — by the time wall 7's HIT_* fires,
-each value is the global OR across all walls.  Wall 0 reads zero from
-the empty cache (OR identity).  Part 3 wires RESOLVED to consume the
-global HIT_* from wall 7 via ``get_value_after_last``.
+The deep T/VIS math is split across four intermediate slots
+(T_STAR_L/R and COL_A/B) whose values flow back to
+T_LO/T_HI/VIS_LO/VIS_HI through the KV cache, keeping the per-step
+critical path shallow (~12 ops at the deepest slot).
+
+HIT_FULL/HIT_X/HIT_Y emit the OR of this wall's flag with the
+previous HIT_* value read from the KV cache — by the time wall 7's
+HIT_* fires, each value is the global OR across all walls.  Wall 0
+reads zero from the empty cache (OR identity).  RESOLVED consumes
+the global HIT_* via ``get_value_after_last``.
 
 Two classes of identifier computation:
 
 * **Base values** (BSP_RANK, IS_RENDERABLE, CROSS/DOT, HIT_*): compute
   from first principles using the attended wall geometry, the BSP
-  side-P vector, and the player's pre-collision pose.  Math is ported
-  from ``wall.py`` 1:1.
+  side-P vector, and the player's pre-collision pose.
 * **Derived values** (T_STAR_L/R, T_LO/T_HI, COL_A/B, VIS_LO/VIS_HI):
   read CROSS/DOT/T/COL from the KV cache via :class:`ThinkingReadback`
-  and apply the ported clip / projection math.  VIS gates on a
+  and apply the clip / projection math.  VIS gates on a
   locally-computed is_renderable (recomputed here rather than read via
   readback — the recompute is shallower than the round-trip through
   an attention hop + dequantize).
@@ -50,14 +50,15 @@ Cross-position data reads (three primary hops):
 
 1. **Current wall identity.**  Most-recent ``THINKING_WALL_N`` marker
    → ``current_wall_index``.
-2. **Wall geometry.**  Single ``attend_argmax_dot`` matching
-   ``wall_j_onehot`` against WALL-position ``wall_position_onehot``;
-   value block concatenates ``(wall_ax, wall_ay, wall_bx, wall_by,
-   wall_bsp_coeffs, wall_bsp_const)``.  Fired at every per-wall
-   identifier step via the ``is_any_identifier`` gate.
+2. **Wall geometry.**  2-wide quadratic-equality ``attend_argmax_dot``
+   keyed on ``(wall_index, -wall_index²)`` against WALL prefill
+   positions; value block concatenates ``(wall_ax, wall_ay, wall_bx,
+   wall_by, wall_bsp_coeffs, wall_bsp_const)``.  Fired at every
+   per-wall identifier step via the ``is_any_identifier`` gate.
 3. **Previous identifier slot** + **prior VALUE readbacks.**  The
-   Part-2 prev-id attention plus :class:`ThinkingReadback`'s per-name
-   attention to recent matching VALUE positions.
+   prev-id attention (reading the slot one-hot column from the
+   embedding) plus :class:`ThinkingReadback`'s per-name attention to
+   recent matching VALUE positions.
 """
 
 from dataclasses import dataclass
@@ -225,11 +226,11 @@ class ThinkingWallKVInput:
     wall_by: Node
     wall_index_at_wall: Node  # host-fed wall_index at WALL positions; the
     # first K channel of wall_geom_attention's
-    # quadratic-equality match (Phase C Part 3).
+    # quadratic-equality match.
     wall_index_neg_sq_at_wall: Node  # ``-wall_index²`` at WALL positions; second
     # K channel.  From WallKVOutput
     # (computed in WALL via one ``square``
-    # sublayer; Phase C Part 1 added it).
+    # sublayer).
     wall_bsp_coeffs: Node  # max_bsp_nodes-wide
     wall_bsp_const: Node  # 1-wide
 
@@ -259,8 +260,8 @@ class ThinkingWallKVInput:
 class ThinkingWallOutput:
     """Outputs for the thinking-wall state machine.
 
-    ``next_token_embedding`` is the 72-wide embedding of the next
-    token the transformer should emit at this position.  Meaningful
+    ``next_token_embedding`` is the ``D_EMBED``-wide embedding of the
+    next token the transformer should emit at this position.  Meaningful
     at thinking positions (marker / identifier / value); the
     orchestrator's ``is_thinking_active`` gate zeros it elsewhere.
 
@@ -276,8 +277,8 @@ class ThinkingWallOutput:
     KV cache — sharing the instance lets its per-name attention-head
     cache dedupe queries across stages.
 
-    Phase B Part 2 adds two scalar KV channels specifically for the
-    SORTED stage's quadratic-equality attention:
+    Two scalar KV channels feed the SORTED stage's quadratic-equality
+    attention:
 
     * ``bsp_rank_scalar_for_sort`` — the wall's BSP rank as a float at
       BSP_RANK identifier positions of renderable walls; a sentinel
@@ -291,8 +292,8 @@ class ThinkingWallOutput:
     attention softmax (match_gain ≈ 20) puts effectively-zero weight
     on non-renderable / non-BSP_RANK keys.
 
-    Phase B Part 2 also exposes the current-wall one-hot at thinking
-    positions so downstream stages can do content-attention keyed by
+    The current-wall one-hot is exposed at thinking positions so
+    downstream stages can do content-attention keyed by
     ``(identifier_name, wall_index)``.  Two variants are needed because
     consumers key different position types:
 
@@ -300,9 +301,9 @@ class ThinkingWallOutput:
       The SORTED stage's quadratic-equality attention reads the V from
       BSP_RANK *identifier* positions, so its V-source channel needs
       the wall_index one-hot exposed at identifier positions.
-    * ``value_wall_index_scalar`` / ``value_wall_index_neg_sq``
-      (Phase C Part 3) — quadratic-equality K channels for content
-      attentions keyed on ``(name-VALUE, wall_index)``: today
+    * ``value_wall_index_scalar`` / ``value_wall_index_neg_sq`` —
+      quadratic-equality K channels for content attentions keyed on
+      ``(name-VALUE, wall_index)``: today
       ``render/vis_hi_content_attention`` and ``sort/vis_lo_attention``.
       Sentinel-gated to live at thinking-VALUE positions (sentinel
       -100 / -1000 elsewhere, same pattern as ``bsp_rank_*_for_sort``).
@@ -384,14 +385,12 @@ def build_thinking_wall(
         )
 
     # ---------------------------------------------------------------------
-    # Attention hop 2: most-recent-identifier slot one-hot.  Phase D
-    # Part 1: V is the slot one-hot column block in W_EMBED — at each
-    # IDENTIFIER row col ``_SLOT_ONEHOT_START + slot`` is +1 and the
-    # other 20 cols are −1; non-identifier rows carry all −1.  The
-    # extract folds into the V projection, so this attention has no
-    # pre-computation other than the embedding leaf itself, dropping
-    # the cond_gate + Concat + cond_gate chain that previously built
-    # this V at depth 4.  ±1 storage matches the per-position
+    # Attention hop 2: most-recent-identifier slot one-hot.  V is the
+    # slot one-hot column block in W_EMBED — at each IDENTIFIER row col
+    # ``_SLOT_ONEHOT_START + slot`` is +1 and the other 20 cols are −1;
+    # non-identifier rows carry all −1.  The extract folds into the V
+    # projection, so this attention has no pre-computation other than
+    # the embedding leaf itself.  ±1 storage matches the per-position
     # ``is_identifier_by_slot[i]`` extract semantics (same column),
     # so the same column does double duty as the per-position bool and
     # the cross-position prev-id V.  Downstream Linears that previously
@@ -428,12 +427,12 @@ def build_thinking_wall(
         prev_slot_onehot = assert_in_range(prev_slot_onehot_raw, -1.0, 1.0)
 
     # ---------------------------------------------------------------------
-    # Phase C Part 3: derive the quadratic-equality K channels for
-    # current_wall_index.  Used by this stage's wall_geom_attention
-    # (Q-side) and exported as value_wall_index_scalar /
-    # value_wall_index_neg_sq for downstream content attentions
-    # (vis_hi at RENDER, vis_lo at SORTED).  ``square`` on a unit
-    # grid is exact at integer wall_index ∈ [0, max_walls-1].
+    # Derive the quadratic-equality K channels for current_wall_index.
+    # Used by this stage's wall_geom_attention (Q-side) and exported as
+    # value_wall_index_scalar / value_wall_index_neg_sq for downstream
+    # content attentions (vis_hi at RENDER, vis_lo at SORTED).
+    # ``square`` on a unit grid is exact at integer wall_index ∈
+    # [0, max_walls-1].
     # ---------------------------------------------------------------------
     with annotate("thinking_wall/wall_index_quad"):
         wi_clamped = clamp(current_wall_index, 0.0, float(max_walls - 1))
@@ -448,12 +447,12 @@ def build_thinking_wall(
     # ---------------------------------------------------------------------
     # Attention hop 3: wall geometry for the current wall.
     #
-    # Phase C Part 3: 2-wide quadratic-equality match on wall_index
-    # (mirrors Phase C Part 1's render/wall_geom_attention).
+    # 2-wide quadratic-equality match on wall_index (same shape as
+    # ``render/wall_geom_attention``).
     # Q at thinking-identifier positions: ``[2·current_wall_index, 1]``;
-    # K at WALL positions: ``[wall_index, -wall_index²]`` (the
-    # ``WallKVOutput`` channels Phase C Part 1 added); sentinels at
-    # non-WALL positions keep softmax mass off them.
+    # K at WALL positions: ``[wall_index, -wall_index²]`` (from
+    # ``WallKVOutput``); sentinels at non-WALL positions keep softmax
+    # mass off them.
     #
     # V block packs (ax, ay, bx, by, bsp_coeffs..., bsp_const) so a
     # single attention head covers every per-wall identifier's
@@ -594,12 +593,10 @@ def build_thinking_wall(
     )
 
     # ---------------------------------------------------------------------
-    # RESOLVED computation: the running-OR HIT_* thinking tokens from
-    # Part 1 carry the global any-hit aggregate by wall 7, so at
-    # RESOLVED_X/Y/ANGLE positions ``get_value_after_last`` returns it
-    # as a scalar in [0, 1].  The cross-position attend_mean_where
-    # aggregation from Phase A Part 4 is gone; the sliding math is
-    # unchanged.
+    # RESOLVED computation: the running-OR HIT_* thinking tokens carry
+    # the global any-hit aggregate by wall 7, so at RESOLVED_X/Y/ANGLE
+    # positions ``get_value_after_last`` returns it as a scalar in
+    # [0, 1].  Sliding math is the standard axis-separated rule.
     # ---------------------------------------------------------------------
     with annotate("thinking_wall/resolved_compute"):
         resolved_x, resolved_y, resolved_angle = _compute_resolved(
@@ -622,10 +619,10 @@ def build_thinking_wall(
         bsp_rank = clamp(bsp_rank, 0.0, 7.0)
 
     # ---------------------------------------------------------------------
-    # Phase B Part 2: expose BSP_RANK scalars as a KV side-channel so the
-    # SORTED stage's quadratic-equality attention at SORT_RESULT id
-    # positions can match bsp_rank against wall_counter.  At every
-    # position we emit ``[bsp_rank_scalar, bsp_rank_neg_sq]``:
+    # Expose BSP_RANK scalars as a KV side-channel so the SORTED stage's
+    # quadratic-equality attention at SORT_RESULT id positions can match
+    # bsp_rank against wall_counter.  At every position we emit
+    # ``[bsp_rank_scalar, bsp_rank_neg_sq]``:
     #
     #   * BSP_RANK id position of renderable wall: ``[r, -r²]``.  The
     #     quadratic-attention query ``[2N, 1]`` dots to
@@ -686,24 +683,24 @@ def build_thinking_wall(
         )
 
     # ---------------------------------------------------------------------
-    # Phase B Part 2: expose ``current_wall_index`` as a 1-hot at
-    # thinking identifier and thinking VALUE positions.  Two gated
-    # variants so downstream stages can key their content attentions
-    # on identifier positions (e.g. the quadratic SORTED attention
-    # reading BSP_RANK id V) or on VALUE positions (e.g. the VIS_LO /
-    # VIS_HI content attentions reading thinking VALUE payloads).
+    # Expose ``current_wall_index`` as a 1-hot at thinking identifier
+    # and thinking VALUE positions.  Two gated variants so downstream
+    # stages can key their content attentions on identifier positions
+    # (e.g. the quadratic SORTED attention reading BSP_RANK id V) or on
+    # VALUE positions (e.g. the VIS_LO / VIS_HI content attentions
+    # reading thinking VALUE payloads).
     # ---------------------------------------------------------------------
     with annotate("thinking_wall/wall_index_onehot_exports"):
-        # identifier_wall_index_onehot is still consumed by SORTED's
+        # identifier_wall_index_onehot is consumed by SORTED's
         # quad_attention V (it returns the picked wall_index as an
         # 8-wide one-hot, then a Linear with arange weights converts
-        # back to scalar).  Phase C Part 3 migrated the *value*-side
-        # one-hot consumers to the new value_wall_index_scalar /
-        # value_wall_index_neg_sq channels exposed below.
+        # back to scalar).  Value-side consumers use the
+        # value_wall_index_scalar / value_wall_index_neg_sq channels
+        # exposed below.
         identifier_wall_index_onehot = cond_gate(is_any_identifier, wall_j_onehot)
 
-    # Phase C Part 3: quadratic-equality exports for content attentions
-    # keyed by ``(name-VALUE, wall_index)``.  Sentinel pattern mirrors
+    # Quadratic-equality exports for content attentions keyed by
+    # ``(name-VALUE, wall_index)``.  Sentinel pattern mirrors
     # ``bsp_rank_*_for_sort`` above: real values gated to thinking-VALUE
     # positions, large-negative sentinels elsewhere keep softmax mass off
     # non-VALUE keys.  ``approximate=False`` on the select keeps the
@@ -729,11 +726,11 @@ def build_thinking_wall(
         )
 
     # ---------------------------------------------------------------------
-    # Phase B Part 1 slot-split: the deep T/VIS chain gets carved into
-    # four new intermediate slots (T_STAR_L/R for plane-crossings, COL_A/B
-    # for atan-projected endpoint columns).  Each downstream slot reads
-    # its upstream intermediates from the KV cache via ``get_value_after_last``
-    # instead of recomputing them in-step.
+    # T/VIS slot-split: the deep T/VIS chain is carved into four
+    # intermediate slots (T_STAR_L/R for plane-crossings, COL_A/B for
+    # atan-projected endpoint columns).  Each downstream slot reads its
+    # upstream intermediates from the KV cache via
+    # ``get_value_after_last`` instead of recomputing them in-step.
     #
     # Shared FOV-edge evaluations: both T_STAR and T_LO/T_HI/COL paths
     # need ``f_L_a, f_L_b, f_R_a, f_R_b``.  Compute once and share (the
@@ -872,16 +869,14 @@ def build_thinking_wall(
         vis_hi = clamp(vis_hi, -2.0, vis_lo_bound_hi)
 
     # ---------------------------------------------------------------------
-    # Phase B Part 1: HIT_* running-OR accumulator.  Each wall's HIT_*
-    # emits the OR of this wall's local flag with every prior wall's
-    # HIT_* — by the time wall 7 fires, each of the three HIT_* values
-    # is the global aggregate across all walls.  The previous value
-    # comes from ``get_value_after_last("HIT_*")``; at wall 0 the cache
-    # is empty, so we gate the readback to 0 using ``current_wall_index``.
-    # OR over [0, 1] inputs is ``max`` (saturating).  Part 3 will wire
-    # RESOLVED to consume the wall-7 global aggregate via a single
-    # readback, replacing the current cross-position attend_mean_where
-    # aggregation.
+    # HIT_* running-OR accumulator.  Each wall's HIT_* emits the OR of
+    # this wall's local flag with every prior wall's HIT_* — by the
+    # time wall 7 fires, each of the three HIT_* values is the global
+    # aggregate across all walls.  The previous value comes from
+    # ``get_value_after_last("HIT_*")``; at wall 0 the cache is empty,
+    # so we gate the readback to 0 using ``current_wall_index``.  OR
+    # over [0, 1] inputs is ``max`` (saturating).  RESOLVED reads the
+    # wall-7 global aggregate via a single readback.
     # ---------------------------------------------------------------------
     with annotate("thinking_wall/hit_running_or"):
         # is_not_wall_zero: +1 at walls 1..7, −1 at wall 0.  ``current_wall_index``
@@ -1189,10 +1184,9 @@ def _compute_bsp_and_renderable(
 
 
 # ---------------------------------------------------------------------------
-# Derived-value helpers (ported from wall._compute_visibility_columns).
-# Phase B Part 1 splits the chain into four new intermediate slots
-# (T_STAR_L/R, COL_A/B) so T_LO/T_HI/VIS_LO/VIS_HI become shallow
-# KV-cache consumers.
+# Derived-value helpers.  The T_STAR_L/R and COL_A/B intermediates
+# carry the deep FOV-clip and atan-projection math so
+# T_LO/T_HI/VIS_LO/VIS_HI stay as shallow KV-cache consumers.
 # ---------------------------------------------------------------------------
 
 
@@ -1304,11 +1298,11 @@ def _compute_resolved(
     """Axis-separated wall sliding via running-OR HIT_* readbacks.
 
     Each HIT_FULL / HIT_X / HIT_Y thinking token emits the OR of its
-    wall's local flag with every prior wall's (Phase B Part 1).  By
-    wall 7 the emitted value is the global any-hit aggregate across all
-    walls.  At RESOLVED_X/Y/ANGLE positions (which fire after wall 7's
-    HIT_Y), ``get_value_after_last`` returns that global aggregate as a
-    scalar in [0, 1] — 0 if no wall was hit on that ray, 1 otherwise.
+    wall's local flag with every prior wall's.  By wall 7 the emitted
+    value is the global any-hit aggregate across all walls.  At
+    RESOLVED_X/Y/ANGLE positions (which fire after wall 7's HIT_Y),
+    ``get_value_after_last`` returns that global aggregate as a scalar
+    in [0, 1] — 0 if no wall was hit on that ray, 1 otherwise.
 
     The resolved position on each axis uses the velocity component if
     *neither* the full ray nor that axis's lone ray hit anything;
@@ -1357,7 +1351,7 @@ def _compute_next_token_embedding(
     current_wall_index: Node,
     max_walls: int,
 ) -> Node:
-    """Build the 72-wide next-token embedding at every position.
+    """Build the ``D_EMBED``-wide next-token embedding at every position.
 
     Three mutually-exclusive contributions sum into the output:
 
@@ -1378,14 +1372,12 @@ def _compute_next_token_embedding(
     marker_contribution = cond_gate(is_thinking_wall_marker, e_bsp_rank)
 
     # ---- Value step: emit successor token. ----
-    # Phase D Part 1: prev_slot_onehot is now ±1 (the V from the
-    # readback attention is the slot one-hot column block in W_EMBED,
-    # which carries +1 at the active slot and −1 elsewhere).  The
-    # original Linear was designed for {0, 1} input
-    # (output = ``next_after_slot[active_slot]``).  Substituting
-    # ``y = (x + 1) / 2`` bakes the {0, 1} ↔ ±1 conversion into the
-    # Linear's weights/bias — pure parameter shift, no extra ops, no
-    # extra layers.
+    # prev_slot_onehot is ±1 (the V from the readback attention is the
+    # slot one-hot column block in W_EMBED, which carries +1 at the
+    # active slot and −1 elsewhere).  The Linear's weights and bias
+    # bake in a ``y = (x + 1) / 2`` conversion so the output equals
+    # ``next_after_slot[active_slot]`` despite the ±1 input — pure
+    # parameter shift, no extra ops.
     next_after_slot = torch.zeros(len(IDENTIFIER_NAMES), D_EMBED)
     for slot, name in _VALUE_SUCCESSOR_BY_SLOT.items():
         next_after_slot[slot] = embed_lookup(name)
@@ -1413,8 +1405,8 @@ def _compute_next_token_embedding(
     is_last_wall = compare(current_wall_index, float(max_walls) - 1.5)
     hy_successor = select(is_last_wall, e_resolved_x, next_marker_embed)
 
-    # Phase D Part 1: prev_slot_onehot is ±1, so the extract at the
-    # HIT_Y slot is already the ±1 bool — no compare(0.5) needed.
+    # prev_slot_onehot is ±1, so the extract at the HIT_Y slot is
+    # already the ±1 bool — no compare(0.5) needed.
     prev_was_hy_bool = extract_from(
         prev_slot_onehot, len(IDENTIFIER_NAMES), _SLOT_HIT_Y, 1, "prev_was_hy"
     )

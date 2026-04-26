@@ -351,13 +351,11 @@ def step_frame(
     past = module.empty_past()
     step = 0
     px, py, angle = float(state.x), float(state.y), float(state.angle)
-    # Phase A Part 4: the host feeds pre-collision (frame-start)
-    # player_x/y to PLAYER_X / PLAYER_Y; collision resolution now lives
-    # in the thinking phase and the post-collision state is read from
-    # the RESOLVED_X / RESOLVED_Y thinking tokens.  The pre-collision
-    # bypass slot at thinking-token positions is gone — thinking_wall
-    # reads player_x/y from the PLAYER broadcast (which is
-    # pre-collision under the Part 4 semantics).
+    # The host feeds pre-collision (frame-start) player_x/y to
+    # PLAYER_X / PLAYER_Y; collision resolution lives in the thinking
+    # phase and the post-collision state is read from the RESOLVED_X /
+    # RESOLVED_Y thinking tokens.  thinking_wall reads pre-collision
+    # player_x/y from the PLAYER broadcast.
 
     # Host-visible overlaid bypass names (fields shared between input
     # and output specs).  The host copies each one's value from the
@@ -545,11 +543,10 @@ def step_frame(
 
     # --- Thinking + Sort + Render (single autoregressive loop) ---
     #
-    # Phase A Part 4: the PLAYER_ANGLE step emits ``THINKING_WALL_0``
-    # as its next-token prediction (via the graph's next-token-embedding
-    # output at PLAYER_ANGLE positions).  The host no longer
-    # synthesizes the first thinking token — it just feeds the argmaxed
-    # ID back in.  From there the transformer drives the full sequence:
+    # The PLAYER_ANGLE step emits ``THINKING_WALL_0`` as its next-token
+    # prediction (via the graph's next-token-embedding output at
+    # PLAYER_ANGLE positions); the host just feeds the argmaxed ID
+    # back in.  From there the transformer drives the full sequence:
     # marker → identifier → value → … → RESOLVED_X/Y/ANGLE →
     # SORTED_WALL → RENDER×k → …, until done.  The host loop is
     # identical across all phases — copy overlaid bypass overflow back
@@ -562,13 +559,13 @@ def step_frame(
 
     prev = _next_inputs_from_overflow(first_thinking_id, overflow_after_pa)
 
-    # Thinking phase budget (Phase B Part 1): per wall, 1 marker + 17 identifiers
-    # + 17 values = 35 steps.  After the last wall, 3 RESOLVED identifiers
-    # + 3 RESOLVED values = 6 steps.  Total = max_walls * 35 + 6, plus a
+    # Thinking phase budget: per wall, 1 marker + 17 identifiers + 17
+    # values = 35 steps.  After the last wall, 3 RESOLVED identifiers +
+    # 3 RESOLVED values = 6 steps.  Total = max_walls * 35 + 6, plus a
     # small safety margin.
     n_thinking = max_walls * 35 + 6 + 4
-    # Per wall in the SORT/RENDER loop (Phase B Part 2): SORTED_WALL
-    # marker + SORT_RESULT id + SORT_RESULT VALUE + up to RENDER tokens.
+    # Per wall in the SORT/RENDER loop: SORTED_WALL marker + SORT_RESULT
+    # id + SORT_RESULT VALUE + up to RENDER tokens.
     max_steps = n_thinking + N * (W * (H // cs + 1) + 3) + 10
     total_steps = 0
     prev_wc = 0.0
@@ -595,15 +592,14 @@ def step_frame(
         pix = overflow["pixels"][0].detach().cpu().numpy().reshape(cs, 3)
 
         # Trace: detect token type from wall_counter changes.
-        # Phase B Part 2: wall_counter increments at the SORT_RESULT id
-        # position (not at the SORTED_WALL marker anymore), so the
-        # increment fires one token later than before.  ``render_col``
-        # still carries ``vis_lo`` but it's seeded at the SORT_RESULT
-        # VALUE position (one step AFTER the id).  The trace below is
-        # only used by the walkthrough harness for sanity diagnostics;
-        # the reference comparison itself goes through pixel output, so
-        # we fill ``vis_lo`` / ``vis_hi`` / ``tex_id`` with 0.0 here
-        # and let the pixel compare catch any divergence.
+        # wall_counter increments at the SORT_RESULT id position (the
+        # SORTED_WALL marker forwards it unchanged).  ``render_col``
+        # carries ``vis_lo``, seeded at the SORT_RESULT VALUE position
+        # (one step after the id).  The trace below is only used by
+        # the walkthrough harness for sanity diagnostics; the reference
+        # comparison itself goes through pixel output, so we fill
+        # ``vis_lo`` / ``vis_hi`` / ``tex_id`` with 0.0 here and let
+        # the pixel compare catch any divergence.
         if trace is not None:
             cur_wc = overflow["wall_counter"][0, 0].item()
             if cur_wc > prev_wc + 0.5:
@@ -667,10 +663,10 @@ def step_frame(
         trace.token_id_log = token_id_log
 
     # Read post-collision (x, y) and post-turn angle from the RESOLVED
-    # thinking tokens.  Phase B Part 1: per wall, 1 marker + 17 id-value
-    # pairs = 35 steps; after all walls, offsets 0..5 of the RESOLVED
-    # tail = [X_ID, X_VAL, Y_ID, Y_VAL, ANGLE_ID, ANGLE_VAL].  So the
-    # VALUE positions land at ``max_walls * 35 + {1, 3, 5}``.
+    # thinking tokens.  Per wall, 1 marker + 17 id-value pairs = 35
+    # steps; after all walls, offsets 0..5 of the RESOLVED tail =
+    # [X_ID, X_VAL, Y_ID, Y_VAL, ANGLE_ID, ANGLE_VAL].  So the VALUE
+    # positions land at ``max_walls * 35 + {1, 3, 5}``.
     def _dequant(token_id: int, name: str) -> float:
         lo, hi = VALUE_RANGE_BY_NAME[name]
         q = max(0, min(N_VALUES - 1, int(token_id)))

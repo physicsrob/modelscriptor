@@ -1,34 +1,29 @@
 """WALL stage: emit per-wall K channels for the quadratic-equality
 content attentions.
 
-After Phase B Part 3 the prefill WALL stage is a thin data carrier.
-Raw wall geometry (``wall_ax/ay/bx/by``, ``wall_tex_id``,
-``wall_bsp_coeffs``, ``wall_bsp_const``) is supplied by the host at
-each WALL position and read directly from ``inputs[...]`` by
-``thinking_wall`` and ``render``.  Per-wall collision flags, BSP
-rank, renderability, visibility columns, and the packed sort-value
-payload are gone:
+The prefill WALL stage is a thin data carrier.  Raw wall geometry
+(``wall_ax/ay/bx/by``, ``wall_tex_id``, ``wall_bsp_coeffs``,
+``wall_bsp_const``) is supplied by the host at each WALL position
+and read directly from ``inputs[...]`` by ``thinking_wall`` and
+``render``.  Per-wall collision flags, BSP rank, renderability,
+visibility columns, and the packed sort-value payload all live
+elsewhere now:
 
-* Running-OR HIT_FULL/HIT_X/HIT_Y thinking tokens (Phase B Part 1)
-  carry the global collision aggregate; RESOLVED reads them via
-  readback (Phase B Part 3).
-* BSP_RANK and IS_RENDERABLE identifier tokens (Phase A Part 3)
-  carry the rank and renderability; SORTED's quadratic-equality
-  attention reads them from the thinking KV (Phase B Part 2).
-* VIS_LO / VIS_HI identifier tokens (Phase A Part 3) carry the
-  visibility columns; RENDER reads them via content attention on
-  wall_index (Phase B Part 2).
+* Running-OR HIT_FULL/HIT_X/HIT_Y thinking tokens carry the global
+  collision aggregate; RESOLVED reads them via readback.
+* BSP_RANK and IS_RENDERABLE identifier tokens carry the rank and
+  renderability; SORTED's quadratic-equality attention reads them
+  from the thinking KV.
+* VIS_LO / VIS_HI identifier tokens carry the visibility columns;
+  RENDER reads them via content attention on wall_index.
 
-Phase C Part 1 added ``wall_index_neg_sq`` (= ``-wall_index²``) to
-support the quadratic-equality wall_index match used by every
-wall_index attention in the graph: ``render/wall_geom_attention``
-(Part 1) and ``thinking_wall/wall_geom_attention`` (Part 3).  A
-sentinel pattern at non-WALL positions is applied at each consumer.
-``wall_index`` itself is the host-fed scalar at WALL positions, used
-directly by consumers as the first quad K channel.
-
-Position one-hot is no longer materialized — the 2-wide quadratic K
-replaces every consumer that previously needed it.
+The stage emits one channel: ``wall_index_neg_sq`` (=
+``-wall_index²``), the second K channel of every quadratic-equality
+wall_index attention in the graph (``render/wall_geom_attention``
+and ``thinking_wall/wall_geom_attention``).  A sentinel pattern at
+non-WALL positions is applied at each consumer.  ``wall_index``
+itself is the host-fed scalar at WALL positions, used directly by
+consumers as the first quad K channel.
 """
 
 from dataclasses import dataclass

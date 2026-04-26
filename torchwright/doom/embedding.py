@@ -1,14 +1,12 @@
 """DOOM's token vocabulary and embedding table.
 
-Phase A Part 1: every autoregressive step consumes and emits a single
-token ID. The host feeds ``token_ids`` as a 1-wide input slot; the
-graph looks the ID up in ``W_EMBED`` to produce a 49-wide residual
-leaf. On the output side, the 49-wide output slice is projected
-through ``W_EMBED.T`` and argmaxed to pick the next ID.
+Every autoregressive step consumes and emits a single token ID.  The
+host feeds ``token_ids`` as a 1-wide input slot; the graph looks the
+ID up in ``W_EMBED`` to produce a 49-wide residual leaf.  On the
+output side, the 49-wide output slice is projected through
+``W_EMBED.T`` and argmaxed to pick the next ID.
 
-Vocabulary layout (Phase B Part 2 adds SORT_RESULT between RESOLVED
-and the decode tokens; Part 1 added T_STAR_L/R + COL_A/B to per-wall
-identifiers, widening them 13→17):
+Vocabulary layout:
 
   |      0 .. 65535 | VALUE (quantized 16-bit integers)            |
   |  65536 .. 65543 | THINKING_WALL markers 0..7                   |
@@ -46,22 +44,21 @@ The raw slot and Gray-code columns are zero for non-VALUE rows. All
 distinguished by the raw slot (dense, gives a monotone cue) and the
 Gray-code payload (±1 per bit, Hamming 1 for adjacent k).
 
-The type-tag block at cols [26:49] (Phase D Part 1) lets the readback
-chain skip the equals_vector + cond_gate + Concat construction that
-otherwise builds these flags at depth 4-5. Storing them as ±1 columns
-in W_EMBED makes them direct extracts at depth 1, dropping the
-critical-path floor for every readback attention.
+The type-tag block at cols [26:49] lets the readback chain skip the
+equals_vector + cond_gate + Concat construction that would otherwise
+build these flags at depth 4-5.  Storing them as ±1 columns in
+W_EMBED makes them direct extracts at depth 1.
 
-The K column (Phase C Part 2) carries small-cardinality integer
-identifiers in a form that's directly readable by attention with no
-decode Linear: for VALUE_k with k ≤ ``MAX_INT_K``, K stores k
-literally.  A consumer does ``attend(V = K_column)`` to recover the
-integer directly, with no decode Linear and no W_consumer
-amplification.  Producers (``emit_integer_value_embedding``,
-``emit_boolean_value_embedding``) leave the K column at 0 in the
-predicted embedding — gray's Hamming-1 margin already drives the
-host argmax to the right VALUE_k row, and any non-zero predicted K
-would bias argmax monotonically toward larger k.
+The K column carries small-cardinality integer identifiers in a form
+that's directly readable by attention with no decode Linear: for
+VALUE_k with k ≤ ``MAX_INT_K``, K stores k literally.  A consumer
+does ``attend(V = K_column)`` to recover the integer directly, with
+no decode Linear and no W_consumer amplification.  Producers
+(``emit_integer_value_embedding``, ``emit_boolean_value_embedding``)
+leave the K column at 0 in the predicted embedding — gray's
+Hamming-1 margin already drives the host argmax to the right VALUE_k
+row, and any non-zero predicted K would bias argmax monotonically
+toward larger k.
 """
 
 from __future__ import annotations
@@ -78,8 +75,8 @@ D_CATEGORY: int = 8
 D_RAW_SLOT: int = 1
 D_GRAY_PAYLOAD: int = 16
 D_K_SLOT: int = 1
-# Phase D Part 1 type-tag block.  D_SLOT_ONEHOT = len(IDENTIFIER_NAMES);
-# the assertion below pins it once IDENTIFIER_NAMES is defined.
+# Type-tag block.  D_SLOT_ONEHOT = len(IDENTIFIER_NAMES); the assertion
+# below pins it once IDENTIFIER_NAMES is defined.
 D_SLOT_ONEHOT: int = 21
 D_IS_ANY_ID: int = 1
 D_IS_VALUE_CATEGORY: int = 1
@@ -94,10 +91,10 @@ D_EMBED: int = (
 )
 assert D_EMBED == 49
 
-# Column offsets for the Phase D Part 1 type-tag block.  These are
-# imported by callers that need to slice the W_EMBED row directly
-# (game_graph._detect_token_types, thinking_wall.find_prev_identifier,
-# thinking_readback.is_value_of).
+# Column offsets for the type-tag block.  Imported by callers that
+# need to slice the W_EMBED row directly (``_detect_token_types`` in
+# game_graph, ``find_prev_identifier`` in thinking_wall,
+# ``is_value_of`` in thinking_readback).
 _SLOT_ONEHOT_START: int = (
     D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD + D_K_SLOT
 )  # 26
@@ -109,12 +106,10 @@ assert _IS_VALUE_CATEGORY_COL == 48
 
 N_VALUES: int = 65536  # 2**16 VALUE IDs
 
-# Phase C Part 2: K column is populated only for VALUE_k with
-# k ≤ MAX_INT_K.  The cap matters only for what an in-graph attention
-# can read back as a literal integer (a square op at the consumer
-# would extend the range — there's no float32 precision wall on K
-# alone, only on the original K_NS quadratic-argmax scheme that has
-# since been removed).
+# K column is populated only for VALUE_k with k ≤ MAX_INT_K.  The cap
+# matters only for what an in-graph attention can read back as a
+# literal integer (a square op at the consumer would extend the range
+# — there's no float32 precision wall on K alone).
 MAX_INT_K: int = 255
 
 
@@ -372,13 +367,13 @@ def _build_w_embed() -> torch.Tensor:
     and the ±1 Gray-like code of ``k`` in cols [9:25].
 
     Rows 0..MAX_INT_K of the VALUE block additionally carry K=k in
-    col 25 (Phase C Part 2's int-slot scheme for small-cardinality
-    integer identifiers).  Rows MAX_INT_K+1..65535 leave it zero.
+    col 25 (the int-slot scheme for small-cardinality integer
+    identifiers).  Rows MAX_INT_K+1..65535 leave it zero.
 
     Rows 65536..V-1 (non-VALUE) carry a distinct category code per
     row in cols [0:8] and zeros in cols [8:26].
 
-    Phase D Part 1 type-tag block at cols [26:49]:
+    Type-tag block at cols [26:49]:
 
       * cols [26:47] — slot one-hot.  +1 at column ``_SLOT_ONEHOT_START + i``
         for the IDENTIFIER row at slot ``i``; −1 in every other one of

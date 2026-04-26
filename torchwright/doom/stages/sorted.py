@@ -2,18 +2,15 @@
 SORT_RESULT id → SORT_RESULT VALUE) with a quadratic-equality attention
 reading BSP ranks from thinking-phase KV.
 
-Phase B Part 2 reshapes SORTED from a single-token stage reading prefill
-WALL payloads into a three-token pipeline reading thinking-phase
-intermediates.  Each wall transition now fires the three-token sequence:
+Each wall transition fires the three-token sequence:
 
     ...RENDER → SORTED_WALL → SORT_RESULT → VALUE(wall_index) → RENDER...
 
 with ``wall_counter`` incrementing at the SORT_RESULT id position (the
 single position at which the quadratic attention computes the picked
 wall_index).  The VALUE position's host-echoed payload carries the
-picked ``wall_index`` in a VALUE token (factored 4+4+4+4 one-hot), which
-downstream stages (RENDER) read at layer 0 via content attention on
-``(identifier=SORT_RESULT, wall_index=wall_index)`` against the KV cache.
+picked ``wall_index`` in a VALUE token, which downstream stages
+(RENDER) read at layer 0 via the K column of the embedding.
 
 Quadratic-equality mechanism
 -----------------------------
@@ -128,9 +125,8 @@ class SortedToken:
 class SortedKVInput:
     """Cross-position values read via attention.
 
-    All values come from thinking-phase positions via ``ThinkingWallOutput``
-    — Phase B Part 2 no longer consumes the prefill WALL payload that
-    SORTED previously used.
+    All values come from thinking-phase positions via
+    ``ThinkingWallOutput``.  No prefill WALL payload is consumed.
     """
 
     # BSP_RANK scalar K/V channels exposed by thinking_wall.  Both are
@@ -143,9 +139,8 @@ class SortedKVInput:
     # read of BSP_RANK id positions.  Zero outside the thinking phase.
     identifier_wall_index_onehot: Node
 
-    # Phase C Part 3: quadratic-equality K channels for wall_index at
-    # thinking VALUE positions.  Replace the prior 8-wide
-    # ``value_wall_index_onehot`` for the VIS_LO content attention.
+    # Quadratic-equality K channels for wall_index at thinking VALUE
+    # positions, used as the K side of the VIS_LO content attention.
     # Sentinel-gated to thinking-VALUE positions.
     value_wall_index_scalar: Node
     value_wall_index_neg_sq: Node
@@ -158,7 +153,7 @@ class SortedKVInput:
     # ``is_value_of("VIS_LO")`` supplies the key-side type indicator.
     readback: ThinkingReadback
 
-    # Embedding leaf (host-echoed token IDs → 72-wide embedding).  Used
+    # Embedding leaf (host-echoed token IDs → embedding).  Used
     # locally to decode the SORT_RESULT VALUE payload at the VALUE
     # position without going through readback.
     embedding: Node
@@ -394,7 +389,7 @@ def _read_vis_lo_for_this_wall(
     """At SORT_RESULT VALUE, read the per-wall ``vis_lo`` from thinking
     VIS_LO VALUE positions keyed by ``(identifier=VIS_LO, wall_index)``.
 
-    Phase C Part 3 quadratic-equality form (mirrors
+    Composite quadratic-equality form (mirrors
     ``render/vis_hi_content_attention``):
 
         Q at SORT_RESULT VALUE: ``[1, 2·wall_index_local, 1]``      (3 wide)
@@ -402,12 +397,12 @@ def _read_vis_lo_for_this_wall(
         K elsewhere:                ``[-100, sentinel, sentinel]`` (large neg)
 
     ``wall_index_local`` is read from the local SORT_RESULT VALUE
-    position's K column (Phase C Part 2: integer-exact at layer 0,
-    no decode).  Score peaks at the matching ``(VIS_LO, wall_index)``
-    key with margin 1 to adjacent walls and ≥1000 to sentinels.
+    position's K column (integer-exact at layer 0, no decode).  Score
+    peaks at the matching ``(VIS_LO, wall_index)`` key with margin 1
+    to adjacent walls and ≥1000 to sentinels.
     """
     # 1. Read wall_index from the local SORT_RESULT VALUE's K column
-    #    (no decode Linear — Phase C Part 2 integer-exact path).
+    #    (no decode Linear — integer-exact path).
     with annotate("sort/decode_local_wall_index"):
         wall_index_local = _decode_local_value_to_float(kv.embedding, "SORT_RESULT")
         wall_index_clamped = clamp(wall_index_local, 0.0, float(max_walls - 1))
@@ -475,7 +470,7 @@ def _decode_local_value_to_float(embedding: Node, name: str) -> Node:
     whose payload carries the value (e.g., SORT_RESULT VALUE decoding
     its own emitted wall_index).
 
-    Phase C Part 2: dispatches on identifier name.  For names in
+    Dispatches on identifier name.  For names in
     :data:`INT_IDENTIFIER_NAMES` (today: ``SORT_RESULT``), reads the
     K column (col 25) directly — the integer is exact, no decode
     Linear, no consumer-side amplification.  For continuous names,

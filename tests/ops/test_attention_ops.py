@@ -1035,9 +1035,9 @@ def test_most_recent_matching_e8_type_lookup():
 
 
 def test_most_recent_matching_scale_1500_tokens():
-    """Phase A scale derisking: with a ~1500-token causal window and
-    sparse matches (every ~30 positions), the softmax concentrates
-    cleanly on the most recent match.
+    """Scale derisking: with a ~1500-token causal window and sparse
+    matches (every ~30 positions), the softmax concentrates cleanly on
+    the most recent match.
 
     This exercises the sizing claim in the docstring — that the
     ``_QUERY_GAIN · n_pos`` recency swing stays well below the match

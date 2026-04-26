@@ -121,8 +121,8 @@ def test_roundtrip_with_host_cast_matches_design_table(
     name: str, lo: float, hi: float, expected_resolution: float
 ) -> None:
     """A full producer→host→consumer round-trip has max error equal to
-    the LSB half-step ``(hi - lo) / (2 · (n_levels - 1))``, which is
-    what the Phase A design doc's resolution column records."""
+    the LSB half-step ``(hi - lo) / (2 · (n_levels - 1))``, which
+    matches the per-name expected_resolution in DESIGN_TABLE."""
     value = InputNode("v", 1, value_range=(lo, hi))
     q_node = quantize_to_range(value, lo=lo, hi=hi)
 

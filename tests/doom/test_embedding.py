@@ -108,8 +108,8 @@ def test_value_row_layout():
     # Gray-code payload at cols [9:25] equals the independent gray_code_16(vid).
     gray_start = D_CATEGORY + D_RAW_SLOT
     assert torch.equal(row[gray_start : gray_start + D_GRAY_PAYLOAD], gray_code_16(vid))
-    # Phase D Part 1 type-tag block: VALUE rows have all −1 in the
-    # slot one-hot, −1 in is_any_identifier, +1 in is_value_category.
+    # Type-tag block: VALUE rows have all −1 in the slot one-hot,
+    # −1 in is_any_identifier, +1 in is_value_category.
     assert torch.all(
         row[_SLOT_ONEHOT_START : _SLOT_ONEHOT_START + D_SLOT_ONEHOT] == -1.0
     )
@@ -151,8 +151,8 @@ def test_value_row_gray_code_properties():
 
 def test_non_value_row_has_zero_payload():
     """Non-VALUE rows zero out cols [8:26] — the raw slot, Gray-code
-    payload, and K are zero.  The Phase D Part 1 type-tag block at
-    cols [26:49] carries other flags and is checked separately."""
+    payload, and K are zero.  The type-tag block at cols [26:49]
+    carries other flags and is checked separately."""
     payload_end = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD  # 25 — before K
     non_value_payload = W_EMBED[N_VALUES:, D_CATEGORY:payload_end]
     assert torch.all(non_value_payload == 0)
@@ -164,9 +164,9 @@ def test_non_value_row_has_zero_payload():
 
 
 def test_slot_onehot_correctness():
-    """Phase D Part 1: each IDENTIFIER row at slot ``i`` has +1 at the
-    matching slot column and −1 at the other 20.  Non-identifier rows
-    (VALUE, markers, decode, prompt) carry all −1."""
+    """Each IDENTIFIER row at slot ``i`` has +1 at the matching slot
+    column and −1 at the other 20.  Non-identifier rows (VALUE,
+    markers, decode, prompt) carry all −1."""
     from torchwright.doom.embedding import (
         D_SLOT_ONEHOT,
         IDENTIFIER_NAMES,
@@ -212,8 +212,8 @@ def test_slot_onehot_correctness():
 
 
 def test_is_any_identifier_correctness():
-    """Phase D Part 1: is_any_identifier column is +1 at the 21
-    IDENTIFIER_NAMES rows, −1 at every other row."""
+    """is_any_identifier column is +1 at the 21 IDENTIFIER_NAMES
+    rows, −1 at every other row."""
     from torchwright.doom.embedding import IDENTIFIER_NAMES, _IS_ANY_ID_COL
 
     col = W_EMBED[:, _IS_ANY_ID_COL]
@@ -224,8 +224,8 @@ def test_is_any_identifier_correctness():
 
 
 def test_is_value_category_correctness():
-    """Phase D Part 1: is_value_category column is +1 at the 65,536
-    VALUE rows, −1 at every other row."""
+    """is_value_category column is +1 at the 65,536 VALUE rows,
+    −1 at every other row."""
     from torchwright.doom.embedding import _IS_VALUE_CATEGORY_COL
 
     col = W_EMBED[:, _IS_VALUE_CATEGORY_COL]
@@ -236,8 +236,8 @@ def test_is_value_category_correctness():
 
 
 def test_argmax_separation_with_typetag():
-    """Phase D Part 1: adding the 23 ±1 type-tag cols increases the
-    argmax margin between distinct categories — self-dot grows by 23,
+    """The 23 ±1 type-tag cols increase the argmax margin between
+    distinct categories — self-dot grows by 23,
     cross-dot between distinct categories grows by at most 23 − 4 = 19
     (because at least one type-tag column has opposite sign).  Net
     margin increases by at least 4.
@@ -272,7 +272,7 @@ def test_argmax_separation_with_typetag():
 
 
 def test_int_slot_column_for_small_k():
-    """Phase C Part 2: K col holds k for k ≤ MAX_INT_K, zero above."""
+    """K col holds k for k ≤ MAX_INT_K, zero above."""
     from torchwright.doom.embedding import D_K_SLOT, MAX_INT_K
 
     k_col_start = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
@@ -427,9 +427,9 @@ def test_encoder_matches_w_embed_row():
     This is the host-side semantic of VALUE emission: the encoder
     produces a row, the host picks the nearest VALUE by argmax.  The
     triangle-wave Gray-code basis plus the raw slot must resolve every
-    integer input to its exact k.  The Phase D Part 1 type-tag tail
-    (slot one-hot all −1, is_any_id −1, is_value_category +1) matches
-    every VALUE row exactly, so it adds a constant offset across the
+    integer input to its exact k.  The type-tag tail (slot one-hot all
+    −1, is_any_id −1, is_value_category +1) matches every VALUE row
+    exactly, so it adds a constant offset across the
     VALUE block and doesn't shift the argmax.
     """
     from torchwright.compiler.forward.compile import forward_compile

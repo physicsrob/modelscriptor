@@ -19,11 +19,11 @@ continuous floats and small-cardinality integers:
 Wire formats
 ------------
 
-Continuous (Phase A/B): the 16-bit integer VALUE ID.  Every VALUE row
-``k`` in ``W_EMBED`` shares the same 8-wide E8 category code in cols
-[0:8], carries ``(2k+1) / 131072`` in col 8 (the raw slot — the
-shifted encoder grid), and a 16-wide ±1 Gray code of ``k`` in cols
-[9:25].  Float ↔ VALUE-ID mapping per identifier name is
+Continuous: the 16-bit integer VALUE ID.  Every VALUE row ``k`` in
+``W_EMBED`` shares the same 8-wide E8 category code in cols [0:8],
+carries ``(2k+1) / 131072`` in col 8 (the raw slot — the shifted
+encoder grid), and a 16-wide ±1 Gray code of ``k`` in cols [9:25].
+Float ↔ VALUE-ID mapping per identifier name is
 ``VALUE_RANGE_BY_NAME[name]``:
 
     q = (value - lo) * (N_VALUES - 1) / (hi - lo)          # produce side
@@ -32,8 +32,8 @@ shifted encoder grid), and a 16-wide ±1 Gray code of ``k`` in cols
 where ``N_VALUES = 65536``.  Host-side uint16 rounding happens between
 the two and contributes one LSB per quantization boundary.
 
-Integer (Phase C Part 2): col 25 of every VALUE row carries ``K = k``
-for ``k ≤ MAX_INT_K`` (zero elsewhere).
+Integer: col 25 of every VALUE row carries ``K = k`` for
+``k ≤ MAX_INT_K`` (zero elsewhere).
 :meth:`ThinkingReadback.get_int_after_last` reads that column
 directly via attention — the matched value IS the integer, no
 dequantize affine, no W_consumer amplification.  Producers
@@ -120,9 +120,8 @@ __all__ = [
 
 # Cols [0:D_CATEGORY] are the E8_VALUE category code shared across all
 # VALUE rows.  The raw slot (col D_CATEGORY) carries the normalized
-# value; the 16-wide Gray-code payload sits immediately after it.
-# Phase C Part 2: col 25 holds K = k for VALUE_k with k ≤ MAX_INT_K
-# (else 0).
+# value; the 16-wide Gray-code payload sits immediately after it.  Col
+# 25 holds K = k for VALUE_k with k ≤ MAX_INT_K (else 0).
 _RAW_SLOT_START = D_CATEGORY
 _GRAY_START = D_CATEGORY + D_RAW_SLOT
 _K_SLOT_START = D_CATEGORY + D_RAW_SLOT + D_GRAY_PAYLOAD
@@ -301,13 +300,12 @@ def encode_value_binary(q: Node, suffix: str = "") -> Node:
     # monotonically toward larger k.  Gray's Hamming-1 margin (≥2)
     # drives the argmax to the right VALUE_k row.
     k_zero = create_literal_value(torch.tensor([0.0]), name=f"encode_K_zero{suffix}")
-    # Phase D Part 1: type-tag block matches the VALUE row pattern in
-    # W_EMBED — slot one-hot all −1, is_any_identifier −1,
-    # is_value_category +1.  Argmax against W_EMBED.T still picks the
-    # closest VALUE row; the type-tag dot is constant across the VALUE
-    # block (slot one-hot self-dot 21 + is_any_id self-dot 1 +
-    # is_value_cat self-dot 1 = 23), so the existing E8/raw/gray/K
-    # argmax shape is preserved.
+    # Type-tag block matches the VALUE row pattern in W_EMBED — slot
+    # one-hot all −1, is_any_identifier −1, is_value_category +1.
+    # Argmax against W_EMBED.T still picks the closest VALUE row; the
+    # type-tag dot is constant across the VALUE block (slot one-hot
+    # self-dot 21 + is_any_id self-dot 1 + is_value_cat self-dot 1 =
+    # 23), so the E8/raw/gray/K argmax shape is preserved.
     slot_onehot_neg = create_literal_value(
         -torch.ones(D_SLOT_ONEHOT), name=f"encode_slot_onehot{suffix}"
     )
@@ -417,10 +415,9 @@ def emit_integer_value_embedding(
     k_zero = create_literal_value(
         torch.tensor([0.0]), name=f"emit_int_k_{name}"
     )
-    # Phase D Part 1: type-tag block matches the VALUE row pattern in
-    # W_EMBED — slot one-hot all −1, is_any_identifier −1,
-    # is_value_category +1.  These literals fold into the next
-    # consumer.
+    # Type-tag block matches the VALUE row pattern in W_EMBED — slot
+    # one-hot all −1, is_any_identifier −1, is_value_category +1.
+    # These literals fold into the next consumer.
     slot_onehot_neg = create_literal_value(
         -torch.ones(D_SLOT_ONEHOT), name=f"emit_int_slot_onehot_{name}"
     )
@@ -475,9 +472,8 @@ def emit_boolean_value_embedding(
     k_zero = create_literal_value(
         torch.tensor([0.0]), name=f"emit_bool_k_{name}"
     )
-    # Phase D Part 1: type-tag block matches the VALUE row pattern in
-    # W_EMBED — slot one-hot all −1, is_any_identifier −1,
-    # is_value_category +1.
+    # Type-tag block matches the VALUE row pattern in W_EMBED — slot
+    # one-hot all −1, is_any_identifier −1, is_value_category +1.
     slot_onehot_neg = create_literal_value(
         -torch.ones(D_SLOT_ONEHOT), name=f"emit_bool_slot_onehot_{name}"
     )
@@ -551,9 +547,9 @@ class ThinkingReadback:
                 f"unknown identifier {name!r}; must be one of {IDENTIFIER_NAMES}"
             )
         slot = IDENTIFIER_NAMES.index(name)
-        # Phase D Part 1: prev_id_slots' V is the ±1 slot one-hot
-        # column block from W_EMBED, so the extract is already the
-        # ±1 bool that bool_all_true expects — no compare(0.5) needed.
+        # prev_id_slots' V is the ±1 slot one-hot column block from
+        # W_EMBED, so the extract is already the ±1 bool that
+        # bool_all_true expects — no compare(0.5) needed.
         prev_slot_i_bool = extract_from(
             self._ctx.prev_id_slots,
             len(IDENTIFIER_NAMES),
@@ -574,22 +570,22 @@ class ThinkingReadback:
         The returned Node is 1-wide with value range
         ``VALUE_RANGE_BY_NAME[name]``.
 
-        Phase C Part 2: this method is now a dispatcher.  Identifiers
-        in :data:`INT_IDENTIFIER_NAMES` (today: ``SORT_RESULT``) route
-        to :meth:`get_int_after_last`, which reads the K column
-        directly — no decode Linear, output is the integer scalar
-        with O(ε) noise.  All other identifiers continue to use the
-        raw + decode path.  Callers don't change.
+        Dispatches by identifier name.  Names in
+        :data:`INT_IDENTIFIER_NAMES` (today: ``SORT_RESULT``) route to
+        :meth:`get_int_after_last`, which reads the K column directly —
+        no decode Linear, output is the integer scalar with O(ε)
+        noise.  Other identifiers use the raw + decode path.  Callers
+        don't need to know which path applies.
 
         **Undefined when the referenced identifier has no prior
-        instance in the causal window.**  Most Phase-A call sites
-        place the consuming step downstream of the producing step in
-        the same frame, so the cache always contains the referenced
-        identifier by the time a consumer fires.  Phase B's running-OR
-        HIT_* consumers fire at every wall including wall 0; the
-        caller must gate the result accordingly and may pass
-        ``assert_hardness_gt=None`` to skip the runtime softmax-hardness
-        check at positions where the cache might legitimately be empty.
+        instance in the causal window.**  Most call sites place the
+        consuming step downstream of the producing step in the same
+        frame, so the cache always contains the referenced identifier
+        by the time a consumer fires.  The running-OR HIT_* consumers
+        fire at every wall including wall 0; the caller must gate the
+        result accordingly and may pass ``assert_hardness_gt=None`` to
+        skip the runtime softmax-hardness check at positions where the
+        cache might legitimately be empty.
 
         Caches per-name: the first call builds the flag + attention +
         Linear; subsequent calls reuse those nodes.  The
