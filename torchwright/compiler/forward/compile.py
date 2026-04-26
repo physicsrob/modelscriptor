@@ -42,6 +42,109 @@ from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 
 
+class _TrackingResidualStreamMap(ResidualStreamMap):
+    """Residual map that records the layer at which each node is freed.
+
+    Used by the heuristic warm-start probe in ``forward_compile`` to
+    capture cancel-layer hints for CP-SAT.  The probe sets
+    ``current_layer`` before each ``schedule_layer`` call; ``free``
+    records that value for every node that gets freed.  Nodes
+    consumed via ``reassign`` (free-add path) don't go through
+    ``free`` and are correctly omitted from the cancel hint.
+    """
+
+    def __init__(self, base: ResidualStreamMap) -> None:
+        super().__init__(base.d)
+        # Copy state from the cloned base map.  We can't reuse base
+        # directly because the tracking subclass is a different type.
+        self._free = set(base._free)
+        self._node_to_indices = dict(base._node_to_indices)
+        self._reserved = set(getattr(base, "_reserved", set()))
+        self.current_layer: int = 0
+        self.cancel_layer: dict[int, int] = {}
+
+    def free(self, node: Node) -> None:  # type: ignore[override]
+        self.cancel_layer[node.node_id] = self.current_layer
+        super().free(node)
+
+
+def _run_heuristic_warm_start(
+    graph: GraphAnalyzer,
+    d: int,
+    d_head: int,
+    pos_encoding: PosEncoding,
+    d_hidden: int,
+    residual_map: ResidualStreamMap,
+    computed: Set[Node],
+    clusters,
+    admission_budget_fraction: float,
+    policy: Optional[SchedulingPolicy],
+    overlay_pinned_inputs: Set[Node],
+    output_node: Node,
+    max_layers: int,
+) -> tuple[dict, dict, dict, int]:
+    """Run the heuristic LayerScheduler in schedule-only mode and
+    capture per-node layer, routing, and cancel-layer hints for
+    CP-SAT.  Mutates a *clone* of ``residual_map`` and ``computed``;
+    the caller's state is untouched.
+
+    Returns ``(hint_layers, hint_routing, hint_cancel, hint_n_layers)``.
+    On heuristic deadlock, all dicts are empty and n_layers is 0 — the
+    CP-SAT solve will then cold-start without a hint.
+    """
+    hint_rmap = _TrackingResidualStreamMap(copy.deepcopy(residual_map))
+    hint_computed = set(computed)
+    hint_scheduler = LayerScheduler(
+        graph,
+        d,
+        d_head,
+        pos_encoding,
+        d_hidden=d_hidden,
+        clusters=clusters,
+        admission_budget_fraction=admission_budget_fraction,
+        policy=policy,
+        pinned_nodes=overlay_pinned_inputs,
+    )
+    hint_layers: dict = {}
+    hint_routing: dict = {}
+    for hi in range(max_layers):
+        if output_node in hint_computed:
+            break
+        hint_rmap.current_layer = hi
+        prev_hint = set(hint_computed)
+        try:
+            attn_ops, mlp_ops, _ = hint_scheduler.schedule_layer(
+                hint_rmap, hint_computed
+            )
+        except RuntimeError:
+            # Heuristic deadlocked / no progress.  Drop the hint
+            # and let CP-SAT cold-start.
+            return {}, {}, {}, 0
+        # Routing decisions for standalone Linears: heuristic placed
+        # compute_linear in attention or compute_linear_bypass in
+        # MLP.  Chain Linears are non-flex (always MLP) so we don't
+        # hint them.
+        for op in attn_ops:
+            if op.op_type == "compute_linear" and op.node is not None:
+                hint_routing[op.node.node_id] = "attn"
+        for op in mlp_ops:
+            if op.op_type == "compute_linear_bypass":
+                hint_routing[op.node.node_id] = "mlp"
+        for node in graph.get_all_nodes():
+            if isinstance(node, Concatenate) and node not in hint_computed:
+                if all(
+                    leaf in hint_computed
+                    for leaf in flatten_concat_nodes([node])
+                ):
+                    hint_computed.add(node)
+        for n in hint_computed - prev_hint:
+            hint_layers[n.node_id] = hi
+        if not attn_ops and not mlp_ops:
+            break
+    hint_n_layers = max(hint_layers.values()) + 1 if hint_layers else 0
+    return hint_layers, hint_routing, dict(hint_rmap.cancel_layer), hint_n_layers
+
+
 def _effective_consumers(graph: GraphAnalyzer, node: Node) -> Set[Node]:
     """Walk through Concatenate consumers transparently.
 
@@ -234,13 +337,9 @@ def forward_compile(
     admission_min_chains: int = 4,
     admission_min_peak_width: int = 32,
     policy: Optional[SchedulingPolicy] = None,
-    use_cpsat: bool = True,
+    optimize: int = 0,
     cpsat_costs: Costs = Costs(),
     cpsat_flex_routing: bool = True,
-    cpsat_time_budget_s: float = 60.0,
-    cpsat_allow_suboptimal: bool = False,
-    cpsat_symmetry_breaking: bool = False,
-    cpsat_fallback_to_heuristic: bool = True,
     assume_zero_init: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
@@ -270,34 +369,27 @@ def forward_compile(
             transfers each output's value to the specified target columns
             via delta: target += (output - target). This enables overlaid
             I/O where output replaces input in-place.
-        use_cpsat: When True (default), run the CP-SAT solver in
-            ``cpsat_scheduler.py`` to produce an optimal placement and
-            replay it via :class:`DirectedLayerScheduler`.  When False,
-            use the heuristic :class:`LayerScheduler` directly.  See
-            ``docs/cpsat_scheduler.md`` for the architecture.
-        cpsat_costs: Objective weights for CP-SAT.  Defaults to
-            ``Costs()`` (alpha=1, beta=0, gamma=0 — pure layer
-            minimization).  Ignored when ``use_cpsat=False``.
+        optimize: Optimization level. ``0`` (default) uses the
+            heuristic :class:`LayerScheduler` and skips CP-SAT
+            entirely — fastest compile, predictable layer count.
+            Higher levels enable CP-SAT with progressively larger
+            time budgets, accepting the best feasible schedule at
+            budget exhaustion (no proven-optimal requirement) and
+            falling back to the heuristic if CP-SAT finds nothing:
+
+            * ``1``: 60s CP-SAT budget — typical iterative-dev win.
+            * ``2``: 180s — closer to optimal on d=3072+ geometry.
+            * ``3``: 300s — exhaustive; proves optimality on
+              parallelism-rich graphs.
+
+            See ``docs/cpsat_scheduler.md`` for the architecture.
+        cpsat_costs: Objective weights for CP-SAT (Pareto navigator).
+            Defaults to ``Costs()`` (alpha=1, beta=0, gamma=0 — pure
+            layer minimization).  Ignored when ``optimize=0``.
         cpsat_flex_routing: When True (default), CP-SAT picks
             attention vs MLP-bypass for each standalone ``Linear``.
             When False, ``policy.local_in_attention`` pins routing.
-            Ignored when ``use_cpsat=False``.
-        cpsat_time_budget_s: Per-solve wall-clock cap for CP-SAT.
-            Ignored when ``use_cpsat=False``.
-        cpsat_allow_suboptimal: When False (default), raise if CP-SAT
-            cannot prove optimality within the budget.  When True,
-            accept a feasible-but-not-proven-optimal schedule.
-            Ignored when ``use_cpsat=False``.
-        cpsat_fallback_to_heuristic: When True (default), if CP-SAT
-            finds no feasible solution within the budget, fall back
-            to the heuristic ``LayerScheduler`` instead of raising.
-            The heuristic warm-start was already a sunk cost so
-            falling back costs only the heuristic-replay compile
-            time; users get a usable schedule on tight geometries
-            (d=2048) where CP-SAT's first-incumbent time exceeds
-            the budget.  When False, raise on no-incumbent for
-            strict CP-SAT semantics (useful in tests).  Ignored
-            when ``use_cpsat=False``.
+            Ignored when ``optimize=0``.
         assume_zero_init: When True, the compile assumes the runtime
             zero-initialises the residual stream (the contract met by
             ``HeadlessTransformer.get_input_res_stream``) and skips
@@ -306,7 +398,8 @@ def forward_compile(
             ~D/d_head fewer attention heads but break under callers
             that pass a non-zero residual stream to ``forward()``
             directly.  Defaults to False — the conservative behaviour
-            from commit cf4af42.
+            that runs BIRTH-layer dirty cancels on every fresh
+            allocation regardless of the runtime contract.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -357,9 +450,9 @@ def forward_compile(
     # BIRTH-layer dirty cancel that would otherwise zero each column
     # before its first additive write.  Subsequent recycled columns
     # return to the clean pool via the cancel ops the heuristic already
-    # emits at node death.  Default-off because commit cf4af42 made the
-    # compiler defensive against non-zero callers and we don't reverse
-    # that without an explicit opt-in.
+    # emits at node death.  Default-off because the compiler is
+    # defensive against non-zero callers and we don't reverse that
+    # without an explicit opt-in.
     if assume_zero_init:
         residual_map.mark_clean(set(residual_map._free))
     computed = set(input_nodes)
@@ -420,6 +513,16 @@ def forward_compile(
         if cols_to_reserve:
             residual_map.reserve(cols_to_reserve)
 
+    # Map optimize level to CP-SAT time budget.  Level 0 skips CP-SAT
+    # entirely; higher levels accept best-feasible (not proven-optimal)
+    # at budget exhaustion and fall back to the heuristic if CP-SAT
+    # finds nothing.
+    _OPTIMIZE_BUDGETS = {1: 60.0, 2: 180.0, 3: 300.0}
+    if optimize not in (0, 1, 2, 3):
+        raise ValueError(f"optimize must be 0, 1, 2, or 3 (got {optimize})")
+    use_cpsat = optimize > 0
+    cpsat_time_budget_s = _OPTIMIZE_BUDGETS.get(optimize, 0.0)
+
     if use_cpsat:
         # Architecture doc §3 marks admission_control as a model
         # precondition; the CP-SAT cumulative does not represent the
@@ -428,87 +531,36 @@ def forward_compile(
         # rather than producing a corrupted compile.
         if admission_control:
             raise RuntimeError(
-                "use_cpsat=True is incompatible with admission_control=True "
-                "(see docs/cpsat_scheduler.md §3 Model preconditions).  "
-                "Pass use_cpsat=False to keep admission control."
+                "optimize>0 (CP-SAT) is incompatible with "
+                "admission_control=True (see docs/cpsat_scheduler.md "
+                "§3 Model preconditions).  Pass optimize=0 to keep "
+                "admission control."
             )
 
-        # Warm-start: run the heuristic scheduler to convergence on a
-        # cloned residual_map / computed set, capturing each schedulable
-        # node's layer, routing, and cancel layer.  CP-SAT consumes the
-        # result via `hint_layers`/`hint_routing`/`hint_cancel`; a
-        # complete known-feasible incumbent dramatically shrinks the
-        # time the solver needs to find any feasible schedule.  We use
-        # the scheduler in schedule-only mode (no weight writes) to
-        # avoid paying the full compile cost twice.
+        # Warm-start: run the heuristic scheduler in schedule-only
+        # mode on a cloned residual_map / computed set, capturing
+        # each schedulable node's layer, routing, and cancel layer.
+        # CP-SAT consumes the result via `hint_*`; a complete
+        # known-feasible incumbent dramatically shrinks the time the
+        # solver needs to find any feasible schedule.
         t_hint_start = time.perf_counter()
-        hint_rmap = copy.deepcopy(residual_map)
-        hint_computed = set(computed)
-        hint_scheduler = LayerScheduler(
-            graph,
-            d,
-            d_head,
-            pos_encoding,
-            d_hidden=d_hidden,
-            clusters=clusters,
-            admission_budget_fraction=admission_budget_fraction,
-            policy=policy,
-            pinned_nodes=overlay_pinned_inputs,
+        hint_layers, hint_routing, hint_cancel, hint_n_layers = (
+            _run_heuristic_warm_start(
+                graph=graph,
+                d=d,
+                d_head=d_head,
+                pos_encoding=pos_encoding,
+                d_hidden=d_hidden,
+                residual_map=residual_map,
+                computed=computed,
+                clusters=clusters,
+                admission_budget_fraction=admission_budget_fraction,
+                policy=policy,
+                overlay_pinned_inputs=overlay_pinned_inputs,
+                output_node=output_node,
+                max_layers=max_layers,
+            )
         )
-        hint_layers: dict = {}
-        hint_routing: dict = {}
-        hint_cancel: dict = {}
-        # Tap residual_map.free to record the cancel layer per node.
-        # The heuristic may free a node multiple times only via
-        # reassign (which doesn't go through free), so the first
-        # observed free is the cancel.
-        _hint_layer_box = [0]
-        _orig_free = hint_rmap.free
-
-        def _logging_free(node):
-            hint_cancel[node.node_id] = _hint_layer_box[0]
-            return _orig_free(node)
-
-        hint_rmap.free = _logging_free  # type: ignore[method-assign]
-        for hi in range(max_layers):
-            if output_node in hint_computed:
-                break
-            _hint_layer_box[0] = hi
-            prev_hint = set(hint_computed)
-            try:
-                attn_ops, mlp_ops, _ = hint_scheduler.schedule_layer(
-                    hint_rmap, hint_computed
-                )
-            except RuntimeError:
-                # Heuristic deadlocked / no progress.  Drop the hint
-                # and let CP-SAT cold-start.
-                hint_layers = {}
-                hint_routing = {}
-                hint_cancel = {}
-                break
-            # Routing decisions for standalone Linears: heuristic
-            # placed compute_linear in attention or compute_linear_bypass
-            # in MLP.  Chains' Linears are non-flex (always MLP) so
-            # we don't hint them.
-            for op in attn_ops:
-                if op.op_type == "compute_linear" and op.node is not None:
-                    hint_routing[op.node.node_id] = "attn"
-            for op in mlp_ops:
-                if op.op_type == "compute_linear_bypass":
-                    hint_routing[op.node.node_id] = "mlp"
-            for node in graph.get_all_nodes():
-                if isinstance(node, Concatenate) and node not in hint_computed:
-                    if all(
-                        leaf in hint_computed
-                        for leaf in flatten_concat_nodes([node])
-                    ):
-                        hint_computed.add(node)
-            for n in hint_computed - prev_hint:
-                hint_layers[n.node_id] = hi
-            if not attn_ops and not mlp_ops:
-                break
-        hint_rmap.free = _orig_free  # type: ignore[method-assign]
-        hint_n_layers = max(hint_layers.values()) + 1 if hint_layers else 0
         if verbose:
             hint_time = time.perf_counter() - t_hint_start
             print(
@@ -518,8 +570,7 @@ def forward_compile(
             print(
                 f"  CP-SAT solver: costs={cpsat_costs}, "
                 f"flex_routing={cpsat_flex_routing}, "
-                f"time_budget_s={cpsat_time_budget_s}, "
-                f"symmetry_breaking={cpsat_symmetry_breaking}"
+                f"time_budget_s={cpsat_time_budget_s}"
             )
 
         # Use the heuristic's layer count as the search horizon (with
@@ -531,10 +582,7 @@ def forward_compile(
             solver_max_layers = min(max_layers, hint_n_layers + 1)
 
         t_solve_start = time.perf_counter()
-        # Use _solve_full so we can log solver progress when verbose.
-        from torchwright.compiler.forward.cpsat_scheduler import _solve_full
-
-        assignment, _stats = _solve_full(
+        assignment, _stats = solve_schedule(
             output_node,
             pos_encoding,
             d=d,
@@ -549,21 +597,18 @@ def forward_compile(
             hint_layers=hint_layers if hint_layers else None,
             hint_routing=hint_routing if hint_routing else None,
             hint_cancel=hint_cancel if hint_cancel else None,
-            symmetry_breaking=cpsat_symmetry_breaking,
             log_search_progress=verbose,
         )
         if assignment is None:
+            # CP-SAT found no feasible incumbent within budget — fall
+            # back to the heuristic schedule.  The warm-start was a
+            # sunk cost; we already know the heuristic produces a
+            # valid schedule.
             if verbose and _stats.solver_log:
                 print("--- CP-SAT solver log (last 40 lines) ---")
                 for line in _stats.solver_log.splitlines()[-40:]:
                     print(f"  {line}")
                 print("--- end CP-SAT solver log ---")
-            if not cpsat_fallback_to_heuristic:
-                raise RuntimeError(
-                    f"CP-SAT returned {_stats.status_name}; no schedule produced "
-                    f"(best_objective_bound={_stats.best_objective_bound}, "
-                    f"n_symmetry_constraints={_stats.n_symmetry_constraints})"
-                )
             if verbose:
                 print(
                     f"  CP-SAT found no feasible incumbent within "
@@ -582,13 +627,6 @@ def forward_compile(
                 pinned_nodes=overlay_pinned_inputs,
             )
         else:
-            if not _stats.is_optimal and not cpsat_allow_suboptimal:
-                raise RuntimeError(
-                    f"CP-SAT returned {_stats.status_name} but did not prove "
-                    f"optimality: objective={_stats.objective_value}, "
-                    f"best_objective_bound={_stats.best_objective_bound}; "
-                    f"pass cpsat_allow_suboptimal=True to accept this schedule"
-                )
             if verbose:
                 solve_time = time.perf_counter() - t_solve_start
                 print(

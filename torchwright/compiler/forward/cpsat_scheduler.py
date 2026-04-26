@@ -13,14 +13,18 @@ Public API:
 - `Costs` — objective weights `(alpha, beta, gamma)`.
 - `ScheduleAssignment` — solver output contract: per-node layer,
   cancel layer, and routing.
-- `solve_schedule(...)` — build and solve, return `ScheduleAssignment`.
-  Raises `RuntimeError` on infeasibility, time-out without a feasible
-  solution, or `FEASIBLE`-but-not-`OPTIMAL` unless
-  `allow_suboptimal=True`.
+- `SolveStats` — solver metadata (status, objective, LB, walltime,
+  log) for diagnostics.
+- `solve_schedule(...)` — build and solve, return
+  `(assignment, stats)`.  ``assignment is None`` when the solver
+  finds no feasible solution within the budget; ``stats.is_optimal``
+  distinguishes proven-optimal from feasible-only.  Raises only on
+  graph-precondition violations (see ``docs/cpsat_scheduler.md`` §3).
 
-The probe script `scripts/cpsat_schedule.py` uses `_solve_full` for
-richer diagnostic output (solver status string, objective value,
-wall time, solver log).
+Callers (``forward_compile``, ``scripts/cpsat_schedule.py``) decide
+how to handle non-optimal / no-solution outcomes — the forward
+compiler falls back to the heuristic schedule, the probe script
+reports the gap.
 """
 
 from __future__ import annotations
@@ -36,7 +40,6 @@ from torchwright.compiler.forward.scheduling_policy import (
     LEGACY_POLICY,
     SchedulingPolicy,
 )
-from torchwright.compiler.forward.sibling_clusters import SiblingClusterAnalyzer
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import (
     Add,
@@ -113,8 +116,8 @@ class SolveStats:
     """Solver metadata for diagnostics.
 
     Returned alongside an optional `ScheduleAssignment` from
-    `_solve_full`. Useful for the probe script and for logging the
-    solver gap when `allow_suboptimal=True`.
+    `solve_schedule`. Useful for the probe script and for logging the
+    solver gap when accepting suboptimal schedules.
     """
 
     status_name: str
@@ -125,7 +128,6 @@ class SolveStats:
     total_attn_heads: int       # -1 if no feasible solution
     total_mlp_bypass_slots: int # -1 if no feasible solution
     is_optimal: bool
-    n_symmetry_constraints: int = 0  # lex-min constraints added before solve
 
 
 # Routing constants used both by this module and by the probe script.
@@ -429,215 +431,11 @@ def uses_residual(node: Node, gm: GraphModel) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Symmetry breaking
-# ---------------------------------------------------------------------------
-
-
-def _chain_fingerprint(chain) -> Tuple:
-    """Hashable structural signature of a sibling-cluster chain.
-
-    Two chains with identical fingerprints have the same multiset of
-    (op type, output width) pairs over their nodes — a strong proxy
-    for "functionally equivalent pipeline" when the chains feed the
-    same join.  The schedule cost (n_layers, total heads, total slots)
-    is invariant under any permutation of equally-fingerprinted chains
-    in the same cluster, so we can safely add a lex-min constraint
-    between their layer assignments to break that combinatorial
-    symmetry in CP-SAT's search.
-    """
-    return tuple(sorted((type(n).__name__, len(n)) for n in chain.nodes))
-
-
-def _add_symmetry_breaking(
-    model: cp_model.CpModel,
-    gm: GraphModel,
-    layer_var: Dict[int, cp_model.IntVar],
-    graph: GraphAnalyzer,
-    hint_layers: Optional[Dict[int, int]] = None,
-) -> int:
-    """Add lex-min constraints across structurally-equivalent sibling chains.
-
-    Detects parallel chains feeding common ``Concatenate`` joins via
-    :class:`SiblingClusterAnalyzer`, groups them by
-    ``_chain_fingerprint``, and chains
-    ``layer_var[chain_i.terminal] <= layer_var[chain_{i+1}.terminal]``
-    within each fingerprint group.  For a group of N equally-shaped
-    chains this eliminates ``N!`` permutations from the search tree.
-
-    **Status:** experimental, off by default.  On the DOOM headless
-    graph (4440 nodes, 196 lex-min constraints across 36 fingerprint
-    groups) the constraints push CP-SAT into a regime where it tightens
-    the lower bound (46 → 49) but spends so long on bound proofs that
-    it never finds a feasible incumbent within reasonable budgets
-    (10–600s) — even though the heuristic warm-start hint is verifiably
-    feasible against every constraint.  Limiting to large groups only
-    (≥ 8 chains) didn't help.  The likely cause is CP-SAT's worker
-    allocation shifting toward ``objective_lb_search`` when
-    propagation is denser, starving incumbent-finding workers.  Worth
-    revisiting with a different solver-parameter mix (LNS-heavy,
-    ``use_lns_only``, or a fixed search strategy that respects the
-    hint).
-
-    Returns the number of constraints added (for diagnostics).
-    """
-    analyzer = SiblingClusterAnalyzer(graph, min_chains=2, min_peak_width=1)
-    clusters = analyzer.analyze()
-
-    def _canonical_key(chain):
-        if hint_layers is not None:
-            hl = hint_layers.get(chain.terminal.node_id)
-            if hl is not None:
-                return (hl, chain.chain_id)
-        return (0, chain.chain_id)
-
-    n_added = 0
-    for cluster in clusters.clusters.values():
-        groups: Dict[Tuple, List] = {}
-        for chain in cluster.chains:
-            groups.setdefault(_chain_fingerprint(chain), []).append(chain)
-        for chains in groups.values():
-            if len(chains) < 2:
-                continue
-            chains.sort(key=_canonical_key)
-            for i in range(len(chains) - 1):
-                a_term = chains[i].terminal
-                b_term = chains[i + 1].terminal
-                if (
-                    a_term.node_id in layer_var
-                    and b_term.node_id in layer_var
-                ):
-                    model.Add(
-                        layer_var[a_term.node_id] <= layer_var[b_term.node_id]
-                    )
-                    n_added += 1
-    return n_added
-
-
-# ---------------------------------------------------------------------------
 # Solver
 # ---------------------------------------------------------------------------
 
 
 def solve_schedule(
-    output_node: Node,
-    pos_encoding: PosEncoding,
-    *,
-    d: int,
-    d_head: int,
-    d_hidden: int,
-    costs: Costs = Costs(),
-    flex_routing: bool = True,
-    time_budget_s: float = 60.0,
-    max_layers: int = 60,
-    allow_suboptimal: bool = False,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_routing: Optional[Dict[int, str]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
-    cancel_slack: Optional[int] = 2,
-    policy: Optional[SchedulingPolicy] = None,
-    reserve_heads: int = 0,
-    assume_zero_init: bool = False,
-    symmetry_breaking: bool = False,
-) -> ScheduleAssignment:
-    """Build and solve the CP-SAT scheduling model.
-
-    Returns a `ScheduleAssignment` for the graph rooted at `output_node`.
-
-    Args:
-        output_node: graph output. Defines the ancestor cone the
-            scheduler operates over.
-        pos_encoding: positional encoding node (always allocated by
-            `forward_compile`; subtracted from the residual budget).
-        d, d_head, d_hidden: transformer geometry. `n_heads_per_layer
-            = d // d_head`. Residual budget is `d - input_residual_cols`.
-        costs: objective weights. See `Costs`.
-        flex_routing: if True, CP-SAT picks attention vs MLP for each
-            standalone `Linear`. If False, standalone Linears use the
-            static routing dictated by `policy.local_in_attention`.
-        time_budget_s: per-solve wall-clock cap.
-        max_layers: search horizon. Should be at least the heuristic's
-            layer count.
-        allow_suboptimal: if False (default), raise on `FEASIBLE` (only
-            return on proven `OPTIMAL`). If True, accept a
-            feasible-but-not-proven-optimal schedule.
-        hint_layers: optional warm-start mapping `node_id -> layer`.
-        hint_routing: optional warm-start mapping
-            `node_id -> "attn"|"mlp"` for flex Linears.  When the
-            heuristic placed a standalone Linear in attention vs
-            MLP-bypass, hinting the same routing lets CP-SAT
-            reconstruct the heuristic's solution as a starting
-            incumbent.
-        hint_cancel: optional warm-start mapping `node_id -> layer`
-            for the cancel layer.  Captures when the heuristic freed
-            each node's columns; combined with `hint_layers` this
-            gives a complete schedule the solver can verify and
-            improve from.
-        cancel_slack: when not None, restrict each non-pinned node's
-            cancel layer to `[earliest_dead, earliest_dead + K]`
-            where `earliest_dead = max(layer[c] + 1)` over consumers
-            and ``K == cancel_slack``.  Cuts the cancel-decision
-            search space ~30x at K=2 with negligible loss of
-            optimality (the heuristic almost always cancels within
-            1–2 layers of the last consumer).  Set to None to keep
-            the wide `[layer[n]+1, max_layers]` domain.  Default 2.
-        policy: only consulted when `flex_routing=False`. Defaults to
-            `LEGACY_POLICY`.
-        reserve_heads: per-layer attention-head budget reserved
-            beyond the modeled compute + cancel + dirty terms.
-            Defaults to 0.  Raise it for graphs whose attention heads
-            are saturated by ops outside the model.
-        assume_zero_init: if True, the model assumes the runtime
-            zero-initialises the residual stream (so the heuristic
-            emits no BIRTH-layer dirty-column cancels for fresh
-            allocations on the initially-free pool).  Pair this with
-            ``forward_compile(assume_zero_init=True)`` so the heuristic
-            and CP-SAT model agree.  Defaults to False — the
-            conservative model that mirrors the heuristic's defensive
-            cancellation behaviour from commit cf4af42.
-
-    Raises `RuntimeError` on `INFEASIBLE`, time-out without a feasible
-    solution, or `FEASIBLE` when `allow_suboptimal=False`. Raises also
-    when the graph violates a model precondition (see
-    `docs/cpsat_scheduler.md` §3): currently, an `Add` whose input is a
-    `Concatenate`.
-    """
-    assignment, stats = _solve_full(
-        output_node,
-        pos_encoding,
-        d=d,
-        d_head=d_head,
-        d_hidden=d_hidden,
-        costs=costs,
-        flex_routing=flex_routing,
-        time_budget_s=time_budget_s,
-        max_layers=max_layers,
-        hint_layers=hint_layers,
-        hint_routing=hint_routing,
-        hint_cancel=hint_cancel,
-        cancel_slack=cancel_slack,
-        policy=policy,
-        log_search_progress=False,
-        reserve_heads=reserve_heads,
-        assume_zero_init=assume_zero_init,
-        symmetry_breaking=symmetry_breaking,
-    )
-    if assignment is None:
-        raise RuntimeError(
-            f"CP-SAT returned {stats.status_name}; no schedule produced "
-            f"(best_objective_bound={stats.best_objective_bound}, "
-            f"n_symmetry_constraints={stats.n_symmetry_constraints})"
-        )
-    if not stats.is_optimal and not allow_suboptimal:
-        raise RuntimeError(
-            f"CP-SAT returned {stats.status_name} but did not prove "
-            f"optimality: objective={stats.objective_value}, "
-            f"best_objective_bound={stats.best_objective_bound}; "
-            f"pass allow_suboptimal=True to accept this schedule"
-        )
-    return assignment
-
-
-def _solve_full(
     output_node: Node,
     pos_encoding: PosEncoding,
     *,
@@ -656,21 +454,73 @@ def _solve_full(
     log_search_progress: bool = False,
     reserve_heads: int = 0,
     assume_zero_init: bool = False,
-    symmetry_breaking: bool = False,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
-    """Internal solve that returns both the assignment and the solver stats.
+    """Build and solve the CP-SAT scheduling model.
 
-    Used by `solve_schedule` (which converts non-`OPTIMAL` results into
-    exceptions per its `allow_suboptimal` policy) and by the probe
-    script in `scripts/cpsat_schedule.py` (which wants the rich stats
-    for diagnostic output regardless of solver outcome).
+    Returns ``(assignment, stats)``.  ``assignment`` is ``None`` when
+    the solver found no feasible solution within the budget; check
+    ``stats.is_optimal`` to distinguish proven-optimal from
+    feasible-only.  Callers decide what to do with non-optimal /
+    no-solution outcomes (the forward compiler falls back to the
+    heuristic; the probe script just reports them).
 
-    Returns `(None, stats)` when no feasible solution exists; otherwise
-    `(assignment, stats)`.
+    Args:
+        output_node: graph output. Defines the ancestor cone the
+            scheduler operates over.
+        pos_encoding: positional encoding node (always allocated by
+            ``forward_compile``; subtracted from the residual budget).
+        d, d_head, d_hidden: transformer geometry. ``n_heads_per_layer
+            = d // d_head``.  Residual budget is
+            ``d - input_residual_cols``.
+        costs: objective weights. See :class:`Costs`.
+        flex_routing: if True, CP-SAT picks attention vs MLP for each
+            standalone ``Linear``.  If False, standalone Linears use
+            the static routing dictated by ``policy.local_in_attention``.
+        time_budget_s: per-solve wall-clock cap.
+        max_layers: search horizon.  Should be at least the heuristic's
+            layer count.
+        hint_layers: optional warm-start mapping ``node_id -> layer``.
+        hint_routing: optional warm-start mapping
+            ``node_id -> "attn"|"mlp"`` for flex Linears.  When the
+            heuristic placed a standalone Linear in attention vs
+            MLP-bypass, hinting the same routing lets CP-SAT
+            reconstruct the heuristic's solution as a starting
+            incumbent.
+        hint_cancel: optional warm-start mapping ``node_id -> layer``
+            for the cancel layer.  Captures when the heuristic freed
+            each node's columns; combined with ``hint_layers`` this
+            gives a complete schedule the solver can verify and
+            improve from.
+        cancel_slack: when not None, restrict each non-pinned node's
+            cancel layer to ``[earliest_dead, earliest_dead + K]``
+            where ``earliest_dead = max(layer[c] + 1)`` over consumers
+            and ``K == cancel_slack``.  Cuts the cancel-decision
+            search space ~30x at K=2 with negligible loss of
+            optimality (the heuristic almost always cancels within
+            1–2 layers of the last consumer).  Set to None to keep
+            the wide ``[layer[n]+1, max_layers]`` domain.  Default 2.
+        policy: only consulted when ``flex_routing=False``.  Defaults
+            to ``LEGACY_POLICY``.
+        log_search_progress: if True, the solver's progress log is
+            forwarded line-by-line and accumulated in
+            ``stats.solver_log``.
+        reserve_heads: per-layer attention-head budget reserved
+            beyond the modeled compute + cancel + dirty terms.
+            Defaults to 0.  Raise it for graphs whose attention heads
+            are saturated by ops outside the model.
+        assume_zero_init: if True, the model assumes the runtime
+            zero-initialises the residual stream (so the heuristic
+            emits no BIRTH-layer dirty-column cancels for fresh
+            allocations on the initially-free pool).  Pair this with
+            ``forward_compile(assume_zero_init=True)`` so the heuristic
+            and CP-SAT model agree.  Defaults to False — the
+            conservative model that mirrors the heuristic's defensive
+            BIRTH-layer cancellation of fresh allocations.
 
-    Raises `RuntimeError` for graph-precondition violations only —
-    these are not solver outcomes, they're prerequisites the solver
-    cannot recover from.
+    Raises ``RuntimeError`` only when the graph violates a model
+    precondition (see ``docs/cpsat_scheduler.md`` §3): currently, an
+    ``Add`` whose input is a ``Concatenate``.  Solver-outcome handling
+    (no-incumbent, FEASIBLE-not-OPTIMAL) is the caller's responsibility.
     """
     if policy is None:
         policy = LEGACY_POLICY
@@ -847,9 +697,8 @@ def _solve_full(
 
         # Birth-layer dirty-column cancel.  When `assume_zero_init` is
         # False (the default, mirroring the heuristic's defensive
-        # behaviour from commit cf4af42), every fresh allocation pays
-        # a cancel head to clear the column's prior value before its
-        # additive write.  When True, the runtime is contracted to
+        # behaviour), every fresh allocation pays a cancel head to
+        # clear the column's prior value before its additive write.  When True, the runtime is contracted to
         # zero-initialise the residual stream and the heuristic skips
         # these cancels — so we skip them in the model too.
         # `Add` is always exempt: under the model precondition (no
@@ -1003,18 +852,6 @@ def _solve_full(
             if nid in cancel_layer and 0 <= L <= max_layers:
                 model.AddHint(cancel_layer[nid], L)
 
-    # ---- Symmetry breaking ----
-    # Sibling chains feeding common ``Concatenate`` joins are
-    # interchangeable when their internal structures match — adding
-    # lex-min between their terminals' layer assignments cuts entire
-    # ``N!`` permutation slices out of CP-SAT's search tree.  Pass the
-    # hint so chain ordering matches the warm-start incumbent.
-    n_sym = 0
-    if symmetry_breaking:
-        n_sym = _add_symmetry_breaking(
-            model, gm, layer_var, gm.graph, hint_layers=hint_layers
-        )
-
     # ---- Decision strategy: schedule by critical path first ----
     nodes_by_cp = sorted(
         gm.schedulable,
@@ -1079,6 +916,5 @@ def _solve_full(
         total_attn_heads=total_heads,
         total_mlp_bypass_slots=total_bypass,
         is_optimal=status == cp_model.OPTIMAL,
-        n_symmetry_constraints=n_sym,
     )
     return assignment, stats

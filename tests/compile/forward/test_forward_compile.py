@@ -34,14 +34,11 @@ D_HEAD = 16
 
 def _verify(
     output_node, n_pos, input_values, pos_encoding=None, max_layers=100,
-    use_cpsat=True,
 ):
     """Compile and verify output matches node.compute().
 
-    ``use_cpsat`` defaults to True (the production default).  Tests that
-    exercise graph patterns the CP-SAT model treats as preconditions
-    (e.g., ``Concatenate``-input ``Add`` nodes — see
-    ``docs/cpsat_scheduler.md`` §3) opt out with ``use_cpsat=False``.
+    Uses ``optimize=0`` (heuristic, the production default).  CP-SAT
+    exercise lives in ``test_cpsat_integration.py``.
     """
     net = forward_compile(
         d=D,
@@ -50,7 +47,6 @@ def _verify(
         pos_encoding=pos_encoding,
         verbose=False,
         max_layers=max_layers,
-        use_cpsat=use_cpsat,
     )
     assert net.residual_assignment is not None
 
@@ -339,7 +335,7 @@ def test_compile_multiple_concats():
     add1 = add(concat([c1, c2]), create_literal_value(torch.tensor([2.0, 2.0])))
     add2 = add(concat([c1, c3]), create_literal_value(torch.tensor([2.0, 2.0])))
     out = add(add1, add2)
-    _verify(out, n_pos=1, input_values={}, use_cpsat=False)
+    _verify(out, n_pos=1, input_values={})
 
 
 def test_compile_switch():

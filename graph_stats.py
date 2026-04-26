@@ -1045,21 +1045,31 @@ def main():
         action="store_true",
         help="Build with render_pixels=False (skip the RENDER texture sub-graph)",
     )
-    parser.add_argument(
-        "--cpsat-time-budget",
-        type=float,
-        default=300.0,
-        help="Per-solve CP-SAT wall-clock cap in seconds (default 300).",
+    # GCC-style -O0/-O1/-O2/-O3 optimization levels.  Mutually
+    # exclusive group; --O1, --O2, --O3 are convenience aliases for
+    # ``--optimize 1/2/3`` so users can write ``-O2`` like with cc.
+    opt_group = parser.add_mutually_exclusive_group()
+    opt_group.add_argument(
+        "-O", "--optimize",
+        type=int,
+        default=0,
+        choices=[0, 1, 2, 3],
+        help=(
+            "Optimization level: 0=heuristic (default, fastest), "
+            "1=CP-SAT 60s, 2=CP-SAT 180s, 3=CP-SAT 300s."
+        ),
     )
-    parser.add_argument(
-        "--no-cpsat",
-        action="store_true",
-        help="Use the heuristic LayerScheduler instead of CP-SAT.",
+    opt_group.add_argument(
+        "--O1", dest="optimize", action="store_const", const=1,
+        help="Alias for --optimize 1.",
     )
-    parser.add_argument(
-        "--cpsat-allow-suboptimal",
-        action="store_true",
-        help="Accept feasible-but-not-proven-optimal CP-SAT schedules.",
+    opt_group.add_argument(
+        "--O2", dest="optimize", action="store_const", const=2,
+        help="Alias for --optimize 2.",
+    )
+    opt_group.add_argument(
+        "--O3", dest="optimize", action="store_const", const=3,
+        help="Alias for --optimize 3.",
     )
     parser.add_argument(
         "--assume-zero-init",
@@ -1068,15 +1078,6 @@ def main():
             "Assume the runtime zero-initialises the residual stream "
             "(the contract HeadlessTransformer.get_input_res_stream "
             "already meets) and skip BIRTH-layer dirty-column cancels."
-        ),
-    )
-    parser.add_argument(
-        "--symmetry-breaking",
-        action="store_true",
-        help=(
-            "Experimental: enable CP-SAT symmetry-breaking on equivalent "
-            "sibling chains (off by default — can starve incumbent search "
-            "on DOOM-scale graphs)."
         ),
     )
     args = parser.parse_args()
@@ -1170,10 +1171,7 @@ def main():
         device=None,
         on_node_scheduled=_track,
         policy=LEGACY_POLICY if args.legacy_policy else None,
-        use_cpsat=not args.no_cpsat,
-        cpsat_time_budget_s=args.cpsat_time_budget,
-        cpsat_allow_suboptimal=args.cpsat_allow_suboptimal,
-        cpsat_symmetry_breaking=args.symmetry_breaking,
+        optimize=args.optimize,
         assume_zero_init=args.assume_zero_init,
     )
     n_layers = max(node_to_layer.values()) + 1 if node_to_layer else 0

@@ -35,7 +35,7 @@ from torchwright.compiler.forward.cpsat_scheduler import (
     GraphModel,
     ScheduleAssignment,
     SolveStats,
-    _solve_full,
+    solve_schedule,
     build_graph_model,
     heads_for,
     is_flex,
@@ -159,7 +159,7 @@ def synthetic_check() -> None:
             f"L2={c.l2.node_id} exclusive={c.exclusive} width={c.width}"
         )
 
-    assignment, stats = _solve_full(
+    assignment, stats = solve_schedule(
         out,
         pos,
         d=256,
@@ -298,7 +298,7 @@ def doom_run(
             f"--- Layer-min CP-SAT, policy={policy_name} (static routing) ---",
             flush=True,
         )
-        assignment, stats = _solve_full(
+        assignment, stats = solve_schedule(
             gm.output_node,
             gm.pos_encoding,
             d=d,
@@ -344,7 +344,7 @@ def doom_run(
     for beta in pareto_betas:
         print()
         print(f"--- beta={beta} (flex routing) ---", flush=True)
-        assignment, stats = _solve_full(
+        assignment, stats = solve_schedule(
             gm.output_node,
             gm.pos_encoding,
             d=d,

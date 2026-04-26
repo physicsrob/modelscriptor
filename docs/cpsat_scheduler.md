@@ -50,11 +50,13 @@ fewer layers).
 ### Code map
 
 - `torchwright/compiler/forward/cpsat_scheduler.py` — the solver.
-  Exports `solve_schedule()` and `ScheduleAssignment`.
+  Exports `solve_schedule()`, `ScheduleAssignment`, `Costs`, and
+  `SolveStats`.
 - `torchwright/compiler/forward/scheduler.py` — adds
   `DirectedLayerScheduler` next to the existing `LayerScheduler`.
-- `torchwright/compiler/forward/compile.py` — adds the `use_cpsat`
-  parameter to `forward_compile` and the cache for solver results.
+- `torchwright/compiler/forward/compile.py` — adds the `optimize`
+  level kwarg to `forward_compile` and the warm-start probe that
+  feeds CP-SAT a complete heuristic hint.
 - `scripts/cpsat_schedule.py` — probe script for ad-hoc Pareto
   exploration. Imports from the production module.
 
@@ -317,7 +319,8 @@ The model is sound for graphs and configurations satisfying:
   represent the sibling-cluster admission constraint described in
   `torchwright/compiler/forward/sibling_clusters.py`. With admission
   control on, the solver may produce schedules the replay cannot
-  honor.
+  honor; `forward_compile` raises if you combine `optimize > 0`
+  with `admission_control=True`.
 - No `Add` node has a `Concatenate` input. The model uses the
   free-add cost for every `Add`. `solve_schedule` rejects graphs
   containing `Concatenate`-input `Add` nodes by raising at solve time.
@@ -389,76 +392,104 @@ CP-SAT against a specific heuristic policy's routing choice.
 forward_compile(
     d, d_head, output_node, pos_encoding,
     ...,
-    use_cpsat: bool = True,
-    cpsat_costs: Costs = Costs(),
-    cpsat_flex_routing: bool = True,
-    cpsat_time_budget_s: float = 60.0,
-    cpsat_allow_suboptimal: bool = False,
+    optimize: int = 0,                # 0=heuristic, 1=60s, 2=180s, 3=300s
+    cpsat_costs: Costs = Costs(),     # advanced: Pareto navigator
+    cpsat_flex_routing: bool = True,  # advanced: routing decision
 )
 ```
 
-`use_cpsat=True` is the default. The flow:
+`optimize` is the user-facing knob:
 
-1. `solve_schedule` runs once, producing a `ScheduleAssignment`.
-2. The assignment is cached on the cache key described in §5.
-3. `DirectedLayerScheduler` consumes the assignment for the per-layer
-   loop.
-4. The compile produces a `HeadlessTransformer` with the same token
-   semantics as the heuristic compile would have produced — the
-   schedule is a placement decision, not a value-changing
-   transformation.
+| level | scheduler | budget |
+|------:|-----------|--------|
+|     0 | heuristic `LayerScheduler` (default) | — |
+|     1 | CP-SAT, accept best-feasible           | 60s |
+|     2 | CP-SAT, accept best-feasible           | 180s |
+|     3 | CP-SAT, accept best-feasible           | 300s |
 
-`use_cpsat=False` falls back to the heuristic `LayerScheduler` and
-runs `forward_compile` exactly as it did before this subsystem
-existed. Use this to bypass the solver overhead in workflows where
+At `optimize=0` the compiler skips CP-SAT entirely — same code path
+as before this subsystem existed.  Use it for fast iteration where
 compile latency matters more than schedule quality.
 
+At `optimize > 0` the flow is:
+
+1. **Warm-start probe.** A schedule-only run of the heuristic
+   produces a complete known-feasible schedule:
+   `(layer, routing, cancel_layer)` per node.
+2. **CP-SAT solve.** `solve_schedule` runs with the full hint and the
+   heuristic's layer count as the search horizon.  Returns
+   `(assignment, stats)`.
+3. **Replay or fall back.** If `assignment is not None`, the
+   `DirectedLayerScheduler` replays it.  If `None` (no feasible
+   incumbent within budget), the compile falls back to a fresh
+   heuristic `LayerScheduler` against the same residual map — users
+   always get a schedule, never a bare exception from a budget
+   timeout.
+4. **Compile.** The chosen scheduler runs the per-layer loop and
+   produces a `HeadlessTransformer`.  Token semantics are identical
+   regardless of which scheduler ran — the schedule is a placement
+   decision, not a value-changing transformation.
+
 The `policy` argument is honored only when `cpsat_flex_routing=False`,
-where it pins the routing of standalone Linears. With
+where it pins the routing of standalone Linears.  With
 `cpsat_flex_routing=True` (the default), `policy` is ignored.
 
-`cpsat_allow_suboptimal=False` (the default) raises `RuntimeError`
-when the solver returns a feasible-but-not-proven-optimal schedule.
-Set to `True` to accept the suboptimal schedule and proceed with
-the compile. See §5 for details.
+`cpsat_costs` is the Pareto navigator (see *Costs* above); ignored
+when `optimize=0`.
 
 ## 5. Runtime behavior
 
 ### When the solver runs
 
-`solve_schedule` runs at the start of `forward_compile`, before the
-first layer is allocated. It does not run during the layer loop. The
-layer loop is then deterministic: `DirectedLayerScheduler` reads the
-assignment and emits ops.
+At `optimize > 0`, `solve_schedule` runs once at the start of
+`forward_compile`, before the first layer is allocated.  It does not
+run during the layer loop.  The layer loop is then deterministic:
+`DirectedLayerScheduler` reads the assignment and emits ops.
 
-### Caching
+### Warm-start hints
 
-The solver result is cached keyed on
-`(graph_hash, d, d_head, d_hidden, costs, flex_routing)`. Subsequent
-compiles with the same key reuse the cached `ScheduleAssignment`. The
-cache lives in process memory; cold compiles pay the solve cost once
-per `(graph, geometry, costs)` tuple.
+Before invoking CP-SAT, `forward_compile` runs the heuristic
+`LayerScheduler` in schedule-only mode (no weight writes) on a
+clone of the residual map.  The probe captures three things per
+node:
 
-`graph_hash` is computed from the graph's node ID set, edge set, and
-per-node widths. Mutating any of these between compiles invalidates
-the cache.
+- `hint_layers[n]` — the layer where the heuristic placed `n`.
+- `hint_routing[n]` — `"attn"` or `"mlp"`, recovered from whether
+  the heuristic emitted `compute_linear` (attention) or
+  `compute_linear_bypass` (MLP) for the node.
+- `hint_cancel[n]` — the layer where the heuristic freed `n`'s
+  residual columns.  Captured by a small `_TrackingResidualStreamMap`
+  subclass that records the current layer when `free()` is called;
+  nodes consumed via `reassign` (the free-add path) don't go
+  through `free` and are correctly omitted.
 
-### Time budget
+All three are passed to `solve_schedule` as `AddHint` calls.  The
+heuristic's layer count also tightens the search horizon
+(`max_layers = min(user_max, hint_n_layers + 1)`), which shrinks
+each `layer_var`'s domain.
 
-`cpsat_time_budget_s` caps wall time per solve. The default of 60
-seconds is sufficient to prove optimality for graphs with low
-thousands of schedulable nodes at moderate dimensions. Larger
-graphs or more sharply mixed cost trade-offs (small `beta` values
-that produce dense Pareto fronts) may need a larger budget.
+### Cancel-domain restriction
 
-If the budget expires without a proven optimum, the solver returns
-the best feasible solution found so far (status `FEASIBLE` instead
-of `OPTIMAL`). The compile's response depends on
-`cpsat_allow_suboptimal` — see *Failure modes* below.
+The cancel decision space is the dominant LB-search cost when the
+attention/residual cumulatives are tight.  By default, each
+non-pinned node's cancel layer is restricted to a small window
+above its earliest dead layer:
+
+```
+last_consumer = max(layer_var[c]) over consumers c
+cancel_layer[n] in [layer_var[n]+1, last_consumer + 1 + cancel_slack]
+```
+
+with `cancel_slack=2`.  The heuristic almost always cancels within
+1–2 layers of the last consumer, so K=2 is generous enough to
+preserve optimality while cutting the cancel-decision space ~30×.
+The kwarg is on `solve_schedule` for users who want to widen or
+disable it; `forward_compile` doesn't expose it (the default is
+correct for every tested geometry).
 
 ### Determinism
 
-CP-SAT runs with `num_search_workers=8` and uses parallel worker
+CP-SAT runs with `num_search_workers=16` and uses parallel worker
 strategies. Different runs may produce different `ScheduleAssignment`
 values for the same model — different worker discovery orders find
 different optima of equal objective value. The compiled
@@ -470,26 +501,62 @@ tolerance boundaries* in `CLAUDE.md`).
 ### Failure modes
 
 **Precondition violation.** `solve_schedule` raises `RuntimeError`
-*before* invoking CP-SAT if the graph or configuration violates a §3
-precondition (admission control on, an `Add` with a `Concatenate`
-input, etc.). No `ScheduleAssignment` is produced.
+*before* invoking CP-SAT if the graph violates a §3 precondition
+(an `Add` with a `Concatenate` input).  `forward_compile` itself
+raises if `admission_control=True` is combined with `optimize > 0`.
 
-**`INFEASIBLE`.** The solver ran and proved no schedule fits the
-constraints — typically because `max_layers` is too small for the
-graph. No `ScheduleAssignment` is produced; `forward_compile` raises
-`RuntimeError` carrying the solver status.
+**`INFEASIBLE`.** CP-SAT proves no schedule fits — typically
+because `max_layers` is too small for the graph.  Returns
+`(None, stats)` with `stats.status_name == "INFEASIBLE"`.
+`forward_compile` falls back to the heuristic; the heuristic
+respects the same `max_layers` and may itself fail with a
+deadlock error.
 
-**Time limit exceeded with no feasible solution.** The solver
-neither proved optimality nor found a feasible schedule within the
-budget (CP-SAT status `UNKNOWN`). Same response as `INFEASIBLE` —
-`RuntimeError`, no `ScheduleAssignment`.
+**Time limit exceeded with no feasible solution** (CP-SAT status
+`UNKNOWN`).  Returns `(None, stats)`.  `forward_compile` falls
+back to the heuristic schedule.
 
 **Time limit exceeded with feasible solution** (CP-SAT status
-`FEASIBLE`). The solver returns a `ScheduleAssignment` that is
-feasible but possibly non-optimal. By default, `forward_compile`
-raises `RuntimeError` carrying the gap (`best_objective_bound` versus
-`objective_value`) so callers know they did not get the proven
-optimum. Setting `cpsat_allow_suboptimal=True` instead accepts the
-schedule, logs the gap, and proceeds. The compiled model is correct
-in either case; the only difference is whether the caller is willing
-to ship a schedule that is possibly larger than necessary.
+`FEASIBLE`).  The solver returns a `ScheduleAssignment` that is
+feasible but possibly non-optimal.  `forward_compile` accepts it —
+`optimize > 0` semantics treat any feasible schedule as success;
+`stats.is_optimal` reports whether optimality was proven.
+
+### Geometry sensitivity
+
+The win-size from CP-SAT versus heuristic depends on residual-stream
+slack.  Measured on the headless DOOM graph (~4.4K nodes):
+
+| geometry            | heuristic | CP-SAT | Δ    | first incumbent | OPTIMAL at |
+|---------------------|----------:|-------:|-----:|----------------:|-----------:|
+| d=2048, d_h=8192    | 61        | 55     | -10% | ~120s           | not in 300s |
+| d=3072, d_h=8192    | 58        | 46     | -21% | ~20s            | ~110s |
+| d=4096, d_h=4096    | 59        | 46     | -22% | (proven)        | ~14s |
+
+At d=2048 the residual cumulative is the binding constraint and
+CP-SAT struggles to close the LB gap within budget.  At d=3072+
+CP-SAT converges optimally in seconds.  The heuristic-fallback
+behavior (when CP-SAT can't find an incumbent) is the right answer
+for d=2048 — users always get a schedule, just not the CP-SAT one.
+
+### Experiments tried that didn't pan out
+
+- **Symmetry breaking on equivalent sibling chains.** Detected
+  parallel chains feeding common `Concatenate` joins via
+  `SiblingClusterAnalyzer`, grouped them by structural
+  fingerprint, and added chained lex-min constraints between
+  layer assignments.  At DOOM scale the constraints tightened
+  the LB but starved incumbent-finding workers — CP-SAT never
+  found a feasible solution within reasonable budgets even with
+  a feasible warm-start hint.  Removed; if revisited, would
+  need a different solver-parameter mix (LNS-heavy or fixed
+  search strategy that respects the hint).
+- **Feasibility-first stop-on-first mode.** Installed a callback
+  that called `StopSearch()` at the first complete feasible
+  solution.  CP-SAT's first feasible reproduces the heuristic
+  warm-start; stopping there returned no improvement over
+  `optimize=0` while paying the model-build cost.  Removed.
+- **`repair_hint=True`** would have let CP-SAT actively complete
+  the partial hint into a feasible solution, but it conflicts
+  with `AddDecisionStrategy` (CP-SAT crashes with
+  "fixed_search != nullptr").  Not pursued.

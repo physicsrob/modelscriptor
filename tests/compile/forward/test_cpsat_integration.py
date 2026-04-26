@@ -55,7 +55,7 @@ def test_relu_chain_compiles_with_cpsat():
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=True,
+        optimize=1,
     )
     actual = net.compute(3, inputs)[out].cpu()
     expected = out.compute(3, inputs)
@@ -70,7 +70,7 @@ def test_branchy_compiles_with_cpsat():
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=True,
+        optimize=1,
     )
     actual = net.compute(2, inputs)[out].cpu()
     expected = out.compute(2, inputs)
@@ -91,14 +91,14 @@ def test_cpsat_matches_heuristic_output():
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=False,
+        optimize=0,
     )
     net_cpsat = forward_compile(
         d=D,
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=True,
+        optimize=1,
     )
     out_heur = net_heur.compute(2, inputs)[out].cpu()
     out_cpsat = net_cpsat.compute(2, inputs)[out].cpu()
@@ -118,14 +118,14 @@ def test_cpsat_layer_count_no_worse_than_heuristic():
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=False,
+        optimize=0,
     )
     net_cpsat = forward_compile(
         d=D,
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=True,
+        optimize=1,
     )
     assert len(net_cpsat.layers) <= len(net_heur.layers), (
         f"CP-SAT used {len(net_cpsat.layers)} layers, "
@@ -147,7 +147,7 @@ def test_cpsat_with_admission_control_raises():
             d_head=D_HEAD,
             output_node=out,
             verbose=False,
-            use_cpsat=True,
+            optimize=1,
             admission_control=True,
         )
 
@@ -167,7 +167,7 @@ def test_cpsat_flex_routing_explores_both_sublayers():
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=True,
+        optimize=1,
         cpsat_flex_routing=True,
     )
     inputs = {"x": torch.randn(2, 8)}
@@ -194,7 +194,7 @@ def test_cpsat_costs_beta_routes_more_to_mlp():
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=True,
+        optimize=1,
         cpsat_costs=Costs(alpha=1, beta=0, gamma=0),
     )
     net_beta = forward_compile(
@@ -202,7 +202,7 @@ def test_cpsat_costs_beta_routes_more_to_mlp():
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=True,
+        optimize=1,
         cpsat_costs=Costs(alpha=1, beta=10, gamma=0),
     )
     # Both compiles should produce the same numerical output.
@@ -226,7 +226,7 @@ def test_cpsat_assume_zero_init_compiles():
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=True,
+        optimize=1,
         assume_zero_init=True,
     )
     actual = net.compute(2, inputs)[out].cpu()
@@ -248,13 +248,52 @@ def test_cpsat_warm_start_layer_count_no_worse():
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=False,
+        optimize=0,
     )
     net_cpsat = forward_compile(
         d=D,
         d_head=D_HEAD,
         output_node=out,
         verbose=False,
-        use_cpsat=True,
+        optimize=1,
     )
     assert len(net_cpsat.layers) <= len(net_heur.layers)
+
+
+def test_cpsat_falls_back_to_heuristic_when_no_incumbent(monkeypatch):
+    """When CP-SAT finds no feasible solution within budget,
+    ``forward_compile`` falls back to the heuristic schedule rather
+    than raising.  Simulated by monkey-patching ``solve_schedule`` to
+    return ``(None, stats)``; the compile must still produce the
+    correct token output.
+    """
+    from torchwright.compiler.forward import compile as compile_mod
+    from torchwright.compiler.forward.cpsat_scheduler import SolveStats
+
+    fake_stats = SolveStats(
+        status_name="UNKNOWN",
+        objective_value=-1,
+        best_objective_bound=0.0,
+        wall_time_s=0.0,
+        solver_log="",
+        total_attn_heads=-1,
+        total_mlp_bypass_slots=-1,
+        is_optimal=False,
+    )
+
+    def fake_solve(*args, **kwargs):
+        return None, fake_stats
+
+    monkeypatch.setattr(compile_mod, "solve_schedule", fake_solve)
+
+    out, inputs = _build_branchy()
+    net = forward_compile(
+        d=D,
+        d_head=D_HEAD,
+        output_node=out,
+        verbose=False,
+        optimize=1,
+    )
+    actual = net.compute(2, inputs)[out].cpu()
+    expected = out.compute(2, inputs)
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
