@@ -527,8 +527,15 @@ VALUE_RANGE_BY_NAME: Dict[str, tuple[float, float]] = {
     "HIT_FULL": (0.0, 1.0),
     "HIT_X": (0.0, 1.0),
     "HIT_Y": (0.0, 1.0),
-    "RESOLVED_X": (-20.0, 20.0),
-    "RESOLVED_Y": (-20.0, 20.0),
+    # Phase B Step 4: range widened from (-20, 20) to (-100, 100) so
+    # the resolved-position envelope matches the ``max_coord = 100``
+    # ceiling that scale-find / normalize_coord operate against.  Host
+    # treats RESOLVED_X/Y as opaque scalars — the host echoes them back
+    # as the next frame's PLAYER_X / PLAYER_Y, so the graph re-normalizes
+    # consistently each frame from whatever real-units position the
+    # host fed in.  RESOLVED_ANGLE stays in [0, 255].
+    "RESOLVED_X": (-100.0, 100.0),
+    "RESOLVED_Y": (-100.0, 100.0),
     "RESOLVED_ANGLE": (0.0, 255.0),
     # SORT_RESULT's VALUE carries the picked wall_index ∈ [0, max_walls).
     # The range declared here must cover every wall_index value the

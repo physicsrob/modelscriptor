@@ -76,6 +76,8 @@ from torchwright.ops.arithmetic_ops import (
     bool_to_01,
     clamp,
     compare,
+    exp,
+    log,
     low_rank_2d,
     max as max_node,
     min as min_node,
@@ -203,6 +205,14 @@ _COL_FOLD_BP_CROSS = [
 _COL_FOLD_BP_DOT_ABS = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
 
 
+# Floor for the log() call inside the scale-find reduction.  Set well
+# below any realistic DOOM scene's largest wall coord magnitude
+# (box_room ≈ 5, multi_room ≈ 12) so a typical compile interpolates
+# rather than clamps; setting it any lower would widen log's input
+# range and inflate float32 cancellation in the slope-delta sum.
+_SCALE_FIND_MIN = 0.5
+
+
 # ---------------------------------------------------------------------------
 # Contract
 # ---------------------------------------------------------------------------
@@ -323,6 +333,27 @@ class ThinkingWallOutput:
     identifier_wall_index_onehot: Node
     value_wall_index_scalar: Node
     value_wall_index_neg_sq: Node
+    # Scale-find broadcasts (Phase B normalization).  All three are
+    # scalar nodes whose value is the same at every position, produced
+    # via ``attend_argmax_dot`` over WALL positions of per-wall
+    # ``max(|ax|, |ay|, |bx|, |by|)``.
+    #
+    # ``global_max_abs_coord`` is the raw max in world units; useful
+    # for diagnostic probes and consumers that want the linear-space
+    # scale directly.
+    #
+    # ``log_inv_scale`` is ``log(1 / global_max_abs_coord)``; designed
+    # to be added to ``log_abs(coord)`` by downstream consumers to
+    # build a normalized log-magnitude before exp (the workhorse path
+    # in ``normalize_coord``).
+    #
+    # ``inv_scale`` is the linear-space ``1 / global_max_abs_coord``,
+    # computed as ``exp(log_inv_scale)``.  Needed for any downstream
+    # consumer that needs the linear-space scaling factor (e.g., the
+    # threshold shift in the texture-column thermometer comparison).
+    global_max_abs_coord: Node
+    log_inv_scale: Node
+    inv_scale: Node
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +550,26 @@ def build_thinking_wall(
             4 + max_bsp_nodes,
             1,
             "tw_sel_bsp_const",
+        )
+
+    # ---------------------------------------------------------------------
+    # Scale-find pass: produce ``global_max_abs_coord`` and
+    # ``log_inv_scale`` once via cross-WALL reduction.  Both are
+    # broadcast scalars used by downstream Phase B normalization
+    # (``normalize_coord``).  Sources are the host-fed wall geometry at
+    # WALL positions, NOT the post-attention sel_*; we want the global
+    # max across every wall, not per-thinking-position attention output.
+    # The reduction has its own attention layer and runs in parallel
+    # with the per-thinking-position computations below.
+    # ---------------------------------------------------------------------
+    with annotate("thinking_wall/scale_find"):
+        global_max_abs_coord, log_inv_scale, inv_scale = _compute_scale_find(
+            kv.wall_ax,
+            kv.wall_ay,
+            kv.wall_bx,
+            kv.wall_by,
+            is_wall=is_wall,
+            max_coord=max_coord,
         )
 
     # ---------------------------------------------------------------------
@@ -1010,12 +1061,133 @@ def build_thinking_wall(
         identifier_wall_index_onehot=identifier_wall_index_onehot,
         value_wall_index_scalar=value_wall_index_scalar,
         value_wall_index_neg_sq=value_wall_index_neg_sq,
+        global_max_abs_coord=global_max_abs_coord,
+        log_inv_scale=log_inv_scale,
+        inv_scale=inv_scale,
     )
 
 
 # ---------------------------------------------------------------------------
 # Base-value helpers
 # ---------------------------------------------------------------------------
+
+
+def _compute_wall_max_abs(
+    wall_ax: Node,
+    wall_ay: Node,
+    wall_bx: Node,
+    wall_by: Node,
+) -> Node:
+    """Per-position ``max(|ax|, |ay|, |bx|, |by|)``.
+
+    At WALL prompt positions where the host has fed the per-wall
+    geometry, this returns that wall's maximum coordinate magnitude.
+    At non-WALL positions the inputs are zero (host default), so the
+    output is also zero — but the caller should still ``cond_gate`` on
+    ``is_wall`` before any cross-position reduction, both for type
+    isolation and as a safety net against host garbage.
+
+    Cost: 1 sublayer for the four parallel ``abs`` calls + 2 sublayers
+    for the binary-tree max reduction = 3 MLP sublayers.
+
+    All ``abs`` and ``max`` ops are exact (modulo float32 round-off);
+    no approximation noise is introduced.
+    """
+    abs_ax = abs_node(wall_ax)
+    abs_ay = abs_node(wall_ay)
+    abs_bx = abs_node(wall_bx)
+    abs_by = abs_node(wall_by)
+    m_ab = max_node(abs_ax, abs_ay)
+    m_cd = max_node(abs_bx, abs_by)
+    return max_node(m_ab, m_cd)
+
+
+def _compute_scale_find(
+    wall_ax: Node,
+    wall_ay: Node,
+    wall_bx: Node,
+    wall_by: Node,
+    *,
+    is_wall: Node,
+    max_coord: float,
+) -> tuple[Node, Node, Node]:
+    """Cross-WALL reduction → (global_max_abs_coord, log_inv_scale, inv_scale).
+
+    Each WALL position contributes its own ``max(|ax|, |ay|, |bx|,
+    |by|)`` to a single ``attend_argmax_dot`` reduction whose query
+    vector is a constant +1.  The winning value is the global maximum
+    coordinate magnitude across every wall in the scene.  No
+    ``assert_hardness_gt`` is set: when multiple walls share the same
+    ``max_abs`` (e.g. box_room's four symmetric walls), the soft
+    average over tied keys equals that shared value, so a soft tie is
+    a *correct* answer rather than a softmax failure.
+
+    The log floor is set well below any realistic DOOM scene's wall
+    extent.  Box room (size 10) gives global_max ≈ 5; multi_room ≈ 12;
+    repositioned E1M1 subsets up to ``max_coord``.  Anything below
+    ~0.5 would mean a degenerate scene.
+
+    Returns:
+        ``(global_max_abs_coord, log_inv_scale, inv_scale)``.
+
+    * ``global_max_abs_coord`` is a 1-wide scalar broadcast to every
+      position.
+    * ``log_inv_scale = -log(global_max_abs_coord)`` is the additive
+      contribution downstream consumers add to ``log_abs(coord)`` to
+      build a normalized log-magnitude.
+    * ``inv_scale = exp(log_inv_scale)`` is the linear-space scale
+      factor, used by consumers that need the multiplicative form
+      (e.g., the texture-column threshold shift in render).
+    """
+    wall_max_abs = _compute_wall_max_abs(wall_ax, wall_ay, wall_bx, wall_by)
+
+    # Type-isolate non-WALL positions before the reduction.  At
+    # non-WALL the host feeds zero-valued wall_a*/wall_b* so the
+    # gating is belt-and-suspenders, but it costs nothing.
+    gated_max = cond_gate(is_wall, wall_max_abs)
+
+    query_const_one = create_literal_value(
+        torch.tensor([1.0]), name="tw_scale_query_one"
+    )
+
+    global_max_abs_coord = attend_argmax_dot(
+        query_vector=query_const_one,
+        key_vector=gated_max,
+        value=gated_max,
+        match_gain=200.0,
+        # No assert_hardness_gt: ties are valid (e.g. box_room's four
+        # symmetric walls all carry the same max_abs); the soft-average
+        # over tied positions returns that shared value, which is the
+        # right answer.
+    )
+
+    # Log of the global max.  log() auto-clamps to [_SCALE_MIN, max_coord]
+    # via its piecewise_linear; we set the floor below any realistic
+    # DOOM scene's wall extent so a typical compile sits inside the
+    # interpolation grid, not on the clamp.
+    log_max = log(
+        global_max_abs_coord,
+        min_value=_SCALE_FIND_MIN,
+        max_value=float(max_coord),
+        n_breakpoints=256,
+    )
+    # log(inv_scale) = log(1 / global_max) = -log(global_max).  Free —
+    # folds into the next Linear sublayer.
+    log_inv_scale = multiply_const(log_max, -1.0)
+
+    # Linear-space inv_scale = exp(log_inv_scale).  log_inv_scale's
+    # range is [-log(max_coord), -log(_SCALE_FIND_MIN)] = e.g.
+    # [-4.6, 0.69] for max_coord = 100; pad both sides for the
+    # piecewise interpolation grid.
+    import math as _math
+
+    inv_scale = exp(
+        log_inv_scale,
+        min_value=-_math.log(float(max_coord)) - 0.1,
+        max_value=-_math.log(_SCALE_FIND_MIN) + 0.1,
+        n_breakpoints=256,
+    )
+    return global_max_abs_coord, log_inv_scale, inv_scale
 
 
 def _compute_hit_flags(

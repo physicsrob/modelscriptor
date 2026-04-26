@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "commit": "88de128",
-  "measured_at": "2026-04-25",
+  "commit": "3829b69",
+  "measured_at": "2026-04-26",
   "ops": [
     {
       "name": "abs",
@@ -531,7 +531,7 @@
       "distributions": [
         {
           "name": "doom_diff_trig",
-          "description": "wall-geometry product over DIFF_BP × TRIG_BP — mirrors the `sort_ey_cos`/`sort_ex_sin` family of calls at `torchwright/doom/stages/wall.py:263` and neighbours.",
+          "description": "wall-geometry product over DIFF_BP × TRIG_BP — mirrors the `sort_ey_cos`/`sort_ex_sin` family of calls at `torchwright/doom/stages/thinking_wall.py:1115` and neighbours.",
           "n_samples": 4096,
           "max_abs_error": 7.77784,
           "mean_abs_error": 1.30067,
@@ -547,7 +547,7 @@
         },
         {
           "name": "doom_diff_vel",
-          "description": "collision product over DIFF_BP × VEL_BP — mirrors the `p_dx_ey`/`p_dy_ex` family at `torchwright/doom/stages/wall.py:205`.",
+          "description": "collision product over DIFF_BP × VEL_BP — mirrors the `p_dx_ey`/`p_dy_ex` family at `torchwright/doom/stages/thinking_wall.py:1014`.",
           "n_samples": 4096,
           "max_abs_error": 5.44453,
           "mean_abs_error": 0.93746,
