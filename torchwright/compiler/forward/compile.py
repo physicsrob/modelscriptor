@@ -240,6 +240,7 @@ def forward_compile(
     cpsat_time_budget_s: float = 60.0,
     cpsat_allow_suboptimal: bool = False,
     cpsat_symmetry_breaking: bool = False,
+    cpsat_fallback_to_heuristic: bool = True,
     assume_zero_init: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
@@ -287,6 +288,16 @@ def forward_compile(
             cannot prove optimality within the budget.  When True,
             accept a feasible-but-not-proven-optimal schedule.
             Ignored when ``use_cpsat=False``.
+        cpsat_fallback_to_heuristic: When True (default), if CP-SAT
+            finds no feasible solution within the budget, fall back
+            to the heuristic ``LayerScheduler`` instead of raising.
+            The heuristic warm-start was already a sunk cost so
+            falling back costs only the heuristic-replay compile
+            time; users get a usable schedule on tight geometries
+            (d=2048) where CP-SAT's first-incumbent time exceeds
+            the budget.  When False, raise on no-incumbent for
+            strict CP-SAT semantics (useful in tests).  Ignored
+            when ``use_cpsat=False``.
         assume_zero_init: When True, the compile assumes the runtime
             zero-initialises the residual stream (the contract met by
             ``HeadlessTransformer.get_input_res_stream``) and skips
@@ -547,36 +558,55 @@ def forward_compile(
                 for line in _stats.solver_log.splitlines()[-40:]:
                     print(f"  {line}")
                 print("--- end CP-SAT solver log ---")
-            raise RuntimeError(
-                f"CP-SAT returned {_stats.status_name}; no schedule produced "
-                f"(best_objective_bound={_stats.best_objective_bound}, "
-                f"n_symmetry_constraints={_stats.n_symmetry_constraints})"
+            if not cpsat_fallback_to_heuristic:
+                raise RuntimeError(
+                    f"CP-SAT returned {_stats.status_name}; no schedule produced "
+                    f"(best_objective_bound={_stats.best_objective_bound}, "
+                    f"n_symmetry_constraints={_stats.n_symmetry_constraints})"
+                )
+            if verbose:
+                print(
+                    f"  CP-SAT found no feasible incumbent within "
+                    f"{cpsat_time_budget_s:.0f}s budget — falling back to "
+                    f"heuristic schedule ({hint_n_layers} layers)"
+                )
+            scheduler = LayerScheduler(
+                graph,
+                d,
+                d_head,
+                pos_encoding,
+                d_hidden=d_hidden,
+                clusters=clusters,
+                admission_budget_fraction=admission_budget_fraction,
+                policy=policy,
+                pinned_nodes=overlay_pinned_inputs,
             )
-        if not _stats.is_optimal and not cpsat_allow_suboptimal:
-            raise RuntimeError(
-                f"CP-SAT returned {_stats.status_name} but did not prove "
-                f"optimality: objective={_stats.objective_value}, "
-                f"best_objective_bound={_stats.best_objective_bound}; "
-                f"pass cpsat_allow_suboptimal=True to accept this schedule"
+        else:
+            if not _stats.is_optimal and not cpsat_allow_suboptimal:
+                raise RuntimeError(
+                    f"CP-SAT returned {_stats.status_name} but did not prove "
+                    f"optimality: objective={_stats.objective_value}, "
+                    f"best_objective_bound={_stats.best_objective_bound}; "
+                    f"pass cpsat_allow_suboptimal=True to accept this schedule"
+                )
+            if verbose:
+                solve_time = time.perf_counter() - t_solve_start
+                print(
+                    f"  CP-SAT solved in {solve_time:.2f}s: "
+                    f"n_layers={assignment.n_layers}"
+                )
+            scheduler = DirectedLayerScheduler(
+                graph,
+                d,
+                d_head,
+                pos_encoding,
+                assignment=assignment,
+                d_hidden=d_hidden,
+                clusters=clusters,
+                admission_budget_fraction=admission_budget_fraction,
+                policy=policy,
+                pinned_nodes=overlay_pinned_inputs,
             )
-        if verbose:
-            solve_time = time.perf_counter() - t_solve_start
-            print(
-                f"  CP-SAT solved in {solve_time:.2f}s: "
-                f"n_layers={assignment.n_layers}"
-            )
-        scheduler = DirectedLayerScheduler(
-            graph,
-            d,
-            d_head,
-            pos_encoding,
-            assignment=assignment,
-            d_hidden=d_hidden,
-            clusters=clusters,
-            admission_budget_fraction=admission_budget_fraction,
-            policy=policy,
-            pinned_nodes=overlay_pinned_inputs,
-        )
     else:
         scheduler = LayerScheduler(
             graph,
@@ -641,7 +671,7 @@ def forward_compile(
 
         t_layer_start = time.perf_counter()
         layer = net.add_layer(append=True)
-        if use_cpsat:
+        if isinstance(scheduler, DirectedLayerScheduler):
             scheduler.set_current_layer(i)
         t_schedule_start = time.perf_counter()
         attn_ops, mlp_ops, biased_linears = scheduler.schedule_layer(
