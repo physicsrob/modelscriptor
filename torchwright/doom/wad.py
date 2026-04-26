@@ -19,7 +19,7 @@ Vertex coordinates typically range from about -4000 to +4000.
 
 import colorsys
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -171,6 +171,23 @@ class BspNode:
     back_child: int
 
 
+@dataclass(frozen=True)
+class Thing:
+    """A map entity placement: player spawns, monsters, items, decorations.
+
+    ``angle`` is in whole degrees (0=east, 90=north, 180=west, 270=south),
+    not the BAM units used by SEGS.  ``type`` is DOOM's thing type id —
+    1..4 for player-1..4 starts, 11 for deathmatch starts, plus monsters
+    and items.  ``flags`` carries skill-level + multiplayer bits.
+    """
+
+    x: int
+    y: int
+    angle: int
+    type: int
+    flags: int
+
+
 @dataclass
 class MapData:
     """All geometry + BSP data parsed from a single map (e.g. E1M1)."""
@@ -183,6 +200,7 @@ class MapData:
     segs: List[Seg]
     subsectors: List[Subsector]
     nodes: List[BspNode]
+    things: List[Thing] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +380,17 @@ class WADReader:
             raise KeyError(f"Map marker {map_name!r} not found in WAD")
         return result
 
+    def _parse_things(self, off: int, size: int) -> List[Thing]:
+        """Parse a THINGS lump — 10 bytes per thing.
+
+        Format: ``<hhHHH`` — x, y, angle (degrees), type, flags.
+        """
+        buf = self._data[off : off + size]
+        return [
+            Thing(x=x, y=y, angle=angle, type=type_, flags=flags)
+            for x, y, angle, type_, flags in struct.iter_unpack("<hhHHH", buf)
+        ]
+
     def _parse_vertexes(self, off: int, size: int) -> List[Vertex]:
         """Parse a VERTEXES lump — 4 bytes per vertex (int16 x, int16 y)."""
         buf = self._data[off : off + size]
@@ -535,6 +564,9 @@ class WADReader:
         missing = [n for n in required if n not in lumps]
         if missing:
             raise KeyError(f"Map {map_name!r} missing required lumps: {missing}")
+        things = (
+            self._parse_things(*lumps["THINGS"]) if "THINGS" in lumps else []
+        )
         return MapData(
             name=map_name,
             vertices=self._parse_vertexes(*lumps["VERTEXES"]),
@@ -544,6 +576,7 @@ class WADReader:
             segs=self._parse_segs(*lumps["SEGS"]),
             subsectors=self._parse_subsectors(*lumps["SSECTORS"]),
             nodes=self._parse_nodes(*lumps["NODES"]),
+            things=things,
         )
 
     def get_map_segments(

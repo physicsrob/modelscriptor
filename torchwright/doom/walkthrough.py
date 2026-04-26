@@ -5,7 +5,7 @@ turn right 90 degrees, repeat.  By default the game logic and rendering
 run inside a compiled transformer.
 
 Usage:
-    python -m torchwright.doom.walkthrough [output.gif] [--scene box|multi] ...
+    python -m torchwright.doom.walkthrough [output.gif] [--scene box|multi|e1m1] ...
 """
 
 import argparse
@@ -131,24 +131,30 @@ def generate_walkthrough(
     start_angle: int,
     total_frames: int = 300,
     wall_threshold: float = 1.5,
+    still: bool = False,
 ) -> List[np.ndarray]:
     """Render a walkthrough sequence, returning a list of uint8 RGB frames.
 
     Args:
         frame_fn: Callable(state, inputs) -> (frame, new_state).
+        still: If True, send empty PlayerInput each frame (no wall-following).
     """
     state = GameState(x=start_x, y=start_y, angle=start_angle)
-    controller = WalkthroughController(
-        segments,
-        config.trig_table,
-        wall_threshold=wall_threshold,
+    controller = (
+        None
+        if still
+        else WalkthroughController(
+            segments,
+            config.trig_table,
+            wall_threshold=wall_threshold,
+        )
     )
 
     frames: List[np.ndarray] = []
     frame_times: List[float] = []
     t_start = time.perf_counter()
     for i in range(total_frames):
-        inputs = controller.get_input(state)
+        inputs = PlayerInput() if controller is None else controller.get_input(state)
 
         t0 = time.perf_counter()
         frame, state = frame_fn(state, inputs)
@@ -220,7 +226,7 @@ def main():
         default="walkthrough.gif",
         help="Output GIF path",
     )
-    parser.add_argument("--scene", choices=["box", "multi"], default="box")
+    parser.add_argument("--scene", choices=["box", "multi", "e1m1"], default="box")
     parser.add_argument(
         "--mode",
         choices=["transformer", "reference"],
@@ -273,6 +279,8 @@ def main():
         floor_color=(0.4, 0.4, 0.4),
     )
 
+    subset = None
+    still = False
     if args.scene == "box":
         segments, textures = box_room_textured(
             wad_path=args.wad,
@@ -280,13 +288,47 @@ def main():
         )
         start_x, start_y, start_angle = 0.0, 0.0, 0
         max_coord = 10.0
-    else:
+    elif args.scene == "multi":
         segments, textures = multi_room_textured(
             wad_path=args.wad,
             tex_size=args.tex_size,
         )
         start_x, start_y, start_angle = -8.0, 0.0, 0
         max_coord = 15.0
+    else:  # e1m1
+        from torchwright.doom.map_subset import load_map_subset
+        from torchwright.doom.wad import WADReader
+
+        # Read the player-1 start (thing type 1) from the WAD's THINGS
+        # lump.  The angle is in degrees (0=east, 90=north); convert to
+        # the renderer's 0-255 scale.
+        md = WADReader(args.wad).get_map("E1M1")
+        spawn = next(t for t in md.things if t.type == 1)
+        spawn_x = float(spawn.x)
+        spawn_y = float(spawn.y)
+        start_angle = round(spawn.angle / 360 * 256) % 256
+        print(
+            f"E1M1 player-1 spawn: pos=({spawn_x}, {spawn_y}) "
+            f"angle_deg={spawn.angle} → renderer_angle={start_angle}"
+        )
+
+        # max_walls > 4 saturates the transformer's ±40 CROSS_A/DOT_A
+        # clamp on far walls, but the reference renderer ray-casts in
+        # world coords with no such limit; pick a count that gives the
+        # spawn alcove + the room and corridor visible from it.
+        subset = load_map_subset(
+            wad_path=args.wad,
+            map_name="E1M1",
+            px=spawn_x,
+            py=spawn_y,
+            max_walls=32,
+            tex_size=args.tex_size,
+        )
+        segments = subset.segments
+        textures = subset.textures
+        start_x, start_y = spawn_x, spawn_y
+        max_coord = 100.0
+        still = True
 
     if args.mode == "transformer":
         from torchwright.doom.compile import compile_game, step_frame
@@ -301,7 +343,8 @@ def main():
             d=args.d,
             chunk_size=args.chunk_size,
         )
-        subset = build_scene_subset(segments, textures)
+        if subset is None:
+            subset = build_scene_subset(segments, textures)
 
         def frame_fn(state, inputs):
             return step_frame(module, state, inputs, subset, config, textures=textures)
@@ -333,6 +376,7 @@ def main():
         start_angle,
         total_frames=args.frames,
         wall_threshold=args.wall_threshold,
+        still=still,
     )
 
     print(f"Saving {args.output} (scale={args.scale}x, fps={args.fps})...")

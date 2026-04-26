@@ -19,6 +19,14 @@ app = modal.App("torchwright-walkthrough", image=IMAGE)
 
 
 def _scene_data(scene, tex_size):
+    """Return ``(subset, start_x, start_y, start_angle, max_coord, still)``.
+
+    ``subset`` is a fully-built :class:`MapSubset` ready to feed
+    :func:`step_frame`.  ``still`` is True when the scene should be
+    rendered without wall-following motion (E1M1's 4-wall subset would
+    walk the player out of loaded geometry within a few frames).
+    """
+    from torchwright.doom.map_subset import build_scene_subset, load_map_subset
     from torchwright.reference_renderer.scenes import (
         box_room_textured,
         multi_room_textured,
@@ -29,13 +37,33 @@ def _scene_data(scene, tex_size):
             wad_path="doom1.wad",
             tex_size=tex_size,
         )
-        return segments, textures, 0.0, 0.0, 0, 10.0
-    else:
+        subset = build_scene_subset(segments, textures)
+        return subset, 0.0, 0.0, 0, 10.0, False
+    elif scene == "multi":
         segments, textures = multi_room_textured(
             wad_path="doom1.wad",
             tex_size=tex_size,
         )
-        return segments, textures, -8.0, 0.0, 0, 15.0
+        subset = build_scene_subset(segments, textures)
+        return subset, -8.0, 0.0, 0, 15.0, False
+    else:  # e1m1
+        from torchwright.doom.wad import WADReader
+
+        # Read player-1 spawn (thing type 1) from the WAD.  Angle is in
+        # degrees; convert to the renderer's 0-255 scale.
+        md = WADReader("doom1.wad").get_map("E1M1")
+        spawn = next(t for t in md.things if t.type == 1)
+        spawn_x, spawn_y = float(spawn.x), float(spawn.y)
+        start_angle = round(spawn.angle / 360 * 256) % 256
+        subset = load_map_subset(
+            wad_path="doom1.wad",
+            map_name="E1M1",
+            px=spawn_x,
+            py=spawn_y,
+            max_walls=32,
+            tex_size=tex_size,
+        )
+        return subset, spawn_x, spawn_y, start_angle, 100.0, True
 
 
 def _config(width, height):
@@ -66,13 +94,14 @@ def generate_transformer(
     d_hidden: int = 0,
 ) -> bytes:
     from torchwright.doom.compile import compile_game, step_frame
-    from torchwright.doom.map_subset import build_scene_subset
     from torchwright.doom.walkthrough import generate_walkthrough, save_gif
 
     config = _config(width, height)
-    segments, textures, start_x, start_y, start_angle, max_coord = _scene_data(
+    subset, start_x, start_y, start_angle, max_coord, still = _scene_data(
         scene, tex_size
     )
+    segments = subset.segments
+    textures = subset.textures
 
     print(f"Compiling game graph (walls-as-tokens, {len(segments)} walls)...")
     module = compile_game(
@@ -85,7 +114,6 @@ def generate_transformer(
         device="cuda",
         d_hidden=d_hidden if d_hidden > 0 else None,
     )
-    subset = build_scene_subset(segments, textures)
 
     def frame_fn(state, inputs):
         return step_frame(module, state, inputs, subset, config, textures=textures)
@@ -100,6 +128,7 @@ def generate_transformer(
         start_angle,
         total_frames=frames,
         wall_threshold=1.5,
+        still=still,
     )
 
     gif_path = "/tmp/walkthrough.gif"
@@ -124,7 +153,9 @@ def generate_reference(
     from torchwright.reference_renderer.render import render_frame
 
     config = _config(width, height)
-    segments, textures, start_x, start_y, start_angle, _ = _scene_data(scene, tex_size)
+    subset, start_x, start_y, start_angle, _, still = _scene_data(scene, tex_size)
+    segments = subset.segments
+    textures = subset.textures
 
     def frame_fn(state, inputs):
         new_state = update_state(
@@ -153,6 +184,7 @@ def generate_reference(
         start_angle,
         total_frames=frames,
         wall_threshold=1.5,
+        still=still,
     )
 
     gif_path = "/tmp/reference.gif"

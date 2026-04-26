@@ -28,6 +28,7 @@ from torchwright.doom.wad import (
     Sector,
     Sidedef,
     Subsector,
+    Thing,
     Vertex,
     WADReader,
     _assign_tex_id,
@@ -99,10 +100,32 @@ def test_find_map_missing_raises(wad: WADReader) -> None:
         ("segs", 732),
         ("subsectors", 237),
         ("nodes", 236),
+        ("things", 138),
     ],
 )
 def test_e1m1_lump_counts(e1m1: MapData, lump: str, expected: int) -> None:
     assert len(getattr(e1m1, lump)) == expected
+
+
+def test_e1m1_player_1_spawn(e1m1: MapData) -> None:
+    """E1M1 player-1 start is at the canonical (1056, -3616) facing north.
+
+    Thing type 1 = player-1 start.  Angle is in degrees with 0=east,
+    90=north — matching DOOM editor convention.
+    """
+    spawns = [t for t in e1m1.things if t.type == 1]
+    assert len(spawns) == 1, f"expected exactly one player-1 spawn, got {len(spawns)}"
+    spawn = spawns[0]
+    assert spawn.x == 1056
+    assert spawn.y == -3616
+    assert spawn.angle == 90  # north
+
+
+def test_e1m1_player_starts_present(e1m1: MapData) -> None:
+    """E1M1 has all four player starts (types 1-4) and a deathmatch start (11)."""
+    types_present = {t.type for t in e1m1.things}
+    for player_type in (1, 2, 3, 4):
+        assert player_type in types_present, f"missing player {player_type} start"
 
 
 # ---------------------------------------------------------------------------
