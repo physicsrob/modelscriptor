@@ -563,19 +563,21 @@ feasible but possibly non-optimal.  `forward_compile` accepts it —
 ### Geometry sensitivity
 
 The win-size from CP-SAT versus heuristic depends on residual-stream
-slack.  Measured on the headless DOOM graph (~4.4K nodes):
+slack.  Measured on the headless DOOM graph (~4.4K nodes); each row
+records the ``optimize`` level (and corresponding budget) used:
 
-| geometry            | heuristic | CP-SAT | Δ    | first incumbent | OPTIMAL at |
-|---------------------|----------:|-------:|-----:|----------------:|-----------:|
-| d=2048, d_h=8192    | 61        | 55     | -10% | ~120s           | not in 300s |
-| d=3072, d_h=8192    | 58        | 46     | -21% | ~20s            | ~110s |
-| d=4096, d_h=4096    | 59        | 46     | -22% | (proven)        | ~14s |
+| geometry            | -O / budget | heuristic | CP-SAT | Δ    | first incumbent | OPTIMAL at |
+|---------------------|-------------|----------:|-------:|-----:|----------------:|-----------:|
+| d=2048, d_h=8192    | -O 1 (60s)  | 61        | (none) | n/a  | not in 60s      | not in 60s |
+| d=3072, d_h=8192    | -O 2 (180s) | 58        | 46     | -21% | ~27s            | ~80s       |
+| d=4096, d_h=4096    | -O 1 (60s)  | 59        | 46     | -22% | ~17s            | ~31s       |
 
 At d=2048 the residual cumulative is the binding constraint and
 CP-SAT struggles to close the LB gap within budget.  At d=3072+
-CP-SAT converges optimally in seconds.  The heuristic-fallback
-behavior (when CP-SAT can't find an incumbent) is the right answer
-for d=2048 — users always get a schedule, just not the CP-SAT one.
+CP-SAT converges optimally inside the budget.  The heuristic-
+fallback behavior (when CP-SAT can't find an incumbent) is the
+right answer for d=2048 — users always get a schedule, just not
+the CP-SAT one.
 
 ### Experiments tried that didn't pan out
 
