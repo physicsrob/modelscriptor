@@ -1,8 +1,7 @@
-"""Quantize/dequantize primitives for Phase A token boundaries.
+"""Quantize/dequantize primitives for thinking-token boundaries.
 
-Phase A (see ``docs/design_byte_token_renderer_phase_a.md``) emits
-intermediate values as 16-bit integer tokens at thinking-token
-boundaries.  The transformer graph itself never rounds — the
+Intermediate values cross thinking-token boundaries as 16-bit integer
+token IDs.  The transformer graph itself never rounds — the
 integer-cast happens at the host boundary when a float output is
 interpreted as a ``uint16`` token ID, and when that token ID is
 re-fed as the next step's input.
@@ -69,8 +68,7 @@ def quantize_to_range(
     **LSB granularity.**  When paired with a host-side round-to-uint16
     and a subsequent :func:`dequantize_from_range`, the accumulated
     error is ``(hi - lo) / (2 · (n_levels - 1))`` per quantization
-    boundary.  See ``docs/design_byte_token_renderer_phase_a.md`` for
-    the Phase A value-type budget.
+    boundary.
 
     Args:
         value: Scalar node whose value range sits inside ``[lo, hi]``.

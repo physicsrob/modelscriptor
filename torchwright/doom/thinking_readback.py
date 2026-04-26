@@ -41,9 +41,7 @@ dequantize affine, no W_consumer amplification.  Producers
 :func:`emit_boolean_value_embedding`) leave the K column at 0 in the
 predicted embedding; gray's Hamming-1 margin (≥2) drives host argmax
 to VALUE_k_target, and any non-zero predicted K would bias argmax
-monotonically toward larger k.  See
-``docs/phase_c_part2_int_slot_embedding.md`` for the full design and
-the integer-emit round-trip bug it fixes.
+monotonically toward larger k.
 
 Depth accounting for the emit path (continuous value):
 
@@ -369,13 +367,12 @@ def emit_integer_value_embedding(
     consumer reads via :meth:`ThinkingReadback.get_int_after_last`
     (attention V = K_column).
 
-    Fixes a latent round-trip bug in the prior raw-slot design: a
-    one-hot row lookup put ``raw = (2·k_target+1)/131072`` in the
-    predicted embedding, which the consumer's continuous-path
+    Routing readback through the K column avoids a calibration
+    mismatch present in the older raw-slot design: a one-hot row
+    lookup put ``raw = (2·k_target+1)/131072`` in the predicted
+    embedding, which the consumer's continuous-path
     ``_decode_payload_to_float`` decoded to ``≈ k_target / 9362``, not
-    ``k_target``.  Routing readback through the K column bypasses that
-    calibration mismatch entirely.  See
-    ``docs/phase_c_part2_int_slot_embedding.md``.
+    ``k_target``.
 
     Depth: 2 MLP sublayers (``in_range`` builds the one-hot; the row
     lookup is a single Linear; the trailing K=0 literal folds).
@@ -664,9 +661,6 @@ class ThinkingReadback:
         positions the K column is 0 (either by W_EMBED layout or by
         the ``is_X_value`` softmax gate).  The matched K value IS the
         integer; no dequantize affine is needed.
-
-        See ``docs/phase_c_part2_int_slot_embedding.md`` for the full
-        design.
         """
         cache_key = f"__int__:{name}"
         if cache_key in self._cache:

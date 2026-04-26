@@ -1,9 +1,9 @@
 """Unit tests for ``torchwright.ops.quantization``.
 
 These ops are pure affine transforms — the graph-side portion of the
-Phase A token-boundary quantization.  The actual LSB rounding happens
-in the host's ``uint16`` cast outside the graph, which the tests
-below simulate explicitly with ``torch.round``.
+thinking-token boundary quantization.  The actual LSB rounding
+happens in the host's ``uint16`` cast outside the graph, which the
+tests below simulate explicitly with ``torch.round``.
 
 Per-op reference-eval tests cover:
 
@@ -12,13 +12,9 @@ Per-op reference-eval tests cover:
   cast sits between (the ops are exact);
 - the LSB granularity ``(hi - lo) / (2 · (n_levels - 1))`` when a
   simulated host round *does* sit between;
-- the three-boundary accumulation estimate from the design doc
-  (~0.003 at the aggressive end of the resolved-position chain);
-- parametric coverage of every value-type mapping in the Phase A
-  design table.
-
-See ``docs/design_byte_token_renderer_phase_a.md`` §Quantization for
-the value-type budget these tests pin.
+- a three-boundary accumulation estimate (~0.003 at the aggressive
+  end of the resolved-position chain);
+- parametric coverage of the established value-type mappings.
 """
 
 from __future__ import annotations
@@ -35,9 +31,9 @@ from torchwright.ops.quantization import (
     quantize_to_range,
 )
 
-# Value-type table from docs/design_byte_token_renderer_phase_a.md §Quantization.
-#
-#                       (lo,   hi)     expected_resolution (design doc)
+# Value-type table: per-name (lo, hi) range and the expected
+# 16-bit resolution (LSB step) those bounds imply.
+#                       (lo,   hi)     expected_resolution
 DESIGN_TABLE: list[tuple[str, float, float, float]] = [
     ("cross_dot_a_b", -40.0, 40.0, 0.0012),
     ("t_lo_t_hi", 0.0, 1.0, 0.000015),
@@ -151,12 +147,11 @@ def test_roundtrip_with_host_cast_matches_design_table(
         f"{name}: max roundtrip error {max_err:.2e} exceeds LSB half-step "
         f"{lsb_half:.2e}"
     )
-    # Cross-check the design table: the "Resolution at 16-bit" column
-    # in docs/design_byte_token_renderer_phase_a.md records the LSB step
+    # Cross-check expected_resolution: this column is the LSB step
     # (level spacing), not the worst-case error.  Round-tripped errors
     # fall in ``[0, lsb_step / 2]``.
     assert math.isclose(lsb_step, expected_resolution, rel_tol=0.05), (
-        f"{name}: LSB step {lsb_step:.6e} disagrees with design-table "
+        f"{name}: LSB step {lsb_step:.6e} disagrees with expected "
         f"resolution {expected_resolution:.6e}"
     )
 

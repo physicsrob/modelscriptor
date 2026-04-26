@@ -62,9 +62,6 @@ amplification.  Producers (``emit_integer_value_embedding``,
 predicted embedding — gray's Hamming-1 margin already drives the
 host argmax to the right VALUE_k row, and any non-zero predicted K
 would bias argmax monotonically toward larger k.
-
-See ``docs/phase_c_part2_int_slot_embedding.md`` for the design
-rationale and the integer-emit bug being fixed.
 """
 
 from __future__ import annotations
@@ -183,8 +180,7 @@ def _category_code(name: str) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Vocabulary ID allocation (matches docs/phase_a_plan.md §"Vocabulary ID
-# ranges" exactly).
+# Vocabulary ID allocation.
 # ---------------------------------------------------------------------------
 
 _VALUE_ID_BASE = 0  # 0 .. 65535
@@ -499,8 +495,7 @@ assert len(THINKING_IDENTIFIER_NAMES) == 20
 # identifier step runs ``quantize_to_range(value, lo, hi)`` to convert
 # its float into a continuous float in ``[0, N_VALUES - 1]``; the
 # consuming step runs ``dequantize_from_range(q, lo, hi)`` to get back
-# the float.  Single LSB == (hi - lo) / (N_VALUES - 1) per design-doc
-# table (``docs/design_byte_token_renderer_phase_a.md``).
+# the float.  Single LSB == (hi - lo) / (N_VALUES - 1).
 #
 # For integer-valued ranges (BSP_RANK 0..7; 0/1 booleans for
 # IS_RENDERABLE / HIT_*; 0..255 for RESOLVED_ANGLE), the identifier

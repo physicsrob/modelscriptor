@@ -2,7 +2,6 @@
 
 Properties verified:
 
-* Vocabulary size and ID range agree with ``docs/phase_a_plan.md``.
 * Every named vocab entry round-trips: ``DOOM_VOCAB[vocab_id(n)] == n``.
 * VALUE rows share the ``E8_VALUE`` category code, carry ``k/65535``
   in the raw slot, and a 16-wide ±1 Gray code in the payload.
