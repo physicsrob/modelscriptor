@@ -16,505 +16,731 @@ forward pass.
 Each frame, the transformer processes this sequence:
 
 ```
-TEX_COL×(num_tex × tex_w) → INPUT → BSP_NODE×M → WALL×N →
-EOS → PLAYER_X → PLAYER_Y → PLAYER_ANGLE →
-[SORTED_WALL → RENDER×k]×N  (interleaved sort + render)
+TEX_COL×(num_tex × tex_w) →
+INPUT → BSP_NODE×M → WALL×N → EOS →
+PLAYER_X → PLAYER_Y → PLAYER_ANGLE →
+[THINKING_WALL_n → (id → VALUE)×17]×N → (RESOLVED → VALUE)×3 →
+[SORTED_WALL → SORT_RESULT → VALUE → RENDER×k]×N
 ```
 
-These compile into four phases:
+These compile into five phases:
 
 | Phase | Tokens | Mode | Typical count |
 |-------|--------|------|---------------|
 | -1 (Tex) | TEX_COL | Prefill | num_tex × tex_w (e.g. 512) |
 | 0 (Prefill) | INPUT + BSP_NODE + WALL + EOS | Prefill | 1 + M + N + 1 (e.g. 58) |
-| 0b (Player) | PLAYER_X + PLAYER_Y + PLAYER_ANGLE | Autoregressive | 3 |
-| 1+2 (Sort+Render) | SORTED_WALL + RENDER (interleaved) | Autoregressive | N + dynamic (~258) |
+| 1 (Player) | PLAYER_X + PLAYER_Y + PLAYER_ANGLE | Autoregressive | 3 |
+| 2 (Thinking) | THINKING_WALL markers + per-wall identifier+VALUE pairs + RESOLVED identifier+VALUE pairs | Autoregressive | N×(1 + 17×2) + 3×2 (e.g. 286) |
+| 3 (Sort+Render) | SORTED_WALL + SORT_RESULT id + VALUE + RENDER (interleaved) | Autoregressive | 3N + render columns (variable) |
 
-Prefill tokens are processed in a single batched forward pass.
-Dependencies between them (WALL reads INPUT's broadcasts, WALL reads
-BSP's side decisions) are resolved internally through attention layers
-within that pass — no autoregressive stepping needed. Autoregressive
-tokens are generated one at a time — each token's output determines
-the next token's input.
+Prefill tokens (phases -1 and 0) are processed in a single batched
+forward pass. The two prefill broadcasts (INPUT → all positions
+for velocity / trig / new angle, BSP → all positions for
+`side_P_vec`) resolve internally through attention layers within
+that pass — no autoregressive stepping needed. Autoregressive
+tokens (phases 1+) are generated one at a time — each token's
+output determines the next token's input.
 
-Sort and render are interleaved: a SORTED_WALL token picks the next
-closest wall and sets up its identity as feedback, then RENDER tokens
-paint that wall's columns.  When a RENDER token finishes the last
-column, it emits ``token_type = E8_SORTED_WALL`` so the transformer
-picks the next wall.  The host just copies overlaid outputs to the
-next input — it never inspects token types or patches wall identity.
+The thinking phase is a sequential cascade: each per-wall block
+emits 17 named scalar values (BSP rank, renderability, rotation
+products, FOV-clip parameters, projected screen columns, collision
+flags) as its own VALUE token. After all 8 walls have emitted, three
+RESOLVED identifiers fire, each consuming the global hit aggregates
+to produce post-collision player state. Sort and render then
+interleave: a 3-position SORTED pipeline picks the next wall and
+emits its index as a VALUE token, after which RENDER tokens paint
+that wall's columns. When RENDER finishes the last column, it
+emits the next SORTED_WALL marker as the next token, and the
+transformer picks the next wall.
 
-## Token Types
+## Token Embedding (`W_EMBED`)
 
-Ten token types, identified by E8 spherical codes (8-dimensional unit
-vectors from the E8 lattice):
+Every token is a single 16-bit integer ID. The host feeds
+`token_ids` as a 1-wide input slot; the graph looks the ID up in
+`W_EMBED` (a `(V, D_EMBED)` matrix, `V = 65576`, `D_EMBED = 49`)
+to produce a 49-wide residual leaf at every position. On the
+output side a 49-wide embedding emit lands in the residual stream
+at every position, gets projected through `W_EMBED.T`, and is
+argmaxed by the host wrapper to pick the next ID.
+
+The 49 columns split into four blocks:
 
 ```
-TOKEN_INPUT          (0)    TOKEN_TEX_COL        (5)
-TOKEN_WALL           (1)    TOKEN_BSP_NODE       (7)
-TOKEN_EOS            (2)    TOKEN_PLAYER_X     (240)
-TOKEN_SORTED_WALL    (3)    TOKEN_PLAYER_Y     (241)
-TOKEN_RENDER         (4)    TOKEN_PLAYER_ANGLE (242)
+cols [ 0 :  8] — E8 category code           (per-category ±1 entries)
+cols [ 8 :  9] — raw slot                   (Gray-code "x" coordinate for VALUE_k)
+cols [ 9 : 25] — Gray-code payload          (16-wide ±1, Hamming-1 between adjacent k)
+cols [25 : 26] — K slot                     (k for VALUE_k, k ≤ 255; else 0)
+cols [26 : 47] — slot one-hot               (21-wide ±1, +1 at the row's own slot)
+cols [47 : 48] — is_any_identifier          (±1)
+cols [48 : 49] — is_value_category          (±1)
 ```
 
-The E8 codes serve as position encoding. Texture IDs also map to E8
-vectors starting at index 8, so the same embedding space covers both
-token type and texture identity.
+**E8 codes.** Each named category gets an 8-dimensional unit
+vector from the E8 lattice (240 of them available). The codes have
+large pairwise distances (self-dot 1600, cross-dot ≤ 800), which
+makes `equals_vector` checks against a known code robust to
+numerical noise. All 65,536 VALUE rows share one code, all 8
+THINKING_WALL markers each get their own, every identifier gets
+its own, and every prompt-position category gets its own.
+
+**Raw slot + Gray code.** The 16-bit VALUE space is encoded
+together: a continuous "x = (2k+1)/131072" raw position plus a
+16-wide ±1 bit pattern that has Hamming distance 1 between
+adjacent k. The producer (`encode_value_binary`) computes the bits
+from triangle waves over x via two `piecewise_linear` sublayers
+plus a packed `compare`-against-0.5 sublayer. The argmax against
+`W_EMBED.T` resolves to the nearest VALUE_k.
+
+**K slot.** For VALUE_k with k ≤ 255 (`MAX_INT_K`), the K column
+holds the integer k literally. A consumer that wants to read back
+an integer (today: SORT_RESULT carrying wall_index 0..7) does
+`attend_most_recent_matching(value=K_column)` and the matched K
+value *is* the integer — no decode Linear. This also bypasses a
+calibration trap in the older raw-slot decode: a one-hot row
+lookup put `raw = (2k+1)/131072` in the predicted embedding, which
+the continuous-path decoder mapped to `≈ k / 9362` instead of `k`.
+
+**Type-tag block (cols 26..49).** The slot one-hot is
+`+1` at the row's own slot column for IDENTIFIER rows and `-1`
+everywhere else (including non-identifier rows). `is_any_identifier`
+is `+1` for the 21 identifier rows, `-1` elsewhere.
+`is_value_category` is `+1` for all 65,536 VALUE rows, `-1`
+elsewhere. Storing these as ±1 (not {0, 1}) means a per-position
+direct extract IS the boolean — a `cond_gate` consumer doesn't
+need a `bool_to_01` shim. Without this block the same flags would
+take ~4–5 layers of `equals_vector` + `cond_gate` to construct
+freshly at every consumer; with it they're a single `extract_from`
+at depth 1.
+
+## Identifiers (21 total)
+
+The identifiers are the named scalars that flow through the
+thinking phase and the sort phase. Each has its own vocab row and
+its own column in the slot one-hot block.
+
+**Per-wall (17):** `BSP_RANK`, `IS_RENDERABLE`, `CROSS_A`, `DOT_A`,
+`CROSS_B`, `DOT_B`, `T_STAR_L`, `T_STAR_R`, `T_LO`, `T_HI`, `COL_A`,
+`COL_B`, `VIS_LO`, `VIS_HI`, `HIT_FULL`, `HIT_X`, `HIT_Y`. Emitted
+once per wall in this exact order.
+
+**RESOLVED (3):** `RESOLVED_X`, `RESOLVED_Y`, `RESOLVED_ANGLE`.
+Emitted once per frame after the last wall's `HIT_Y`.
+
+**Sort phase (1):** `SORT_RESULT`. Emitted once per sort step at
+the SORT_RESULT position, carrying the picked wall index.
+
+Each identifier has a declared `(lo, hi)` float range in
+`VALUE_RANGE_BY_NAME` (e.g. `BSP_RANK ∈ [0, 7]`,
+`CROSS_A ∈ [-40, 40]`, `VIS_LO ∈ [-2, 122]`,
+`SORT_RESULT ∈ [0, 7]`). The producer scales its float into
+`[0, 65535]` via `quantize_to_range`; the host's argmax against
+`W_EMBED.T` rounds to a uint16 token ID; the consumer scales back
+via `dequantize_from_range`. The boundary contributes one
+`(hi - lo) / (2·65535)` LSB of error per quantization round-trip.
+
+## Token Types (E8 category codes)
+
+Ten prompt-side and decode-side categories use distinct E8 codes;
+the 21 identifiers and the 65,536 VALUE rows each get their own
+codes too. The full assignment lives in `embedding._CATEGORY_INDEX`.
+
+The prompt-position codes:
+
+```
+INPUT        BSP_NODE    WALL         EOS         TEX_COL
+PLAYER_X     PLAYER_Y    PLAYER_ANGLE
+SORTED_WALL  RENDER      DONE
+```
+
+Texture IDs map to E8 vectors at offset 8, so the same code space
+covers token type and texture identity.
 
 ## Stages
 
 ### TEX_COL — Texture Data (Phase -1)
 
-One token per column of each texture. Each carries the raw RGB pixel
-data for that column (`tex_h × 3` floats) plus an E8 code identifying
-which texture it belongs to and a one-hot encoding of its column index
-within that texture.
+One token per column of each texture. Each carries the raw RGB
+pixel data for that column (`tex_h × 3` floats), an E8 code
+identifying which texture it belongs to, and a one-hot encoding of
+its column index within that texture.
 
 These tokens sit in the KV cache for the rest of the frame. When
 RENDER tokens need texture pixels, they retrieve them via
-`attend_argmax_dot` — a dot-product attention where the query encodes
-(texture_id, column_index) and the best-matching TEX_COL position's
-pixel data is returned as the value.
+`attend_argmax_dot` — a dot-product attention where the query
+encodes (texture_id, column_index) and the matching TEX_COL
+position's pixel data is returned as the value.
 
-The stage's only computation is converting the host-fed column index
-into a one-hot vector (`tc_onehot_01`) used as the attention key.
+The stage's only computation is converting the host-fed column
+index into a one-hot vector (`tc_onehot_01`) used as the attention
+key.
 
 ### INPUT — Player Controls (Phase 0)
 
-A single token. Receives the player's current angle and six boolean
-movement flags (forward, backward, turn left, turn right, strafe
-left, strafe right). Does not receive player position — that is
-consumed by BSP, WALL, and EOS directly.
+A single token. Receives the player's current angle and six
+boolean movement flags (forward, backward, turn left, turn right,
+strafe left, strafe right). Does not receive player position —
+that goes in directly via `PLAYER_X`/`PLAYER_Y`.
 
 Computes:
 
 - **New angle**: `(old_angle + turn_right×speed - turn_left×speed) mod 256`.
   Angles are integers 0..255 (a full circle in 256 steps).
-- **Velocity**: `(dx, dy)` from the new angle and movement flags.
-  Forward/backward move along the facing direction; strafing moves
-  perpendicular. Uses `piecewise_linear` trig lookups over the
-  256-entry trig table.
-- **Trig values**: `(cos, sin)` of the new angle, needed by
-  downstream stages for coordinate rotations.
+- **Velocity**: `(vel_dx, vel_dy)` from the new angle and movement
+  flags. Forward/backward move along the facing direction;
+  strafing moves perpendicular. Uses `piecewise_linear` lookups
+  over a 256-entry trig table.
+- **Trig values**: `(move_cos, move_sin)` of the new angle.
 
-All five derived values (vel_dx, vel_dy, move_cos, move_sin,
-new_angle) are **broadcast to every position** via
-`attend_mean_where`. Since exactly one position has `is_input=1`, the
-"mean" is just that position's value — every subsequent token can read
-the player's velocity and facing direction via attention.
+All five derived values are broadcast to every position via
+`attend_mean_where`. Since exactly one position has `is_input=1`,
+the "mean" is just that position's value — every subsequent token
+can read the player's velocity and facing direction via attention.
 
 ### BSP_NODE — Spatial Classification (Phase 0)
 
 M tokens (typically 48), one per splitting plane of the BSP tree.
 
-Each BSP_NODE token carries a normalized plane `(nx, ny, d)` and
-classifies the player as FRONT or BACK:
+Each token carries a normalized plane `(nx, ny, d)` and classifies
+the player as FRONT or BACK:
 
 ```
 side_P = sign(nx × player_x + ny × player_y + d)
 ```
 
-The result (1 for FRONT, 0 for BACK) is spread into slot `i` of an
-M-wide vector via the token's `bsp_node_id_onehot`. An
-`attend_mean_where` over all BSP_NODE positions gathers these into a
-shared `side_P_vec` — a binary vector available at every position
-telling which side of every BSP plane the player is on.
+The result (1 for FRONT, 0 for BACK) is spread into slot `i` of
+an M-wide vector via the token's `bsp_node_id_onehot`. An
+`attend_mean_where` over all BSP_NODE positions gathers these into
+a shared `side_P_vec` — a binary vector available at every
+position telling which side of every BSP plane the player is on.
+The thinking-phase BSP_RANK identifier consumes `side_P_vec` to
+compute each wall's BSP rank.
 
-WALL tokens consume `side_P_vec` to compute their BSP rank (see
-below).
+### WALL — Geometry Carrier (Phase 0)
 
-### WALL — Geometry + Physics (Phase 0)
+N tokens (typically 8), one per wall segment. After the Phase B
+gut, this stage is just a thin data carrier:
 
-N tokens (typically 8), one per wall segment. The workhorse of the
-prefill phase. Each WALL token performs several computations on its
-wall segment, then packs the results into a payload for the sort
-stage:
+- Raw geometry (`ax`, `ay`, `bx`, `by`, `tex_id`,
+  `wall_bsp_coeffs`, `wall_bsp_const`) is host-supplied at every
+  WALL position and read directly by consumers via attention.
+- The stage's only computation is `wall_index_neg_sq = -wall_index²`,
+  the second channel of the quadratic-equality K used by every
+  attention that picks a wall by index. The first channel
+  (`wall_index` itself) is forwarded unchanged from the host
+  input. One `square` MLP sublayer.
 
-**1. Collision detection.**
-Three ray-segment intersection tests: the player's full velocity
-vector `(vel_dx, vel_dy)`, an x-only ray `(vel_dx, 0)`, and a y-only
-ray `(0, vel_dy)`. Each produces a hit/miss flag (±1). Uses
-`piecewise_linear_2d` products to compute parametric intersection
-coordinates and validity checks.
+All collision detection, BSP rank computation, renderability
+gating, FOV clipping, and screen-column projection that previous
+designs did at the WALL token now happen inside the thinking
+phase, with each result emitted as its own identifier-VALUE
+pair.
 
-The axis-separated rays enable wall sliding in the EOS stage: if the
-full velocity hits a wall but the x-only ray doesn't, the player can
-still slide along the x axis (see EOS below).
+### EOS — End of Prompt (Phase 0)
 
-**2. BSP rank.**
-`rank = dot(wall_bsp_coeffs, side_P_vec) + wall_bsp_const` — a dot
-product of host-precomputed coefficients against the BSP side
-decisions. Produces a clean integer in 0..N-1 that gives the
-front-to-back ordering of walls from the player's current position.
-The BSP tree structure guarantees these ranks are a permutation — no
-ties — which is critical for the sort stage's argmin attention to
-produce clean selections.
+A single token marking the end of the prefill. After the Phase A
+gut, EOS performs no graph computation — it exists purely as a
+boundary marker so the prefill batch has a known endpoint. The
+PLAYER tokens fire next.
 
-**3. Visibility column range.**
-Projects the wall onto the screen to determine which columns
-(`vis_lo`, `vis_hi`) it subtends. Involves rotating both wall
-endpoints into the player's frame, clipping against the field-of-view
-cone (two half-plane tests), and projecting the clipped endpoints via
-`atan(cross/dot)` (approximated by `low_rank_2d` with rank 3). Gated
-to 0 for non-renderable walls.
+### PLAYER_X / PLAYER_Y / PLAYER_ANGLE — State Broadcast (Phase 1)
 
-A wall is **renderable** if it is a real wall token, its central ray
-is not parallel to the wall (`|sort_den| > 0.05`), and the
-intersection is in front of the player (`sort_num_t × sign(sort_den)
-> 0`).
+Three tokens emitted before the thinking phase.
 
-**4. Payload packing.**
-All per-wall data is concatenated into a single `sort_value` vector
-(8 + max_walls wide) for the SORTED stage to retrieve via attention.
-Layout (from `wall_payload.py`):
-
-```
-[0..5)    wall geometry       (ax, ay, bx, by, tex_id)
-[5..6)    bsp_rank            (the sort score)
-[6..8)    visibility columns  (vis_lo, vis_hi)
-[8..8+N)  position_onehot     (wall identity one-hot)
-```
-
-**Indicators_above.**
-A max_walls-wide thermometer vector where slot `c` is 1 iff
-`bsp_rank >= c` AND the wall is renderable. This is the key-side
-basis for the SORTED stage's threshold-based argmin attention.
-
-### EOS — Collision Resolution (Phase 0)
-
-A single token marking the end of prefill.
-
-Aggregates the per-WALL hit flags via `attend_mean_where` over WALL
-positions. If the averaged flag for any ray exceeds a threshold
-(0.05), at least one wall was hit. Applies axis-separated wall
-sliding — movement on an axis is blocked only if **both** the full
-velocity ray and that axis's solo ray hit a wall:
-
-- X-axis: blocked only if both the full ray and the x-only ray hit.
-- Y-axis: blocked only if both the full ray and the y-only ray hit.
-
-This is what enables wall sliding: if the player walks diagonally
-into a wall, the full velocity ray hits, but the perpendicular
-axis's solo ray may miss, allowing the player to slide along the
-wall on that axis.
-
-The resolved `(x, y)` is emitted as overflow outputs
-(`eos_resolved_x`, `eos_resolved_y`). The new angle (unchanged by
-collision — EOS only resolves position) is emitted separately as
-`eos_new_angle`. The host reads all three and feeds them to the
-PLAYER tokens in Phase 0b.
-
-### PLAYER — State Broadcast (Phase 0b)
-
-Three tokens, emitted after EOS and before SORTED:
-
-- **PLAYER_X**: broadcasts the resolved x position to all positions.
-- **PLAYER_Y**: broadcasts the resolved y position to all positions.
+- **PLAYER_X**: broadcasts the pre-collision x position to all
+  positions.
+- **PLAYER_Y**: broadcasts the pre-collision y position to all
+  positions.
 - **PLAYER_ANGLE**: looks up `cos(θ)` and `sin(θ)` via
-  `piecewise_linear` trig tables and broadcasts both to all positions.
+  `piecewise_linear` trig tables and broadcasts both.
+  PLAYER_ANGLE also emits `THINKING_WALL_0` as its next-token
+  prediction so the autoregressive loop steps directly into the
+  thinking phase without a host nudge.
 
-The host feeds the resolved player state (read from EOS overflow
-outputs) as the `player_x`, `player_y`, `player_angle` inputs at
-these three positions. The `attend_mean_where` broadcasts land in
-the KV cache, so all downstream tokens (SORTED, RENDER) can read the
-post-collision player position and trig values via attention.
+The host feeds the *pre-collision* `(x, y, angle)`; collision
+resolution happens later in the thinking phase via the RESOLVED
+identifiers, whose emitted values RENDER consumes via readback.
 
-### SORTED_WALL — Front-to-Back Sort
+### THINKING_WALL — Per-Wall State Machine (Phase 2)
 
-Interleaved with RENDER — one SORTED_WALL token runs before each
-wall's RENDER tokens. Each picks the next-closest wall in BSP rank
-order.
+The bulk of the per-frame compute. For each wall index
+`n ∈ [0, N)` the host emits a `THINKING_WALL_n` marker token, then
+the transformer drives 17 alternating identifier-VALUE pairs:
 
-The attention primitive is `attend_argmin_above_integer`: given a
-threshold one-hot (derived from the feedback-driven
-`sort_position_index`), it finds the WALL position with the smallest
-BSP rank strictly exceeding that threshold. The key-side
-`indicators_above` thermometer encodes both the rank comparison and
-the renderability gate — non-renderable walls have all-zero indicators
-and are invisible to the attention.
+```
+THINKING_WALL_n
+  BSP_RANK         VALUE(bsp_rank)        # integer 0..N-1
+  IS_RENDERABLE    VALUE(is_renderable)   # 0 or 1
+  CROSS_A          VALUE(cross_a)         # rotation product, [-40, 40]
+  DOT_A            VALUE(dot_a)           #   "
+  CROSS_B          VALUE(cross_b)
+  DOT_B            VALUE(dot_b)
+  T_STAR_L         VALUE(t_star_L)        # left-FOV clip parameter, [-2, 2]
+  T_STAR_R         VALUE(t_star_R)        # right-FOV clip parameter
+  T_LO             VALUE(t_lo)            # FOV clip min, [0, 1]
+  T_HI             VALUE(t_hi)            # FOV clip max
+  COL_A            VALUE(col_a)           # endpoint-A screen column, [-2, W+2]
+  COL_B            VALUE(col_b)           #   "
+  VIS_LO           VALUE(vis_lo)          # visible column min
+  VIS_HI           VALUE(vis_hi)          # visible column max
+  HIT_FULL         VALUE(hit_running_or)  # collision flag, running OR
+  HIT_X            VALUE(hit_x_running_or)
+  HIT_Y            VALUE(hit_y_running_or)
+```
 
-Each SORTED token:
+35 tokens per wall (1 marker + 17 identifier+VALUE pairs); with 8
+walls that's 280 tokens. The transformer drives the marker→id
+and id→VALUE next-token predictions; the host echoes them back
+unchanged.
 
-1. Converts `sort_position_index` to a threshold one-hot (clamped to
-   `[0, max_walls-1]` for exhaustion safety).
-2. Runs `attend_argmin_above_integer` over WALL positions, retrieving
-   the packed payload of the winning wall.
-3. Unpacks the payload into visibility columns, wall identity one-hot,
-   texture ID, and BSP rank.
-4. Detects sort exhaustion: if `sort_position_index > sel_bsp_rank`,
-   the attention averaged garbage (no valid keys above threshold).
-   Emits `sort_done = +1` so the host can stop early.
-5. Outputs `sort_position_index + 1` so the next SORTED token picks
-   the next wall in rank order.
+**Three primary cross-position reads at each identifier step:**
 
-The threshold advances by 1 each step: SORTED outputs
-`position_index + 1`, RENDER forwards it unchanged.
+1. **Current wall identity.** `attend_most_recent_matching` fires
+   on `THINKING_WALL_n` markers and returns the most recent
+   marker's `n`. Determines which wall this position is computing
+   for.
+2. **Wall geometry.** A 2-wide quadratic-equality `attend_argmax_dot`
+   keys on `(wall_index, -wall_index²)` against WALL prefill
+   positions and reads the value block
+   `(wall_ax, wall_ay, wall_bx, wall_by, wall_bsp_coeffs, wall_bsp_const)`.
+   Same shape attention as in the SORTED stage; see "Quadratic-
+   equality attention" below.
+3. **Prior identifier values.** `ThinkingReadback.get_value_after_last(name)`
+   runs `attend_most_recent_matching` against thinking-VALUE
+   positions whose preceding identifier was `name`, returning the
+   prior value's raw slot decoded back to a float. Lets a step
+   read what an earlier identifier emitted (for example, `T_LO`
+   reads `T_STAR_L` and `T_STAR_R` via this path instead of
+   recomputing the FOV clip).
 
-**Feedback to RENDER.** At each SORTED position, the overlaid outputs
-carry the selected wall's identity (`sel_onehot`, `vis_lo`, `vis_hi`,
-`sel_tex_id`) plus `render_col = vis_lo` and `render_chunk_k = 0`.
-The host copies these to the next token's input via standard feedback
-— no caching, no conditional logic.  The SORTED token also outputs
-`token_type = E8_RENDER` so the next token runs the RENDER stage.
+**Two classes of identifier computation:**
 
-### RENDER — Pixel Generation
+- **Base values** (BSP_RANK, IS_RENDERABLE, CROSS/DOT, HIT_*):
+  derived from first principles using the attended wall geometry,
+  the BSP `side_P_vec`, and the player pre-collision pose. Math
+  is the same ray-segment intersection / atan projection / FOV
+  clipping that older designs ran at the WALL token.
+- **Derived values** (T_STAR_L/R, T_LO, T_HI, COL_A/B, VIS_LO,
+  VIS_HI): read CROSS/DOT/T/COL from the KV cache via
+  `ThinkingReadback` and apply the next layer of clip / project
+  math. The derivation chain is split across slots so each step's
+  own depth is small (~12 ops at the deepest slot).
 
-The pixel-producing token.  Each paints a vertical chunk of one screen
-column.  Wall identity comes from discrete overlaid inputs
-(`render_wall_j_onehot`, `render_tex_id`, `render_vis_lo`,
-`render_vis_hi`) set by the preceding SORTED_WALL token and forwarded
-unchanged by RENDER tokens within the same wall.
+**Running-OR HIT_* accumulators.** Each `HIT_FULL` thinking token
+emits not just *this* wall's collision flag but the OR of it with
+the previous `HIT_FULL` value read from the KV cache:
 
-**Per-token computation:**
+```
+emitted = saturate(this_walls_flag + prev_HIT_FULL_value)
+```
 
-1. **Wall geometry attention.** Attend to the WALL position matching
-   `render_wall_j_onehot` and read raw geometry `(ax, ay, bx, by)`.
+`saturate(x) = min(1, max(0, x))` clamps the OR result. By the
+time wall N-1's `HIT_FULL` fires, the emitted value is the global
+OR across all walls. Wall 0 reads zero from the empty cache, the
+OR identity. Same structure for `HIT_X` and `HIT_Y`. The RESOLVED
+identifiers later read these globals as scalars via a single
+attention hop, with no cross-position aggregation needed.
 
-2. **Render precomputation.** From raw geometry plus player state
-   (position and cos/sin from PLAYER broadcasts), compute the rotation
-   products `(sort_den, C, D, E, sort_num_t)` and derive `H_inv`.
-   These are the same quantities the WALL stage used to compute in
-   earlier designs — now they're computed fresh at each RENDER token
-   from the raw wall coordinates and player state.
+**RESOLVED identifiers (frame boundary).** After the last wall's
+`HIT_Y`, three tokens fire:
 
-3. **Active column.** The active column is `render_col`.  SORTED sets
-   this to `vis_lo` for each new wall; the state machine advances it
-   on column transitions.
+```
+RESOLVED_X       VALUE(resolved_x)
+RESOLVED_Y       VALUE(resolved_y)
+RESOLVED_ANGLE   VALUE(resolved_angle)
+```
 
-4. **Angle offset.** `angle_offset = (col × fov / W) - fov/2` — the
-   horizontal angle of this column relative to the screen center, in
-   trig-table steps (0..255 units).
+Each reads the global aggregates and applies axis-separated wall
+sliding:
 
-5. **Wall height.** `tan(angle_offset)` via piecewise_linear, then:
-   ```
-   den_over_cos = sort_den - C × tan(offset)
-   wall_height  = H_inv × |den_over_cos|
-   ```
-   The first line is the per-column horizontal projection factor. The
-   second scales by the wall's precomputed height reciprocal. Uses
-   `piecewise_linear_2d` with log-spaced breakpoints for `H_inv`
-   (values span 0.01 to ~H/0.3).
+```
+any_hit_full = readback("HIT_FULL") > 0.5
+any_hit_x    = readback("HIT_X")    > 0.5
+any_hit_y    = readback("HIT_Y")    > 0.5
 
-6. **Texture column.** Determines which column of the wall's texture
-   maps to this screen column:
-   ```
-   abs_nuc = |D + E × tan(offset)|
-   tex_col = |{k : tex_w × abs_nuc >= k × abs_den}|
-   ```
-   This is a thermometer comparison — no division needed. Each
-   threshold `k` is an exact `multiply_const` + `subtract` +
-   `compare`, so the only approximation error comes from the upstream
-   `piecewise_linear_2d` that produced `abs_nuc`.
+use_new_x = NOT(any_hit_full AND any_hit_x)   # block X only if both rays hit
+use_new_y = NOT(any_hit_full AND any_hit_y)   # block Y only if both rays hit
 
-7. **Texture fetch.** `attend_argmax_dot` retrieves the pixel data
-   from the matching TEX_COL position in the KV cache. The query
-   is `(tex_id_e8, scaled_col_onehot)` — the E8 code of the
-   texture (looked up via piecewise_linear from the integer tex_id)
-   concatenated with a scaled one-hot of the texture column. The
-   TEX_COL key is `(texture_id_e8, scaled_tc_onehot_01)`. The
-   dot product is largest at the matching (texture, column) pair.
+resolved_x = select(use_new_x, player_x + vel_dx, player_x)
+resolved_y = select(use_new_y, player_y + vel_dy, player_y)
+```
 
-8. **Chunk fill.** Paints `chunk_size` rows (default 20) of the
-   column. For each row, computes the texture row index via
-   `floor((y - wall_top) × tex_height / wall_height)`, extracts the
-   RGB from the texture column via `dynamic_extract`, and composites
-   over ceiling/floor colors using `in_range` masks.
+`RESOLVED_ANGLE` is just the `INPUT` stage's post-turn angle —
+collision doesn't rotate the player. RENDER reads
+`resolved_x` / `resolved_y` later via the same readback machinery.
 
-9. **State transitions.** Three mutually exclusive cases:
-   - **More chunks**: `active_start + chunk_size < wall_bottom` —
-     stay on this column, advance `chunk_k` by 1.
-     Next token type: `E8_RENDER`.
-   - **Advance column**: no more chunks, `active_col + 1 <= vis_hi`
-     — move to the next column, reset `chunk_k` to 0.
-     Next token type: `E8_RENDER`.
-   - **Advance wall**: no more chunks, no more columns — add
-     `render_wall_j_onehot` to `render_mask`.  If all walls masked,
-     set `done = +1`.  Otherwise set next token type to
-     `E8_SORTED_WALL` so the transformer picks the next wall.
-     (`sort_position_index` is forwarded unchanged — SORTED
-     increments it on its own turn.)
+### SORTED — Front-to-Back Selection (Phase 3)
+
+Each wall transition fires a 3-position pipeline:
+
+```
+SORTED_WALL marker → SORT_RESULT id → SORT_RESULT VALUE → RENDER...
+```
+
+The marker fires at the start of each new wall transition;
+`wall_counter` (an autoregressive 1-wide overlay) tracks "how many
+walls picked so far," starting at 0.
+
+**SORT_RESULT id position — the quadratic-equality attention.** Goal:
+pick the renderable wall whose `bsp_rank == wall_counter`.
+Expand the squared distance:
+
+```
+score(key) = -(bsp_rank - N)² = -bsp_rank² + 2·N·bsp_rank - N²
+```
+
+The `-N²` term is query-only and falls out of softmax. The
+remaining dot product splits into:
+
+```
+query at SORT_RESULT id  : [2N, 1]
+key at BSP_RANK position : [bsp_rank, -bsp_rank²]   (renderable)
+key elsewhere            : [-100, -1000]            (sentinel)
+```
+
+`match_gain = 20` over a unit score gap drives softmax
+concentration above 0.999 on the matching wall. Sentinel keys
+(non-renderable walls and non-BSP_RANK positions) score so far
+below the matching wall that they fall out entirely. The
+attention's V carries `[wall_index_onehot, bsp_rank_scalar]` — the
+picked wall's identity one-hot (decoded to a scalar via a Linear
+over `[0, 1, …, max_walls-1]`) plus its BSP rank (used post-hoc
+for the exhaustion check).
+
+**Exhaustion detection.** When `wall_counter` exceeds the number
+of renderable walls, no wall's rank matches; softmax concentration
+falls and the picked wall's rank disagrees with `wall_counter`.
+The same attention also returns the picked rank; a post-hoc
+`compare(picked_rank, wall_counter)` produces `sort_done`, which
+the host reads from overflow and uses to terminate.
+
+**SORT_RESULT VALUE position.** The picked wall_index is emitted
+as a 16-bit VALUE token via `emit_integer_value_embedding`. The
+predicted embedding carries the Gray code for `k = wall_index`;
+the host's argmax against `W_EMBED.T` picks `VALUE_k`. When the
+host feeds that token back, the embedding leaf at the SORT_RESULT
+VALUE position is `W_EMBED[k]` — whose K column carries `k`
+literally. A downstream attention reading the K column of the
+most-recent SORT_RESULT VALUE position recovers `wall_index` as a
+clean integer with no decode Linear.
+
+The same position also reads `VIS_LO` for this wall via a 3-wide
+content attention (composite key
+`[is_vis_lo_value, value_wall_index_scalar, value_wall_index_neg_sq]`,
+quadratic-equality on the wall index) and writes it to
+`render_col` — RENDER's first column for the new wall.
+
+### RENDER — Pixel Generation (Phase 3)
+
+The pixel-producing token. Each paints `chunk_size` rows (default
+20) of one screen column.
+
+**Wall identity.** Read via
+`readback.get_int_after_last("SORT_RESULT")`, which attends to the
+most-recent SORT_RESULT VALUE position and returns the integer
+wall_index from the K column. No overlay carry.
+
+**Wall geometry.** A 2-wide quadratic-equality `attend_argmax_dot`
+keys on `(wall_index, -wall_index²)` against WALL positions and
+reads `(ax, ay, bx, by, tex_id)`. Same K shape as SORTED's
+attention. Replaced an older 8-wide one-hot scheme that needed a
+multi-layer `in_range` Q-prep cascade.
+
+**vis_hi.** A 3-wide content attention against thinking VIS_HI
+VALUE positions, keyed on
+`(is_vis_hi_value, value_wall_index_scalar, value_wall_index_neg_sq)`.
+Same quadratic-equality shape as the SORT_RESULT-VALUE vis_lo
+read. (`vis_lo` itself was already written into `render_col` by
+the SORT_RESULT VALUE step, so RENDER reads it directly from its
+overlaid input.)
+
+**Per-token pipeline:**
+
+1. **Render precompute.** From raw geometry plus player
+   `(resolved_x, resolved_y, cos, sin)` (post-collision position
+   from the RESOLVED readbacks; cos/sin from the PLAYER_ANGLE
+   broadcast), compute the rotation products `(sort_den, C, D, E,
+   sort_num_t)` and derive `H_inv`. Same math the older WALL
+   stage used to ship in its payload; recomputed fresh here from
+   raw inputs.
+2. **Active column.** The active column is `col` (an autoregressive
+   overlay; SORT_RESULT VALUE seeds it to `vis_lo`).
+3. **Wall height.** `tan(angle_offset)` via `piecewise_linear`,
+   then `wall_height = H_inv × |sort_den - C × tan(offset)|`.
+   Uses `piecewise_linear_2d` with log-spaced breakpoints for
+   `H_inv` (values span 0.01 to ~H/0.3).
+4. **Texture column.** A thermometer comparison
+   `tex_col = |{k : tex_w × |D + E·tan(offset)| ≥ k × abs_den}|`
+   — no division, every threshold is a `multiply_const + subtract +
+   compare`.
+5. **Texture fetch.** `attend_argmax_dot` retrieves pixels from
+   the matching TEX_COL position. Query is
+   `(tex_id_e8, scaled_col_onehot)`; key is
+   `(texture_id_e8, scaled_tc_onehot_01)`.
+6. **Chunk fill.** Paints `chunk_size` rows. For each row,
+   computes the texture row index via
+   `floor((y - wall_top) × tex_height / wall_height)`, extracts
+   RGB via `dynamic_extract`, and composites over ceiling/floor
+   colors using `in_range` masks.
+7. **State transitions.** Three mutually exclusive cases:
+   - **More chunks** (`active_start + chunk_size < wall_bottom`):
+     stay on this column, advance `chunk_k` by 1. Next token type:
+     `RENDER`.
+   - **Advance column** (no more chunks, `col + 1 ≤ vis_hi`): move
+     to the next column, reset `chunk_k` to 0. Next token type:
+     `RENDER`.
+   - **Advance wall** (no more chunks, no more columns): if
+     `wall_counter ≥ max_walls`, set `done = +1`. Otherwise next
+     token type: `SORTED_WALL`, so the transformer picks the next
+     wall (and `wall_counter` increments at the SORTED_WALL → SORT_RESULT
+     id step that follows).
+
+**Headless mode.** Setting `render_pixels=False` at build time
+skips steps 5 and 6 (the texture fetch and chunk fill) and emits
+zero pixels. The state machine still runs identically. Used by
+rollout tests that assert on tokens, not pixels.
 
 ## Outputs
 
-Every position produces two categories of output:
+Every position produces two categories of output.
 
-### Overlaid Outputs (Autoregressive Feedback)
+### Overlaid outputs (autoregressive feedback)
 
-Fed back as the next token's input via delta transfer — the output
-lands at the same residual-stream columns as the corresponding input.
-The host copies each overlaid field verbatim from output to input.
+Land back at the matching input slot in the next step's residual
+stream via delta transfer. The host copies each field verbatim.
 
-- **token_type** (8-wide): E8 code for the next token type.  SORTED
-  outputs `E8_RENDER` (always followed by RENDER).  RENDER outputs
-  `E8_SORTED_WALL` on wall transitions (not done), `E8_RENDER`
-  otherwise.  The host copies this to the next input without
-  inspecting it.
+| Field | Width | Producer | Notes |
+|-------|-------|----------|-------|
+| `render_col` | 1 | SORT_RESULT VALUE seeds to `vis_lo`; RENDER advances | Current screen column |
+| `render_chunk_k` | 1 | SORT_RESULT VALUE resets to 0; RENDER increments | Chunk index in column |
+| `wall_counter` | 1 | SORT_RESULT id increments; SORTED_WALL marker, SORT_RESULT VALUE, and RENDER all forward unchanged | Number of walls picked so far |
 
-- **render_mask** (max_walls-wide): Walls fully rendered so far.
-  RENDER updates this on wall transitions by adding the current
-  wall's one-hot.  SORTED forwards it unchanged.
+### Overflow outputs (host reads)
 
-- **sort_position_index** (1): Which sorted wall we're on (0-indexed).
-  SORTED outputs `position_index + 1`; RENDER forwards it unchanged.
+Placed after the input region in the residual stream. Read by
+the host but not fed back as input.
 
-- **render_col** (1): Current screen column. SORTED seeds this to
-  `vis_lo`; RENDER advances it via the state machine.
+| Field | Width | Notes |
+|-------|-------|-------|
+| `next_token_embedding` | 49 | Argmaxed against `W_EMBED.T` to pick the next token ID. Built by a flat `switch()` over six mutually-exclusive branches: SORT_RESULT id → factored VALUE(wall_index); SORT_RESULT VALUE → embed("RENDER"); thinking-active (excluding SORT_RESULT) → thinking_wall's cascade; SORTED_WALL marker → embed("SORT_RESULT"); RENDER → render's next-type; PLAYER_ANGLE → embed("THINKING_WALL_0"). |
+| `pixels` | chunk_size × 3 | RGB strip for the current chunk |
+| `col` | 1 | Screen column index of the current chunk |
+| `start` | 1 | Screen row where the chunk begins |
+| `length` | 1 | Number of rows in the chunk (0 for non-RENDER) |
+| `done` | 1 | +1 when all walls fully rendered |
+| `advance_wall` | 1 | +1 on wall transitions (informational) |
+| `sort_done` | 1 | +1 at SORT_RESULT id when sort exhausted |
+| `sort_wall_index` | 1 | Picked wall_index (host-visible, not fed back) |
 
-- **render_chunk_k** (1): Chunk index within the current column
-  (0, 1, 2, ...). Reset to 0 on column and wall transitions.
+The host's loop is trivial: step the transformer, read
+`(pixels, col, start, length)` from overflow, bitblit the strip to
+the framebuffer at `(col, start)` with skip-fill compositing,
+copy overlaid outputs to the next input, argmax
+`next_token_embedding` to pick the next token ID, and stop when
+`done > 0` or `sort_done > 0`. The host never inspects token type,
+never caches wall data, never patches inputs.
 
-- **render_tex_id** (1): Texture ID of the wall being rendered.
-  SORTED seeds this from the wall payload; RENDER forwards it.
+## Cross-Position Primitives
 
-- **render_vis_lo**, **render_vis_hi** (1 each): Screen-column
-  visibility bounds. SORTED seeds from the wall payload; RENDER
-  forwards.
+Every cross-position dependency in the graph compiles to a
+specific attention shape:
 
-- **render_wall_j_onehot** (max_walls-wide): One-hot identifying
-  which wall is currently being rendered. SORTED seeds from the
-  wall payload; RENDER forwards. Used by the wall geometry
-  attention to read the correct WALL position's raw coordinates.
+- **`attend_mean_where`** — broadcasts. Used by INPUT (broadcast
+  velocity / new angle / move trig), BSP (broadcast `side_P_vec`),
+  and PLAYER_X / PLAYER_Y / PLAYER_ANGLE (broadcast pre-collision
+  position and cos/sin).
+- **`attend_argmax_dot`** — content-addressed lookup. Used by
+  texture fetch (TEX_COL → RENDER), wall geometry attentions
+  (WALL → thinking_wall and WALL → RENDER, both 2-wide
+  quadratic-equality), and the SORT_RESULT id quadratic-equality
+  attention (BSP_RANK thinking positions → SORT_RESULT id).
+- **`attend_most_recent_matching`** — cache readback. Used by the
+  thinking-phase prev-id channel, by `ThinkingReadback` for prior
+  identifier values, by RENDER for `wall_index`, `resolved_x`,
+  `resolved_y`, and by the various `vis_lo` / `vis_hi` content
+  attentions.
 
-### Overflow Outputs (Host Reads)
+The old `attend_argmin_above_integer` primitive is gone — every
+"pick the smallest above threshold" pattern in the previous design
+turned into a quadratic-equality dot product over the right
+identity scalar.
 
-Placed after the input region in the residual stream. The host reads
-these directly:
+**Quadratic-equality attention.** Given a scalar key `k_i` at each
+position and a target `k_target` at the query, building K =
+`[k_i, -k_i²]` and Q = `[2·k_target, 1]` makes the dot product
+`-(k_i - k_target)² + k_target²`. The constant query-side term
+falls out of softmax; the remaining score peaks at `k_i = k_target`
+and falls off quadratically with distance. Used in five places:
 
-- **pixels** (chunk_size × 3 wide): RGB values for the current chunk.
-- **col** (1): Screen column index.
-- **start** (1): Screen row where this chunk begins.
-- **length** (1): Number of rows painted (0 for non-RENDER tokens).
-- **done** (1): +1 when all walls are fully rendered, -1 otherwise.
-- **advance_wall** (1): +1 when transitioning to the next wall, -1
-  otherwise.  Informational only — the host does not need this because
-  wall transitions are driven by the `token_type` overlaid output.
-- **sort_done** (1): +1 when the sort has exhausted all renderable
-  walls at this SORTED position, -1 otherwise.
-- **eos_resolved_x**, **eos_resolved_y** (1 each): Collision-resolved
-  player position. The host reads these from the EOS token's output
-  and feeds them to the PLAYER tokens.
-- **eos_new_angle** (1): Post-input new angle (from the INPUT stage,
-  not computed by EOS). The host feeds this to PLAYER_ANGLE.
+- 2-wide pure form (`match_gain = 20`, unit score gap): the
+  SORT_RESULT id BSP-rank match, and the two wall_index → WALL
+  geometry matches (one fired from RENDER, one from
+  thinking_wall).
+- 3-wide composite form prefixed with a type-match bit
+  (`match_gain = 12000`, score gap ≥ 2 between matching+matching-
+  type and any other key): VIS_LO read at SORT_RESULT VALUE, VIS_HI
+  read at RENDER. The type bit picks out thinking-VALUE positions
+  whose preceding identifier was VIS_LO / VIS_HI; the quadratic
+  pair picks the wall.
 
-The host's rendering loop is trivial: step the transformer, read
-`(pixels, col, start, length)` from overflow output, bitblit the
-pixel strip to the framebuffer at `(col, start)` with skip-fill
-compositing (don't overwrite already-filled pixels), copy overlaid
-outputs to the next input, and stop when `done > 0` or
-`sort_done > 0`.  The host never inspects token type, never caches
-wall data, never patches inputs.
+Both forms give softmax concentration above 0.99.
 
-## How the Graph Becomes a Transformer
+## Compilation
 
-The computational graph compiles to a standard transformer via
-`compile_game` (which calls `compile_headless` internally):
+The graph compiles to a standard transformer via
+`forward_compile` (called by `compile_game` / `compile_headless`):
 
-- **Attention heads** implement cross-position data flows:
-  - `attend_mean_where`: broadcast (INPUT→all, BSP→all, PLAYER→all,
-    WALL→EOS for collision aggregation).
-  - `attend_argmin_above_integer`: threshold-based selection
-    (WALL→SORTED for front-to-back sort).
-  - `attend_argmax_dot`: dot-product lookup (TEX_COL→RENDER for
-    texture fetch, WALL→RENDER for wall geometry).
-
+- **Attention heads** implement the cross-position primitives
+  above.
 - **MLP sublayers** implement nonlinear functions via
   `piecewise_linear` and `piecewise_linear_2d` approximations:
   trig lookups (cos, sin, tan over 256 entries), reciprocals
-  (geometric-breakpoint grids for ~1% relative error), 2D products
-  (coordinate rotations, perspective projection), and comparisons.
-
+  (geometric breakpoint grids for ~1% relative error), 2D
+  products (rotations, perspective projection), comparisons, and
+  the L1/L2 triangle-wave Gray-code encoder.
 - **Linear layers** implement exact affine transforms: coordinate
-  rotations, payload packing/unpacking, wall-top/bottom from
-  wall-height, threshold one-hot construction.
+  rotations, payload packing/unpacking, scaling, and threshold
+  one-hot construction.
 
-Every cross-position dependency flows through attention. There is no
-mechanism for data to travel between positions except through the
-attention heads — the MLP and Linear layers operate position-wise.
-This is what makes the graph a legitimate transformer, not just a
-program that happens to run on GPU.
+Every cross-position dependency flows through attention. There is
+no mechanism for data to travel between positions except through
+the attention heads — MLP and Linear layers operate position-wise.
+The compile-time scheduler (CP-SAT, see `cpsat_scheduler.md`)
+places every node into a layer subject to read-after-write and
+column-allocation constraints.
 
 ## Typical Dimensions
 
-For the default `compile_game` configuration (8 walls, 8 textures of
-64×64, 48 BSP nodes, chunk_size=20, d=2048):
+For the default `compile_game` configuration (8 walls, 8 textures
+of 64×64, 48 BSP nodes, chunk_size=20, d=2048):
 
 | Parameter | Value |
 |-----------|-------|
-| d (residual stream width) | 2048 |
-| d_head | 32 or 64 |
+| `d` (residual stream width) | 2048 (3072 in the larger walkthrough config) |
+| `d_head` | 32 or 64 |
+| `D_EMBED` | 49 |
+| `V` (vocab size) | 65576 |
 | Prefill tokens | ~570 (512 TEX_COL + 58 game) |
 | Player tokens | 3 |
-| Sort tokens | 8 |
+| Thinking tokens | 286 (8 × 35 + 6) |
+| Sort tokens (per frame) | 3 × 8 = 24 |
 | Render tokens | variable (depends on screen size + wall visibility) |
+| Compiled depth | varies with `d` and the scheduler; recent measurements land in the 50-70 layer range |
 
-Layer count and parameters depend on the graph configuration and
-optimization passes. All parameters are deterministic — no training
-is involved.
+All parameters are deterministic — no training is involved.
 
 ## Key Design Decisions
 
-**Why E8 spherical codes for token types?**
+**Why E8 spherical codes for category labels?**
 The 8-dimensional E8 lattice provides 240 unit vectors with large
-pairwise distances. Using these as token-type identifiers means the
-`equals_vector` check (a dot product against the known code) has
-wide margin between match and non-match, making the comparison robust
-to numerical noise in the residual stream.
+pairwise distances (self-dot 1600, cross-dot ≤ 800). Using these
+as category identifiers makes the `equals_vector` check (a dot
+product against the known code) have wide margin between match
+and non-match, making the comparison robust to numerical noise in
+the residual stream.
 
-**Why BSP-based sort instead of distance sort?**
-BSP ranks are clean integers computed via a simple dot product —
-no division, no distance calculation, no numerical ambiguity at
-equal distances. The BSP tree guarantees a total order (no ties),
-which is critical for the argmin attention to produce clean
-one-hot-like selections. Distance-based sorting would require
-comparing floating-point distances with potential ties at wall
-intersections.
+**Why a Gray code for VALUE rows?**
+The 65,536 VALUE rows share a single E8 category code, so the
+host's argmax against `W_EMBED.T` distinguishes them by the raw
+slot and Gray-code payload alone. Adjacent VALUE_k rows have
+Hamming distance 1 in the 16-wide Gray code (dot product 14
+between adjacent rows vs. self-dot 16), giving a clean argmax
+margin. The producer side computes the Gray code via two
+`piecewise_linear` triangle-wave sublayers plus a packed
+`compare` sublayer — three MLP sublayers total — and never has
+to maintain a 65,536-row lookup table at the producer.
 
-**Why a simple counter threshold instead of feeding back the selected rank?**
-Each SORTED token's threshold is `sort_position_index` (0, 1, 2, ...),
-incremented by 1 at each SORTED step. The token at step `i` picks the
-wall with the `i`-th smallest BSP rank among renderable walls. The
-alternative would be feeding back the selected wall's actual BSP rank
-as the next threshold — but that would require the attention to
-produce a clean integer rank under piecewise-linear approximation
-noise, then use that noisy value as the next threshold. The counter
-approach avoids compounding attention noise through the sort sequence.
-Exhaustion (fewer renderable walls than sort positions) is detected by
-comparing `sort_position_index` against the selected wall's BSP rank.
+**Why a K column for small-cardinality integers?**
+For `SORT_RESULT` (which carries `wall_index ∈ [0, 7]`), readback
+needs the *integer* not just a float approximation of it. With
+`K_column[VALUE_k] = k` for `k ≤ 255`, an attention with
+`V = K_column` returns the integer literally — no decode Linear,
+no calibration drift. The K column is also what the K-slot
+readback uses to make wall_index round-trip cleanly through the
+SORTED → RENDER hand-off.
 
-**Why PLAYER tokens instead of EOS broadcasting state?**
-The EOS token resolves the collision and emits the new `(x, y, angle)`
-as overflow outputs. Rather than broadcasting from EOS (which would
-mix collision intermediates into the KV cache row that RENDER reads),
-three dedicated PLAYER tokens broadcast one value each. The host reads
-the resolved state from EOS overflow and feeds it as inputs to
-PLAYER_X, PLAYER_Y, PLAYER_ANGLE. Each `attend_mean_where` broadcast
-gives every downstream position clean access to the resolved player
-state.
+**Why the type-tag block in the embedding?**
+The slot one-hot, `is_any_identifier`, and `is_value_category`
+columns let the readback chain skip the
+`equals_vector` + `cond_gate` + `Concat` construction that
+otherwise builds these flags at depth 4–5 fresh at each consumer.
+Storing them as ±1 columns in `W_EMBED` makes them direct extracts
+at depth 1, dropping the critical-path floor for every readback
+attention.
 
-**Why does RENDER recompute wall geometry instead of reading precomputed values?**
-Earlier designs precomputed `(sort_den, C, D, E, H_inv)` at WALL
-positions and packed them into the sort payload for SORTED to forward
-to RENDER via feedback. The current design has RENDER read raw
-`(ax, ay, bx, by)` from WALL via a dot-product attention on
-`render_wall_j_onehot`, then compute the rotation products fresh using
-player state from the PLAYER broadcasts. This eliminated the
-`render_feedback` vector and the THINKING token type that existed to
-load wall data into that feedback. The trade-off is more compute per
-RENDER token in exchange for a simpler, feedback-free data flow.
+**Why thinking tokens for per-wall computation?**
+Earlier designs ran all per-wall math at the prefill WALL token
+in a single deep computation (~62 ops), then packed the results
+into a wide payload for downstream stages to retrieve via
+attention. Splitting into autoregressive thinking tokens has
+three wins: (1) the per-wall critical path drops to ~12 ops at the
+deepest slot because each step reads its inputs from the KV cache
+instead of recomputing from scratch; (2) cross-position
+aggregation collapses to readbacks (e.g. global hit-aggregate via
+running OR + single readback, replacing
+`attend_mean_where` over WALL positions); (3) downstream
+consumers (SORTED, RENDER) can read named scalar values via
+content attention instead of unpacking a fixed payload.
 
-**Why chunked rendering?**
-A single RENDER token paints `chunk_size` rows (default 20). A wall
-that is 60 rows tall at some column needs 3 RENDER tokens for that
-column. This bounds the per-token output width at `chunk_size × 3`
-RGB values. Without chunking, the worst case (a wall filling the
-entire screen height) would need a very wide output — eating residual
-stream budget. Chunking trades token count for narrower outputs.
+**Why running-OR HIT_* accumulators?**
+Cross-position aggregation via `attend_mean_where` followed by a
+threshold compare produces a soft signal whose worst case bumps
+into the per-op noise budget when many walls contribute. Folding
+the OR into the autoregressive sequence — each `HIT_*` step emits
+`saturate(this_flag + prev_value)` — keeps the running aggregate
+in 0/1 territory at every step (saturation clamps drift) and
+reduces the consumer's read to a single readback hop.
+
+**Why quadratic-equality attention for integer-keyed lookups?**
+Earlier "pick the smallest above threshold" mechanisms used the
+`attend_argmin_above_integer` primitive over a thermometer-coded
+key. That worked but required 8-wide one-hot Q (or
+8-wide thermometer K) and was sensitive to softmax dilution when
+many candidate keys had similar scores. The quadratic-equality
+identity `-(k - k_target)² = -k² + 2·k_target·k - k_target²`
+collapses the same lookup to a 2-wide K and Q with a clean
+gap-of-1 between adjacent integer keys. Saves residual-stream
+width at the consumer and gives sharper softmax concentration.
+
+**Why SORT_RESULT as its own VALUE token?**
+Earlier designs piped wall identity from SORTED into RENDER via
+overlaid outputs (`render_wall_j_onehot`, `render_vis_lo`,
+`render_vis_hi`, `render_tex_id`). Emitting wall_index as a
+SORT_RESULT VALUE token instead lets RENDER read it via the same
+KV-cache readback every other thinking-token consumer uses, with
+no special-case overlay machinery and no per-RENDER-token forward
+of stale wall identity.
+
+**Why does RENDER recompute wall geometry instead of reading
+precomputed values?**
+The per-wall rotation products `(sort_den, C, D, E, H_inv)`
+depend on player position, which only becomes resolved
+(post-collision) at the RESOLVED step in the thinking phase. By
+the time RENDER fires, recomputing from raw `(ax, ay, bx, by)` +
+`(resolved_x, resolved_y, cos, sin)` is cheaper than threading
+the products through the thinking phase as additional VALUE
+tokens. Raw geometry is read via the 2-wide quadratic-equality
+wall_index attention; player state is read via the existing
+PLAYER broadcast and RESOLVED readbacks.
+
+**Why a simple counter (`wall_counter`) instead of feeding back the selected rank?**
+Each SORTED step's threshold is `wall_counter`, an integer that
+increments by 1 at each SORT_RESULT id step. The SORT_RESULT id
+position picks the wall whose `bsp_rank == wall_counter`. The
+alternative — feeding the picked rank back as the next threshold
+— would require the attention to produce a clean integer rank
+under piecewise-linear approximation noise, then use that noisy
+value as the next threshold. The counter approach avoids
+compounding attention noise through the sort sequence.
+Exhaustion is detected by comparing `wall_counter` against the
+selected wall's BSP rank.
 
 **Why is the host "dumb"?**
 The host's only jobs are: (1) feed token inputs, (2) copy overlaid
 outputs back as the next input, (3) bitblit pixel strips to the
-framebuffer, (4) stop when `done > 0`. It performs no game logic,
-no sorting, no rendering decisions. This constraint keeps the
-transformer self-contained — the forward pass alone is the complete
-game engine, and the host is a generic autoregressive inference loop
-that could drive any graph, not just DOOM.
+framebuffer, (4) argmax `next_token_embedding` against
+`W_EMBED.T` to pick the next token ID, (5) stop when `done > 0`.
+It performs no game logic, no sorting, no rendering decisions.
+This constraint keeps the transformer self-contained — the
+forward pass alone is the complete game engine, and the host is
+a generic autoregressive inference loop that could drive any
+graph, not just DOOM.
