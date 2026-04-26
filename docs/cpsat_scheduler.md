@@ -185,10 +185,28 @@ Per schedulable node `n`:
   where `n`'s residual columns are reclaimed. The value `max_layers`
   is the sentinel for "never freed."
 - `is_attn[n]` — boolean. Pinned to 1 for `Attn` and `Add`. Pinned to
-  0 for standalone `ReLU`, `LiteralValue`, and chain-internal Linears.
-  For standalone `Linear` nodes (Linears outside any chain) the value
-  is free under `flex_routing=True` and pinned per `policy` under
-  `flex_routing=False`.
+  0 for standalone `ReLU`, `LiteralValue`, chain `R`, chain `L2`, and
+  exclusive chain `L1`. For standalone `Linear` nodes (Linears outside
+  any chain) and non-exclusive chain `L1` the value is free under
+  `flex_routing=True` and pinned per `policy` under
+  `flex_routing=False`. Non-exclusive `L1` is the chain `L1` whose
+  standalone realization (writing `L1`'s value to its own residual
+  cols for the non-chain consumers) runs as a separate op alongside
+  the chain composite — it consumes attention heads when
+  `is_attn[L1]=1` or MLP-bypass slots when `is_attn[L1]=0`, additive
+  on top of the chain composite's `len(R)` MLP slots at the same
+  layer.
+
+For each `Add` node `A`:
+
+- `is_free[A]` — derived boolean (not a free decision variable).
+  `is_free[A]` is the OR over `A`'s addends `E` of "every other
+  consumer of `E` finishes strictly before `layer_var[A]`," each
+  consumer comparison itself reified into a `before[E, C, A]`
+  boolean. An addend that is a `Concatenate`, an input/`LiteralValue`
+  pinned node, or has any consumer outside the schedulable set
+  (terminal `Concatenate`) is forced not-dead, matching
+  `LayerScheduler._is_dead_for_add`.
 
 Per chain (defined in §2) the three nodes' `layer_var` are constrained
 equal — the chain runs as a single composite in the MLP sublayer of
@@ -224,24 +242,36 @@ Three `AddCumulative` constraints, one per resource pool. The cost
 function `heads_for(n)` returns the integer number of attention heads
 the op consumes if scheduled in the attention sublayer:
 `⌈d_v/d_head⌉` for `Attn`, `⌈d_input/d_head⌉` for `Linear`,
-`⌈d_output/d_head⌉` for `Add` (the optimistic free-add cost — see
-*Model preconditions* below).
+`⌈d_output/d_head⌉` for `Add` (the unit free-add cost — `Add`'s
+actual cost is `1 ·` or `2 ·` this depending on `is_free[A]`).
 
 **Attention budget — heads plus cancel columns plus dirty-allocation
 columns, all combined.** Capacity `n_heads_per_layer · d_head` per
 layer.
 
-- For each node `n` with attention cost `heads_for(n) > 0`: an
-  optional unit-width interval at `layer_var[n]` gated by
+- For each non-`Add` node `n` with attention cost `heads_for(n) > 0`:
+  an optional unit-width interval at `layer_var[n]` gated by
   `is_attn[n]`. Demand `heads_for(n) · d_head` (the column footprint
   of those heads).
+- For each `Add` node `A` (always attention-routed): two optional
+  unit-width intervals at `layer_var[A]`. The free-add interval is
+  gated by `is_free[A]` with demand `heads_for(A) · d_head`; the
+  compute-add interval is gated by `is_free[A].Not()` with demand
+  `2 · heads_for(A) · d_head` (compute-add copies both addends into
+  fresh columns, so it costs roughly twice the free-add heads). The
+  two intervals are mutually exclusive — exactly one is active at
+  `layer_var[A]`.
 - For each non-pinned residual-using schedulable node `n`: a
   unit-width DEATH-layer cancel interval at `cancel_layer[n]`,
   demand `len(n)` columns.
-- For each non-pinned residual-using schedulable node `n`: a
-  unit-width BIRTH-layer dirty interval at `layer_var[n]`, demand
-  `len(n)` columns. The heuristic combines DEATH-layer dead-node
-  cancels and BIRTH-layer dirty-allocation cancels into one batched
+- For each non-pinned residual-using non-`Add` schedulable node `n`:
+  a unit-width BIRTH-layer dirty interval at `layer_var[n]`, demand
+  `len(n)` columns. For `Add` nodes the BIRTH-layer dirty interval
+  is gated by `is_free[A].Not()` — free-add reuses the dead addend's
+  already-clean cols (no fresh allocation, no dirty bits to clear),
+  while compute-add allocates fresh cols and pays the dirty cancel.
+  The heuristic combines DEATH-layer dead-node cancels and BIRTH-
+  layer dirty-allocation cancels into one batched
   `AttnHeadOp("cancel", ...)` per layer, so they share the
   attention head budget.
 
@@ -266,6 +296,11 @@ hidden slots, not residual, so they have no columns to cancel.
 - For each MLP-routed standalone `Linear` `n`: an optional unit-width
   interval at `layer_var[n]` gated by `¬is_attn[n]`. Demand
   `2 · n.d_output` (MLP bypass slots).
+- For each non-exclusive chain `L1`: an optional unit-width interval
+  at `layer_var[L1]` gated by `¬is_attn[L1]`. Demand
+  `2 · L1.d_output` for the standalone realization in MLP-bypass.
+  Additive on top of the chain composite's slot demand at the same
+  layer.
 - For each standalone `ReLU` `n`: an optional unit-width interval
   gated by `¬is_attn[n]`. Demand `len(n)`.
 - For each L1→ReLU→L2 chain: a regular unit-width interval at
@@ -308,10 +343,13 @@ The heuristic `LayerScheduler` distinguishes two `Add` scheduling
 modes: **free_add** (one input is dead — the `Add` reuses the dead
 input's residual columns and only needs to copy the live input,
 costing `⌈len(n)/d_head⌉` heads) and **compute_add** (both inputs
-still alive — the `Add` allocates fresh columns and copies both
-inputs, costing up to twice that). The heuristic also disallows
-free_add when an input is a `Concatenate`, because `Concatenate` nodes
-do not own residual columns and so cannot have their cols reused.
+still alive, or one input is a `Concatenate` — the `Add` allocates
+fresh columns and copies both inputs, costing roughly twice that
+plus a dirty cancel for the fresh cols). The model encodes both
+regimes via a per-Add `is_free[A]` boolean derived from reified
+consumer-ordering booleans (see *Variables*), so the cumulative
+budget reflects the regime the heuristic will actually use at
+replay.
 
 The model is sound for graphs and configurations satisfying:
 
@@ -321,15 +359,15 @@ The model is sound for graphs and configurations satisfying:
   control on, the solver may produce schedules the replay cannot
   honor; `forward_compile` raises if you combine `optimize > 0`
   with `admission_control=True`.
-- No `Add` node has a `Concatenate` input. The model uses the
-  free-add cost for every `Add`. `solve_schedule` rejects graphs
-  containing `Concatenate`-input `Add` nodes by raising at solve time.
 - Chains are atomic. A chain `(L1, R, L2)` (defined in §2) is always
   scheduled as one MLP composite; the model does not consider
-  splitting a chain into separate ops.
-- Standalone Linears are the only flex-routing-eligible node type.
-  `Attn`, `Add`, standalone `ReLU`, and `LiteralValue` have routing
-  fixed by their type.
+  splitting a chain into separate ops. Chain `L1` may have a
+  separate standalone realization (when non-exclusive), modeled
+  separately via `is_attn[L1]`.
+- Standalone Linears and non-exclusive chain `L1` are the only
+  flex-routing-eligible node types. `Attn`, `Add`, standalone
+  `ReLU`, `LiteralValue`, chain `R`, chain `L2`, and exclusive chain
+  `L1` have routing fixed by their type.
 
 ## 4. API
 
@@ -501,9 +539,9 @@ tolerance boundaries* in `CLAUDE.md`).
 ### Failure modes
 
 **Precondition violation.** `solve_schedule` raises `RuntimeError`
-*before* invoking CP-SAT if the graph violates a §3 precondition
-(an `Add` with a `Concatenate` input).  `forward_compile` itself
-raises if `admission_control=True` is combined with `optimize > 0`.
+on structural problems (no residual columns left after pre-allocated
+inputs).  `forward_compile` itself raises if `admission_control=True`
+is combined with `optimize > 0`.
 
 **`INFEASIBLE`.** CP-SAT proves no schedule fits — typically
 because `max_layers` is too small for the graph.  Returns
