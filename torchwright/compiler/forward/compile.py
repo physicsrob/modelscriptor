@@ -424,11 +424,12 @@ def forward_compile(
 
         # Warm-start: run the heuristic scheduler to convergence on a
         # cloned residual_map / computed set, capturing each schedulable
-        # node's layer.  CP-SAT consumes the result via `hint_layers`;
-        # a known-feasible incumbent dramatically shrinks the time the
-        # solver needs to find any feasible schedule.  We use the
-        # scheduler in schedule-only mode (no weight writes) to avoid
-        # paying the full compile cost twice.
+        # node's layer, routing, and cancel layer.  CP-SAT consumes the
+        # result via `hint_layers`/`hint_routing`/`hint_cancel`; a
+        # complete known-feasible incumbent dramatically shrinks the
+        # time the solver needs to find any feasible schedule.  We use
+        # the scheduler in schedule-only mode (no weight writes) to
+        # avoid paying the full compile cost twice.
         t_hint_start = time.perf_counter()
         hint_rmap = copy.deepcopy(residual_map)
         hint_computed = set(computed)
@@ -444,9 +445,24 @@ def forward_compile(
             pinned_nodes=overlay_pinned_inputs,
         )
         hint_layers: dict = {}
+        hint_routing: dict = {}
+        hint_cancel: dict = {}
+        # Tap residual_map.free to record the cancel layer per node.
+        # The heuristic may free a node multiple times only via
+        # reassign (which doesn't go through free), so the first
+        # observed free is the cancel.
+        _hint_layer_box = [0]
+        _orig_free = hint_rmap.free
+
+        def _logging_free(node):
+            hint_cancel[node.node_id] = _hint_layer_box[0]
+            return _orig_free(node)
+
+        hint_rmap.free = _logging_free  # type: ignore[method-assign]
         for hi in range(max_layers):
             if output_node in hint_computed:
                 break
+            _hint_layer_box[0] = hi
             prev_hint = set(hint_computed)
             try:
                 attn_ops, mlp_ops, _ = hint_scheduler.schedule_layer(
@@ -456,7 +472,19 @@ def forward_compile(
                 # Heuristic deadlocked / no progress.  Drop the hint
                 # and let CP-SAT cold-start.
                 hint_layers = {}
+                hint_routing = {}
+                hint_cancel = {}
                 break
+            # Routing decisions for standalone Linears: heuristic
+            # placed compute_linear in attention or compute_linear_bypass
+            # in MLP.  Chains' Linears are non-flex (always MLP) so
+            # we don't hint them.
+            for op in attn_ops:
+                if op.op_type == "compute_linear" and op.node is not None:
+                    hint_routing[op.node.node_id] = "attn"
+            for op in mlp_ops:
+                if op.op_type == "compute_linear_bypass":
+                    hint_routing[op.node.node_id] = "mlp"
             for node in graph.get_all_nodes():
                 if isinstance(node, Concatenate) and node not in hint_computed:
                     if all(
@@ -468,6 +496,7 @@ def forward_compile(
                 hint_layers[n.node_id] = hi
             if not attn_ops and not mlp_ops:
                 break
+        hint_rmap.free = _orig_free  # type: ignore[method-assign]
         hint_n_layers = max(hint_layers.values()) + 1 if hint_layers else 0
         if verbose:
             hint_time = time.perf_counter() - t_hint_start
@@ -507,6 +536,8 @@ def forward_compile(
             policy=policy,
             assume_zero_init=assume_zero_init,
             hint_layers=hint_layers if hint_layers else None,
+            hint_routing=hint_routing if hint_routing else None,
+            hint_cancel=hint_cancel if hint_cancel else None,
             symmetry_breaking=cpsat_symmetry_breaking,
             log_search_progress=verbose,
         )

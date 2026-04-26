@@ -531,6 +531,9 @@ def solve_schedule(
     max_layers: int = 60,
     allow_suboptimal: bool = False,
     hint_layers: Optional[Dict[int, int]] = None,
+    hint_routing: Optional[Dict[int, str]] = None,
+    hint_cancel: Optional[Dict[int, int]] = None,
+    cancel_slack: Optional[int] = 2,
     policy: Optional[SchedulingPolicy] = None,
     reserve_heads: int = 0,
     assume_zero_init: bool = False,
@@ -558,6 +561,25 @@ def solve_schedule(
             return on proven `OPTIMAL`). If True, accept a
             feasible-but-not-proven-optimal schedule.
         hint_layers: optional warm-start mapping `node_id -> layer`.
+        hint_routing: optional warm-start mapping
+            `node_id -> "attn"|"mlp"` for flex Linears.  When the
+            heuristic placed a standalone Linear in attention vs
+            MLP-bypass, hinting the same routing lets CP-SAT
+            reconstruct the heuristic's solution as a starting
+            incumbent.
+        hint_cancel: optional warm-start mapping `node_id -> layer`
+            for the cancel layer.  Captures when the heuristic freed
+            each node's columns; combined with `hint_layers` this
+            gives a complete schedule the solver can verify and
+            improve from.
+        cancel_slack: when not None, restrict each non-pinned node's
+            cancel layer to `[earliest_dead, earliest_dead + K]`
+            where `earliest_dead = max(layer[c] + 1)` over consumers
+            and ``K == cancel_slack``.  Cuts the cancel-decision
+            search space ~30x at K=2 with negligible loss of
+            optimality (the heuristic almost always cancels within
+            1–2 layers of the last consumer).  Set to None to keep
+            the wide `[layer[n]+1, max_layers]` domain.  Default 2.
         policy: only consulted when `flex_routing=False`. Defaults to
             `LEGACY_POLICY`.
         reserve_heads: per-layer attention-head budget reserved
@@ -590,6 +612,9 @@ def solve_schedule(
         time_budget_s=time_budget_s,
         max_layers=max_layers,
         hint_layers=hint_layers,
+        hint_routing=hint_routing,
+        hint_cancel=hint_cancel,
+        cancel_slack=cancel_slack,
         policy=policy,
         log_search_progress=False,
         reserve_heads=reserve_heads,
@@ -624,6 +649,9 @@ def _solve_full(
     time_budget_s: float = 60.0,
     max_layers: int = 60,
     hint_layers: Optional[Dict[int, int]] = None,
+    hint_routing: Optional[Dict[int, str]] = None,
+    hint_cancel: Optional[Dict[int, int]] = None,
+    cancel_slack: Optional[int] = 2,
     policy: Optional[SchedulingPolicy] = None,
     log_search_progress: bool = False,
     reserve_heads: int = 0,
@@ -737,6 +765,14 @@ def _solve_full(
         ).OnlyEnforceIf(same_ok.Not())
 
     # ---- Cancel layer per schedulable node ----
+    # The natural lower bound on cancel_layer[n] is
+    # ``max(layer[c] + 1)`` over consumers — the columns must outlive
+    # every reader.  The natural upper bound is ``max_layers``, which
+    # leaves ~60 candidate values per node on a DOOM-scale graph.
+    # When ``cancel_slack`` is set, restrict to a small window above
+    # the lower bound: the heuristic almost always cancels within 1–2
+    # layers of the last consumer, so K=2 cuts the cancel decision
+    # space ~30x with negligible loss of optimality.
     cancel_layer: Dict[int, cp_model.IntVar] = {}
     for n in gm.schedulable:
         cl = model.NewIntVar(0, max_layers, f"cl_n{n.node_id}")
@@ -746,6 +782,7 @@ def _solve_full(
             model.Add(cl == max_layers)
             continue
         keep_forever = False
+        consumer_layer_vars: List[cp_model.IntVar] = []
         for c in gm.consumers_eff.get(n, set()):
             if isinstance(c, Concatenate):
                 model.Add(cl == max_layers)
@@ -753,8 +790,19 @@ def _solve_full(
                 break
             if c.node_id in layer_var:
                 model.Add(cl >= layer_var[c.node_id] + 1)
+                consumer_layer_vars.append(layer_var[c.node_id])
         if keep_forever:
             continue
+        if cancel_slack is not None and consumer_layer_vars:
+            last_cons = model.NewIntVar(
+                0, max_layers - 1, f"last_cons_n{n.node_id}"
+            )
+            model.AddMaxEquality(last_cons, consumer_layer_vars)
+            model.Add(cl <= last_cons + 1 + cancel_slack)
+        elif cancel_slack is not None and not consumer_layer_vars:
+            # No layer-bound consumers — cancel can fire right after
+            # the node's own birth layer.
+            model.Add(cl <= layer_var[n.node_id] + 1 + cancel_slack)
 
     # ---- Combined attn-heads + cancel-cols cumulative ----
     # Per-node attn interval is OPTIONAL (gated by is_attn[n]) when
@@ -937,10 +985,23 @@ def _solve_full(
     )
 
     # ---- Hint ----
+    # A complete hint (layer + routing + cancel) gives CP-SAT a
+    # full feasible incumbent it can verify and improve from, which
+    # is much faster than reconstructing routing and cancel timing
+    # from a layer-only hint.  Hints are soft — CP-SAT is free to
+    # discard them and explore alternatives.
     if hint_layers is not None:
         for nid, L in hint_layers.items():
             if nid in layer_var and 0 <= L < max_layers:
                 model.AddHint(layer_var[nid], L)
+    if hint_routing is not None:
+        for nid, route in hint_routing.items():
+            if nid in is_attn:
+                model.AddHint(is_attn[nid], 1 if route == ATTN else 0)
+    if hint_cancel is not None:
+        for nid, L in hint_cancel.items():
+            if nid in cancel_layer and 0 <= L <= max_layers:
+                model.AddHint(cancel_layer[nid], L)
 
     # ---- Symmetry breaking ----
     # Sibling chains feeding common ``Concatenate`` joins are
