@@ -739,6 +739,66 @@ def test_relu_chain_broken_by_fanout_bypass():
     assert len(computed) > before
 
 
+def test_relu_chain_broken_by_fanout_bypass_emits_l1_standalone():
+    """Non-exclusive L1 + bypass policy: the bypass loop emits a
+    standalone ``compute_linear_bypass(L1)`` alongside the chain
+    composite's ``compute_relu(L2)``, in the same MLP sublayer.
+
+    Regression test for the smallest reproducing layer of the
+    silent value-corruption bug where the chain block marked L1 as
+    ``computed`` and pre-allocated its residual cols but emitted no
+    op that wrote a value into them — leaving consumers of L1 to
+    read uninitialized data.
+    """
+    pos = _make_pos_encoding()
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
+    r = ReLU(l1, name="r")
+    l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
+    other = _make_linear(l1, 2, "other")
+    out_cat = Concatenate([l2, other])
+    out = _make_linear(out_cat, 1, "final")
+
+    graph = GraphAnalyzer(out)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(x)
+    computed = {pos, x}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    attn_ops, mlp_ops, biased = scheduler.schedule_layer(rmap, computed)
+
+    # The chain composite must be emitted (writes L2).
+    relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]
+    assert len(relu_ops) == 1
+    assert relu_ops[0].node is l2
+
+    # AND a separate compute_linear_bypass for L1 must be emitted in
+    # the same MLP sublayer — without it, L1's residual cols are
+    # allocated but never written and consumers read garbage.
+    bypass_ops = [
+        op for op in mlp_ops
+        if op.op_type == "compute_linear_bypass" and op.node is l1
+    ]
+    assert len(bypass_ops) == 1, (
+        f"Expected a compute_linear_bypass(L1) op in the same MLP "
+        f"sublayer as the chain composite, but mlp_ops were: "
+        f"{[(op.op_type, getattr(op.node, 'name', op.node)) for op in mlp_ops]}. "
+        f"L1 must be written when it has consumers besides the "
+        f"chain's ReLU."
+    )
+
+    # Both the chain composite and the bypass realization should
+    # have actually completed: L1, R, and L2 in computed_nodes.
+    assert l1 in computed
+    assert r in computed
+    assert l2 in computed
+    # L1's residual cols are allocated and were just written by the
+    # bypass op.
+    assert rmap.is_allocated(l1)
+    assert bypass_ops[0].target_cols == rmap.get_indices(l1)
+
+
 def test_linear_with_computed_relu_input():
     """Linear whose input ReLU is already computed can be scheduled standalone.
 

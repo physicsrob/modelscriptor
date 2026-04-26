@@ -1040,6 +1040,46 @@ def main():
         action="store_true",
         help="Use legacy scheduling (standalone Linears in attention)",
     )
+    parser.add_argument(
+        "--render-pixels-off",
+        action="store_true",
+        help="Build with render_pixels=False (skip the RENDER texture sub-graph)",
+    )
+    # GCC-style -O0/-O1/-O2/-O3 optimization levels.  Mutually
+    # exclusive group; --O1, --O2, --O3 are convenience aliases for
+    # ``--optimize 1/2/3`` so users can write ``-O2`` like with cc.
+    opt_group = parser.add_mutually_exclusive_group()
+    opt_group.add_argument(
+        "-O", "--optimize",
+        type=int,
+        default=0,
+        choices=[0, 1, 2, 3],
+        help=(
+            "Optimization level: 0=heuristic (default, fastest), "
+            "1=CP-SAT 60s, 2=CP-SAT 180s, 3=CP-SAT 300s."
+        ),
+    )
+    opt_group.add_argument(
+        "--O1", dest="optimize", action="store_const", const=1,
+        help="Alias for --optimize 1.",
+    )
+    opt_group.add_argument(
+        "--O2", dest="optimize", action="store_const", const=2,
+        help="Alias for --optimize 2.",
+    )
+    opt_group.add_argument(
+        "--O3", dest="optimize", action="store_const", const=3,
+        help="Alias for --optimize 3.",
+    )
+    parser.add_argument(
+        "--assume-zero-init",
+        action="store_true",
+        help=(
+            "Assume the runtime zero-initialises the residual stream "
+            "(the contract HeadlessTransformer.get_input_res_stream "
+            "already meets) and skip BIRTH-layer dirty-column cancels."
+        ),
+    )
     args = parser.parse_args()
 
     if args.scene == "box":
@@ -1098,6 +1138,7 @@ def main():
         max_walls=max_walls,
         max_coord=max_coord,
         chunk_size=args.chunk_size,
+        render_pixels=not args.render_pixels_off,
     )
     output = graph_io.concat_output()
     print(f"build_game_graph: {_time.perf_counter() - _t0:.1f}s", flush=True)
@@ -1124,12 +1165,14 @@ def main():
         d_head,
         output,
         pos,
-        verbose=False,
+        verbose=True,
         max_layers=400,
         d_hidden=d_hidden,
         device=None,
         on_node_scheduled=_track,
         policy=LEGACY_POLICY if args.legacy_policy else None,
+        optimize=args.optimize,
+        assume_zero_init=args.assume_zero_init,
     )
     n_layers = max(node_to_layer.values()) + 1 if node_to_layer else 0
 

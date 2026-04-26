@@ -1,0 +1,602 @@
+# cpsat_scheduler
+
+Optimization-driven scheduler for `forward_compile`. Produces an optimal
+placement of every graph node into transformer layers, an optimal
+cancellation timing for every node's residual columns, and (optionally)
+an optimal attention-versus-MLP routing for every standalone `Linear`.
+
+## 1. Overview
+
+`forward_compile` turns a computation graph into a
+`HeadlessTransformer` (the compiler's output type — a transformer with
+no embedding layer and no LM head, just a residual-stream and stacked
+attention-plus-MLP layers) by walking the graph layer by layer,
+placing nodes into either the attention sublayer (which costs attention
+heads) or the MLP sublayer (which costs MLP hidden slots), and
+cancelling residual columns when nodes become dead.
+
+Two scheduler implementations exist:
+
+- **`LayerScheduler`** (heuristic). Greedy, layer by layer, with no
+  lookahead. Picks the next layer's contents based on local pressure
+  (residual occupancy, critical-path length, ready set). Fast — no
+  solver overhead — and good enough for many graphs.
+
+- **`DirectedLayerScheduler`** (this subsystem). A subclass of
+  `LayerScheduler` that takes a precomputed `ScheduleAssignment` from
+  the CP-SAT solver in `cpsat_scheduler.py` and replays it. The solver
+  considers all layers simultaneously and proves an optimal schedule
+  under a configurable cost objective. Because `DirectedLayerScheduler`
+  is a subclass that overrides only the macro decisions (which node
+  goes in which layer, in which sublayer, when each is cancelled) and
+  inherits the parent's allocator and op-emission code, every
+  micro-decision and every runtime invariant the parent enforces
+  (cancel batching, source column capture, dirty-bit tracking, the
+  four allocator invariants I1–I4 documented in `CLAUDE.md`) holds
+  unchanged.
+
+The CP-SAT scheduler exists because the heuristic's local decisions —
+which `Linear` goes to attention versus MLP, when to cancel a dead
+node — are globally suboptimal on the `(layer count, attention head
+count)` Pareto front. The solver enumerates that front under a
+configurable cost objective. The user navigates it via
+`Costs(alpha, beta, gamma)` (see §4); two notable points on it are
+"layer-min" (matches or beats every heuristic policy on layer count)
+and "heads-min" (matches the lowest-attention heuristic policy with
+fewer layers).
+
+## 2. Architecture
+
+### Code map
+
+- `torchwright/compiler/forward/cpsat_scheduler.py` — the solver.
+  Exports `solve_schedule()`, `ScheduleAssignment`, `Costs`, and
+  `SolveStats`.
+- `torchwright/compiler/forward/scheduler.py` — adds
+  `DirectedLayerScheduler` next to the existing `LayerScheduler`.
+- `torchwright/compiler/forward/compile.py` — adds the `optimize`
+  level kwarg to `forward_compile` and the warm-start probe that
+  feeds CP-SAT a complete heuristic hint.
+- `scripts/cpsat_schedule.py` — probe script for ad-hoc Pareto
+  exploration. Imports from the production module.
+
+### Data flow
+
+```
+   computation graph
+   (output_node, pos_encoding)
+              │
+              ▼
+   ┌───────────────────────────────┐
+   │  cpsat_scheduler.py           │
+   │    solve_schedule(            │
+   │      graph, d, d_head,        │
+   │      d_hidden, costs,         │
+   │      flex_routing,            │
+   │      time_budget,             │
+   │    )                          │
+   └───────────────────────────────┘
+              │
+              ▼
+   ScheduleAssignment
+     node_to_layer
+     node_to_cancel_layer
+     node_to_routing
+              │
+              ▼
+   ┌───────────────────────────────┐
+   │  forward_compile(use_cpsat=…) │
+   │    │                          │
+   │    ▼                          │
+   │  DirectedLayerScheduler       │
+   │    .schedule_layer(L)         │
+   │    for L in 0..n_layers       │
+   └───────────────────────────────┘
+              │
+              ▼
+   HeadlessTransformer
+```
+
+### `ScheduleAssignment`
+
+The contract between the solver and the replay. A frozen dataclass:
+
+```python
+@dataclass(frozen=True)
+class ScheduleAssignment:
+    node_to_layer: Dict[int, int]
+    node_to_cancel_layer: Dict[int, int]
+    node_to_routing: Dict[int, str]   # "attn" or "mlp"
+    n_layers: int
+```
+
+Every schedulable node — every non-`Concatenate`, non-input node in the
+ancestor cone of `output_node` — appears in all three dicts.
+(`Concatenate` is the graph's "view" op: it has no value of its own and
+is never placed in the residual stream; consumers reference its leaves
+directly.) When the solver returns `OPTIMAL` or `FEASIBLE`, the
+assignment is fully populated and respects every constraint in §3. On
+`INFEASIBLE` or unrecoverable time-out, no assignment is returned and
+`forward_compile` raises (see §5).
+
+The solver guarantees:
+
+- `node_to_layer[n]` is the transformer layer where `n` executes.
+- `node_to_cancel_layer[n]` is the layer where `n`'s residual columns
+  are reclaimed. Set to `n_layers` for nodes that stay alive forever
+  (inputs, output, output-cone leaves).
+- `node_to_routing[n]` is either `"attn"` or `"mlp"` — which sublayer
+  of `node_to_layer[n]` runs the op.
+
+A **chain** is a triple `(L1, R, L2)` where `L1` is a `Linear`, `R` is
+a `ReLU` reading from `L1`, and `L2` is a `Linear` reading from `R`,
+with each link being the unique consumer/producer at that point. Chain
+detection runs once at the start of `solve_schedule`; once detected, a
+chain is **atomic** — the solver always schedules its three nodes into
+one MLP sublayer at the same layer (`L1`'s compute happens inline
+inside the MLP's `linear1`, `R` is the chain's hidden activation living
+in `linear1`'s slots, and `L2` is the chain's residual-stream output).
+**Chain-internal** nodes (any of `L1`, `R`, `L2` of a detected chain)
+share a `node_to_layer` value and all carry routing `"mlp"`.
+
+### `DirectedLayerScheduler`
+
+Subclass of `LayerScheduler`. Three things change relative to the
+heuristic; everything else inherits from the parent and runs unchanged.
+
+What it overrides:
+
+- **Ready filter.** Only nodes with `assignment.node_to_layer[n] ==
+  current_layer` are eligible to schedule this layer. Nodes whose
+  layer has not arrived yet stay deferred.
+- **Routing.** Each `Linear` is forced into the attention sublayer or
+  the MLP bypass per `assignment.node_to_routing[n]`. The
+  `policy.local_in_attention` setting is ignored.
+- **Cancellation.** At each layer `L`, cancels are queued for every
+  node where `assignment.node_to_cancel_layer[n] == L`. The
+  heuristic's eager freeing of dead nodes is suppressed.
+
+What it preserves (by inheriting the parent's per-layer code path):
+
+- Cancel coalescing into a single batched
+  `AttnHeadOp("cancel", None, cancel_cols)`. Cancels queued by the
+  override flow into the parent's existing batching machinery, which
+  emits one cancel op per layer.
+- Dirty-bit tracking and same-batch cancellation of dirty target
+  columns from fresh allocations.
+- Source column capture (`q_source_cols`, `k_source_cols`, etc.) via
+  `_require_live` at schedule time.
+- All four allocator invariants I1–I4 (see `CLAUDE.md`). These are
+  runtime assertions inside `ResidualStreamMap` and the
+  weight-writer, which `DirectedLayerScheduler` doesn't touch.
+
+## 3. The optimization model
+
+The solver builds a CP-SAT model from the graph and minimizes the
+configured objective.
+
+### Variables
+
+Per schedulable node `n`:
+
+- `layer_var[n]` ∈ [0, max_layers−1] — the transformer layer where
+  `n` executes.
+- `cancel_layer[n]` ∈ [layer_var[n]+1, max_layers] — the layer
+  where `n`'s residual columns are reclaimed. The value `max_layers`
+  is the sentinel for "never freed."
+- `is_attn[n]` — boolean. Pinned to 1 for `Attn` and `Add`. Pinned to
+  0 for standalone `ReLU`, `LiteralValue`, chain `R`, chain `L2`, and
+  exclusive chain `L1`. For standalone `Linear` nodes (Linears outside
+  any chain) and non-exclusive chain `L1` the value is free under
+  `flex_routing=True` and pinned per `policy` under
+  `flex_routing=False`. Non-exclusive `L1` is the chain `L1` whose
+  standalone realization (writing `L1`'s value to its own residual
+  cols for the non-chain consumers) runs as a separate op alongside
+  the chain composite — it consumes attention heads when
+  `is_attn[L1]=1` or MLP-bypass slots when `is_attn[L1]=0`, additive
+  on top of the chain composite's `len(R)` MLP slots at the same
+  layer.
+
+For each `Add` node `A`:
+
+- `is_free[A]` — derived boolean (not a free decision variable).
+  `is_free[A]` is the OR over `A`'s addends `E` of "every other
+  consumer of `E` finishes strictly before `layer_var[A]`," each
+  consumer comparison itself reified into a `before[E, C, A]`
+  boolean. An addend that is a `Concatenate`, an input/`LiteralValue`
+  pinned node, or has any consumer outside the schedulable set
+  (terminal `Concatenate`) is forced not-dead, matching
+  `LayerScheduler._is_dead_for_add`.
+
+Per chain (defined in §2) the three nodes' `layer_var` are constrained
+equal — the chain runs as a single composite in the MLP sublayer of
+its layer.
+
+A chain's `L1` is **exclusive** if its only graph consumer is the
+chain's `R`. An exclusive `L1` has no residual position of its own —
+its value is computed inline inside `linear1` from its input's
+residual columns and only ever lives in the MLP hidden slots. A
+non-exclusive `L1` has additional consumers and so needs a residual
+position alongside the chain.
+
+### Dependency constraints
+
+For each directed edge `u → v` in the graph (after walking
+`Concatenate` inputs to their leaves):
+
+```
+same_layer_ok = is_attn[u] ∧ ¬is_attn[v]
+
+if  same_layer_ok:  layer_var[v] ≥ layer_var[u]
+else:               layer_var[v] ≥ layer_var[u] + 1
+```
+
+This encodes the within-layer sublayer ordering: attention writes
+happen first within a layer, then MLP reads. The only same-layer
+producer/consumer pair that fits is `u` writing in attention and `v`
+reading in MLP.
+
+### Resource cumulatives
+
+Three `AddCumulative` constraints, one per resource pool. The cost
+function `heads_for(n)` returns the integer number of attention heads
+the op consumes if scheduled in the attention sublayer:
+`⌈d_v/d_head⌉` for `Attn`, `⌈d_input/d_head⌉` for `Linear`,
+`⌈d_output/d_head⌉` for `Add` (the unit free-add cost — `Add`'s
+actual cost is `1 ·` or `2 ·` this depending on `is_free[A]`).
+
+**Attention budget — heads plus cancel columns plus dirty-allocation
+columns, all combined.** Capacity `n_heads_per_layer · d_head` per
+layer.
+
+- For each non-`Add` node `n` with attention cost `heads_for(n) > 0`:
+  an optional unit-width interval at `layer_var[n]` gated by
+  `is_attn[n]`. Demand `heads_for(n) · d_head` (the column footprint
+  of those heads).
+- For each `Add` node `A` (always attention-routed): two optional
+  unit-width intervals at `layer_var[A]`. The free-add interval is
+  gated by `is_free[A]` with demand `heads_for(A) · d_head`; the
+  compute-add interval is gated by `is_free[A].Not()` with demand
+  `2 · heads_for(A) · d_head` (compute-add copies both addends into
+  fresh columns, so it costs roughly twice the free-add heads). The
+  two intervals are mutually exclusive — exactly one is active at
+  `layer_var[A]`.
+- For each non-pinned residual-using schedulable node `n`: a
+  unit-width DEATH-layer cancel interval at `cancel_layer[n]`,
+  demand `len(n)` columns.
+- For each non-pinned residual-using non-`Add` schedulable node `n`:
+  a unit-width BIRTH-layer dirty interval at `layer_var[n]`, demand
+  `len(n)` columns. For `Add` nodes the BIRTH-layer dirty interval
+  is gated by `is_free[A].Not()` — free-add reuses the dead addend's
+  already-clean cols (no fresh allocation, no dirty bits to clear),
+  while compute-add allocates fresh cols and pays the dirty cancel.
+  The heuristic combines DEATH-layer dead-node cancels and BIRTH-
+  layer dirty-allocation cancels into one batched
+  `AttnHeadOp("cancel", ...)` per layer, so they share the
+  attention head budget.
+
+The combined-column form `H_a · d_head + cancel_cols + dirty_cols
+≤ n_heads · d_head` is mathematically equivalent to the heuristic's
+per-layer `H_a + ⌈(cancel_cols + dirty_cols)/d_head⌉ ≤ n_heads`. Both
+`H_a` and `n_heads` are non-negative integers, and `d_head > 0`.
+Forward: from `H_a · d_head + (cancel_cols + dirty_cols) ≤ n_heads
+· d_head`, divide by `d_head` and use the fact that
+`(n_heads − H_a)` is an integer to conclude
+`⌈(cancel_cols + dirty_cols)/d_head⌉ ≤ n_heads − H_a`. Reverse: from
+`H_a + ⌈(cancel_cols + dirty_cols)/d_head⌉ ≤ n_heads`, multiply by
+`d_head` and use `cancel_cols + dirty_cols ≤
+⌈(cancel_cols + dirty_cols)/d_head⌉ · d_head`.
+
+The DEATH and BIRTH terms only run for residual-using nodes —
+chain-internal exclusive `L1` and chain-internal `ReLU` live in MLP
+hidden slots, not residual, so they have no columns to cancel.
+
+**MLP slot budget.** Capacity `d_hidden` per layer.
+
+- For each MLP-routed standalone `Linear` `n`: an optional unit-width
+  interval at `layer_var[n]` gated by `¬is_attn[n]`. Demand
+  `2 · n.d_output` (MLP bypass slots).
+- For each non-exclusive chain `L1`: an optional unit-width interval
+  at `layer_var[L1]` gated by `¬is_attn[L1]`. Demand
+  `2 · L1.d_output` for the standalone realization in MLP-bypass.
+  Additive on top of the chain composite's slot demand at the same
+  layer.
+- For each standalone `ReLU` `n`: an optional unit-width interval
+  gated by `¬is_attn[n]`. Demand `len(n)`.
+- For each L1→ReLU→L2 chain: a regular unit-width interval at
+  `layer_var[chain.relu]`, demand `len(chain.relu)` (the chain's
+  hidden width).
+
+**Residual column budget.** Capacity `d − input_residual_cols`,
+where `input_residual_cols` is the sum of widths of pre-allocated
+input nodes plus `pos_encoding`.
+
+- For each residual-using node `n`: a regular interval
+  `[layer_var[n], cancel_layer[n])`, demand `len(n)`.
+
+`uses_residual(n)` is `False` for chain-internal `ReLU` (lives in
+MLP hidden slots, not residual) and exclusive chain L1 (computed
+inline inside `linear1` from its input's residual columns, never
+written back to the stream). True for everything else.
+
+### Objective
+
+```
+minimize  alpha · n_layers
+        + beta  · total_attn_heads
+        + gamma · total_mlp_bypass_slots
+```
+
+where:
+
+- `n_layers = max(layer_var) + 1`.
+- `total_attn_heads = Σ heads_for(n)` over attention-routed nodes.
+  For pinned-attention nodes this is a constant; for flex Linears
+  it depends on `is_attn[n]`.
+- `total_mlp_bypass_slots = Σ 2 · n.d_output` over MLP-routed flex
+  Linears. Chain composite slots and standalone ReLU slots are
+  constants and therefore don't appear in the objective.
+
+### Model preconditions
+
+The heuristic `LayerScheduler` distinguishes two `Add` scheduling
+modes: **free_add** (one input is dead — the `Add` reuses the dead
+input's residual columns and only needs to copy the live input,
+costing `⌈len(n)/d_head⌉` heads) and **compute_add** (both inputs
+still alive, or one input is a `Concatenate` — the `Add` allocates
+fresh columns and copies both inputs, costing roughly twice that
+plus a dirty cancel for the fresh cols). The model encodes both
+regimes via a per-Add `is_free[A]` boolean derived from reified
+consumer-ordering booleans (see *Variables*), so the cumulative
+budget reflects the regime the heuristic will actually use at
+replay.
+
+The model is sound for graphs and configurations satisfying:
+
+- `admission_control=False` in `forward_compile`. The model does not
+  represent the sibling-cluster admission constraint described in
+  `torchwright/compiler/forward/sibling_clusters.py`. With admission
+  control on, the solver may produce schedules the replay cannot
+  honor; `forward_compile` raises if you combine `optimize > 0`
+  with `admission_control=True`.
+- Chains are atomic. A chain `(L1, R, L2)` (defined in §2) is always
+  scheduled as one MLP composite; the model does not consider
+  splitting a chain into separate ops. Chain `L1` may have a
+  separate standalone realization (when non-exclusive), modeled
+  separately via `is_attn[L1]`.
+- Standalone Linears and non-exclusive chain `L1` are the only
+  flex-routing-eligible node types. `Attn`, `Add`, standalone
+  `ReLU`, `LiteralValue`, chain `R`, chain `L2`, and exclusive chain
+  `L1` have routing fixed by their type.
+
+## 4. API
+
+### `Costs`
+
+```python
+@dataclass(frozen=True)
+class Costs:
+    alpha: int = 1
+    beta: int = 0
+    gamma: int = 0
+```
+
+The objective is
+`alpha · n_layers + beta · total_attn_heads + gamma · total_mlp_bypass_slots`.
+All three are non-negative integers.
+
+`alpha` weights the layer count. The default `alpha=1` always
+penalizes adding a layer.
+
+`beta` weights the total attention head count. Set this above zero
+when sequence length makes attention compute expensive: per-token
+attention compute scales as `O(L · d_head)` per head for sequence
+length `L`, while per-layer compute (the full
+`d × d_hidden` MLP matmul plus the `4 · d²` attention QKVO matmuls)
+is independent of `L`. For long autoregressive sequences this means
+attention dominates total compute and a small reduction in head
+count pays back larger than a small reduction in layer count. As a
+starting point, `beta ≈ L` makes one attention head equivalent to
+one extra layer.
+
+`gamma` weights MLP bypass slot usage. The per-layer MLP matmul
+costs the full `d × d_hidden` regardless of how many slots are used
+— zero-padded slots still pay — so `gamma = 0` is the normal case.
+Provided so that deployments with deployment-time slot pruning can
+express a non-trivial slot cost.
+
+### `flex_routing`
+
+Short for "flexible routing" — whether the standalone-`Linear`
+sublayer choice (attention versus MLP-bypass) is a CP-SAT decision
+variable rather than fixed by the policy.
+
+When `True` (the default), each standalone `Linear` (a `Linear`
+outside any chain) gets its own `is_attn` decision variable and the
+solver picks attention versus MLP per node. When `False`, standalone
+Linears are pinned per `policy.local_in_attention` and only the
+placement and cancellation decisions are optimized.
+
+`flex_routing=True` weakly dominates `flex_routing=False` on the
+solver objective: anything `flex_routing=False` can produce is also
+producible under `flex_routing=True`, and the larger search space
+admits strictly better optima for objectives where the routing choice
+matters. The `flex_routing=False` mode exists to support comparing
+CP-SAT against a specific heuristic policy's routing choice.
+
+### `forward_compile` integration
+
+```python
+forward_compile(
+    d, d_head, output_node, pos_encoding,
+    ...,
+    optimize: int = 0,                # 0=heuristic, 1=60s, 2=180s, 3=300s
+    cpsat_costs: Costs = Costs(),     # advanced: Pareto navigator
+    cpsat_flex_routing: bool = True,  # advanced: routing decision
+)
+```
+
+`optimize` is the user-facing knob:
+
+| level | scheduler | budget |
+|------:|-----------|--------|
+|     0 | heuristic `LayerScheduler` (default) | — |
+|     1 | CP-SAT, accept best-feasible           | 60s |
+|     2 | CP-SAT, accept best-feasible           | 180s |
+|     3 | CP-SAT, accept best-feasible           | 300s |
+
+At `optimize=0` the compiler skips CP-SAT entirely — same code path
+as before this subsystem existed.  Use it for fast iteration where
+compile latency matters more than schedule quality.
+
+At `optimize > 0` the flow is:
+
+1. **Warm-start probe.** A schedule-only run of the heuristic
+   produces a complete known-feasible schedule:
+   `(layer, routing, cancel_layer)` per node.
+2. **CP-SAT solve.** `solve_schedule` runs with the full hint and the
+   heuristic's layer count as the search horizon.  Returns
+   `(assignment, stats)`.
+3. **Replay or fall back.** If `assignment is not None`, the
+   `DirectedLayerScheduler` replays it.  If `None` (no feasible
+   incumbent within budget), the compile falls back to a fresh
+   heuristic `LayerScheduler` against the same residual map — users
+   always get a schedule, never a bare exception from a budget
+   timeout.
+4. **Compile.** The chosen scheduler runs the per-layer loop and
+   produces a `HeadlessTransformer`.  Token semantics are identical
+   regardless of which scheduler ran — the schedule is a placement
+   decision, not a value-changing transformation.
+
+The `policy` argument is honored only when `cpsat_flex_routing=False`,
+where it pins the routing of standalone Linears.  With
+`cpsat_flex_routing=True` (the default), `policy` is ignored.
+
+`cpsat_costs` is the Pareto navigator (see *Costs* above); ignored
+when `optimize=0`.
+
+## 5. Runtime behavior
+
+### When the solver runs
+
+At `optimize > 0`, `solve_schedule` runs once at the start of
+`forward_compile`, before the first layer is allocated.  It does not
+run during the layer loop.  The layer loop is then deterministic:
+`DirectedLayerScheduler` reads the assignment and emits ops.
+
+### Warm-start hints
+
+Before invoking CP-SAT, `forward_compile` runs the heuristic
+`LayerScheduler` in schedule-only mode (no weight writes) on a
+clone of the residual map.  The probe captures three things per
+node:
+
+- `hint_layers[n]` — the layer where the heuristic placed `n`.
+- `hint_routing[n]` — `"attn"` or `"mlp"`, recovered from whether
+  the heuristic emitted `compute_linear` (attention) or
+  `compute_linear_bypass` (MLP) for the node.
+- `hint_cancel[n]` — the layer where the heuristic freed `n`'s
+  residual columns.  Captured by a small `_TrackingResidualStreamMap`
+  subclass that records the current layer when `free()` is called;
+  nodes consumed via `reassign` (the free-add path) don't go
+  through `free` and are correctly omitted.
+
+All three are passed to `solve_schedule` as `AddHint` calls.  The
+heuristic's layer count also tightens the search horizon
+(`max_layers = min(user_max, hint_n_layers + 1)`), which shrinks
+each `layer_var`'s domain.
+
+### Cancel-domain restriction
+
+The cancel decision space is the dominant LB-search cost when the
+attention/residual cumulatives are tight.  By default, each
+non-pinned node's cancel layer is restricted to a small window
+above its earliest dead layer:
+
+```
+last_consumer = max(layer_var[c]) over consumers c
+cancel_layer[n] in [layer_var[n]+1, last_consumer + 1 + cancel_slack]
+```
+
+with `cancel_slack=2`.  The heuristic almost always cancels within
+1–2 layers of the last consumer, so K=2 is generous enough to
+preserve optimality while cutting the cancel-decision space ~30×.
+The kwarg is on `solve_schedule` for users who want to widen or
+disable it; `forward_compile` doesn't expose it (the default is
+correct for every tested geometry).
+
+### Determinism
+
+CP-SAT runs with `num_search_workers=16` and uses parallel worker
+strategies. Different runs may produce different `ScheduleAssignment`
+values for the same model — different worker discovery orders find
+different optima of equal objective value. The compiled
+`HeadlessTransformer` differs across runs only in scheduling: token
+outputs are bitwise identical (modulo float-point ordering effects
+that already affect every compile, see *FP nondeterminism at
+tolerance boundaries* in `CLAUDE.md`).
+
+### Failure modes
+
+**Precondition violation.** `solve_schedule` raises `RuntimeError`
+on structural problems (no residual columns left after pre-allocated
+inputs).  `forward_compile` itself raises if `admission_control=True`
+is combined with `optimize > 0`.
+
+**`INFEASIBLE`.** CP-SAT proves no schedule fits — typically
+because `max_layers` is too small for the graph.  Returns
+`(None, stats)` with `stats.status_name == "INFEASIBLE"`.
+`forward_compile` falls back to the heuristic; the heuristic
+respects the same `max_layers` and may itself fail with a
+deadlock error.
+
+**Time limit exceeded with no feasible solution** (CP-SAT status
+`UNKNOWN`).  Returns `(None, stats)`.  `forward_compile` falls
+back to the heuristic schedule.
+
+**Time limit exceeded with feasible solution** (CP-SAT status
+`FEASIBLE`).  The solver returns a `ScheduleAssignment` that is
+feasible but possibly non-optimal.  `forward_compile` accepts it —
+`optimize > 0` semantics treat any feasible schedule as success;
+`stats.is_optimal` reports whether optimality was proven.
+
+### Geometry sensitivity
+
+The win-size from CP-SAT versus heuristic depends on residual-stream
+slack.  Measured on the headless DOOM graph (~4.4K nodes); each row
+records the ``optimize`` level (and corresponding budget) used:
+
+| geometry            | -O / budget | heuristic | CP-SAT | Δ    | first incumbent | OPTIMAL at |
+|---------------------|-------------|----------:|-------:|-----:|----------------:|-----------:|
+| d=2048, d_h=8192    | -O 1 (60s)  | 61        | (none) | n/a  | not in 60s      | not in 60s |
+| d=3072, d_h=8192    | -O 2 (180s) | 58        | 46     | -21% | ~27s            | ~80s       |
+| d=4096, d_h=4096    | -O 1 (60s)  | 59        | 46     | -22% | ~17s            | ~31s       |
+
+At d=2048 the residual cumulative is the binding constraint and
+CP-SAT struggles to close the LB gap within budget.  At d=3072+
+CP-SAT converges optimally inside the budget.  The heuristic-
+fallback behavior (when CP-SAT can't find an incumbent) is the
+right answer for d=2048 — users always get a schedule, just not
+the CP-SAT one.
+
+### Experiments tried that didn't pan out
+
+- **Symmetry breaking on equivalent sibling chains.** Detected
+  parallel chains feeding common `Concatenate` joins via
+  `SiblingClusterAnalyzer`, grouped them by structural
+  fingerprint, and added chained lex-min constraints between
+  layer assignments.  At DOOM scale the constraints tightened
+  the LB but starved incumbent-finding workers — CP-SAT never
+  found a feasible solution within reasonable budgets even with
+  a feasible warm-start hint.  Removed; if revisited, would
+  need a different solver-parameter mix (LNS-heavy or fixed
+  search strategy that respects the hint).
+- **Feasibility-first stop-on-first mode.** Installed a callback
+  that called `StopSearch()` at the first complete feasible
+  solution.  CP-SAT's first feasible reproduces the heuristic
+  warm-start; stopping there returned no improvement over
+  `optimize=0` while paying the model-build cost.  Removed.
+- **`repair_hint=True`** would have let CP-SAT actively complete
+  the partial hint into a feasible solution, but it conflicts
+  with `AddDecisionStrategy` (CP-SAT crashes with
+  "fixed_search != nullptr").  Not pursued.

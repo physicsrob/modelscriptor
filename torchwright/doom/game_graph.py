@@ -141,10 +141,10 @@ def build_game_graph(
     BSP_NODE token); it bounds how deep × broad the BSP tree can be.
 
     ``render_pixels`` (default True) controls whether the RENDER stage
-    builds the texture-attention and texture-coordinate sub-graphs.
-    Setting it False produces a "headless" variant that runs the same
-    autoregressive loop but emits zero pixels — used by rollout tests
-    that assert on tokens, not pixels.
+    builds the pixel-producing sub-graphs (texture-coord, texture-attention,
+    and per-row chunk fill).  Setting it False produces a "headless"
+    variant that runs the same autoregressive loop but emits zero pixels —
+    used by rollout tests that assert on tokens, not pixels.
     """
     import time as _time
 

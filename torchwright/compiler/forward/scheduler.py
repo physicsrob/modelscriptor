@@ -10,6 +10,7 @@ Mutates residual_map (allocate, free, reassign) and computed_nodes (add).
 from typing import Dict, List, Optional, Set, Tuple
 
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
+from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.sibling_clusters import SiblingClusters
@@ -129,7 +130,7 @@ class LayerScheduler:
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
     ) -> Tuple[List[AttnHeadOp], List[MLPOp], List[Node], bool]:
         # --- 1. Classify ready nodes ---
-        all_ready = self.graph.get_ready_nodes(computed_nodes)
+        all_ready = self._get_ready_nodes(computed_nodes)
 
         ready = set()
         free_adds = []
@@ -193,7 +194,7 @@ class LayerScheduler:
         # --- 2.5. Re-check readiness after attention ---
         # Nodes computed by attention may unlock MLP-eligible nodes in the same
         # layer (the MLP sublayer reads x + attn(x), so it sees attention results).
-        newly_ready = self.graph.get_ready_nodes(computed_nodes) - all_ready
+        newly_ready = self._get_ready_nodes(computed_nodes) - all_ready
         for node in newly_ready:
             if isinstance(node, Add):
                 a0, a1 = node.inputs
@@ -211,6 +212,25 @@ class LayerScheduler:
             if exclusive:
                 ready.discard(l1)
         chains.extend(new_chains)
+
+        # Newly-ready MLP-routed Linears: extend bypass_linears so the
+        # MLP sublayer picks them up this layer.  bypass_linears was
+        # built before the attn pass ran, so any Linear whose inputs
+        # only became available after attn (an attn->mlp same-layer
+        # dependency) was missed.  Without this catch-up the Linear is
+        # deferred a layer — fine for the heuristic, but the CP-SAT
+        # model's same_layer_ok rule (docs/cpsat_scheduler.md §3 Dependency
+        # constraints) assumes the same-layer placement is realised.
+        bypass_set = set(bypass_linears)
+        for node in ready:
+            if not isinstance(node, Linear) or node in bypass_set:
+                continue
+            inp = node.inputs[0]
+            if isinstance(inp, ReLU) and inp not in computed_nodes:
+                continue  # chain candidate, handled in MLP sublayer 3a
+            if not self._route_linear_to_attn(node):
+                bypass_linears.append(node)
+                bypass_set.add(node)
 
         # --- 3. MLP sublayer ---
         # Dirty target cols for MLP writes are folded into the same
@@ -342,9 +362,8 @@ class LayerScheduler:
             heads_used += n_heads
 
         # Build compute candidates: Attn nodes, standalone Linears, deferred Adds.
-        # When policy routes position-local ops to MLP, standalone Linears
-        # are skipped here and scheduled via bypass in _schedule_mlp_sublayer.
-        local_policy = self.policy.local_in_attention
+        # When the routing hook says MLP for a Linear, it's skipped here and
+        # scheduled via bypass in _schedule_mlp_sublayer.
         compute_candidates = []
         bypass_linears: list[Node] = []
         for node in ready:
@@ -360,7 +379,7 @@ class LayerScheduler:
                 # as a standalone Linear reading from the ReLU's residual slot.
                 if isinstance(inp, ReLU) and inp not in computed_nodes:
                     continue
-                if local_policy == "never":
+                if not self._route_linear_to_attn(node):
                     bypass_linears.append(node)
                     continue
                 n_heads = self._heads_for_linear(node)
@@ -636,19 +655,23 @@ class LayerScheduler:
             dirty = residual_map.dirty_subset(target_cols)
             if dirty:
                 residual_map.mark_clean(dirty)
-            computed_nodes.update({l1, relu, l2})
-            # Mark the chain-representative (l2) as scheduled — that's
-            # the node that appears in node_to_chain when the cluster
-            # analyzer classifies an MLP chain's output as the branch
-            # terminal.  l1 and relu may also be in the chain, but
-            # terminal detection relies on the direct join input.
-            self._mark_scheduled(l2)
-            self._mark_scheduled(l1)
+            # The chain composite emits the chain output (L2) and L1's
+            # value lives in MLP hidden slots inline.  For exclusive
+            # chains, L1 has no residual realization (no consumers
+            # besides R), so marking L1 computed here is correct.  For
+            # non-exclusive chains, L1's standalone realization
+            # (writing L1's value to its own residual cols for the
+            # non-chain consumers) is the bypass loop's job — leave
+            # L1 out of computed_nodes so the bypass loop processes
+            # it as a regular Linear, allocating cols and emitting
+            # compute_linear_bypass(L1) in this same MLP sublayer.
+            computed_nodes.add(relu)
+            computed_nodes.add(l2)
             self._mark_scheduled(relu)
-
-            # L1 with fanout: also allocate L1 in residual stream
-            if not exclusive and not residual_map.is_allocated(l1):
-                self._try_allocate(l1, residual_map)
+            self._mark_scheduled(l2)
+            if exclusive:
+                computed_nodes.add(l1)
+                self._mark_scheduled(l1)
 
         # 3b. Standalone ReLU (not part of chain)
         standalone_relus = sorted(
@@ -808,14 +831,28 @@ class LayerScheduler:
 
         Returns list of (l1, relu, l2, d_hidden, exclusive).
         exclusive means L1 has no effective consumers other than the ReLU.
+
+        Each ReLU and each Linear participates in at most one chain.
+        Linear de-dup matters when ``fuse_consecutive_linears`` has
+        rewired a Linear's input to point at an upstream ReLU — the
+        same Linear can then satisfy both the L2 condition for one
+        chain and the L1 condition for a downstream chain.  Without
+        de-dup the two chains would share that Linear; the heuristic
+        per-layer pruning (``ready.discard(l2)`` after scheduling)
+        usually rescues this, but the static CP-SAT counterpart
+        (``_detect_chains_static``) has no such pruning, so both
+        sides apply the same exclusion for parity.
         """
         chains = []
         seen_relus = set() if exclude_relus is None else set(exclude_relus)
+        seen_linears: Set[Node] = set()
 
         for node in ready:
             if not isinstance(node, Linear):
                 continue
             l1 = node
+            if l1 in seen_linears:
+                continue
 
             for consumer in self.graph.get_consumers(l1):
                 if not isinstance(consumer, ReLU) or consumer in seen_relus:
@@ -830,11 +867,15 @@ class LayerScheduler:
                 l2 = l2_candidates[0]
                 if l2.inputs[0] is not relu:
                     continue
+                if l2 in seen_linears:
+                    continue
 
                 l1_eff = self._get_effective_consumers(l1)
                 exclusive = l1_eff == {relu}
                 chains.append((l1, relu, l2, len(relu), exclusive))
                 seen_relus.add(relu)
+                seen_linears.add(l1)
+                seen_linears.add(l2)
                 break  # one chain per L1
 
         return chains
@@ -996,6 +1037,30 @@ class LayerScheduler:
             if self._is_dead(node, computed_nodes):
                 dead.append(node)
         return dead
+
+    # ------------------------------------------------------------------
+    # Hook methods — overridden by DirectedLayerScheduler
+    # ------------------------------------------------------------------
+
+    def _get_ready_nodes(self, computed_nodes: Set[Node]) -> Set[Node]:
+        """Return the set of nodes eligible to schedule this layer.
+
+        The default returns ``graph.get_ready_nodes(...)`` unchanged.
+        :class:`DirectedLayerScheduler` filters this to only nodes whose
+        precomputed ``ScheduleAssignment`` says to run at the current
+        layer.
+        """
+        return self.graph.get_ready_nodes(computed_nodes)
+
+    def _route_linear_to_attn(self, node: Linear) -> bool:
+        """Should a standalone ``Linear`` go to the attention sublayer?
+
+        The default consults ``policy.local_in_attention``: ``"never"`` ->
+        MLP bypass, anything else -> attention.
+        :class:`DirectedLayerScheduler` overrides this to read the
+        per-node routing decision from its ``ScheduleAssignment``.
+        """
+        return self.policy.local_in_attention != "never"
 
     def _heads_for_node(self, node: Node) -> int:
         """Number of attention heads needed to copy a node's output."""
@@ -1163,3 +1228,113 @@ class LayerScheduler:
                 f"free_count={residual_map.get_free_count()}, "
                 f"allocated={len(residual_map.get_allocated_nodes())}."
             )
+
+
+class DirectedLayerScheduler(LayerScheduler):
+    """LayerScheduler driven by a precomputed CP-SAT ``ScheduleAssignment``.
+
+    See ``docs/cpsat_scheduler.md`` §2 for the spec.  Three things change
+    relative to the parent heuristic:
+
+    - **Ready filter.** Only nodes with
+      ``assignment.node_to_layer[n] == current_layer`` are eligible to
+      schedule this layer.  Other ready nodes stay deferred until their
+      assigned layer.
+    - **Routing.** Each standalone ``Linear`` is forced into the attention
+      sublayer or the MLP bypass per ``assignment.node_to_routing[n]``.
+      ``policy.local_in_attention`` is ignored.
+    - **Cancellation.** Dead-node candidates restricted to nodes with
+      ``assignment.node_to_cancel_layer[n] == current_layer``.  The
+      heuristic's eager freeing of freshly-dead inputs is suppressed,
+      so cancellation timing follows the assignment exactly.
+
+    What it preserves (by inheriting the parent's per-layer code path):
+    cancel coalescing into a single batched ``AttnHeadOp("cancel")``,
+    dirty-bit tracking, source-column capture via ``_require_live``,
+    and the four allocator invariants I1–I4 (which run inside
+    ``ResidualStreamMap`` and the weight-writer that this subclass
+    doesn't touch).
+
+    The caller must invoke :meth:`set_current_layer` with the layer
+    index *before* each :meth:`schedule_layer` call — the subclass has
+    no way to know which layer the compile loop is currently building.
+    """
+
+    def __init__(
+        self,
+        graph: GraphAnalyzer,
+        d: int,
+        d_head: int,
+        pos_encoding: PosEncoding,
+        assignment: ScheduleAssignment,
+        d_hidden: Optional[int] = None,
+        clusters: Optional[SiblingClusters] = None,
+        admission_budget_fraction: float = 0.4,
+        policy: Optional[SchedulingPolicy] = None,
+        pinned_nodes: Optional[Set[Node]] = None,
+    ):
+        super().__init__(
+            graph,
+            d,
+            d_head,
+            pos_encoding,
+            d_hidden=d_hidden,
+            clusters=clusters,
+            admission_budget_fraction=admission_budget_fraction,
+            policy=policy,
+            pinned_nodes=pinned_nodes,
+        )
+        self._assignment = assignment
+        self._current_layer: int = -1
+
+    def set_current_layer(self, layer: int) -> None:
+        """Tell the subclass which transformer layer is being built next.
+
+        Must be called before every :meth:`schedule_layer` invocation —
+        the ready/cancel filters key on ``current_layer``.
+        """
+        self._current_layer = layer
+
+    def _get_ready_nodes(self, computed_nodes: Set[Node]) -> Set[Node]:
+        if self._current_layer < 0:
+            raise RuntimeError(
+                "DirectedLayerScheduler.set_current_layer() must be called "
+                "before schedule_layer()."
+            )
+        all_ready = self.graph.get_ready_nodes(computed_nodes)
+        n2l = self._assignment.node_to_layer
+        return {n for n in all_ready if n2l.get(n.node_id) == self._current_layer}
+
+    def _route_linear_to_attn(self, node: Linear) -> bool:
+        return self._assignment.node_to_routing.get(node.node_id) == "attn"
+
+    def _find_dead_nodes(
+        self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
+    ) -> List[Node]:
+        if self._current_layer < 0:
+            raise RuntimeError(
+                "DirectedLayerScheduler.set_current_layer() must be called "
+                "before schedule_layer()."
+            )
+        graph_nodes = self.graph.get_all_nodes()
+        n2cl = self._assignment.node_to_cancel_layer
+        dead: List[Node] = []
+        for node in residual_map.get_allocated_nodes():
+            if node not in graph_nodes:
+                continue
+            if node not in computed_nodes:
+                continue
+            if n2cl.get(node.node_id) != self._current_layer:
+                continue
+            dead.append(node)
+        return dead
+
+    def _freshly_dead_inputs(
+        self,
+        node: Node,
+        computed_nodes: Set[Node],
+        residual_map: ResidualStreamMap,
+    ) -> List[Node]:
+        # Suppress mid-layer eager freeing: the assignment specifies the
+        # canonical cancel timing, surfaced by ``_find_dead_nodes``.
+        return []

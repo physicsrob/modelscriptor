@@ -32,8 +32,14 @@ D = 256
 D_HEAD = 16
 
 
-def _verify(output_node, n_pos, input_values, pos_encoding=None, max_layers=100):
-    """Compile and verify output matches node.compute()."""
+def _verify(
+    output_node, n_pos, input_values, pos_encoding=None, max_layers=100,
+):
+    """Compile and verify output matches node.compute().
+
+    Uses ``optimize=0`` (heuristic, the production default).  CP-SAT
+    exercise lives in ``test_cpsat_integration.py``.
+    """
     net = forward_compile(
         d=D,
         d_head=D_HEAD,
@@ -317,7 +323,13 @@ def test_compile_relu_add():
 
 
 def test_compile_multiple_concats():
-    """Shared constants across multiple concat -> add paths."""
+    """Shared constants across multiple concat -> add paths.
+
+    The graph has ``Concatenate``-input ``Add`` nodes (which force the
+    heuristic into ``compute_add``).  CP-SAT models the compute-add
+    regime via ``is_free[A]=False``; ``test_cpsat_compiles_concatenate_input_add``
+    in ``test_cpsat_integration.py`` covers the CP-SAT path.
+    """
     c1 = create_literal_value(torch.tensor([1.0]))
     c2 = create_literal_value(torch.tensor([1.0]))
     c3 = create_literal_value(torch.tensor([1.0]))
