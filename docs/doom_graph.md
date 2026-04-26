@@ -219,6 +219,99 @@ these three positions. The `attend_mean_where` broadcasts land in
 the KV cache, so all downstream tokens (SORTED, RENDER) can read the
 post-collision player position and trig values via attention.
 
+### Phase B — In-graph coordinate normalization (scale-find)
+
+To keep precision-sensitive coord-coord multiplies inside a tight
+piecewise-linear cell envelope (`NORM_DIFF_BP`, denser near zero than
+`DIFF_BP`), the thinking phase runs a **scale-find pass** before the
+per-wall identifier cascade emits values:
+
+1. Each WALL position contributes its own `max(|ax|, |ay|, |bx|,
+   |by|)` to a single cross-position `attend_argmax_dot` reduction
+   whose query is a constant 1.  The winning value is the global
+   maximum coord magnitude across every wall in the scene.
+2. `log_inv_scale = -log(global_max_abs_coord)` and `inv_scale =
+   exp(log_inv_scale)` follow as 1-sublayer transformations.
+
+The three scalars (`global_max_abs_coord`, `log_inv_scale`,
+`inv_scale`) are broadcast across every position via the standard
+KV-cache mechanism and live in `ThinkingWallOutput`.  Downstream
+consumers read them through `RenderKVInput` (RENDER reads
+`log_inv_scale` for `normalize_coord` calls and `inv_scale` for the
+texture-column threshold shift).
+
+`normalize_coord(coord, log_inv_scale)` decomposes ``coord ·
+inv_scale`` as ``sign(coord) · exp(log|coord| + log_inv_scale)``;
+each step is a single MLP sublayer.  The end-to-end relative error
+is ~0.07 % over the operating envelope (|coord| ∈ [0.1, 100],
+|coord · inv_scale| ≤ 1).
+
+**Per-stage decision rule.**  Normalization is applied per-stage,
+not globally.  A stage normalizes its coord inputs only if it has
+an internal computation whose precision needs to be uniform across
+scene scales (i.e. it multiplies coord by coord at a regime where
+the piecewise-linear cell width matters relative to the result
+magnitude).  Stages without such a need stay in real units, because
+normalization makes their inputs scale with `inv_scale^d` for some
+degree `d > 0` — and once the inputs shrink below an op's
+discrete-decision deadband, the op silently outputs the wrong
+answer.
+
+* **RENDER** normalizes (the wall_height log-decomp and the
+  texture-column thermometer both need scale-invariant precision).
+* **Thinking_wall** does *not* normalize.  Its outputs are
+  sign-bearing (HIT_*, IS_RENDERABLE), wire-format-clamped (CROSS,
+  DOT, RESOLVED), or scale-invariant ratios (T_STAR, T_LO/HI,
+  COL_A/B as `atan(cross/dot)·col_scale`).  Normalizing
+  `sort_num_t = (b-a) × (a-p)` would make it scale with
+  `inv_scale²`, pushing the downstream `compare(adj_num_t, 0)`'s
+  0.1-input-unit deadband to swallow nearly all valid geometry on
+  large scenes.
+* **SORTED** does *not* normalize.  Its math operates on integer
+  ranks (BSP rank, position index) for which `inv_scale` is
+  meaningless.
+
+The corollary: `compare(x, 0)` is not a scale-free sign operator —
+it is a margin test with absolute tolerance `1/sharpness` in input
+units.  Sign extraction on a normalized degree-`d>0` quantity will
+fail at scenes where `inv_scale^d` is small enough to push typical
+inputs into the ramp deadband.  See
+`docs/numerical_noise_findings.md` for the worked example from
+the diagnostic session.
+
+### Phase B — Host-side coord shift (`MapSubset.scene_origin`)
+
+Real DOOM maps (E1M1 etc.) place geometry thousands of units from
+the WAD origin; the player spawn might be at `(1056, -3616)`.  The
+graph's `max_coord` envelope (default 20, raised to 100 for
+real-map subsets) won't admit such inputs.  Rather than widen
+`max_coord` to ten thousand and lose breakpoint density everywhere,
+the host carries a per-scene `scene_origin` tuple on `MapSubset`
+and applies it as a translation at the host boundary:
+
+* `step_frame` subtracts `scene_origin` from `wall_ax/ay/bx/by`,
+  player `(px, py)`, and the BSP plane `d` (transformed via
+  `d → d + nx·origin_x + ny·origin_y`) before each prefill /
+  autoregressive feed.
+* When reading `RESOLVED_X` / `RESOLVED_Y` back from overflow,
+  `step_frame` adds `scene_origin` so the host's `GameState` stays
+  in world coords.
+* `load_map_subset` defaults `scene_origin` to the player spawn —
+  a one-line heuristic that keeps the player and the closest walls
+  inside the local envelope without any per-frame recomputation.
+* `build_scene_subset` (hand-authored scenes) defaults
+  `scene_origin = (0, 0)`; its scenes are already centred near
+  origin, so the shift is a no-op.
+
+The graph never sees `scene_origin` — it's a host-side affine
+constant baked at subset build time.  The wire format's
+post-rotation `CROSS_A` / `DOT_A` clamp at ±40 is the residual
+limit: walls more than ~40 units from the player's facing
+direction (after rotation) saturate the clamp regardless of the
+shift.  In practice this only affects walls that the closest-N
+selection picks beyond the local room, and the `IS_RENDERABLE`
+gate degrades gracefully (those walls were already non-gameplay).
+
 ### SORTED_WALL — Front-to-Back Sort
 
 Interleaved with RENDER — one SORTED_WALL token runs before each
@@ -271,11 +364,20 @@ unchanged by RENDER tokens within the same wall.
    `render_wall_j_onehot` and read raw geometry `(ax, ay, bx, by)`.
 
 2. **Render precomputation.** From raw geometry plus player state
-   (position and cos/sin from PLAYER broadcasts), compute the rotation
-   products `(sort_den, C, D, E, sort_num_t)` and derive `H_inv`.
-   These are the same quantities the WALL stage used to compute in
-   earlier designs — now they're computed fresh at each RENDER token
-   from the raw wall coordinates and player state.
+   (position and cos/sin from PLAYER broadcasts), normalize the six
+   coords (`sel_ax/ay/bx/by`, `player_x/y`) by the broadcast
+   `log_inv_scale` (Phase B scale-find), then compute the rotation
+   products `(sort_den, C, D, E, sort_num_t)` directly in normalized
+   units.  All eight `piecewise_linear_2d` multiplies use
+   `NORM_DIFF_BP × TRIG_BP` (or `NORM_DIFF_BP × NORM_DIFF_BP` for the
+   diff-diff cross product), giving denser cells near zero than the
+   real-units `DIFF_BP` grid.  The four "trig-product" outputs scale
+   linearly with `inv_scale`; `sort_num_t` (= `(b-a) × (a-p)`) scales
+   with `inv_scale²` — wall_height applies the appropriate corrections
+   (next step) and texture-column reads ratios that are
+   scale-invariant.  No `H_inv` is computed at this point; the old
+   `reciprocal × multiply_2d` decomposition for wall_height has been
+   replaced by a log-domain combination (step 5).
 
 3. **Active column.** The active column is `render_col`.  SORTED sets
    this to `vis_lo` for each new wall; the state machine advances it
@@ -285,15 +387,24 @@ unchanged by RENDER tokens within the same wall.
    horizontal angle of this column relative to the screen center, in
    trig-table steps (0..255 units).
 
-5. **Wall height.** `tan(angle_offset)` via piecewise_linear, then:
+5. **Wall height (log-decomp).** `tan(angle_offset)` via
+   piecewise_linear, then:
    ```
-   den_over_cos = sort_den - C × tan(offset)
-   wall_height  = H_inv × |den_over_cos|
+   den_over_cos_norm = sort_den_norm - C_norm × tan(offset)
+   log_wall_height   = log(H) + log(|den_over_cos_norm|)
+                                + log_inv_scale
+                                - log(|sort_num_t_norm|)
+   wall_height       = clamp(exp(log_wall_height), 0, H)
    ```
-   The first line is the per-column horizontal projection factor. The
-   second scales by the wall's precomputed height reciprocal. Uses
-   `piecewise_linear_2d` with log-spaced breakpoints for `H_inv`
-   (values span 0.01 to ~H/0.3).
+   The math comes from `wall_height_real = H · |den_over_cos_real|
+   / |sort_num_t_real|` after substituting the normalized values
+   `|abs_den_norm| = inv_scale · |abs_den_real|` and `|abs_num_norm|
+   = inv_scale² · |abs_num_real|`.  Two parallel `log()` calls + a
+   Linear sum + `exp()` keep every intermediate well-conditioned in
+   float32 (each per-section log error ~3e-3 relative); the old
+   `reciprocal × multiply_2d` form would have multiplied two
+   per-op piecewise errors and accumulated them at the divide-by-small
+   denominator regime.
 
 6. **Texture column.** Determines which column of the wall's texture
    maps to this screen column:

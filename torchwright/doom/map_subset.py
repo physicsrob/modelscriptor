@@ -79,6 +79,14 @@ class MapSubset:
     ``segments``, columns match ``bsp_nodes``.  Unused columns (when
     fewer than ``max_bsp_nodes`` real nodes are present) are filled
     with zeros, so they contribute nothing to rank.
+
+    ``scene_origin`` is a per-scene host-side coord shift.  Segments
+    and BSP planes are stored in world coords; ``step_frame`` subtracts
+    ``scene_origin`` from wall geometry, BSP plane d-coefficients, and
+    the player position before feeding the graph, then adds it back to
+    ``RESOLVED_X/Y`` to reconstruct world coords.  The graph never sees
+    ``scene_origin``.  Default ``(0.0, 0.0)`` is a no-op shift suitable
+    for hand-authored scenes already centered near the origin.
     """
 
     segments: List[Segment]
@@ -90,6 +98,7 @@ class MapSubset:
     # Original seg indices in md.segs, in the same order as ``segments``.
     # Useful for cross-checking against the reference BSP traversal.
     original_seg_indices: List[int]
+    scene_origin: Tuple[float, float] = (0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +544,15 @@ def load_map_subset(
     whose leaves cover the selected segs' subsectors.  Precomputes the
     per-seg coefficients needed by the transformer's BSP rank sort.
 
+    Sets ``scene_origin = (px, py)`` so ``step_frame`` shifts world
+    coords into a player-centred frame before feeding the graph.  Raw
+    DOOM map coords for E1M1-class maps run to thousands of units; the
+    player-spawn origin keeps the host-feed envelope near zero,
+    bringing the player and any nearby walls inside the
+    ``max_coord``-sized clamp envelope without changing graph
+    topology.  Distant walls outside the local envelope still get
+    fed; ``CROSS_A``/``DOT_A`` clamping at ±40 absorbs the overflow.
+
     Raises ``ValueError`` if the required BSP subtree exceeds
     ``max_bsp_nodes`` — callers should increase the cap or reduce
     ``max_walls``.
@@ -675,6 +693,7 @@ def load_map_subset(
         seg_bsp_coeffs=coeffs,
         seg_bsp_consts=consts,
         original_seg_indices=list(selected_orig),
+        scene_origin=(float(px), float(py)),
     )
 
 

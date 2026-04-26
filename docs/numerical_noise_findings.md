@@ -175,14 +175,22 @@ expect `max_abs_error < 1e-3`; for `x_max/x_min ≤ 10⁷`, expect
 `max_abs_error < 5e-3`. Translate to `x` via
 `rel_err_in_x ≈ abs_err_in_log` (approximate; exact for small errors).
 
-**Not yet wired into DOOM.** These ops are candidates for the log-
-space reformulations discussed in the broader log-space analysis (a
-robust `atan2` via `atan(exp(log|cross| − log|dot|))`, wall-height as
-`exp(log H − log|num_t| + log|den/cos|)`, sign-and-log-magnitude
-comparisons replacing `_T_COMPARE_SCALE = 100` in
-`torchwright/doom/stages/wall.py`). When a callsite lands, add a
-matching `doom_*` distribution mirroring its production input range,
-and extend the call-site table below.
+**Wired into DOOM as of Phase B Step 2.** `_compute_wall_height` in
+`torchwright/doom/stages/render.py` is now exactly the
+`exp(log H − log|num_t| + log|den/cos|)` log-space reformulation
+flagged here.  Both `log()` calls use the sectioned form (input
+ranges span 4–6 decades on the normalized chain); the `exp()` runs
+on a tight `[log(1e-3), log(2H)+1]` window so its uniform grid
+resolves wall-height pixels well inside the integer-row tolerance.
+The callsite is captured by `doom_log_abs_num` / `doom_log_abs_den`
+and `doom_exp_wall_height` distributions if/when added to
+`scripts/measure_op_noise.py`; see the table below for the current
+coverage.
+
+The other candidates remain unwired: `atan2` still uses `low_rank_2d`
+in `_endpoint_to_column`, and the legacy `_T_COMPARE_SCALE = 100`
+heuristic is gone (the prefill `wall.py` path it lived in was reduced
+to a thin data carrier in Phase B Part 3).
 
 ### `log_abs` fuses `abs + log` into one sublayer for typical ranges
 
@@ -218,6 +226,45 @@ this floor at ~1.2e-3 absolute, comfortably inside the noise budget.
   outputs near `log(min_abs) = -2.3` so a small absolute drift gives
   a misleading "relative" number. Same near-output-zero pathology as
   `square` and `multiply_2d`. Score on absolute error, not relative.
+
+### `compare(x, 0)` is a margin test, not a scale-free sign operator
+
+`compare(x, threshold, step_sharpness=10)` produces a piecewise-linear
+ramp of width `1/step_sharpness` in input units around the threshold
+— the default 0.1-input-unit ramp.  Inside that ramp the output is
+neither cleanly +1 nor -1; it slopes linearly between them.  Any
+downstream consumer that uses a `compare` output through `cond_gate`
+or `bool_all_true` expects a crisp ±1 and is brittle to mid-ramp
+values.
+
+This is the bit-level reason `east_wall_collide` flipped to
+`is_renderable = False` during a now-discarded experiment that
+normalized thinking_wall's `sort_num_t`:
+
+* In real units: `sort_num_t = (b-a) × (a-p)` for that scene is ~25
+  (player ~5 units from wall, wall extent ~10).
+  `compare(sort_num_t · sign(sort_den), 0)` lands at +25 — fully
+  outside the 0.1 ramp, crisp +1.
+* Normalized to degree-2 in `inv_scale`: `sort_num_t_norm =
+  inv_scale² · sort_num_t ≈ (1/12)² · 25 ≈ 0.17`.  Still above the
+  0.1 ramp half-width, but `inv_scale` for E1M1-class scenes
+  (`inv_scale ≈ 7e-4`) gives `sort_num_t_norm ≈ 1.2e-5`, deep
+  inside the ramp.  Downstream `is_renderable` becomes a noisy
+  ~-0.21 value, gated through `bool_all_true`, contaminating
+  `vis_lo` / `vis_hi`.
+
+**Working rule for callers.**  Don't normalize a quantity whose
+downstream consumer is a sign extraction `compare(x, 0)` (or
+similarly small-threshold margin tests).  Either keep that quantity
+in real units, or change the downstream extraction to a
+scale-aware predicate (e.g. comparing `x` against an
+`inv_scale`-parameterized epsilon rather than the constant 0).
+
+This is the diagnostic the per-stage normalization rule documented
+in `docs/doom_graph.md` (Phase B) protects against — RENDER
+normalizes because its consumers tolerate (and need)
+scale-invariant precision; thinking_wall and SORTED don't, because
+their consumers are sign / integer / wire-clamped.
 
 ### Known gap: reciprocal sorted callsite blocked on op-math
 
@@ -261,10 +308,13 @@ changes.
 
 | Callsite | What it computes | Distribution | Op |
 | --- | --- | --- | --- |
-| `torchwright/doom/stages/render.py:697` | `inv_abs_num_t = reciprocal(abs_num_t, min=0.3, max=…)` | `doom_reciprocal_wall` | `reciprocal` |
 | `torchwright/doom/stages/thinking_wall.py:1196` | `inv_denom_abs = reciprocal(denom_abs, min=0.1, max=…)` | `doom_reciprocal_sorted` (currently unwired, see "Known gap" above) | `reciprocal` |
 | `torchwright/doom/stages/thinking_wall.py:1115` (family) | `sort_ey_cos`, `sort_ex_sin`, etc. via `piecewise_linear_2d` | `doom_diff_trig` | `piecewise_linear_2d` |
 | `torchwright/doom/stages/thinking_wall.py:1014` (family) | `p_dx_ey`, `p_dy_ex`, etc. via `piecewise_linear_2d` | `doom_diff_vel` | `piecewise_linear_2d` |
+| `torchwright/doom/stages/render.py` (`_compute_precomputes` family) | `r_ey_cos`, `r_ex_sin`, … on `NORM_DIFF_BP × TRIG_BP` (post Phase B single-chain rewrite) | not yet measured — falls under existing `doom_diff_trig` budget; tighter cells should give strictly lower error | `piecewise_linear_2d` |
+| `torchwright/doom/stages/render.py` (`_compute_wall_height`) | `log(abs_num_t_norm)` and `log(abs_den_over_cos_norm)` on the sectioned-log path | not yet measured; matches the `log_4decades_001_100` and `log_6decades_wide` budgets | `log` |
+| `torchwright/doom/stages/render.py` (`_compute_wall_height`) | `exp(log(H) + log_abs_den + log_inv_scale − log_abs_num)` | not yet measured; matches the `exp` measured `1.92e-4` rel-error bound | `exp` |
+| `torchwright/doom/stages/_normalize.py` | `coord · inv_scale` via `log_abs + Linear + exp + sign-mux` | `log_abs_3decades_pm100` (for the log_abs leaf) | `log_abs`, `exp`, `cond_gate` |
 | `torchwright/doom/stages/sorted.py` | `atan_front_* = low_rank_2d(cross, dot, …, rank=3)` | `doom_atan_cross_dot` | `low_rank_2d` |
 | `torchwright/doom/stages/thinking_wall.py` | BSP side-bit compare (threshold 0.5) | `compare_near_thresh_05` | `compare` |
 
@@ -272,6 +322,18 @@ changes.
 `stages/thinking_wall.py`** (the prefill WALL stage was gutted to a data
 carrier; all per-wall compute now lives in the thinking cascade).  Line
 numbers above are post-Phase-B-Part-3.
+
+**Phase B Step 1+2 (in-graph normalization)** rewrote the RENDER
+precompute pipeline as a single normalized chain and replaced the old
+`reciprocal × multiply_2d` wall_height with a log-decomposition.  The
+removed render-side `reciprocal` callsite (formerly
+`render.py:697`) is gone; its `doom_reciprocal_wall` distribution is
+no longer exercised by production code, though the budget remains
+useful as a regression baseline against the `reciprocal` op generally.
+The newly-introduced `log` / `exp` and `normalize_coord` callsites are
+not yet measured against tailored DOOM distributions; the existing
+`log_*` and `exp` measurements are the right budgets to compare
+against.
 
 Foundation ops (`piecewise_linear`, `square`, `square_signed`,
 `multiply_integers`, the exact negative controls, and the logic ops) are

@@ -25,6 +25,8 @@ to the line-clip factoring and the assert_in_range nodes already
 guard their bounds.
 """
 
+from typing import List
+
 import pytest
 
 from tests.doom._rollout.reference import compute_reference
@@ -278,3 +280,4 @@ class TestRollout:
                 f"slot {slot} (wall {wall_i}): compiled emitted "
                 f"{actual} RENDERs, reference expected {expected}"
             )
+
