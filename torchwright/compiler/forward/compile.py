@@ -198,6 +198,69 @@ def _verify_end_of_layer_liveness(
         )
 
 
+def _verify_end_of_layer_writes(
+    attn_ops: list,
+    mlp_ops: list,
+    prev_computed: Set[Node],
+    prev_allocated: Set[Node],
+    computed: Set[Node],
+    residual_map,
+    layer_idx: int,
+) -> None:
+    """Invariant B (within-layer): every node freshly added to
+    ``computed_nodes`` this layer that owns residual columns must
+    have been written by some op in this layer's ``attn_ops`` or
+    ``mlp_ops``.
+
+    Catches the failure mode where the scheduler marks a node
+    computed and allocates its columns but emits no op that writes
+    a value into them.  Without this check, downstream consumers
+    silently read uninitialized data and the compile produces
+    wrong values with no error.
+
+    Gated behind ``TW_COMPILER_VERIFY=1`` like its sibling
+    :func:`_verify_end_of_layer_liveness` — the walk is cheap but
+    the assertion machinery is debug-mode only.
+    """
+    written_nodes: Set[Node] = set()
+    for op in attn_ops:
+        if op.op_type == "cancel":
+            continue
+        if op.node is not None:
+            written_nodes.add(op.node)
+    for op in mlp_ops:
+        if op.node is not None:
+            written_nodes.add(op.node)
+
+    newly_computed = computed - prev_computed
+    for node in newly_computed:
+        if isinstance(node, Concatenate):
+            continue
+        if not residual_map.is_allocated(node):
+            # Exclusive chain L1 and chain ReLU live only in MLP hidden
+            # slots; LiteralValue may be folded into output bias without
+            # owning residual cols.  No residual write expected.
+            continue
+        if node in prev_allocated:
+            # The node's cols were owned by a prior allocation (e.g.
+            # the dead addend in an add_into reassign).  The reassign
+            # itself does the value write via the add_into op, which
+            # is captured in written_nodes via op.node == add_node.
+            # Pre-existing cols don't need a separate write.
+            continue
+        if node in written_nodes:
+            continue
+        raise AssertionError(
+            f"End-of-layer {layer_idx} write-coverage violation: "
+            f"{node!r} was added to computed_nodes and allocated to "
+            f"cols {residual_map.get_indices(node)} this layer, but "
+            f"no op in attn_ops or mlp_ops wrote a value into those "
+            f"cols.  Downstream consumers would read uninitialized "
+            f"data.  Emitted ops: "
+            f"{[(op.op_type, op.node) for op in attn_ops + mlp_ops]}."
+        )
+
+
 def _verify_overlay_target_protection(
     overlays,
     residual_map,
@@ -704,7 +767,13 @@ def forward_compile(
         if output_node in computed:
             break
 
-        prev_computed = set(computed) if on_node_scheduled else None
+        verify_compiler = bool(os.environ.get("TW_COMPILER_VERIFY"))
+        prev_computed = (
+            set(computed) if (on_node_scheduled or verify_compiler) else None
+        )
+        prev_allocated = (
+            set(residual_map.get_allocated_nodes()) if verify_compiler else None
+        )
         occupied_before = d - residual_map.get_free_count()
 
         t_layer_start = time.perf_counter()
@@ -734,7 +803,11 @@ def forward_compile(
                 if all(leaf in computed for leaf in flatten_concat_nodes([node])):
                     computed.add(node)
 
-        if os.environ.get("TW_COMPILER_VERIFY"):
+        if verify_compiler:
+            _verify_end_of_layer_writes(
+                attn_ops, mlp_ops, prev_computed, prev_allocated,
+                computed, residual_map, i,
+            )
             _verify_end_of_layer_liveness(graph, residual_map, computed, i)
 
         if on_node_scheduled is not None and prev_computed is not None:

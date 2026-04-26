@@ -655,19 +655,23 @@ class LayerScheduler:
             dirty = residual_map.dirty_subset(target_cols)
             if dirty:
                 residual_map.mark_clean(dirty)
-            computed_nodes.update({l1, relu, l2})
-            # Mark the chain-representative (l2) as scheduled — that's
-            # the node that appears in node_to_chain when the cluster
-            # analyzer classifies an MLP chain's output as the branch
-            # terminal.  l1 and relu may also be in the chain, but
-            # terminal detection relies on the direct join input.
-            self._mark_scheduled(l2)
-            self._mark_scheduled(l1)
+            # The chain composite emits the chain output (L2) and L1's
+            # value lives in MLP hidden slots inline.  For exclusive
+            # chains, L1 has no residual realization (no consumers
+            # besides R), so marking L1 computed here is correct.  For
+            # non-exclusive chains, L1's standalone realization
+            # (writing L1's value to its own residual cols for the
+            # non-chain consumers) is the bypass loop's job — leave
+            # L1 out of computed_nodes so the bypass loop processes
+            # it as a regular Linear, allocating cols and emitting
+            # compute_linear_bypass(L1) in this same MLP sublayer.
+            computed_nodes.add(relu)
+            computed_nodes.add(l2)
             self._mark_scheduled(relu)
-
-            # L1 with fanout: also allocate L1 in residual stream
-            if not exclusive and not residual_map.is_allocated(l1):
-                self._try_allocate(l1, residual_map)
+            self._mark_scheduled(l2)
+            if exclusive:
+                computed_nodes.add(l1)
+                self._mark_scheduled(l1)
 
         # 3b. Standalone ReLU (not part of chain)
         standalone_relus = sorted(

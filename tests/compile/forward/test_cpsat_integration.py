@@ -16,7 +16,6 @@ import torch
 
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import Costs
-from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY
 from torchwright.graph import Add, Linear, ReLU
 from torchwright.ops.arithmetic_ops import (
     add,
@@ -271,22 +270,18 @@ def test_cpsat_compiles_fanout_chain():
     """Non-exclusive chain L1 — L1 also feeds another consumer.
 
     Mirrors ``test_relu_chain_broken_by_fanout`` from
-    ``test_scheduler.py``.  The chain composite emits L1 inline inside
-    ``linear1``; the standalone realization of L1 (writing L1's value
-    to its own residual cols for the non-chain consumer) is a separate
-    realization that costs attention heads (LEGACY_POLICY routes it to
-    attention).  Before the P1 fix, the CP-SAT model treated L1 as
-    chain-internal — no `is_attn[L1]` decision, no attention-head
-    cost charged for the standalone realization — so a CP-SAT
-    schedule could pack a layer beyond what the heuristic could replay.
-    With the P1 fix, the model accounts for L1's standalone heads.
+    ``test_scheduler.py``.  The chain composite emits L1 inline
+    inside ``linear1``; the standalone realization of L1 (writing
+    L1's value to its own residual cols for the non-chain consumer)
+    is emitted by the bypass loop in the same MLP sublayer.  The
+    P1 CP-SAT model fix accounts for both realizations' resource
+    cost.
 
-    Pinned to ``LEGACY_POLICY`` + ``cpsat_flex_routing=False`` because
-    the heuristic's handling of non-exclusive L1 under the default
-    bypass policy has a separate, pre-existing soundness gap (the
-    chain block marks L1 as ``computed`` before the bypass loop has
-    a chance to emit ``compute_linear_bypass`` for it — left for a
-    follow-up).
+    Exercises the default (``local_in_attention="never"``) policy
+    so L1 routes through MLP-bypass — the path that previously
+    silently produced wrong values because the chain block marked
+    L1 ``computed`` before the bypass loop could emit
+    ``compute_linear_bypass`` for it.
     """
     x = create_input("x", 8)
     l1 = Linear(x, torch.randn(8, 16), torch.zeros(16), name="l1")
@@ -298,11 +293,9 @@ def test_cpsat_compiles_fanout_chain():
 
     net_heur = forward_compile(
         d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=0,
-        policy=LEGACY_POLICY,
     )
     net_cpsat = forward_compile(
         d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=1,
-        policy=LEGACY_POLICY, cpsat_flex_routing=False,
     )
     out_heur = net_heur.compute(2, inputs)[out].cpu()
     out_cpsat = net_cpsat.compute(2, inputs)[out].cpu()
