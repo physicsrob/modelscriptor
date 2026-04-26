@@ -210,6 +210,12 @@ def compile_game(
         logit_output_name="next_token_embedding",
     )
     module.eval()
+    # Stash graph_io and pos_encoding so probe scripts can resolve
+    # internal nodes by name (e.g., to call ``module.debug_value`` after
+    # ``step_frame(..., debug_at_token=...)``).  Tests/runtime callers
+    # don't touch these.
+    module._game_graph_io = graph_io
+    module._game_pos_encoding = pos_encoding
     return module
 
 
@@ -289,6 +295,7 @@ def step_frame(
     textures: Optional[List[np.ndarray]] = None,
     trace: Optional[FrameTrace] = None,
     stop_after_thinking: bool = False,
+    debug_at_token: Optional[int] = None,
 ) -> Tuple[np.ndarray, GameState]:
     """Run one frame via the multi-phase rollout.
 
@@ -311,6 +318,16 @@ def step_frame(
             the full thinking phase + the SORTED_WALL token.  Use
             for thinking-token tests that only need the token-stream
             trace and not pixel output.
+        debug_at_token: If set, run ``module.step(debug=True)`` for
+            the autoregressive iteration whose INPUT token sits at
+            absolute position ``debug_at_token`` in the
+            ``token_id_log``.  After ``step_frame`` returns, the
+            module's residual-stream snapshots from that step remain
+            cached, so the caller can extract any graph node's value
+            via ``module.debug_value(node)``.  Used by the
+            ``scripts/probe_render_*`` family.  Note: only one such
+            step is captured; the next ``debug=True`` call would
+            overwrite the snapshot.
 
     Returns:
         ``(frame, new_state)`` where frame is ``(H, W, 3)`` float32.
@@ -335,8 +352,21 @@ def step_frame(
     if textures is None:
         textures = subset.textures
 
+    # Host-side coord shift: subset.segments and subset.bsp_nodes are
+    # stored in world coords; we subtract scene_origin from wall
+    # geometry, BSP plane d, and player_x/y before feeding the graph.
+    # Reverse the shift after reading RESOLVED_X/Y.  (0, 0) is a no-op
+    # for hand-authored scenes already centred near the origin.
+    origin_x, origin_y = subset.scene_origin
+
     walls = [
-        {"ax": s.ax, "ay": s.ay, "bx": s.bx, "by": s.by, "tex_id": float(s.texture_id)}
+        {
+            "ax": s.ax - origin_x,
+            "ay": s.ay - origin_y,
+            "bx": s.bx - origin_x,
+            "by": s.by - origin_y,
+            "tex_id": float(s.texture_id),
+        }
         for s in subset.segments
     ]
 
@@ -350,7 +380,14 @@ def step_frame(
 
     past = module.empty_past()
     step = 0
-    px, py, angle = float(state.x), float(state.y), float(state.angle)
+    # ``state.x``, ``state.y`` are in world coords; the graph expects
+    # the host-shifted frame.  Apply scene_origin once here; the
+    # ``px`` / ``py`` locals stay in shifted coords through the rest of
+    # this function.  The reverse shift is applied to RESOLVED below
+    # before constructing ``new_state``.
+    px = float(state.x) - origin_x
+    py = float(state.y) - origin_y
+    angle = float(state.angle)
     # The host feeds pre-collision (frame-start) player_x/y to
     # PLAYER_X / PLAYER_Y; collision resolution lives in the thinking
     # phase and the post-collision state is read from the RESOLVED_X /
@@ -423,7 +460,15 @@ def step_frame(
         onehot[i] = 1.0
         if i < len(subset.bsp_nodes):
             plane = subset.bsp_nodes[i]
-            nx, ny, d = plane.nx, plane.ny, plane.d
+            # Shift the plane equation into the host-shifted frame.
+            # ``side_P`` classifies sign of ``nx*x + ny*y + d`` in
+            # world coords; after substituting ``x = x_shifted +
+            # origin_x``, ``y = y_shifted + origin_y`` the same
+            # classification reads ``nx*x_shifted + ny*y_shifted +
+            # (d + nx*origin_x + ny*origin_y)``.
+            nx = plane.nx
+            ny = plane.ny
+            d = plane.d + plane.nx * origin_x + plane.ny * origin_y
         else:
             nx, ny, d = 0.0, 0.0, 0.0
         rows.append(
@@ -577,7 +622,20 @@ def step_frame(
     token_id_log: List[int] = [first_thinking_id]
 
     for k in range(max_steps):
-        next_ids, overflow, past = _step(prev, past, step)
+        # The input token for this iteration is the last element of
+        # token_id_log so far (position == len(token_id_log) - 1).  When
+        # ``debug_at_token`` matches, take the debug=True path so the
+        # residual snapshots for THIS step land on ``module._debug_state``.
+        debug_this_step = (
+            debug_at_token is not None and len(token_id_log) - 1 == debug_at_token
+        )
+        if debug_this_step:
+            with torch.no_grad():
+                next_ids, overflow, past = module.step(
+                    prev, past, past_len=step, debug=True
+                )
+        else:
+            next_ids, overflow, past = _step(prev, past, step)
         step += 1
         total_steps += 1
 
@@ -719,9 +777,12 @@ def step_frame(
     else:
         print(f"  sort+render 0 steps  total={t_total*1000:.0f}ms")
 
+    # Reverse the host-side coord shift before exposing the new state
+    # to the caller — ``GameState`` is in world coords, while ``px`` /
+    # ``py`` above are in the shifted frame the graph operates in.
     new_state = GameState(
-        x=px,
-        y=py,
+        x=px + origin_x,
+        y=py + origin_y,
         angle=round(new_angle_raw) % 256,
         move_speed=state.move_speed,
         turn_speed=state.turn_speed,

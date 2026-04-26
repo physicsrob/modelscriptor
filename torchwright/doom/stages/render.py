@@ -13,8 +13,11 @@ Per-token flow:
    attend to the matching WALL position, read (ax, ay, bx, by,
    tex_id, vis_lo, vis_hi).
 2. **Precompute**: from raw geometry plus player state (position and
-   cos/sin from PLAYER broadcasts), compute the rotation products
-   (sort_den, C, D, E, sort_num_t) and derive H_inv.
+   cos/sin from PLAYER broadcasts), normalize the coords by the
+   broadcast ``log_inv_scale`` and compute the rotation products
+   (sort_den, C, D, E, sort_num_t).  Wall_height applies a log-domain
+   correction to recover real pixels; texture column reads ratios that
+   are scale-invariant.
 3. The **active column** is ``col`` (SORTED sets this to ``vis_lo``
    for each new wall).
 4. Compute wall height + texture u-coordinate.
@@ -53,10 +56,11 @@ from torchwright.ops.arithmetic_ops import (
     bool_to_01,
     clamp,
     compare,
+    exp,
+    log,
     multiply_const,
     piecewise_linear,
     piecewise_linear_2d,
-    reciprocal,
     subtract,
     sum_nodes,
     thermometer_floor_div,
@@ -72,12 +76,13 @@ from torchwright.reference_renderer.types import RenderConfig
 
 from torchwright.doom.embedding import D_EMBED, VALUE_RANGE_BY_NAME, embed_lookup
 from torchwright.doom.graph_constants import (
-    DIFF_BP,
+    NORM_DIFF_BP,
     TEX_E8_OFFSET,
     TRIG_BP,
 )
 from torchwright.doom.graph_utils import extract_from
 from torchwright.doom.renderer import _textured_column_fill
+from torchwright.doom.stages._normalize import normalize_coord
 from torchwright.doom.thinking_readback import ThinkingReadback
 
 # ---------------------------------------------------------------------------
@@ -147,6 +152,20 @@ class RenderKVInput:
     value_wall_index_scalar: Node
     value_wall_index_neg_sq: Node
     is_thinking_value: Node
+
+    # Coord-normalization scalars — broadcast from the THINKING_WALL
+    # scale-find pass (``thinking_wall._compute_scale_find``).
+    #
+    # ``log_inv_scale`` is ``log(1 / global_max_abs_coord)``, used by
+    # ``normalize_coord`` to add into ``log|coord|`` and exp back to a
+    # normalized magnitude.
+    #
+    # ``inv_scale`` is the linear-space ``1 / global_max_abs_coord``,
+    # needed for the texture-column threshold shift (which is fixed
+    # at ``-0.5`` in real units; in normalized space it scales with
+    # ``inv_scale``).
+    log_inv_scale: Node
+    inv_scale: Node
 
 
 @dataclass
@@ -264,7 +283,12 @@ def build_render(
         )
 
     with annotate("render/precompute"):
-        sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv = _compute_precomputes(
+        # Single normalized-units precompute chain.  Outputs scale with
+        # ``inv_scale`` (sort_den, C, D, E) or ``inv_scale²``
+        # (sort_num_t).  Wall_height applies a log-decomposition to
+        # recover real pixels; texture column reads ratios that are
+        # scale-invariant.
+        sort_den, precomp_C, precomp_D, precomp_E, sort_num_t = _compute_precomputes(
             sel_ax,
             sel_ay,
             sel_bx,
@@ -273,7 +297,7 @@ def build_render(
             kv.player_y,
             kv.player_cos,
             kv.player_sin,
-            H=H,
+            kv.log_inv_scale,
             max_coord=max_coord,
         )
 
@@ -289,11 +313,12 @@ def build_render(
             tan_o,
             tan_val_bp,
         )
+        abs_num_t = abs(sort_num_t)
         wall_top, wall_bottom, wall_height = _compute_wall_height(
-            precomp_H_inv,
+            abs_num_t,
             abs_den_over_cos,
+            kv.log_inv_scale,
             H=H,
-            max_coord=max_coord,
         )
 
     if render_pixels:
@@ -304,6 +329,7 @@ def build_render(
                 tan_o,
                 tan_val_bp,
                 abs_den_over_cos,
+                kv.inv_scale,
                 max_coord=max_coord,
                 tex_w=tex_w,
             )
@@ -587,33 +613,67 @@ def _compute_precomputes(
     player_y: Node,
     player_cos: Node,
     player_sin: Node,
+    log_inv_scale: Node,
     *,
-    H: int,
     max_coord: float,
 ) -> tuple[Node, Node, Node, Node, Node]:
-    """Compute (sort_den, C, D, E, H_inv) from raw wall geometry + player state.
+    """Compute (sort_den, C, D, E, sort_num_t) in **normalized** units.
 
-    Same math as the former WALL-stage ``_compute_render_precomputation``
-    and ``_compute_central_ray_intersection``, now computed at RENDER time.
+    Each raw wall / player coord is normalized via :func:`normalize_coord`
+    so the downstream products run on the tighter ``NORM_DIFF_BP`` grid
+    instead of ``DIFF_BP``.  In normalized space ``norm_w_ex = ex ·
+    inv_scale`` (and friends), so:
+
+    * The four "trig" outputs (sort_den, C, D, E) scale linearly with
+      ``inv_scale``: each is one ``norm_diff × trig`` product, which
+      equals ``inv_scale · (real_diff × trig)``.
+    * ``sort_num_t = norm_w_ey · norm_w_fx + norm_w_ex · norm_w_gy``
+      scales as ``inv_scale²`` — both factors are normalized.
+
+    Consumers that care about ratios (the texture-column thermometer
+    comparison) are invariant to ``inv_scale``; consumers that care
+    about absolute values (wall_height via :func:`_compute_wall_height`)
+    multiply by the appropriate power of ``inv_scale`` to recover the
+    real-units answer.
     """
-    w_ex = subtract(sel_bx, sel_ax)
-    w_ey = subtract(sel_by, sel_ay)
-    w_fx = subtract(sel_ax, player_x)
-    w_gy = subtract(player_y, sel_ay)
+    norm_sel_ax = normalize_coord(
+        sel_ax, log_inv_scale, max_abs=float(max_coord), name="norm_sel_ax"
+    )
+    norm_sel_ay = normalize_coord(
+        sel_ay, log_inv_scale, max_abs=float(max_coord), name="norm_sel_ay"
+    )
+    norm_sel_bx = normalize_coord(
+        sel_bx, log_inv_scale, max_abs=float(max_coord), name="norm_sel_bx"
+    )
+    norm_sel_by = normalize_coord(
+        sel_by, log_inv_scale, max_abs=float(max_coord), name="norm_sel_by"
+    )
+    norm_player_x = normalize_coord(
+        player_x, log_inv_scale, max_abs=float(max_coord), name="norm_player_x"
+    )
+    norm_player_y = normalize_coord(
+        player_y, log_inv_scale, max_abs=float(max_coord), name="norm_player_y"
+    )
+
+    # Differences in normalized space (Linear, exact).
+    norm_w_ex = subtract(norm_sel_bx, norm_sel_ax)
+    norm_w_ey = subtract(norm_sel_by, norm_sel_ay)
+    norm_w_fx = subtract(norm_sel_ax, norm_player_x)
+    norm_w_gy = subtract(norm_player_y, norm_sel_ay)
 
     # sort_den = ey*cos - ex*sin
     r_ey_cos = piecewise_linear_2d(
-        w_ey,
+        norm_w_ey,
         player_cos,
-        DIFF_BP,
+        NORM_DIFF_BP,
         TRIG_BP,
         lambda a, b: a * b,
         name="r_ey_cos",
     )
     r_ex_sin = piecewise_linear_2d(
-        w_ex,
+        norm_w_ex,
         player_sin,
-        DIFF_BP,
+        NORM_DIFF_BP,
         TRIG_BP,
         lambda a, b: a * b,
         name="r_ex_sin",
@@ -622,17 +682,17 @@ def _compute_precomputes(
 
     # C = ey*sin + ex*cos
     r_ey_sin = piecewise_linear_2d(
-        w_ey,
+        norm_w_ey,
         player_sin,
-        DIFF_BP,
+        NORM_DIFF_BP,
         TRIG_BP,
         lambda a, b: a * b,
         name="r_ey_sin",
     )
     r_ex_cos = piecewise_linear_2d(
-        w_ex,
+        norm_w_ex,
         player_cos,
-        DIFF_BP,
+        NORM_DIFF_BP,
         TRIG_BP,
         lambda a, b: a * b,
         name="r_ex_cos",
@@ -641,17 +701,17 @@ def _compute_precomputes(
 
     # D = fx*sin + gy*cos
     r_fx_sin = piecewise_linear_2d(
-        w_fx,
+        norm_w_fx,
         player_sin,
-        DIFF_BP,
+        NORM_DIFF_BP,
         TRIG_BP,
         lambda a, b: a * b,
         name="r_fx_sin",
     )
     r_gy_cos = piecewise_linear_2d(
-        w_gy,
+        norm_w_gy,
         player_cos,
-        DIFF_BP,
+        NORM_DIFF_BP,
         TRIG_BP,
         lambda a, b: a * b,
         name="r_gy_cos",
@@ -660,53 +720,46 @@ def _compute_precomputes(
 
     # E = fx*cos - gy*sin
     r_fx_cos = piecewise_linear_2d(
-        w_fx,
+        norm_w_fx,
         player_cos,
-        DIFF_BP,
+        NORM_DIFF_BP,
         TRIG_BP,
         lambda a, b: a * b,
         name="r_fx_cos",
     )
     r_gy_sin = piecewise_linear_2d(
-        w_gy,
+        norm_w_gy,
         player_sin,
-        DIFF_BP,
+        NORM_DIFF_BP,
         TRIG_BP,
         lambda a, b: a * b,
         name="r_gy_sin",
     )
     precomp_E = subtract(r_fx_cos, r_gy_sin)
 
-    # sort_num_t = ey*fx + ex*gy
+    # sort_num_t = ey*fx + ex*gy.  Both factors normalized → output
+    # scales as inv_scale².  Wall_height takes ``log(abs(sort_num_t))``
+    # and adds ``log_inv_scale`` to recover real units; see
+    # :func:`_compute_wall_height`.
     r_ey_fx = piecewise_linear_2d(
-        w_ey,
-        w_fx,
-        DIFF_BP,
-        DIFF_BP,
+        norm_w_ey,
+        norm_w_fx,
+        NORM_DIFF_BP,
+        NORM_DIFF_BP,
         lambda a, b: a * b,
         name="r_ey_fx",
     )
     r_ex_gy = piecewise_linear_2d(
-        w_ex,
-        w_gy,
-        DIFF_BP,
-        DIFF_BP,
+        norm_w_ex,
+        norm_w_gy,
+        NORM_DIFF_BP,
+        NORM_DIFF_BP,
         lambda a, b: a * b,
         name="r_ex_gy",
     )
     sort_num_t = add(r_ey_fx, r_ex_gy)
 
-    # H_inv = H / |sort_num_t|
-    abs_num_t = abs(sort_num_t)
-    inv_abs_num_t = reciprocal(
-        abs_num_t,
-        min_value=0.3,
-        max_value=2.0 * max_coord * max_coord,
-        step=1.0,
-    )
-    precomp_H_inv = multiply_const(inv_abs_num_t, float(H))
-
-    return sort_den, precomp_C, precomp_D, precomp_E, precomp_H_inv
+    return sort_den, precomp_C, precomp_D, precomp_E, sort_num_t
 
 
 # ---------------------------------------------------------------------------
@@ -747,11 +800,18 @@ def _compute_den_over_cos(
     tan_o: Node,
     tan_val_bp,
 ):
-    """``den/cos = sort_den - C*tan(offset)`` — per-column horizontal projection factor."""
+    """``den/cos = sort_den - C*tan(offset)`` — per-column horizontal projection factor.
+
+    Operates on **normalized-units** ``sort_den`` and ``C`` from
+    :func:`_compute_precomputes`, so the C·tan multiply uses
+    ``NORM_DIFF_BP`` on the C axis (denser cells than ``DIFF_BP`` near
+    zero, where the texture-column thermometer is most sensitive).
+    Output ``den_over_cos`` scales as ``inv_scale``.
+    """
     C_tan = piecewise_linear_2d(
         precomp_C,
         tan_o,
-        DIFF_BP,
+        NORM_DIFF_BP,
         tan_val_bp,
         lambda a, b: a * b,
         name="C_tan_o",
@@ -766,36 +826,89 @@ def _compute_den_over_cos(
 # ---------------------------------------------------------------------------
 
 
+_ABS_NUM_FLOOR = 3e-5
+"""Floor for ``log(abs(sort_num_t_norm))``.
+
+In real units, ``sort_num_t = (b-a)×(a-p)`` is bounded below by ~0.3
+when the wall is non-degenerate (existing reciprocal floor in the old
+real-units chain).  After two-coord normalization the same floor lands
+at ``0.3 · inv_scale²``; the worst case is ``inv_scale ≈ 1/max_coord``,
+so for ``max_coord = 100`` the normalized floor sits at
+``0.3 · 1e-4 = 3e-5``.  Walls with smaller ``|sort_num_t|`` than this
+are degenerate (the player is essentially on the wall line) and the
+clamp at the end of :func:`_compute_wall_height` handles the resulting
+saturation."""
+
+_ABS_DEN_FLOOR = 1e-4
+"""Floor for ``log(abs_den_over_cos_norm)``.
+
+Real-units floor ≈ 0.01; normalized floor = ``0.01 · inv_scale_min ≈
+0.01 · (1/max_coord) = 1e-4`` for ``max_coord = 100``.  A smaller
+denominator means the wall is tangent to the central ray; the clamp
+handles saturation."""
+
+
 def _compute_wall_height(
-    precomp_H_inv: Node,
-    abs_den_over_cos: Node,
+    abs_num_t_norm: Node,
+    abs_den_over_cos_norm: Node,
+    log_inv_scale: Node,
     *,
     H: int,
-    max_coord: float,
 ):
-    """Wall height = H_inv * |den/cos|, clamped.  Wall span is centered on H/2.
+    """Wall height in pixels via log-domain combination of normalized inputs.
 
-    Uses a log-spaced breakpoint grid for ``H_inv`` (values span ``0.01`` to
-    ``H/0.3``) because the division step produces a highly non-uniform
-    distribution.
+    Math.  In real units, ``wall_height = H · |abs_den_over_cos| /
+    |abs_num_t|``.  Substituting the normalized chain's
+    ``abs_den_norm = inv_scale · abs_den_real`` and ``abs_num_norm =
+    inv_scale² · abs_num_real`` gives::
+
+        real_wall_height
+          = H · (abs_den_norm / inv_scale) / (abs_num_norm / inv_scale²)
+          = H · abs_den_norm · inv_scale / abs_num_norm
+
+    In log space::
+
+        log_wall_height = log(H) + log(abs_den_norm) + log_inv_scale
+                        - log(abs_num_norm)
+
+    Replacing the old ``reciprocal × multiply_2d`` decomposition with
+    two parallel ``log()`` calls + a Linear sum + ``exp`` keeps every
+    intermediate within float32's well-conditioned regime: the log/exp
+    cancellations bound output error by the per-section log error
+    (~3e-3 relative) instead of the multiplicative product of two
+    unrelated piecewise-linear errors.
     """
-    max_h_inv = float(H) / 0.3
-    h_inv_n = 16
-    h_inv_ratio = (max_h_inv / 0.01) ** (1.0 / (h_inv_n - 1))
-    height_inv_bp = [0.01 * (h_inv_ratio**k) for k in range(h_inv_n)]
-    height_inv_bp[0] = 0.0
-    height_inv_bp[-1] = max_h_inv
+    log_abs_num = log(
+        abs_num_t_norm,
+        min_value=_ABS_NUM_FLOOR,
+        max_value=8.0,
+        n_breakpoints=256,
+    )
+    log_abs_den = log(
+        abs_den_over_cos_norm,
+        min_value=_ABS_DEN_FLOOR,
+        max_value=5.0,
+        n_breakpoints=256,
+    )
 
-    doc_max = 2.5 * max_coord
-    doc_bp = [doc_max * i / 15 for i in range(16)]
+    # log_wall_height = log(H) + log_abs_den + log_inv_scale - log_abs_num.
+    sum_in = Concatenate([log_abs_den, log_inv_scale, log_abs_num])
+    sum_w = torch.tensor([[1.0], [1.0], [-1.0]])
+    sum_b = torch.tensor([math.log(float(H))])
+    log_wall_height = Linear(sum_in, sum_w, sum_b, name="log_wall_height")
 
-    wall_height_raw = piecewise_linear_2d(
-        precomp_H_inv,
-        abs_den_over_cos,
-        height_inv_bp,
-        doc_bp,
-        lambda a, b: a * b,
-        name="wall_height_raw",
+    # exp's input range bounds the well-resolved zone.  Below
+    # ``log(1e-3)`` any wall_height rounds to zero pixels; above
+    # ``log(2H)`` the post-clamp pins to H.  Inputs outside the declared
+    # range are clamped by :func:`piecewise_linear` so the exp is well-
+    # defined for the whole input domain even on pathological scenes.
+    log_wh_lo = math.log(1e-3)
+    log_wh_hi = math.log(2.0 * float(H)) + 1.0
+    wall_height_raw = exp(
+        log_wall_height,
+        min_value=log_wh_lo,
+        max_value=log_wh_hi,
+        n_breakpoints=256,
     )
     wall_height = clamp(wall_height_raw, 0.0, float(H))
 
@@ -817,55 +930,73 @@ def _compute_wall_height(
 
 
 def _compute_texture_column(
-    precomp_D: Node,
-    precomp_E: Node,
+    precomp_D_norm: Node,
+    precomp_E_norm: Node,
     tan_o: Node,
     tan_val_bp,
-    abs_den_over_cos: Node,
+    abs_den_over_cos_norm: Node,
+    inv_scale: Node,
     *,
     max_coord: float,
     tex_w: int,
 ) -> Node:
     """Texture column index via thermometer comparison (no division).
 
-    Instead of computing ``u = abs_nuc / abs_den`` — which requires a
-    piecewise-linear approximation of division whose error at the critical
-    boundary ``u = 0.5`` can flip the tex_col — we determine tex_col as
-    a count:
+    Operates on **normalized-units** precomputes (D, E, abs_den_over_cos)
+    where each is scaled by ``inv_scale`` relative to the real-units
+    versions.  The ratio ``u = abs_nuc / abs_den`` is invariant under
+    that scaling, so the thermometer comparison
 
         tex_col = |{k ∈ 1..tex_w-1 : tex_w · abs_nuc ≥ k · abs_den}|
 
-    Both ``tex_w · abs_nuc`` and ``k · abs_den`` are exact linear scalings
-    (``multiply_const``), so the subtraction carries no approximation error
-    beyond what is already in ``abs_nuc`` and ``abs_den_over_cos``.
+    produces the same answer as the real-units version *for the
+    ratios*, with the precision benefit that the upstream multiplies
+    used ``NORM_DIFF_BP`` (denser cells) instead of ``DIFF_BP``.
 
-    Threshold ``−0.5`` instead of 0: the exact boundary (diff = 0,
-    i.e. u = k/tex_w) counts as TRUE, matching ``floor_int``'s behavior of
-    returning ``k`` when its input equals ``k`` exactly.  For the box room
-    (tex_w=8, |den|=10) the minimum margin per comparison is ≈ 0.48 —
-    far above the comparison transition half-width of 0.05.
+    The threshold is the only thing that needs scale-aware handling.
+    The original real-units code used ``compare(diff, -0.5)`` so the
+    exact-boundary case (diff = 0, i.e. u = k/tex_w) counts as TRUE
+    via the ramp.  In normalized space the diff is ``inv_scale ×
+    real_diff``, so the equivalent threshold becomes
+    ``-0.5 · inv_scale``.  We pre-shift the diff to put the threshold
+    at 0:
+
+        shifted_diff = diff_norm + 0.5 · inv_scale
+
+    and use ``compare(shifted_diff, 0, sharpness=1000)`` so the ramp
+    width in real units is ``1 / (1000 · inv_scale)``.  For our
+    operating envelope ``inv_scale ∈ [0.01, 1]`` this gives a real-
+    units ramp of ``[0.001, 0.1]`` — at-or-tighter than the original
+    ``0.1``-wide ramp at every scene scale.
     """
-    E_tan = piecewise_linear_2d(
-        precomp_E,
+    E_tan_n = piecewise_linear_2d(
+        precomp_E_norm,
         tan_o,
-        DIFF_BP,
+        NORM_DIFF_BP,
         tan_val_bp,
         lambda a, b: a * b,
-        name="E_tan_o",
+        name="E_tan_o_norm",
     )
-    num_u_over_cos = add(precomp_D, E_tan)
-    abs_nuc = abs(num_u_over_cos)
+    num_u_over_cos_n = add(precomp_D_norm, E_tan_n)
+    abs_nuc_n = abs(num_u_over_cos_n)
 
-    # Scale abs_nuc by tex_w once (exact).
-    nuc_scaled = multiply_const(abs_nuc, float(tex_w))
+    # Scale abs_nuc by tex_w once (exact, Linear).
+    nuc_scaled_n = multiply_const(abs_nuc_n, float(tex_w))
 
-    # Threshold slightly below 0 so exact-boundary case counts as TRUE.
-    _THRESH = -0.5
+    # Pre-shift the diff so the comparison threshold is 0.  In
+    # normalized space ``-0.5 · real-units`` becomes
+    # ``-0.5 · inv_scale``.  Subtracting ``-0.5 · inv_scale`` (i.e.,
+    # adding ``+0.5 · inv_scale``) puts the threshold at 0.
+    half_inv_scale = multiply_const(inv_scale, 0.5)
+
     bits = []
     for k in range(1, tex_w):
-        k_den = multiply_const(abs_den_over_cos, float(k))
-        diff = subtract(nuc_scaled, k_den)
-        bits.append(bool_to_01(compare(diff, _THRESH)))
+        k_den_n = multiply_const(abs_den_over_cos_norm, float(k))
+        diff_n = subtract(nuc_scaled_n, k_den_n)
+        shifted_diff_n = add(diff_n, half_inv_scale)
+        bits.append(
+            bool_to_01(compare(shifted_diff_n, 0.0, sharpness=1000.0))
+        )
 
     return sum_nodes(bits)
 

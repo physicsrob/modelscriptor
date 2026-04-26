@@ -24,7 +24,7 @@ from torchwright.doom.game import GameState
 from torchwright.doom.input import PlayerInput
 from torchwright.doom.map_subset import MapSubset
 from torchwright.doom.thinking_readback import INT_IDENTIFIER_NAMES
-from torchwright.doom.trace import FrameTrace
+from torchwright.doom.trace import FrameTrace, RenderStepTrace
 from torchwright.ops.quantization import DEFAULT_N_LEVELS
 from torchwright.reference_renderer.types import RenderConfig
 
@@ -47,6 +47,12 @@ class Rollout:
 
     token_id_log: List[int]
     max_walls: int
+    # ``render_steps[i]`` is the i-th RENDER token whose ``length > 0``
+    # (length-zero RENDERs are still emitted but the bitblit is a no-op
+    # and ``trace.render_steps`` skips them — see ``step_frame``).  Each
+    # entry's ``wall_index`` is the sort-slot index, not the wall_i;
+    # group them with ``render_steps_per_sort_slot()``.
+    render_steps: List[RenderStepTrace]
 
     # ------------------------------------------------------------
     # Token decoding
@@ -218,6 +224,27 @@ class Rollout:
                 return i
         return None
 
+    # ------------------------------------------------------------
+    # RENDER overflow
+    # ------------------------------------------------------------
+
+    def render_steps_per_sort_slot(self) -> List[List[RenderStepTrace]]:
+        """Group :attr:`render_steps` by the sort slot that emitted them.
+
+        Each :class:`RenderStepTrace` carries the ``wall_index``
+        (sort-slot index, not wall_i) the host detected from
+        ``wall_counter`` at emission time.  Groups are returned in
+        ascending sort-slot order, with empty inner lists for slots
+        that emitted only length-zero RENDERs.
+        """
+        if not self.render_steps:
+            return []
+        max_slot = max(s.wall_index for s in self.render_steps)
+        out: List[List[RenderStepTrace]] = [[] for _ in range(max_slot + 1)]
+        for s in self.render_steps:
+            out[s.wall_index].append(s)
+        return out
+
 
 def run_rollout(
     *,
@@ -250,4 +277,8 @@ def run_rollout(
         trace=trace,
     )
     max_walls = int(module.metadata.get("max_walls", 8))
-    return Rollout(token_id_log=list(trace.token_id_log), max_walls=max_walls)
+    return Rollout(
+        token_id_log=list(trace.token_id_log),
+        max_walls=max_walls,
+        render_steps=list(trace.render_steps),
+    )

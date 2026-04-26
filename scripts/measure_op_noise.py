@@ -45,8 +45,11 @@ from torchwright.ops.arithmetic_ops import (
     ceil_int,
     clamp,
     compare,
+    exp,
     floor_int,
     linear_bin_index,
+    log,
+    log_abs,
     low_rank_2d,
     max as max_op,
     min as min_op,
@@ -126,6 +129,49 @@ def _uniform_1d(
     random_part = torch.rand((n_samples - 256, 1), generator=gen) * (hi - lo) + lo
     grid_part = torch.linspace(lo, hi, 256).unsqueeze(1)
     data = torch.cat([random_part, grid_part], dim=0)
+    return InputDistribution(
+        name=name,
+        description=description,
+        inputs={input_name: data},
+        n_samples=n_samples,
+    )
+
+
+def _signed_log_uniform_with_v_bottom(
+    name: str,
+    description: str,
+    min_abs: float,
+    max_abs: float,
+    input_name: str = "x",
+    n_samples: int = 4096,
+    seed: int = 0,
+) -> InputDistribution:
+    """Signed log-uniform |x|∈[min_abs, max_abs] plus V-bottom grid.
+
+    Used by ``log_abs``: |x| is log-uniform on [min_abs, max_abs] with
+    sign uniform ±; structured grid concentrates samples in
+    ``[-2·min_abs, 2·min_abs]`` to stress the V-bottom transition zone.
+    """
+    import math as _math
+
+    gen = torch.Generator().manual_seed(seed)
+    n_v_grid = 64  # structured grid around V-bottom
+    n_random = n_samples - n_v_grid
+
+    log_lo = _math.log(min_abs)
+    log_hi = _math.log(max_abs)
+    u = torch.rand(n_random, generator=gen)
+    abs_x = torch.exp(log_lo + u * (log_hi - log_lo))
+    signs = (
+        torch.randint(0, 2, (n_random,), generator=gen).to(torch.float32) * 2.0
+        - 1.0
+    )
+    random_part = (signs * abs_x).unsqueeze(1)
+
+    # V-bottom grid: linear from -2·min_abs to +2·min_abs.
+    v_grid = torch.linspace(-2.0 * min_abs, 2.0 * min_abs, n_v_grid).unsqueeze(1)
+
+    data = torch.cat([random_part, v_grid], dim=0)
     return InputDistribution(
         name=name,
         description=description,
@@ -367,6 +413,47 @@ def _distributions() -> Dict[str, InputDistribution]:
             0.1,
             50.0,
         ),
+        "log_4decades_001_100": _uniform_1d(
+            "log_4decades_001_100",
+            "log(x) over [0.01, 100] — 4 decades. With per-decade "
+            "sectioning (default), each section's pre-cancellation "
+            "magnitude is bounded by `section_factor=10`, so float32 "
+            "ULP noise is ~1.2e-6 per section. The dominant residual "
+            "error comes from the multiply_2d blending grid in routing.",
+            0.01,
+            100.0,
+        ),
+        "log_6decades_wide": _uniform_1d(
+            "log_6decades_wide",
+            "log(x) over [0.01, 30000] — 6 decades. Stresses the "
+            "sectioning path: a single-section piecewise log over this "
+            "range fails outright (cancellation floor `(x_max/x_min) · "
+            "2⁻²³ ≈ 0.36 absolute, observed worst ~1.0 abs). Sectioning "
+            "drops the floor to ~5e-3 absolute, dominated by "
+            "compare-cancellation noise at large `x` propagating "
+            "through multiply_2d blending.",
+            0.01,
+            30000.0,
+        ),
+        "log_abs_3decades_pm100": _signed_log_uniform_with_v_bottom(
+            "log_abs_3decades_pm100",
+            "log_abs(x) for x ∈ [-100, 100] with min_abs=0.1, max_abs=100 "
+            "(3 decades on |x|). Signed log-uniform |x| samples plus a "
+            "V-bottom grid concentrated in [-0.2, 0.2] to stress the "
+            "flat-zone transition at ±min_abs. Single-piecewise path "
+            "(ratio 1000 < single-piecewise threshold).",
+            0.1,
+            100.0,
+        ),
+        "exp_pm5": _uniform_1d(
+            "exp_pm5",
+            "exp(x) over [-5, 5] — output spans [exp(-5), exp(5)] ≈ "
+            "[0.0067, 148.4], the natural pairing for log over [0.01, 100]. "
+            "Uniform 256-BP grid (`Δx ≈ 0.0392`); per-cell relative-error "
+            "bound is `(Δx)²/8 ≈ 1.9e-4`.",
+            -5.0,
+            5.0,
+        ),
         "parabola_0_10_step1": _uniform_1d(
             "parabola_0_10_step1",
             "f(x)=x² on [0, 10] with integer breakpoints — probes generic "
@@ -603,6 +690,76 @@ def _target_ops() -> List[TargetOp]:
                 "reciprocal graph whose `(min_value, max_value, step)` matches "
                 "its production callsite: `(0.3, 200.0, 1.0)` for "
                 "`doom_reciprocal_wall` (`torchwright/doom/stages/wall.py:431`)."
+            ),
+        ),
+        TargetOp(
+            name="log",
+            module=_ARITH,
+            source_file=_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: log(
+                nodes["x"], min_value=0.01, max_value=100.0, n_breakpoints=256
+            ),
+            reference_fn=lambda inputs: torch.log(inputs["x"]),
+            distribution_names=(
+                "log_4decades_001_100",
+                "log_6decades_wide",
+            ),
+            build_graphs_per_distribution={
+                "log_6decades_wide": lambda nodes: log(
+                    nodes["x"],
+                    min_value=0.01,
+                    max_value=30000.0,
+                    n_breakpoints=256,
+                ),
+            },
+            notes=(
+                "Natural log via per-section piecewise-linear "
+                "interpolation. The op auto-sections the input range "
+                "geometrically by `section_factor=10` (default decades) "
+                "and routes via thermometer compare + multiply_2d "
+                "blending, so float32 cancellation is bounded by "
+                "section width regardless of overall input range. Pairs "
+                "with `exp` for log-space arithmetic chains."
+            ),
+        ),
+        TargetOp(
+            name="log_abs",
+            module=_ARITH,
+            source_file=_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: log_abs(
+                nodes["x"], min_abs=0.1, max_abs=100.0, n_breakpoints=256
+            ),
+            reference_fn=lambda inputs: torch.log(
+                torch.clamp(inputs["x"].abs(), min=0.1, max=100.0)
+            ),
+            distribution_names=("log_abs_3decades_pm100",),
+            notes=(
+                "Fused `log(clamp(|x|, min_abs, max_abs))` for signed "
+                "input. Single-piecewise V-shape over signed `x` for "
+                "`max_abs/min_abs ≤ 10⁴` (1 sublayer); falls back to "
+                "`abs + sectioned log` for wider ratios (3 sublayers). "
+                "Pairs with `exp` and Linear addition for log-domain "
+                "multiplication of a signed by a positive value."
+            ),
+        ),
+        TargetOp(
+            name="exp",
+            module=_ARITH,
+            source_file=_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: exp(
+                nodes["x"], min_value=-5.0, max_value=5.0, n_breakpoints=256
+            ),
+            reference_fn=lambda inputs: torch.exp(inputs["x"]),
+            distribution_names=("exp_pm5",),
+            notes=(
+                "Natural exponential via piecewise-linear interpolation "
+                "with uniform breakpoint spacing. Constant relative output "
+                "error per cell `(Δx)²/8` because `d²exp/dx² = exp`. "
+                "Pairs with `log` to implement `A·B = exp(log A + log B)` "
+                "and `A/B = exp(log A − log B)` in log-space chains."
             ),
         ),
         TargetOp(

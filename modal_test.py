@@ -27,6 +27,8 @@ app = modal.App("torchwright-test", image=IMAGE)
 
 _HEAVY_FILES = [
     "tests/doom/test_rollout.py",
+    "tests/doom/test_rollout_walkthrough.py",
+    "tests/doom/test_rollout_e1m1.py",
     "tests/doom/test_frame_match.py",
     "tests/doom/test_affine_bounds.py",
 ]

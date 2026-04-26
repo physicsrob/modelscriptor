@@ -382,6 +382,8 @@ def build_game_graph(
             value_wall_index_scalar=thinking_wall_out.value_wall_index_scalar,
             value_wall_index_neg_sq=thinking_wall_out.value_wall_index_neg_sq,
             is_thinking_value=tf["is_thinking_value"],
+            log_inv_scale=thinking_wall_out.log_inv_scale,
+            inv_scale=thinking_wall_out.inv_scale,
         ),
         is_render=tf["is_render"],
         is_wall=tf["is_wall"],

@@ -25,7 +25,11 @@ import numpy as np
 from torchwright.doom.game import GameState, update_state
 from torchwright.doom.input import PlayerInput
 from torchwright.doom.map_subset import MapSubset
-from torchwright.reference_renderer.render import project_wall
+from torchwright.reference_renderer.render import (
+    _ray_angle_for_column,
+    intersect_ray_segment,
+    project_wall,
+)
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
 
@@ -170,6 +174,28 @@ class WallRef:
 
 
 @dataclass
+class RenderTokenExpectation:
+    """Expected per-RENDER overflow values for one (wall, col, chunk) triple.
+
+    Mirrors the float arithmetic in ``render._chunk_fill``:
+
+        vis_top    = clamp(wall_top_f,    0, H)
+        vis_bottom = clamp(wall_bottom_f, 0, H)
+        active_start = vis_top + chunk_k * chunk_size
+        chunk_length = clamp(vis_bottom - active_start, 0, chunk_size)
+
+    where ``wall_top_f = H/2 - H/(2 * perp_distance)``.  ``start`` and
+    ``length`` are int-rounded to match the host's ``int(round(...))``
+    extraction in ``step_frame``.
+    """
+
+    col: int
+    start: int
+    length: int
+    chunk_k: int
+
+
+@dataclass
 class Reference:
     """Full reference snapshot for one scenario.
 
@@ -184,6 +210,13 @@ class Reference:
     ``sort_order`` element, set to the wall's ``vis_hi - vis_lo + 1``
     when that wall is project-visible (else 0 — the slot still emits
     RENDERs but the count comparison is skipped via ``is_projected``).
+
+    ``render_tokens_per_sort_slot`` is the per-slot list of expected
+    ``RenderTokenExpectation`` entries, one per (col, chunk_k) pair the
+    chunk loop should visit for that wall — computed from the graph's
+    chunk-fill arithmetic, not from the reference renderer's
+    ``render_wall_column`` (which uses a different rounding rule).
+    Slots whose wall is not project-visible get an empty list.
     """
 
     walls: List[WallRef]
@@ -192,6 +225,69 @@ class Reference:
     resolved_angle: float
     sort_order: List[int]
     render_count_per_sort_slot: List[int]
+    render_tokens_per_sort_slot: List[List[RenderTokenExpectation]]
+
+
+def _render_tokens_for_wall(
+    seg: Segment,
+    px: float,
+    py: float,
+    angle: int,
+    config: RenderConfig,
+    chunk_size: int,
+) -> List[RenderTokenExpectation]:
+    """Expected RENDER overflow tuples for one wall, one full sort slot.
+
+    Iterates every screen column; for each column where the column ray
+    hits the wall, emits one entry per chunk_k produced by the graph's
+    chunk loop.  The loop stops when the graph's ``has_more_chunks``
+    predicate flips false:
+
+        has_more_chunks ⇔ wall_bottom_clamped - (active_start + chunk_size) > 0.5
+
+    Equivalently, after emitting chunk K the loop stops if
+    ``vis_bottom - vis_top - (K+1)*chunk_size <= 0.5``.
+
+    Columns with no hit (or perp_distance ≤ 0) emit no entries — those
+    columns don't reach the chunk loop.
+    """
+    H = config.screen_height
+    out: List[RenderTokenExpectation] = []
+    for col in range(config.screen_width):
+        ray_angle = _ray_angle_for_column(col, angle, config)
+        ray_cos = float(config.trig_table[ray_angle, 0])
+        ray_sin = float(config.trig_table[ray_angle, 1])
+        hit = intersect_ray_segment(px, py, ray_cos, ray_sin, seg)
+        if hit is None:
+            continue
+        t, _u = hit
+        angle_diff = (ray_angle - angle) % 256
+        perp_cos = float(config.trig_table[angle_diff, 0])
+        perp_distance = t * perp_cos
+        if perp_distance <= 0.0:
+            continue
+        wall_top_f = H / 2.0 - H / (2.0 * perp_distance)
+        wall_bottom_f = H / 2.0 + H / (2.0 * perp_distance)
+        vis_top = max(0.0, min(float(H), wall_top_f))
+        vis_bottom = max(0.0, min(float(H), wall_bottom_f))
+        k = 0
+        while True:
+            active_start = vis_top + k * chunk_size
+            length = max(0.0, min(float(chunk_size), vis_bottom - active_start))
+            out.append(
+                RenderTokenExpectation(
+                    col=col,
+                    start=int(round(active_start)),
+                    length=int(round(length)),
+                    chunk_k=k,
+                )
+            )
+            # Graph's has_more_chunks predicate: > 0.5 margin guards
+            # against rounding flicker at the chunk boundary.
+            if vis_bottom - (active_start + chunk_size) <= 0.5:
+                break
+            k += 1
+    return out
 
 
 def compute_reference(
@@ -204,6 +300,7 @@ def compute_reference(
     config: RenderConfig,
     move_speed: float = 0.3,
     turn_speed: int = 4,
+    chunk_size: int = 20,
 ) -> Reference:
     """Build a :class:`Reference` for the given scenario."""
     trig = config.trig_table
@@ -281,13 +378,34 @@ def compute_reference(
     # count to 0 — the slot still emits some RENDERs (driven by the
     # graph's FOV-clipped vis_lo/vis_hi) but the test skips the count
     # comparison via ``is_projected``.
+    # Render-time projection uses POST-step state — the SORTED + RENDER
+    # phase reads the resolved player position from PLAYER_X/Y/ANGLE,
+    # not the pre-step input.  Pre- and post-step differ by one
+    # ``move_speed`` step under ``forward=True`` etc., which shifts
+    # perp_distance enough to flip a chunk-loop boundary by ~2 rows.
+    render_px = float(new_state.x)
+    render_py = float(new_state.y)
+    render_angle = int(new_state.angle) % 256
+
     render_count_per_sort_slot: List[int] = []
+    render_tokens_per_sort_slot: List[List[RenderTokenExpectation]] = []
     for wall_i in sort_order:
         ref = walls[wall_i]
         if ref.is_projected:
             render_count_per_sort_slot.append(int(round(ref.vis_hi - ref.vis_lo + 1)))
+            render_tokens_per_sort_slot.append(
+                _render_tokens_for_wall(
+                    segs[wall_i],
+                    render_px,
+                    render_py,
+                    render_angle,
+                    config,
+                    chunk_size,
+                )
+            )
         else:
             render_count_per_sort_slot.append(0)
+            render_tokens_per_sort_slot.append([])
 
     return Reference(
         walls=walls,
@@ -296,4 +414,5 @@ def compute_reference(
         resolved_angle=float(new_state.angle),
         sort_order=sort_order,
         render_count_per_sort_slot=render_count_per_sort_slot,
+        render_tokens_per_sort_slot=render_tokens_per_sort_slot,
     )
