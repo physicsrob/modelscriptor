@@ -1070,6 +1070,15 @@ def main():
             "already meets) and skip BIRTH-layer dirty-column cancels."
         ),
     )
+    parser.add_argument(
+        "--symmetry-breaking",
+        action="store_true",
+        help=(
+            "Experimental: enable CP-SAT symmetry-breaking on equivalent "
+            "sibling chains (off by default — can starve incumbent search "
+            "on DOOM-scale graphs)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.scene == "box":
@@ -1164,6 +1173,7 @@ def main():
         use_cpsat=not args.no_cpsat,
         cpsat_time_budget_s=args.cpsat_time_budget,
         cpsat_allow_suboptimal=args.cpsat_allow_suboptimal,
+        cpsat_symmetry_breaking=args.symmetry_breaking,
         assume_zero_init=args.assume_zero_init,
     )
     n_layers = max(node_to_layer.values()) + 1 if node_to_layer else 0

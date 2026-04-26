@@ -239,6 +239,7 @@ def forward_compile(
     cpsat_flex_routing: bool = True,
     cpsat_time_budget_s: float = 60.0,
     cpsat_allow_suboptimal: bool = False,
+    cpsat_symmetry_breaking: bool = False,
     assume_zero_init: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
@@ -472,12 +473,13 @@ def forward_compile(
             hint_time = time.perf_counter() - t_hint_start
             print(
                 f"  Heuristic warm-start: {hint_n_layers} layers "
-                f"({hint_time:.2f}s)"
+                f"({hint_time:.2f}s, {len(hint_layers)} hinted nodes)"
             )
             print(
                 f"  CP-SAT solver: costs={cpsat_costs}, "
                 f"flex_routing={cpsat_flex_routing}, "
-                f"time_budget_s={cpsat_time_budget_s}"
+                f"time_budget_s={cpsat_time_budget_s}, "
+                f"symmetry_breaking={cpsat_symmetry_breaking}"
             )
 
         # Use the heuristic's layer count as the search horizon (with
@@ -489,7 +491,10 @@ def forward_compile(
             solver_max_layers = min(max_layers, hint_n_layers + 1)
 
         t_solve_start = time.perf_counter()
-        assignment = solve_schedule(
+        # Use _solve_full so we can log solver progress when verbose.
+        from torchwright.compiler.forward.cpsat_scheduler import _solve_full
+
+        assignment, _stats = _solve_full(
             output_node,
             pos_encoding,
             d=d,
@@ -499,11 +504,30 @@ def forward_compile(
             flex_routing=cpsat_flex_routing,
             time_budget_s=cpsat_time_budget_s,
             max_layers=solver_max_layers,
-            allow_suboptimal=cpsat_allow_suboptimal,
             policy=policy,
             assume_zero_init=assume_zero_init,
             hint_layers=hint_layers if hint_layers else None,
+            symmetry_breaking=cpsat_symmetry_breaking,
+            log_search_progress=verbose,
         )
+        if assignment is None:
+            if verbose and _stats.solver_log:
+                print("--- CP-SAT solver log (last 40 lines) ---")
+                for line in _stats.solver_log.splitlines()[-40:]:
+                    print(f"  {line}")
+                print("--- end CP-SAT solver log ---")
+            raise RuntimeError(
+                f"CP-SAT returned {_stats.status_name}; no schedule produced "
+                f"(best_objective_bound={_stats.best_objective_bound}, "
+                f"n_symmetry_constraints={_stats.n_symmetry_constraints})"
+            )
+        if not _stats.is_optimal and not cpsat_allow_suboptimal:
+            raise RuntimeError(
+                f"CP-SAT returned {_stats.status_name} but did not prove "
+                f"optimality: objective={_stats.objective_value}, "
+                f"best_objective_bound={_stats.best_objective_bound}; "
+                f"pass cpsat_allow_suboptimal=True to accept this schedule"
+            )
         if verbose:
             solve_time = time.perf_counter() - t_solve_start
             print(

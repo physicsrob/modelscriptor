@@ -36,6 +36,7 @@ from torchwright.compiler.forward.scheduling_policy import (
     LEGACY_POLICY,
     SchedulingPolicy,
 )
+from torchwright.compiler.forward.sibling_clusters import SiblingClusterAnalyzer
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import (
     Add,
@@ -124,6 +125,7 @@ class SolveStats:
     total_attn_heads: int       # -1 if no feasible solution
     total_mlp_bypass_slots: int # -1 if no feasible solution
     is_optimal: bool
+    n_symmetry_constraints: int = 0  # lex-min constraints added before solve
 
 
 # Routing constants used both by this module and by the probe script.
@@ -427,6 +429,91 @@ def uses_residual(node: Node, gm: GraphModel) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Symmetry breaking
+# ---------------------------------------------------------------------------
+
+
+def _chain_fingerprint(chain) -> Tuple:
+    """Hashable structural signature of a sibling-cluster chain.
+
+    Two chains with identical fingerprints have the same multiset of
+    (op type, output width) pairs over their nodes — a strong proxy
+    for "functionally equivalent pipeline" when the chains feed the
+    same join.  The schedule cost (n_layers, total heads, total slots)
+    is invariant under any permutation of equally-fingerprinted chains
+    in the same cluster, so we can safely add a lex-min constraint
+    between their layer assignments to break that combinatorial
+    symmetry in CP-SAT's search.
+    """
+    return tuple(sorted((type(n).__name__, len(n)) for n in chain.nodes))
+
+
+def _add_symmetry_breaking(
+    model: cp_model.CpModel,
+    gm: GraphModel,
+    layer_var: Dict[int, cp_model.IntVar],
+    graph: GraphAnalyzer,
+    hint_layers: Optional[Dict[int, int]] = None,
+) -> int:
+    """Add lex-min constraints across structurally-equivalent sibling chains.
+
+    Detects parallel chains feeding common ``Concatenate`` joins via
+    :class:`SiblingClusterAnalyzer`, groups them by
+    ``_chain_fingerprint``, and chains
+    ``layer_var[chain_i.terminal] <= layer_var[chain_{i+1}.terminal]``
+    within each fingerprint group.  For a group of N equally-shaped
+    chains this eliminates ``N!`` permutations from the search tree.
+
+    **Status:** experimental, off by default.  On the DOOM headless
+    graph (4440 nodes, 196 lex-min constraints across 36 fingerprint
+    groups) the constraints push CP-SAT into a regime where it tightens
+    the lower bound (46 → 49) but spends so long on bound proofs that
+    it never finds a feasible incumbent within reasonable budgets
+    (10–600s) — even though the heuristic warm-start hint is verifiably
+    feasible against every constraint.  Limiting to large groups only
+    (≥ 8 chains) didn't help.  The likely cause is CP-SAT's worker
+    allocation shifting toward ``objective_lb_search`` when
+    propagation is denser, starving incumbent-finding workers.  Worth
+    revisiting with a different solver-parameter mix (LNS-heavy,
+    ``use_lns_only``, or a fixed search strategy that respects the
+    hint).
+
+    Returns the number of constraints added (for diagnostics).
+    """
+    analyzer = SiblingClusterAnalyzer(graph, min_chains=2, min_peak_width=1)
+    clusters = analyzer.analyze()
+
+    def _canonical_key(chain):
+        if hint_layers is not None:
+            hl = hint_layers.get(chain.terminal.node_id)
+            if hl is not None:
+                return (hl, chain.chain_id)
+        return (0, chain.chain_id)
+
+    n_added = 0
+    for cluster in clusters.clusters.values():
+        groups: Dict[Tuple, List] = {}
+        for chain in cluster.chains:
+            groups.setdefault(_chain_fingerprint(chain), []).append(chain)
+        for chains in groups.values():
+            if len(chains) < 2:
+                continue
+            chains.sort(key=_canonical_key)
+            for i in range(len(chains) - 1):
+                a_term = chains[i].terminal
+                b_term = chains[i + 1].terminal
+                if (
+                    a_term.node_id in layer_var
+                    and b_term.node_id in layer_var
+                ):
+                    model.Add(
+                        layer_var[a_term.node_id] <= layer_var[b_term.node_id]
+                    )
+                    n_added += 1
+    return n_added
+
+
+# ---------------------------------------------------------------------------
 # Solver
 # ---------------------------------------------------------------------------
 
@@ -447,6 +534,7 @@ def solve_schedule(
     policy: Optional[SchedulingPolicy] = None,
     reserve_heads: int = 0,
     assume_zero_init: bool = False,
+    symmetry_breaking: bool = False,
 ) -> ScheduleAssignment:
     """Build and solve the CP-SAT scheduling model.
 
@@ -506,11 +594,13 @@ def solve_schedule(
         log_search_progress=False,
         reserve_heads=reserve_heads,
         assume_zero_init=assume_zero_init,
+        symmetry_breaking=symmetry_breaking,
     )
     if assignment is None:
         raise RuntimeError(
             f"CP-SAT returned {stats.status_name}; no schedule produced "
-            f"(best_objective_bound={stats.best_objective_bound})"
+            f"(best_objective_bound={stats.best_objective_bound}, "
+            f"n_symmetry_constraints={stats.n_symmetry_constraints})"
         )
     if not stats.is_optimal and not allow_suboptimal:
         raise RuntimeError(
@@ -538,6 +628,7 @@ def _solve_full(
     log_search_progress: bool = False,
     reserve_heads: int = 0,
     assume_zero_init: bool = False,
+    symmetry_breaking: bool = False,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Internal solve that returns both the assignment and the solver stats.
 
@@ -851,6 +942,18 @@ def _solve_full(
             if nid in layer_var and 0 <= L < max_layers:
                 model.AddHint(layer_var[nid], L)
 
+    # ---- Symmetry breaking ----
+    # Sibling chains feeding common ``Concatenate`` joins are
+    # interchangeable when their internal structures match — adding
+    # lex-min between their terminals' layer assignments cuts entire
+    # ``N!`` permutation slices out of CP-SAT's search tree.  Pass the
+    # hint so chain ordering matches the warm-start incumbent.
+    n_sym = 0
+    if symmetry_breaking:
+        n_sym = _add_symmetry_breaking(
+            model, gm, layer_var, gm.graph, hint_layers=hint_layers
+        )
+
     # ---- Decision strategy: schedule by critical path first ----
     nodes_by_cp = sorted(
         gm.schedulable,
@@ -866,7 +969,7 @@ def _solve_full(
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_budget_s
     solver.parameters.log_search_progress = log_search_progress
-    solver.parameters.num_search_workers = 8
+    solver.parameters.num_search_workers = 16
 
     log_buf: List[str] = []
 
@@ -915,5 +1018,6 @@ def _solve_full(
         total_attn_heads=total_heads,
         total_mlp_bypass_slots=total_bypass,
         is_optimal=status == cp_model.OPTIMAL,
+        n_symmetry_constraints=n_sym,
     )
     return assignment, stats
