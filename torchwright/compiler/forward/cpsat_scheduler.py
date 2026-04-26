@@ -205,17 +205,30 @@ def _detect_chains_static(
 ) -> List[Chain]:
     """Mirror `LayerScheduler._detect_chains` over the entire graph.
 
-    Each ReLU matches at most one chain. Iteration is in node-id order
-    for determinism.
+    Each ReLU matches at most one chain.  Each Linear is also used in
+    at most one chain — `fuse_consecutive_linears` mutates a Linear's
+    input to point at an upstream ReLU, which can leave a single
+    Linear satisfying the structural conditions for both L1 of one
+    chain and L2 of another (`... -> R -> L_shared -> R' -> ...`
+    after fusion of `L_a -> L_b` becomes `L_b = L_shared`).  Without
+    Linear-de-dup the two chains would couple via the shared Linear's
+    `layer_var` equality and the model would be `INFEASIBLE`.
+
+    Iteration is in node-id order for determinism; node-id roughly
+    corresponds to upstream-first graph build order, so when an
+    overlap exists the upstream chain is detected first and wins.
     """
     chains: List[Chain] = []
     seen_relus: Set[Node] = set()
+    seen_linears: Set[Node] = set()
 
     linears = sorted(
         (n for n in schedulable if isinstance(n, Linear)),
         key=lambda n: n.node_id,
     )
     for l1 in linears:
+        if l1 in seen_linears:
+            continue
         for consumer in graph.get_consumers(l1):
             if not isinstance(consumer, ReLU) or consumer in seen_relus:
                 continue
@@ -226,6 +239,8 @@ def _detect_chains_static(
                 continue
             l2 = l2_candidates[0]
             if l2.inputs[0] is not relu:
+                continue
+            if l2 in seen_linears:
                 continue
             l1_eff = consumers_eff.get(l1, set())
             exclusive = l1_eff == {relu}
@@ -239,6 +254,8 @@ def _detect_chains_static(
                 )
             )
             seen_relus.add(relu)
+            seen_linears.add(l1)
+            seen_linears.add(l2)
             break
 
     return chains
@@ -296,9 +313,29 @@ def build_graph_model(output_node: Node, pos_encoding: PosEncoding) -> GraphMode
     chains = _detect_chains_static(graph, set(schedulable), consumers_eff)
     node_to_chain: Dict[Node, Chain] = {}
     for c in chains:
-        node_to_chain[c.l1] = c
-        node_to_chain[c.relu] = c
-        node_to_chain[c.l2] = c
+        # Structural invariant: a node appears in at most one chain.
+        # `_detect_chains_static` enforces this via `seen_relus` and
+        # `seen_linears`; this assertion catches regressions in the
+        # detector itself and is cheap (linear in chain count).
+        # Without this, a fusion-induced overlap (`L_b` is L2 of one
+        # chain and L1 of another) silently makes the CP-SAT model
+        # `INFEASIBLE` — the chain-coupling equalities force two
+        # ReLUs onto the same layer, contradicting their dependency
+        # ordering — which is then masked by the heuristic-fallback
+        # path.
+        for role, node in (("l1", c.l1), ("relu", c.relu), ("l2", c.l2)):
+            if node in node_to_chain:
+                prior = node_to_chain[node]
+                raise AssertionError(
+                    f"Chain detector produced overlapping chains: "
+                    f"{node!r} appears as {role} of chain "
+                    f"{c.chain_id} and was already registered for "
+                    f"chain {prior.chain_id} "
+                    f"(L1={prior.l1!r}, ReLU={prior.relu!r}, "
+                    f"L2={prior.l2!r}).  This indicates a missing "
+                    f"de-dup in `_detect_chains_static`."
+                )
+            node_to_chain[node] = c
 
     pinned_nodes: Set[Node] = set(input_nodes)
     pinned_nodes.add(output_node)

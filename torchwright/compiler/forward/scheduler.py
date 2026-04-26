@@ -831,14 +831,28 @@ class LayerScheduler:
 
         Returns list of (l1, relu, l2, d_hidden, exclusive).
         exclusive means L1 has no effective consumers other than the ReLU.
+
+        Each ReLU and each Linear participates in at most one chain.
+        Linear de-dup matters when ``fuse_consecutive_linears`` has
+        rewired a Linear's input to point at an upstream ReLU — the
+        same Linear can then satisfy both the L2 condition for one
+        chain and the L1 condition for a downstream chain.  Without
+        de-dup the two chains would share that Linear; the heuristic
+        per-layer pruning (``ready.discard(l2)`` after scheduling)
+        usually rescues this, but the static CP-SAT counterpart
+        (``_detect_chains_static``) has no such pruning, so both
+        sides apply the same exclusion for parity.
         """
         chains = []
         seen_relus = set() if exclude_relus is None else set(exclude_relus)
+        seen_linears: Set[Node] = set()
 
         for node in ready:
             if not isinstance(node, Linear):
                 continue
             l1 = node
+            if l1 in seen_linears:
+                continue
 
             for consumer in self.graph.get_consumers(l1):
                 if not isinstance(consumer, ReLU) or consumer in seen_relus:
@@ -853,11 +867,15 @@ class LayerScheduler:
                 l2 = l2_candidates[0]
                 if l2.inputs[0] is not relu:
                     continue
+                if l2 in seen_linears:
+                    continue
 
                 l1_eff = self._get_effective_consumers(l1)
                 exclusive = l1_eff == {relu}
                 chains.append((l1, relu, l2, len(relu), exclusive))
                 seen_relus.add(relu)
+                seen_linears.add(l1)
+                seen_linears.add(l2)
                 break  # one chain per L1
 
         return chains
