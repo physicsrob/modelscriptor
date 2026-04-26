@@ -342,7 +342,11 @@ def routing(node: Node, gm: GraphModel, policy: SchedulingPolicy) -> str:
     if isinstance(node, LiteralValue):
         return MLP
     if isinstance(node, Linear):
-        if node in gm.node_to_chain:
+        chain = gm.node_to_chain.get(node)
+        if chain is not None and not (node is chain.l1 and not chain.exclusive):
+            # Chain ReLU/L2 and exclusive L1 are pinned to MLP. Non-
+            # exclusive L1 has a standalone realization that follows
+            # the same policy as a standalone Linear.
             return MLP
         if policy.local_in_attention == "always":
             return ATTN
@@ -359,26 +363,39 @@ def is_flex(node: Node, gm: GraphModel) -> bool:
     = 2 · d_output`). The heuristic picks one statically per policy;
     CP-SAT can pick per-node.
 
-    Chain L1/R/L2 stay locked to MLP — splitting a chain into
-    separate ops would need a different model structure.
+    Non-exclusive chain L1 (a chain L1 with consumers besides the
+    chain's ReLU) is also flex: the heuristic emits a standalone
+    realization of L1 alongside the chain composite (writing L1's
+    value to its own residual columns for the non-chain consumers),
+    and that realization can run in attention or MLP-bypass per
+    policy. Chain composite still always runs in MLP.
+
+    Chain ReLU and L2 stay locked to MLP — splitting a chain into
+    separate ops would need a different model structure. Exclusive
+    L1 has no standalone realization (computed inline inside
+    `linear1`), so its routing is not a decision.
 
     `Attn` / `Add` / standalone `ReLU` / `LiteralValue` stay locked
     because they have only one valid sublayer.
     """
-    if isinstance(node, Linear) and node not in gm.node_to_chain:
+    if not isinstance(node, Linear):
+        return False
+    chain = gm.node_to_chain.get(node)
+    if chain is None:
         return True
-    return False
+    return node is chain.l1 and not chain.exclusive
 
 
 def heads_for(node: Node, d_head: int) -> int:
     """Heads consumed if attention-routed.
 
-    Mirrors `LayerScheduler._heads_*`. `Add` cost uses the OPTIMISTIC
-    free-add count (`⌈d_out/d_head⌉` — one head per `d_head`-wide
-    chunk of the live addend, copied into the dead addend's cols).
-    The model precondition (see `docs/cpsat_scheduler.md` §3) requires
-    no `Add` to have a `Concatenate` input, so the dynamic free-vs-
-    compute classification always resolves to free-add.
+    Mirrors `LayerScheduler._heads_*`. For `Add`, returns the free-
+    add unit count (`⌈d_out/d_head⌉` — one head per `d_head`-wide
+    chunk of the live addend, copied into the dead addend's cols);
+    the compute-add regime costs `2 ·` this. The CP-SAT model gates
+    free vs compute via a per-Add `is_free` boolean derived from
+    reified consumer-ordering booleans; see the helper inside
+    `solve_schedule` and `docs/cpsat_scheduler.md` §3.
     """
     if isinstance(node, Attn):
         return (node.d_v + d_head - 1) // d_head
@@ -394,10 +411,18 @@ def heads_for(node: Node, d_head: int) -> int:
 def slots_for(node: Node, gm: GraphModel) -> int:
     """MLP slots consumed if MLP-routed.
 
-    Chain-internal nodes (L1/R/L2) return 0 individually — the chain
-    composite (modeled separately) carries the `len(R)` slot demand.
+    Chain ReLU and L2 return 0 — the chain composite (modeled
+    separately) carries the `len(R)` slot demand. Exclusive L1
+    similarly returns 0 (no standalone realization).
+
+    Non-exclusive L1 returns `2 · d_output` for the MLP-bypass slot
+    demand of its standalone realization. This is additive on top of
+    the chain composite's `len(R)` demand at the same layer.
     """
-    if node in gm.node_to_chain:
+    chain = gm.node_to_chain.get(node)
+    if chain is not None:
+        if node is chain.l1 and not chain.exclusive:
+            return 2 * node.d_output  # standalone MLP-bypass realization
         return 0
     if isinstance(node, ReLU):
         return len(node)
@@ -517,10 +542,10 @@ def solve_schedule(
             conservative model that mirrors the heuristic's defensive
             BIRTH-layer cancellation of fresh allocations.
 
-    Raises ``RuntimeError`` only when the graph violates a model
-    precondition (see ``docs/cpsat_scheduler.md`` §3): currently, an
-    ``Add`` whose input is a ``Concatenate``.  Solver-outcome handling
-    (no-incumbent, FEASIBLE-not-OPTIMAL) is the caller's responsibility.
+    Raises ``RuntimeError`` only on structural problems (no residual
+    columns left after pre-allocated inputs).  Solver-outcome
+    handling (no-incumbent, FEASIBLE-not-OPTIMAL) is the caller's
+    responsibility.
     """
     if policy is None:
         policy = LEGACY_POLICY
@@ -529,25 +554,6 @@ def solve_schedule(
         raise ValueError("alpha=beta=gamma=0 — no objective.")
 
     gm = build_graph_model(output_node, pos_encoding)
-
-    # Precondition: no Add input is a Concatenate (see architecture
-    # doc §3 Model preconditions). The model assumes free-add cost;
-    # Concatenate-input Adds force the heuristic into compute-add and
-    # would invalidate the LB.
-    for n in gm.schedulable:
-        if not isinstance(n, Add):
-            continue
-        for inp in n.inputs:
-            if isinstance(inp, Concatenate):
-                raise RuntimeError(
-                    f"CP-SAT precondition violation: Add node "
-                    f"id={n.node_id} has a Concatenate input "
-                    f"({type(inp).__name__} id={inp.node_id}). The "
-                    f"CP-SAT model assumes free-add cost; "
-                    f"Concatenate-input Adds force compute-add and "
-                    f"would invalidate the resource budget. See "
-                    f"docs/cpsat_scheduler.md §3 Model preconditions."
-                )
 
     n_heads_per_layer = d // d_head
     input_residual = sum(len(n) for n in gm.input_nodes)
@@ -654,16 +660,122 @@ def solve_schedule(
             # the node's own birth layer.
             model.Add(cl <= layer_var[n.node_id] + 1 + cancel_slack)
 
+    # ---- Add free/compute classification ----
+    # The heuristic schedules an `Add` via `add_into` (free regime)
+    # iff at least one addend is dead at the Add's layer — every
+    # other consumer of that addend has already computed in a strictly
+    # prior layer.  Free-add costs `⌈d_out/d_head⌉` heads (copy the
+    # live addend into the dead addend's already-allocated cols).
+    # Otherwise the heuristic falls back to `compute_add`: fresh cols,
+    # both inputs copied (≈ 2× heads) plus a BIRTH-layer dirty cancel
+    # for the fresh cols.
+    #
+    # Encode: `is_free[A]` is a boolean equal to OR over addends E of
+    # `E_dead_at_A` = AND over E's other consumers C of
+    # `layer_var[C] < layer_var[A]`.  Strict inequality matches the
+    # heuristic, which reads `computed_nodes` snapshotted at layer
+    # start, so a same-layer attention consumer doesn't count as
+    # making the addend dead at an MLP-routed Add (Adds always run in
+    # attention anyway, so this corner doesn't fire — but the strict
+    # form is the conservative/correct encoding).
+    is_free: Dict[int, cp_model.IntVar] = {}
+    for A in gm.schedulable:
+        if not isinstance(A, Add):
+            continue
+        addend_dead_bools: List[cp_model.IntVar] = []
+        for E in A.inputs:
+            E_dead = model.NewBoolVar(f"E_dead_A{A.node_id}_E{E.node_id}")
+            disqualifying = (
+                isinstance(E, Concatenate)
+                or E in gm.pinned_nodes
+                or E.node_id not in layer_var
+            )
+            if disqualifying:
+                model.Add(E_dead == 0)
+                addend_dead_bools.append(E_dead)
+                continue
+            other_consumers = [c for c in gm.consumers_eff.get(E, set()) if c is not A]
+            # Any consumer that lacks a layer_var (terminal Concatenate
+            # in the output cone, or any non-schedulable consumer) is
+            # "always alive" — E can never be dead at A.
+            has_unschedulable = any(
+                isinstance(c, Concatenate) or c.node_id not in layer_var
+                for c in other_consumers
+            )
+            if has_unschedulable:
+                model.Add(E_dead == 0)
+                addend_dead_bools.append(E_dead)
+                continue
+            before_bools: List[cp_model.IntVar] = []
+            for C in other_consumers:
+                b = model.NewBoolVar(
+                    f"before_E{E.node_id}_C{C.node_id}_A{A.node_id}"
+                )
+                model.Add(layer_var[C.node_id] < layer_var[A.node_id]).OnlyEnforceIf(b)
+                model.Add(layer_var[C.node_id] >= layer_var[A.node_id]).OnlyEnforceIf(
+                    b.Not()
+                )
+                before_bools.append(b)
+            if before_bools:
+                model.AddBoolAnd(before_bools).OnlyEnforceIf(E_dead)
+                model.AddBoolOr([b.Not() for b in before_bools]).OnlyEnforceIf(
+                    E_dead.Not()
+                )
+            else:
+                # E feeds only A — E_dead is constant True.
+                model.Add(E_dead == 1)
+            addend_dead_bools.append(E_dead)
+        is_free_A = model.NewBoolVar(f"is_free_A{A.node_id}")
+        if addend_dead_bools:
+            model.AddBoolOr(addend_dead_bools).OnlyEnforceIf(is_free_A)
+            model.AddBoolAnd([b.Not() for b in addend_dead_bools]).OnlyEnforceIf(
+                is_free_A.Not()
+            )
+        else:
+            model.Add(is_free_A == 0)
+        is_free[A.node_id] = is_free_A
+
     # ---- Combined attn-heads + cancel-cols cumulative ----
     # Per-node attn interval is OPTIONAL (gated by is_attn[n]) when
     # the node could run in either sublayer; for pinned nodes, the
     # bool is constant and CP-SAT presolve drops the unreachable
     # branch.
+    #
+    # `Add` gets two optional intervals — one demand for the free-add
+    # regime (`⌈d_out/d_head⌉` heads), one for compute-add (`2 ·
+    # ⌈d_out/d_head⌉` heads), gated by `is_free[A]` and its negation
+    # respectively.  Adds are pinned to attention so we don't gate by
+    # `is_attn[A]` here.
     attn_intervals: List = []
     attn_demands: List[int] = []
     for n in gm.schedulable:
         h = heads_for(n, d_head)
         if h <= 0:
+            continue
+        if isinstance(n, Add):
+            free_end = model.NewIntVar(1, max_layers, f"aend_free_n{n.node_id}")
+            model.Add(free_end == layer_var[n.node_id] + 1)
+            iv_free = model.NewOptionalIntervalVar(
+                layer_var[n.node_id],
+                1,
+                free_end,
+                is_free[n.node_id],
+                f"aiv_free_n{n.node_id}",
+            )
+            attn_intervals.append(iv_free)
+            attn_demands.append(h * d_head)
+
+            comp_end = model.NewIntVar(1, max_layers, f"aend_comp_n{n.node_id}")
+            model.Add(comp_end == layer_var[n.node_id] + 1)
+            iv_comp = model.NewOptionalIntervalVar(
+                layer_var[n.node_id],
+                1,
+                comp_end,
+                is_free[n.node_id].Not(),
+                f"aiv_comp_n{n.node_id}",
+            )
+            attn_intervals.append(iv_comp)
+            attn_demands.append(2 * h * d_head)
             continue
         end = model.NewIntVar(1, max_layers, f"aend_n{n.node_id}")
         model.Add(end == layer_var[n.node_id] + 1)
@@ -698,21 +810,31 @@ def solve_schedule(
         # Birth-layer dirty-column cancel.  When `assume_zero_init` is
         # False (the default, mirroring the heuristic's defensive
         # behaviour), every fresh allocation pays a cancel head to
-        # clear the column's prior value before its additive write.  When True, the runtime is contracted to
-        # zero-initialise the residual stream and the heuristic skips
-        # these cancels — so we skip them in the model too.
-        # `Add` is always exempt: under the model precondition (no
-        # `Concatenate`-input `Add`) the heuristic always reaches the
-        # `Add` via the free-add path, reusing the dead addend's
-        # already-allocated columns — no fresh allocation, no dirty
-        # bits to clear.
-        if assume_zero_init or isinstance(n, Add):
+        # clear the column's prior value before its additive write.
+        # When True, the runtime is contracted to zero-initialise the
+        # residual stream and the heuristic skips these cancels — so
+        # we skip them in the model too.
+        #
+        # `Add` is conditional: free-add reuses the dead addend's
+        # already-clean cols (no dirty bits), so no cancel.  Compute-
+        # add allocates fresh cols and pays the dirty cancel.  Gate
+        # the dirty interval by `is_free[A].Not()`.
+        if assume_zero_init:
             continue
         d_end = model.NewIntVar(1, max_layers, f"dend_n{n.node_id}")
         model.Add(d_end == layer_var[n.node_id] + 1)
-        d_iv = model.NewIntervalVar(
-            layer_var[n.node_id], 1, d_end, f"div_n{n.node_id}"
-        )
+        if isinstance(n, Add):
+            d_iv = model.NewOptionalIntervalVar(
+                layer_var[n.node_id],
+                1,
+                d_end,
+                is_free[n.node_id].Not(),
+                f"div_n{n.node_id}",
+            )
+        else:
+            d_iv = model.NewIntervalVar(
+                layer_var[n.node_id], 1, d_end, f"div_n{n.node_id}"
+            )
         dirty_intervals.append(d_iv)
         dirty_demands.append(len(n))
 
@@ -780,7 +902,13 @@ def solve_schedule(
         h = heads_for(n, d_head)
         if h == 0:
             continue
-        if flex_routing and is_flex(n, gm):
+        if isinstance(n, Add):
+            # Add always runs in attention; cost is h (free) or 2h
+            # (compute), gated by `is_free[A]`.  Always pay h, plus
+            # an extra h when not free.
+            fixed_attn_heads += h
+            attn_term.append(h * is_free[n.node_id].Not())
+        elif flex_routing and is_flex(n, gm):
             attn_term.append(h * is_attn[n.node_id])
         else:
             r = routing(n, gm, policy)
@@ -788,7 +916,7 @@ def solve_schedule(
                 fixed_attn_heads += h
     total_attn_heads = model.NewIntVar(
         0,
-        fixed_attn_heads + sum(heads_for(n, d_head) for n in gm.schedulable),
+        fixed_attn_heads + 2 * sum(heads_for(n, d_head) for n in gm.schedulable),
         "total_attn_heads",
     )
     if attn_term:

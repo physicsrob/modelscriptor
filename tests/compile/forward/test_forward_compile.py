@@ -325,9 +325,10 @@ def test_compile_relu_add():
 def test_compile_multiple_concats():
     """Shared constants across multiple concat -> add paths.
 
-    The graph has ``Concatenate``-input ``Add`` nodes — a CP-SAT model
-    precondition (``docs/cpsat_scheduler.md`` §3 Model preconditions),
-    so this test pins the heuristic scheduler.
+    The graph has ``Concatenate``-input ``Add`` nodes (which force the
+    heuristic into ``compute_add``).  CP-SAT models the compute-add
+    regime via ``is_free[A]=False``; ``test_cpsat_compiles_concatenate_input_add``
+    in ``test_cpsat_integration.py`` covers the CP-SAT path.
     """
     c1 = create_literal_value(torch.tensor([1.0]))
     c2 = create_literal_value(torch.tensor([1.0]))

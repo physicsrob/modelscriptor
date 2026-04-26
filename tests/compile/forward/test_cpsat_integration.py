@@ -16,9 +16,16 @@ import torch
 
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import Costs
+from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY
 from torchwright.graph import Add, Linear, ReLU
-from torchwright.ops.arithmetic_ops import add, relu
-from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.arithmetic_ops import (
+    add,
+    add_scaled_nodes,
+    concat,
+    relu,
+    sum_nodes,
+)
+from torchwright.ops.inout_nodes import create_input, create_literal_value
 
 
 D = 256
@@ -258,6 +265,135 @@ def test_cpsat_warm_start_layer_count_no_worse():
         optimize=1,
     )
     assert len(net_cpsat.layers) <= len(net_heur.layers)
+
+
+def test_cpsat_compiles_fanout_chain():
+    """Non-exclusive chain L1 — L1 also feeds another consumer.
+
+    Mirrors ``test_relu_chain_broken_by_fanout`` from
+    ``test_scheduler.py``.  The chain composite emits L1 inline inside
+    ``linear1``; the standalone realization of L1 (writing L1's value
+    to its own residual cols for the non-chain consumer) is a separate
+    realization that costs attention heads (LEGACY_POLICY routes it to
+    attention).  Before the P1 fix, the CP-SAT model treated L1 as
+    chain-internal — no `is_attn[L1]` decision, no attention-head
+    cost charged for the standalone realization — so a CP-SAT
+    schedule could pack a layer beyond what the heuristic could replay.
+    With the P1 fix, the model accounts for L1's standalone heads.
+
+    Pinned to ``LEGACY_POLICY`` + ``cpsat_flex_routing=False`` because
+    the heuristic's handling of non-exclusive L1 under the default
+    bypass policy has a separate, pre-existing soundness gap (the
+    chain block marks L1 as ``computed`` before the bypass loop has
+    a chance to emit ``compute_linear_bypass`` for it — left for a
+    follow-up).
+    """
+    x = create_input("x", 8)
+    l1 = Linear(x, torch.randn(8, 16), torch.zeros(16), name="l1")
+    r = ReLU(l1)
+    l2 = Linear(r, torch.randn(16, 4), torch.zeros(4), name="l2")
+    other = Linear(l1, torch.randn(16, 4), torch.zeros(4), name="other")
+    out = sum_nodes([l2, other])
+    inputs = {"x": torch.randn(2, 8)}
+
+    net_heur = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=0,
+        policy=LEGACY_POLICY,
+    )
+    net_cpsat = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=1,
+        policy=LEGACY_POLICY, cpsat_flex_routing=False,
+    )
+    out_heur = net_heur.compute(2, inputs)[out].cpu()
+    out_cpsat = net_cpsat.compute(2, inputs)[out].cpu()
+    expected = out.compute(2, inputs)
+    torch.testing.assert_close(out_cpsat, expected, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(out_heur, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_cpsat_compiles_shared_input_adds():
+    """Two Adds sharing both inputs — neither addend can be free.
+
+    Mirrors ``test_compile_add_shared_inputs`` from
+    ``test_forward_compile.py``.  Both ``x`` and ``y`` feed both Adds,
+    so neither input is dead at either Add's layer — the heuristic
+    falls back to ``compute_add`` (the costly regime).  Under the P2
+    fix, CP-SAT models the compute-add cost and must produce a
+    schedule that's replayable.
+    """
+    width = 8
+    x = create_input("x", width)
+    y = create_input("y", width)
+    sum1 = add(x, y)
+    sum2 = add(x, y)
+    out = add_scaled_nodes(1.0, sum1, 1.0, sum2)
+    inputs = {"x": torch.randn(2, width), "y": torch.randn(2, width)}
+
+    net_heur = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=0,
+        max_layers=10,
+    )
+    net_cpsat = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=1,
+        max_layers=10,
+    )
+    out_heur = net_heur.compute(2, inputs)[out].cpu()
+    out_cpsat = net_cpsat.compute(2, inputs)[out].cpu()
+    expected = out.compute(2, inputs)
+    torch.testing.assert_close(out_cpsat, expected, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(out_heur, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_cpsat_compiles_three_adds_shared_inputs():
+    """Three Adds sharing both inputs — the calculator pattern.
+
+    Mirrors ``test_compile_three_adds_shared_inputs`` from
+    ``test_forward_compile.py``.  Each addend has multiple Add
+    consumers; whether an addend is dead at a given Add depends on
+    when the other Adds are scheduled — exercises the reified
+    consumer-ordering booleans.
+    """
+    x = create_input("x", 1)
+    y = create_input("y", 1)
+    s1 = add(x, y)
+    s2 = add(x, y)
+    s3 = add(x, y)
+    out = sum_nodes([s1, s2, s3])
+    inputs = {
+        "x": torch.tensor([[3.0], [7.0]]),
+        "y": torch.tensor([[4.0], [2.0]]),
+    }
+
+    net_cpsat = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=1,
+        max_layers=10,
+    )
+    out_cpsat = net_cpsat.compute(2, inputs)[out].cpu()
+    expected = out.compute(2, inputs)
+    torch.testing.assert_close(out_cpsat, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_cpsat_compiles_concatenate_input_add():
+    """Add with a Concatenate input — used to be a precondition raise.
+
+    Before P2, ``solve_schedule`` rejected graphs containing
+    ``Concatenate``-input Adds with a precondition error: the model
+    assumed free-add cost everywhere, but the heuristic forces
+    ``compute_add`` for these (Concatenate has no reusable cols).
+    After P2, the model encodes both regimes and the precondition is
+    gone — these graphs compile cleanly under ``optimize=1``.
+    """
+    c1 = create_literal_value(torch.tensor([1.0]))
+    c2 = create_literal_value(torch.tensor([1.0]))
+    c3 = create_literal_value(torch.tensor([2.0, 2.0]))
+    out = add(concat([c1, c2]), c3)
+
+    net_cpsat = forward_compile(
+        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=1,
+    )
+    actual = net_cpsat.compute(1, {})[out].cpu()
+    expected = out.compute(1, {})
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
 def test_cpsat_falls_back_to_heuristic_when_no_incumbent(monkeypatch):
