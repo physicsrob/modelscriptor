@@ -8,6 +8,7 @@ dependencies = [
     "onnx",
     "pygame>=2.6.1",
     "ortools>=9.10",
+    "pydantic>=2.0",
 ]
 
 [project.optional-dependencies]

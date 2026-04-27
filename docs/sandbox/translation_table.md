@@ -69,11 +69,11 @@ commit. Out-of-date entries here are how port-time discovers
 | Sandbox | Real-graph counterpart | Notes |
 |---------|------------------------|-------|
 | `type_switch(*branches)` | `compose_switch` in `torchwright/graph/` | Mutually-exclusive branch selection |
-| `relu(input_range)` | `relu` op in `torchwright/ops/` | Piecewise-linear with 2 breakpoints, exact for affine inputs |
+| `relu(input_range)` | `relu` op in `torchwright/ops/` | Sandbox places 3 breakpoints with one at the kink (`x = 0`) so ReLU is exact across `input_range` (modulo the per-call gaussian); falls back to 2 breakpoints when `lo == 0` or `hi == 0` |
 | `clamp(lo, hi)` | `clamp` / `clip` op in `torchwright/ops/arithmetic_ops.py` | Identity PWL with runtime clamping at the input boundaries |
 | `compare_const(c, input_range)` | `compare_const(c)` op in `torchwright/ops/` | Steep ramp around `c` |
 | `piecewise_linear(fn, breakpoints, input_range)` | `piecewise_linear` op | Generic 1D PWL, equivalent to `pwl_def` |
-| `multiply(a, b)` | `multiply_2d` op in `torchwright/ops/` | Bilinear PWL |
+| `multiply(input_range, breakpoints=2)` | `multiply` 2D op in `torchwright/ops/arithmetic_ops.py` | Factory; the returned `PWLDef2D` is then applied to two same-shape Vecs. Bilinear interpolation reproduces `a * b` exactly with a 2x2 grid (modulo the per-call gaussian) |
 | `piecewise_linear_2d(fn, breakpoints, input_range)` | `piecewise_linear_2d` op | Generic 2D PWL |
 
 ## Debug primitives

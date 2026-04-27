@@ -123,9 +123,14 @@ that isn't in the stdlib, ask — adding one is a platform-side decision
 about which approximation strategy to commit to.
 
 Pre-built primitives covering common patterns are in
-`doom_sandbox.api.std` (e.g. `RELU`, `compare_const(c)`, `tan`, `cos`).
-Use them. If something you need isn't there, **ask before adding a new
-primitive** — new primitives carry a porting cost.
+`doom_sandbox.api.std` — currently `relu(input_range)`,
+`clamp(lo, hi)`, `compare_const(c, input_range)`,
+`piecewise_linear(fn, breakpoints, input_range)`,
+`multiply(input_range, breakpoints=2)`,
+`piecewise_linear_2d(fn, breakpoints, input_range)`, and
+`type_switch(*branches)`. Use them. If something you need isn't there,
+**ask before adding a new primitive** — new primitives carry a
+porting cost.
 
 ## Free utilities
 

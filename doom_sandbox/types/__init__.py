@@ -8,8 +8,6 @@ texture pixel arrays, name → id maps) don't break loading; phase 1
 doesn't need them.
 """
 
-from .frame import Frame
-from .frame_input import FrameInput
 from .game_state import GameState
 from .map_subset import BSPNode, MapSubset, Segment, Texture
 
@@ -19,6 +17,4 @@ __all__ = [
     "BSPNode",
     "Texture",
     "GameState",
-    "FrameInput",
-    "Frame",
 ]

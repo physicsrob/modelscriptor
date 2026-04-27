@@ -52,7 +52,7 @@ contract holds.
 doom_sandbox/
 ├── CLAUDE.md                       # sandbox agent's complete context
 ├── api/                            # agent-facing API
-├── types/                          # pydantic schemas + dataclasses (Frame)
+├── types/                          # pydantic schemas (MapSubset, GameState, ...)
 ├── runtime/                        # framework internals (agent does NOT import)
 ├── fixtures/                       # serialized MapSubsets
 └── phases/
