@@ -189,15 +189,24 @@ class Past:
         )
 
     def _auto_inputs(self, input_token: "Token") -> dict[str, Vec]:
-        """Build the auto-published input.* exports for a token."""
+        """Build the auto-published input.* exports for a token.
+
+        Iterates over every slot declared on the canonical token type
+        (not just the slots the caller passed in `Token.values`) so an
+        omitted slot is still queryable as `input.<slot>` with value 0
+        — consistent with `extract_*_slot`'s "missing slot reads as 0"
+        behavior.
+        """
         out: dict[str, Vec] = {}
         n_types = len(self._layout.types)
         type_data = np.zeros(n_types, dtype=np.float64)
         type_data[self._layout.type_columns[input_token.type.name]] = 1.0
         out["input.type"] = _make_vec(type_data, depth=0)
-        for slot_name, slot_value in input_token.values.items():
+        canonical = self._layout.types_by_name[input_token.type.name]
+        for slot_name in canonical.slots:
+            value = input_token.values.get(slot_name, 0)
             out[f"input.{slot_name}"] = _make_vec(
-                np.array([float(slot_value)], dtype=np.float64), depth=0
+                np.array([float(value)], dtype=np.float64), depth=0
             )
         return out
 
@@ -371,8 +380,17 @@ class Past:
         self, query: Vec, key_name: str, value_name: str
     ) -> Vec:
         """Among positions matching the query (within `MARGIN` of the
-        top `query·key` score), return the value at the most recent.
-        Raises if no position has both names."""
+        top `query·key` score across all candidates), return the value
+        at the most recent. Raises only if no position has both names.
+
+        "Matching" is defined relative to the candidate set's top score
+        — if no position truly matches the query the function still
+        returns a value (degraded to recency among similarly-low
+        scores), mirroring the real graph's
+        `attend_most_recent_matching` behavior. Wrap with a
+        select-against-sentinel pattern at the call site if the
+        caller can't guarantee at least one real match exists.
+        """
         kv = self._collect_qk(query, key_name, value_name)
         if not kv:
             raise RuntimeError(

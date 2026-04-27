@@ -1,5 +1,14 @@
 # Chunk 7 plan — Implementing the framework runtime
 
+> **HISTORICAL — superseded.** This doc was the pre-implementation plan
+> for the framework runtime. It's preserved for context on the design
+> intent, but specifics drifted during execution: tests live colocated
+> inside `doom_sandbox/` (not `tests/sandbox/`), the `exports` dict was
+> replaced by `past.publish(...)`, the noise model is real interp +
+> per-element gaussian, etc. For the canonical agent-facing contract,
+> read `doom_sandbox/CLAUDE.md`. For the platform-facing summary, read
+> `docs/sandbox/overview.md` and `docs/sandbox/translation_table.md`.
+
 This document is the executable plan for chunk 7. It assumes the
 sandbox API skeleton already exists at `doom_sandbox/api/` (with every
 function and method body raising `NotImplementedError("framework

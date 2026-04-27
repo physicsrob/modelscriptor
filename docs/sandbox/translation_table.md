@@ -24,7 +24,7 @@ commit. Out-of-date entries here are how port-time discovers
 |---------|------------------------|-------|
 | `pwl_def(fn, breakpoints, input_range)` at module level | A `PiecewiseLinear` op in `torchwright/ops/` constructed from the same `fn` and breakpoint configuration | Sandbox stores the function; real-graph builds the breakpoint table at compile time |
 | `PWLDef.__call__(vec)` | `piecewise_linear(node, op)` in graph construction | Adds 1 MLP sublayer in the compiled transformer |
-| Affine PWLs (noise-free) | `Linear` node in the graph | The compiler can recognize affine PWLs and lower them to `Linear` if useful |
+| Affine PWLs (interp-residual = 0) | `Linear` node in the graph | The compiler can recognize affine PWLs and lower them to `Linear` if useful. The sandbox's per-call gaussian (`σ = 1e-6 * |value|`) still applies — it represents FP32 / matmul noise, not the PWL approximation residual |
 
 ## Token system
 
@@ -58,7 +58,8 @@ commit. Out-of-date entries here are how port-time discovers
 |---------|------------------------|-------|
 | `ForwardOutput.next_token` | The 49-wide `next_token_embedding` overflow output | Argmaxed against `W_EMBED.T` by the host |
 | `ForwardOutput.pixels` | The `pixels`/`col`/`start`/`length` overflow region | Read by the host, blitted, never re-embedded |
-| `ForwardOutput.exports` | Residual-column allocations holding cross-position values | Each export name maps to a designated column range |
+| `past.publish(name, vec)` | Writing a column (or column range) to the residual stream after an MLP/attention layer | Each published name maps to a designated column range. Subsequent attention layers (this position's later layers, or any later position's layers) can read it. Re-publishing under the same name = a residual-column rewrite by a later layer |
+| `input.type` / `input.<slot>` auto-publish | The token's E8 / Gray-coded slots already on the residual stream from the embedding layer | Free in the real graph — the embedding deposits the slot info; sandbox materializes it as queryable Vecs at every position |
 | `Config.terminal_token_types` | The `done` overflow signal | Host stops when `done > 0` |
 | `Config.max_positions` | The host loop's safety cap | No real-graph counterpart needed (host concern) |
 | `run(config, prefill, forward)` | The host loop in `torchwright/doom/play.py` / `step_frame` | The autoregressive driver |
@@ -69,7 +70,7 @@ commit. Out-of-date entries here are how port-time discovers
 |---------|------------------------|-------|
 | `type_switch(*branches)` | `compose_switch` in `torchwright/graph/` | Mutually-exclusive branch selection |
 | `relu(input_range)` | `relu` op in `torchwright/ops/` | Piecewise-linear with 2 breakpoints, exact for affine inputs |
-| `saturate(input_range)` | `saturate` / `clip` op | Clamp to [0, 1] |
+| `clamp(lo, hi)` | `clamp` / `clip` op in `torchwright/ops/arithmetic_ops.py` | Identity PWL with runtime clamping at the input boundaries |
 | `compare_const(c, input_range)` | `compare_const(c)` op in `torchwright/ops/` | Steep ramp around `c` |
 | `piecewise_linear(fn, breakpoints, input_range)` | `piecewise_linear` op | Generic 1D PWL, equivalent to `pwl_def` |
 | `multiply(a, b)` | `multiply_2d` op in `torchwright/ops/` | Bilinear PWL |

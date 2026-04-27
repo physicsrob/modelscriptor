@@ -414,8 +414,10 @@ key, more separation) or pick a different primitive.
 ```python
 from doom_sandbox.api import Config, TokenVocab
 
+DONE = TokenType("DONE", slots={})
+
 def setup() -> Config:
-    vocab = TokenVocab([RENDER, VALUE, THINKING_WALL, NO_OP, ...])
+    vocab = TokenVocab([RENDER, VALUE, THINKING_WALL, NO_OP, DONE, ...])
 
     def decode_pixels(input_tok: Token, pixels_vec: Vec) -> list[Pixel]:
         # Called at every position. Return [] for non-render positions
@@ -426,7 +428,7 @@ def setup() -> Config:
     return Config(
         vocab=vocab,
         decode_pixels=decode_pixels,
-        max_chunk_size=32,    # pixels per render token
+        terminal_token_types={DONE},
     )
 ```
 
@@ -482,7 +484,7 @@ from .reference import expected_bsp_ranks
 
 def test_phase1_box_room():
     map = load_fixture("box_room")
-    state = GameState(player_x=0.0, player_y=0.0, angle=0)
+    state = GameState(x=0.0, y=0.0, angle=0)
 
     expected = expected_bsp_ranks(map, state)
 

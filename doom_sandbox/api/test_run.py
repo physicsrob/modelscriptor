@@ -476,6 +476,25 @@ def test_publish_before_lookup_required():
         run(config, [Token(TICK)], fwd)
 
 
+def test_input_dot_star_omitted_slot_publishes_zero():
+    """If a Token is constructed without specifying a declared slot, the
+    framework still auto-publishes `input.<slot>` as a 1-Vec carrying 0
+    — consistent with `extract_*_slot`'s "missing slot reads as 0"
+    behavior. A regression that publishes only the explicitly supplied
+    slots would silently make the slot un-queryable here."""
+    config = _config([RENDER_FOR_AUTOPUB, STOP], terminals=[STOP])
+    seen_col: list[Vec] = []
+
+    def fwd(v, past):
+        seen_col.append(past.mean("input.col"))
+        return ForwardOutput(next_token=make_token(STOP))
+
+    # RENDER_FOR_AUTOPUB declares "col" but we don't supply it in values.
+    run(config, [Token(RENDER_FOR_AUTOPUB, {})], fwd)
+    assert seen_col[0].shape == 1
+    assert abs(seen_col[0]._data[0] - 0.0) < 1e-3
+
+
 def test_input_dot_star_auto_published_at_self_via_past():
     """At the in-flight position, both `input.type` and `input.<slot>` are
     auto-published and queryable via past.*."""

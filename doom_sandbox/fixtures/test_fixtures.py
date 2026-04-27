@@ -73,15 +73,19 @@ def test_box_room_ranks_form_a_permutation():
 
 
 def test_box_room_ranks_match_known_player_position():
-    """Spot check: for a player at the origin (the BSP root splits at
-    x=0, then y=2.5 in front and y=-2.5 in back), the rank vector
-    is determined."""
+    """Spot check the exact rank vector at a known player position. A
+    sign error or coefficient permutation in the fixture-generation
+    pipeline would silently pass a permutation-only check, so we pin
+    the concrete rank vector here.
+
+    At player (0.5, 0.5) inside the box_room (segments at x=±5, y=±5):
+    side_P_vec = [1, 1, 0] (FRONT of x=0 plane, FRONT of y=-2.5
+    plane, BACK of y=+2.5 plane). With the committed
+    seg_bsp_coeffs / seg_bsp_consts, the resulting rank vector is
+    [0, 2, 3, 1]."""
     scene = load_fixture("box_room")
-    state = GameState(x=0.5, y=0.5, angle=0)  # FRONT of node 0 (x>0), FRONT of node 1 (y > -2.5)
+    state = GameState(x=0.5, y=0.5, angle=0)
     ranks = expected_bsp_ranks(scene, state)
-    # Whatever the exact ordering, it must be a permutation and
-    # deterministic.
-    assert sorted(ranks) == [0, 1, 2, 3]
-    # Re-running yields the same result.
-    again = expected_bsp_ranks(scene, state)
-    assert ranks == again
+    assert ranks == [0, 2, 3, 1]
+    # Determinism — re-running yields the same result.
+    assert expected_bsp_ranks(scene, state) == ranks

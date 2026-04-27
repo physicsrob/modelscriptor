@@ -140,7 +140,7 @@ autoregressively. Some options to consider:
   (one per BSP node) after `PLAYER_X` / `PLAYER_Y`. Each thinking
   position attends to its corresponding `BSP_NODE` data and the
   player position to compute its bit. The per-wall `BSP_RANK`
-  computation then reads these via `past.most_recent_matching` or
+  computation then reads these via `past.pick_most_recent` or
   `past.mean`.
 - Inline computation at each `BSP_RANK` position — read all BSP planes
   and the player position via attention, compute side bits inline. Costs

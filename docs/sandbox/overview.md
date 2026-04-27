@@ -39,7 +39,7 @@ enough to keep ambitious design work tractable.
 | Side | Audience | What they see | What they own |
 |------|----------|---------------|---------------|
 | **Sandbox** | the resident agent | `doom_sandbox/CLAUDE.md` + their phase's directory | per-phase `setup.py` / `prefill.py` / `forward.py` / `extract.py` / `reference.py` / tests |
-| **Platform** | us | `docs/sandbox/*.md` + the framework runtime + this overview | `doom_sandbox/api/` (the API surface), `doom_sandbox/runtime/` (framework internals), `doom_sandbox/types/` (pydantic schemas), `tests/sandbox/` (framework tests), `docs/sandbox/` (these docs) |
+| **Platform** | us | `docs/sandbox/*.md` + the framework runtime + this overview | `doom_sandbox/api/` (the API surface), `doom_sandbox/runtime/` (framework internals), `doom_sandbox/types/` (pydantic schemas), `doom_sandbox/fixtures/` (JSON-serialized scenes), framework tests colocated with the code they test (e.g. `doom_sandbox/api/test_*.py`), `docs/sandbox/` (these docs) |
 
 The sandbox-resident agent treats the platform side as a black box.
 We treat the sandbox side as a contract — we don't read the agent's
@@ -65,8 +65,10 @@ doom_sandbox/
         ├── reference.py
         └── test_<phase>.py
 
-tests/sandbox/                      # framework tests (platform-only)
 docs/sandbox/                       # platform docs (this directory)
+scripts/build_sandbox_fixtures.py   # platform-side fixture generator
+                                    # (framework tests live colocated as
+                                    #  doom_sandbox/<area>/test_*.py)
 ```
 
 ## Phase lifecycle
@@ -110,17 +112,19 @@ These rules keep the sandbox honest as it grows:
 
 5. **Negative tests for invariants.** The framework enforces several
    invariants — `pwl_def` construction frozen during `forward()`,
-   `Vec.data` not in the public API, exports must be Vecs, etc.
-   Each invariant has a negative test in `tests/sandbox/` that
-   asserts the framework raises when violated. Adding an invariant
-   without its negative test is forbidden.
+   `publish` only inside forward, names starting with `input.` are
+   reserved, etc. Each invariant has a negative test colocated with
+   the relevant module (e.g. `doom_sandbox/api/test_run.py` for the
+   forward-lifecycle invariants) that asserts the framework raises
+   when violated. Adding an invariant without its negative test is
+   forbidden.
 
 ## Where to start, when
 
 | You want to | Read | Edit |
 |-------------|------|------|
 | Understand the sandbox | this file + `doom_sandbox/CLAUDE.md` | nothing |
-| Add or change a primitive | `docs/sandbox/translation_table.md` | `doom_sandbox/api/`, the table, `tests/sandbox/` |
+| Add or change a primitive | `docs/sandbox/translation_table.md` | `doom_sandbox/api/`, the table, the colocated `test_*.py` next to the changed file |
 | Update the type schemas | `torchwright/doom/map_subset.py` (source of truth) | `doom_sandbox/types/`, project-side round-trip test |
-| Implement framework runtime | API stubs in `doom_sandbox/api/`, this file | `doom_sandbox/runtime/`, `tests/sandbox/` |
+| Implement framework runtime | API stubs in `doom_sandbox/api/`, this file | `doom_sandbox/runtime/`, the colocated `test_*.py` files |
 | Spec a new phase | existing `PHASE.md` files for tone/shape | new `doom_sandbox/phases/<name>/PHASE.md` + `reference.py` |
