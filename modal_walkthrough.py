@@ -19,18 +19,22 @@ app = modal.App("torchwright-walkthrough", image=IMAGE)
 
 
 def _scene_data(scene, tex_size):
-    """Return ``(subset, start_x, start_y, start_angle, max_coord, still)``.
+    """Return ``(subset, start_x, start_y, start_angle, max_coord, still, player_eye_z)``.
 
     ``subset`` is a fully-built :class:`MapSubset` ready to feed
     :func:`step_frame`.  ``still`` is True when the scene should be
-    rendered without wall-following motion (E1M1's 4-wall subset would
-    walk the player out of loaded geometry within a few frames).
+    rendered without wall-following motion (E1M1's 64-wall subset
+    would walk the player out of loaded geometry within a few
+    frames).  ``player_eye_z`` is in raw DOOM world units (= sector
+    floor + 41).
     """
-    from torchwright.doom.map_subset import build_scene_subset, load_map_subset
-    from torchwright.reference_renderer.scenes import (
-        box_room_textured,
-        multi_room_textured,
+    from torchwright.doom.map_subset import (
+        DOOM_PLAYER_EYE_HEIGHT,
+        build_scene_subset,
+        find_sector_at,
+        load_map_subset,
     )
+    from torchwright.reference_renderer.scenes import box_room_textured
 
     if scene == "box":
         segments, textures = box_room_textured(
@@ -38,14 +42,7 @@ def _scene_data(scene, tex_size):
             tex_size=tex_size,
         )
         subset = build_scene_subset(segments, textures)
-        return subset, 0.0, 0.0, 0, 10.0, False
-    elif scene == "multi":
-        segments, textures = multi_room_textured(
-            wad_path="doom1.wad",
-            tex_size=tex_size,
-        )
-        subset = build_scene_subset(segments, textures)
-        return subset, -8.0, 0.0, 0, 15.0, False
+        return subset, 0.0, 0.0, 0, 200.0, False, DOOM_PLAYER_EYE_HEIGHT
     else:  # e1m1
         from torchwright.doom.wad import WADReader
 
@@ -55,15 +52,29 @@ def _scene_data(scene, tex_size):
         spawn = next(t for t in md.things if t.type == 1)
         spawn_x, spawn_y = float(spawn.x), float(spawn.y)
         start_angle = round(spawn.angle / 360 * 256) % 256
+        spawn_floor_h = float(md.sectors[find_sector_at(md, spawn_x, spawn_y)].floor_h)
+        # See walkthrough.py for the rationale behind max_walls=64.
+        # The reference renderer is scale-invariant; raw DOOM coords
+        # are fed through.  Transformer callers running E1M1 will
+        # need their own host-side scaling step.
         subset = load_map_subset(
             wad_path="doom1.wad",
             map_name="E1M1",
             px=spawn_x,
             py=spawn_y,
-            max_walls=32,
+            max_walls=64,
+            max_bsp_nodes=96,
             tex_size=tex_size,
         )
-        return subset, spawn_x, spawn_y, start_angle, 100.0, True
+        return (
+            subset,
+            spawn_x,
+            spawn_y,
+            start_angle,
+            4000.0,
+            True,
+            spawn_floor_h + DOOM_PLAYER_EYE_HEIGHT,
+        )
 
 
 def _config(width, height):
@@ -73,7 +84,7 @@ def _config(width, height):
     return RenderConfig(
         screen_width=width,
         screen_height=height,
-        fov_columns=32,
+        fov_columns=64,  # ~90° H-FOV, DOOM canonical
         trig_table=generate_trig_table(),
         ceiling_color=(0.2, 0.2, 0.2),
         floor_color=(0.4, 0.4, 0.4),
@@ -83,10 +94,10 @@ def _config(width, height):
 @app.function(gpu="a100-80gb", cpu=8, timeout=1800)
 def generate_transformer(
     scene: str = "box",
-    width: int = 120,
-    height: int = 100,
+    width: int = 320,
+    height: int = 200,
     chunk_size: int = 20,
-    tex_size: int = 64,
+    tex_size: int = 1024,
     frames: int = 10,
     fps: int = 10,
     scale: int = 4,
@@ -97,9 +108,10 @@ def generate_transformer(
     from torchwright.doom.walkthrough import generate_walkthrough, save_gif
 
     config = _config(width, height)
-    subset, start_x, start_y, start_angle, max_coord, still = _scene_data(
+    subset, start_x, start_y, start_angle, max_coord, still, eye_z = _scene_data(
         scene, tex_size
     )
+    config.player_eye_z = eye_z
     segments = subset.segments
     textures = subset.textures
 
@@ -141,9 +153,9 @@ def generate_transformer(
 @app.function(cpu=4, timeout=1800)
 def generate_reference(
     scene: str = "box",
-    width: int = 120,
-    height: int = 100,
-    tex_size: int = 64,
+    width: int = 320,
+    height: int = 200,
+    tex_size: int = 1024,
     frames: int = 10,
     fps: int = 10,
     scale: int = 4,
@@ -153,7 +165,10 @@ def generate_reference(
     from torchwright.reference_renderer.render import render_frame
 
     config = _config(width, height)
-    subset, start_x, start_y, start_angle, _, still = _scene_data(scene, tex_size)
+    subset, start_x, start_y, start_angle, _, still, eye_z = _scene_data(
+        scene, tex_size
+    )
+    config.player_eye_z = eye_z
     segments = subset.segments
     textures = subset.textures
 
@@ -197,10 +212,10 @@ def generate_reference(
 @app.local_entrypoint()
 def main(
     scene: str = "box",
-    width: int = 120,
-    height: int = 100,
+    width: int = 320,
+    height: int = 200,
     chunk_size: int = 20,
-    tex_size: int = 64,
+    tex_size: int = 1024,
     frames: int = 10,
     fps: int = 10,
     scale: int = 4,

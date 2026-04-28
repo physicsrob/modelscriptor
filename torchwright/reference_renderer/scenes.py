@@ -4,183 +4,59 @@ import numpy as np
 
 from torchwright.reference_renderer.types import Segment
 
+# DOOM convention: floor at z=0, ceiling at z=128 = a "standard" ceiling
+# for a normal-sized room.  Player eye sits 41 units above the floor.
+_BOX_FLOOR = 0.0
+_BOX_CEILING = 128.0
 
-def box_room(size: float = 10.0) -> List[Segment]:
-    """A square room centered at the origin with four colored walls.
 
-    Each wall has a distinct color so orientation is visible:
+def box_room(size: float = 256.0) -> List[Segment]:
+    """A square one-sector room centred at the origin.
+
+    DOOM-shaped: floor at z=0, ceiling at z=128, walls 128 units tall.
+    Default ``size=256`` gives a 256×256 floor plan with the four walls
+    at ±128.  Each segment carries the front sector's floor / ceiling
+    so the renderer projects them on the same code path as WAD-loaded
+    segs.
+
+    DOOM convention: a sector's boundary linedefs are wound so that
+    FRONT (= right of the a→b direction) points into the sector.  For
+    a closed room that's *clockwise* traversal viewed from above
+    (with +y north): east wall going south, south going west, west
+    going north, north going east.
+
+    Each wall has a distinct color (one-sided seg, no texture):
         +x (east)  = red
         -x (west)  = green
         +y (north) = blue
         -y (south) = yellow
-
-    Args:
-        size: Side length of the room.
-
-    Returns:
-        List of 4 Segments forming the room walls.
     """
     h = size / 2.0
+    common = dict(front_floor=_BOX_FLOOR, front_ceiling=_BOX_CEILING)
     return [
-        Segment(ax=h, ay=-h, bx=h, by=h, color=(1.0, 0.0, 0.0)),  # east (red)
-        Segment(ax=-h, ay=h, bx=-h, by=-h, color=(0.0, 1.0, 0.0)),  # west (green)
-        Segment(ax=-h, ay=h, bx=h, by=h, color=(0.0, 0.0, 1.0)),  # north (blue)
-        Segment(ax=h, ay=-h, bx=-h, by=-h, color=(1.0, 1.0, 0.0)),  # south (yellow)
+        # East wall going south (right side faces west = inside)
+        Segment(ax=h, ay=h, bx=h, by=-h, color=(1.0, 0.0, 0.0), **common),
+        # South wall going west (right side faces north = inside)
+        Segment(ax=h, ay=-h, bx=-h, by=-h, color=(1.0, 1.0, 0.0), **common),
+        # West wall going north (right side faces east = inside)
+        Segment(ax=-h, ay=-h, bx=-h, by=h, color=(0.0, 1.0, 0.0), **common),
+        # North wall going east (right side faces south = inside)
+        Segment(ax=-h, ay=h, bx=h, by=h, color=(0.0, 0.0, 1.0), **common),
     ]
-
-
-def multi_room() -> List[Segment]:
-    """Two rooms connected by a corridor, with diagonal walls.
-
-    Layout (top-down, +x right, +y up)::
-
-        Room A (left)         Corridor          Room B (right)
-        (-12,-6)──────(-4,-6)         (4,-4)──────(12,-4)
-        |              |     ╲       ╱      |              |
-        |              |      (-2,-2)──(2,-2)      |              |
-        |     ★A       |                    |       ★B     |
-        |              |      (-2, 2)──(2, 2)      |              |
-        |              |     ╱       ╲      |              |
-        (-12, 6)──────(-4, 6)         (4, 4)──────(12, 4)
-
-    ★A = player start for room A tests (e.g. -8, 0)
-    ★B = player start for room B tests (e.g.  8, 0)
-
-    22 segments total. Includes two diagonal walls in the corridor
-    transitions. Each room/section has a distinct color palette.
-
-    Returns:
-        List of 22 Segments.
-    """
-    RED = (0.8, 0.2, 0.1)
-    GREEN = (0.1, 0.7, 0.2)
-    BLUE = (0.2, 0.3, 0.8)
-    YELLOW = (0.8, 0.8, 0.1)
-    CYAN = (0.1, 0.7, 0.7)
-    MAGENTA = (0.7, 0.1, 0.6)
-    ORANGE = (0.9, 0.5, 0.1)
-    GRAY = (0.5, 0.5, 0.5)
-
-    return [
-        # Room A walls
-        Segment(ax=-12, ay=-6, bx=-4, by=-6, color=RED),  # south
-        Segment(ax=-12, ay=6, bx=-12, by=-6, color=GREEN),  # west
-        Segment(ax=-4, ay=6, bx=-12, by=6, color=BLUE),  # north
-        Segment(ax=-4, ay=-6, bx=-4, by=-2, color=YELLOW),  # east-south (doorway)
-        Segment(ax=-4, ay=2, bx=-4, by=6, color=YELLOW),  # east-north (doorway)
-        # Corridor south wall
-        Segment(ax=-4, ay=-2, bx=-2, by=-2, color=GRAY),  # entry south
-        Segment(ax=-2, ay=-2, bx=2, by=-2, color=GRAY),  # middle south
-        Segment(ax=2, ay=-2, bx=4, by=-4, color=GRAY),  # exit south (diagonal!)
-        # Corridor north wall
-        Segment(ax=-4, ay=2, bx=-2, by=2, color=GRAY),  # entry north
-        Segment(ax=-2, ay=2, bx=2, by=2, color=GRAY),  # middle north
-        Segment(ax=2, ay=2, bx=4, by=4, color=GRAY),  # exit north (diagonal!)
-        # Room B walls
-        Segment(ax=4, ay=-4, bx=12, by=-4, color=CYAN),  # south
-        Segment(ax=12, ay=-4, bx=12, by=4, color=MAGENTA),  # east
-        Segment(ax=12, ay=4, bx=4, by=4, color=ORANGE),  # north
-        Segment(ax=4, ay=4, bx=4, by=2, color=BLUE),  # west-north (doorway)
-        Segment(ax=4, ay=-2, bx=4, by=-4, color=BLUE),  # west-south (doorway)
-        # Extra interior walls for complexity
-        Segment(ax=-10, ay=0, bx=-8, by=0, color=RED),  # shelf in room A
-        Segment(ax=8, ay=-2, bx=10, by=0, color=CYAN),  # diagonal wall in room B!
-        Segment(ax=8, ay=2, bx=10, by=0, color=ORANGE),  # diagonal wall in room B!
-        # Pillars (short segments)
-        Segment(ax=0, ay=-1.5, bx=0, by=-0.5, color=MAGENTA),  # corridor pillar south
-        Segment(ax=0, ay=0.5, bx=0, by=1.5, color=MAGENTA),  # corridor pillar north
-        Segment(ax=-7, ay=-3, bx=-7, by=-2, color=GREEN),  # pillar in room A
-    ]
-
-
-def multi_room_textured(
-    wad_path: str | None = "doom1.wad",
-    tex_size: int = 8,
-) -> Tuple[List[Segment], List[np.ndarray]]:
-    """Multi-room scene with textured walls.
-
-    Same geometry as ``multi_room()`` but with WAD textures assigned:
-        0 = STARTAN3 (room A walls, interior walls)
-        1 = STARG3   (doorways)
-        2 = BROWN1   (corridor, pillars)
-        3 = BROWNGRN (room B walls)
-
-    Returns ``(segments, textures)``.
-    """
-    if wad_path is not None:
-        from torchwright.doom.wad import WADReader
-        from torchwright.reference_renderer.textures import downscale_texture
-
-        wad = WADReader(wad_path)
-        names = ["STARTAN3", "STARG3", "BROWN1", "BROWNGRN"]
-        raw = [wad.get_texture(n) for n in names]
-        assert all(t is not None for t in raw), "WAD texture not found"
-        textures = [
-            downscale_texture(t, tex_size, tex_size) for t in raw if t is not None
-        ]
-    else:
-        from torchwright.reference_renderer.textures import default_texture_atlas
-
-        textures = default_texture_atlas()
-
-    T_A, T_DOOR, T_CORR, T_B = 0, 1, 2, 3
-
-    RED = (0.8, 0.2, 0.1)
-    GREEN = (0.1, 0.7, 0.2)
-    BLUE = (0.2, 0.3, 0.8)
-    YELLOW = (0.8, 0.8, 0.1)
-    CYAN = (0.1, 0.7, 0.7)
-    MAGENTA = (0.7, 0.1, 0.6)
-    ORANGE = (0.9, 0.5, 0.1)
-    GRAY = (0.5, 0.5, 0.5)
-
-    segments = [
-        # Room A walls
-        Segment(ax=-12, ay=-6, bx=-4, by=-6, color=RED, texture_id=T_A),
-        Segment(ax=-12, ay=6, bx=-12, by=-6, color=GREEN, texture_id=T_A),
-        Segment(ax=-4, ay=6, bx=-12, by=6, color=BLUE, texture_id=T_A),
-        Segment(ax=-4, ay=-6, bx=-4, by=-2, color=YELLOW, texture_id=T_DOOR),
-        Segment(ax=-4, ay=2, bx=-4, by=6, color=YELLOW, texture_id=T_DOOR),
-        # Corridor south wall
-        Segment(ax=-4, ay=-2, bx=-2, by=-2, color=GRAY, texture_id=T_CORR),
-        Segment(ax=-2, ay=-2, bx=2, by=-2, color=GRAY, texture_id=T_CORR),
-        Segment(ax=2, ay=-2, bx=4, by=-4, color=GRAY, texture_id=T_CORR),
-        # Corridor north wall
-        Segment(ax=-4, ay=2, bx=-2, by=2, color=GRAY, texture_id=T_CORR),
-        Segment(ax=-2, ay=2, bx=2, by=2, color=GRAY, texture_id=T_CORR),
-        Segment(ax=2, ay=2, bx=4, by=4, color=GRAY, texture_id=T_CORR),
-        # Room B walls
-        Segment(ax=4, ay=-4, bx=12, by=-4, color=CYAN, texture_id=T_B),
-        Segment(ax=12, ay=-4, bx=12, by=4, color=MAGENTA, texture_id=T_B),
-        Segment(ax=12, ay=4, bx=4, by=4, color=ORANGE, texture_id=T_B),
-        Segment(ax=4, ay=4, bx=4, by=2, color=BLUE, texture_id=T_DOOR),
-        Segment(ax=4, ay=-2, bx=4, by=-4, color=BLUE, texture_id=T_DOOR),
-        # Extra interior walls
-        Segment(ax=-10, ay=0, bx=-8, by=0, color=RED, texture_id=T_A),
-        Segment(ax=8, ay=-2, bx=10, by=0, color=CYAN, texture_id=T_A),
-        Segment(ax=8, ay=2, bx=10, by=0, color=ORANGE, texture_id=T_A),
-        # Pillars
-        Segment(ax=0, ay=-1.5, bx=0, by=-0.5, color=MAGENTA, texture_id=T_CORR),
-        Segment(ax=0, ay=0.5, bx=0, by=1.5, color=MAGENTA, texture_id=T_CORR),
-        Segment(ax=-7, ay=-3, bx=-7, by=-2, color=GREEN, texture_id=T_CORR),
-    ]
-    return segments, textures
 
 
 def box_room_textured(
-    size: float = 10.0,
+    size: float = 256.0,
     wad_path: str | None = None,
-    tex_size: int = 8,
+    tex_size: int = 1024,
 ) -> Tuple[List[Segment], List[np.ndarray]]:
-    """Box room with textured walls.
+    """Box room with textured walls — sector-aware, DOOM-shaped.
 
-    When *wad_path* is provided, loads real DOOM textures from the WAD
-    and downscales them to *tex_size* x *tex_size*.  Otherwise falls
-    back to the built-in procedural textures.
-
-    Returns ``(segments, textures)`` where each wall uses a different
-    texture: east=STARTAN3/brick, west=STARG3/stone, north=BROWN1/stripe,
-    south=BROWNGRN/checker.
+    Same geometry and orientation as :func:`box_room`, but each wall
+    references a texture index.  When *wad_path* is provided, loads
+    real DOOM textures (STARTAN3, STARG3, BROWN1, BROWNGRN) at native
+    resolution (capped at *tex_size* per axis).  Otherwise falls back
+    to the built-in procedural texture atlas.
     """
     h = size / 2.0
 
@@ -200,10 +76,12 @@ def box_room_textured(
 
         textures = default_texture_atlas()
 
+    common = dict(front_floor=_BOX_FLOOR, front_ceiling=_BOX_CEILING)
     segments = [
-        Segment(ax=h, ay=-h, bx=h, by=h, color=(1, 0, 0), texture_id=0),
-        Segment(ax=-h, ay=h, bx=-h, by=-h, color=(0, 1, 0), texture_id=1),
-        Segment(ax=-h, ay=h, bx=h, by=h, color=(0, 0, 1), texture_id=2),
-        Segment(ax=h, ay=-h, bx=-h, by=-h, color=(1, 1, 0), texture_id=3),
+        # Same clockwise winding as box_room.
+        Segment(ax=h, ay=h, bx=h, by=-h, color=(1, 0, 0), texture_id=0, **common),
+        Segment(ax=h, ay=-h, bx=-h, by=-h, color=(1, 1, 0), texture_id=3, **common),
+        Segment(ax=-h, ay=-h, bx=-h, by=h, color=(0, 1, 0), texture_id=1, **common),
+        Segment(ax=-h, ay=h, bx=h, by=h, color=(0, 0, 1), texture_id=2, **common),
     ]
     return segments, textures

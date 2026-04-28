@@ -40,7 +40,6 @@ from torchwright.reference_renderer.textures import default_texture_atlas
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
-
 _TRIG = generate_trig_table()
 _MOVE_SPEED = 0.3
 _TURN_SPEED = 4
@@ -61,19 +60,16 @@ def _box_room_config():
 
 
 def _box_room_segments(half=5.0):
+    common = dict(
+        color=(0.8, 0.2, 0.1),
+        front_floor=-1.0,
+        front_ceiling=1.0,
+    )
     return [
-        Segment(
-            ax=half, ay=-half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=0
-        ),
-        Segment(
-            ax=-half, ay=-half, bx=-half, by=half, color=(0.8, 0.2, 0.1), texture_id=1
-        ),
-        Segment(
-            ax=-half, ay=half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=2
-        ),
-        Segment(
-            ax=-half, ay=-half, bx=half, by=-half, color=(0.8, 0.2, 0.1), texture_id=3
-        ),
+        Segment(ax=half, ay=-half, bx=half, by=half, texture_id=0, **common),
+        Segment(ax=-half, ay=-half, bx=-half, by=half, texture_id=1, **common),
+        Segment(ax=-half, ay=half, bx=half, by=half, texture_id=2, **common),
+        Segment(ax=-half, ay=-half, bx=half, by=-half, texture_id=3, **common),
     ]
 
 
@@ -147,9 +143,9 @@ class TestRollout:
         sit at their fixed offsets."""
         log = rollout.token_id_log
         expected_min_len = _MAX_WALLS * _STEPS_PER_WALL + 7
-        assert len(log) >= expected_min_len, (
-            f"token_id_log length {len(log)} < expected_min {expected_min_len}"
-        )
+        assert (
+            len(log) >= expected_min_len
+        ), f"token_id_log length {len(log)} < expected_min {expected_min_len}"
 
         for wall_i in range(_MAX_WALLS):
             base = wall_i * _STEPS_PER_WALL
@@ -280,4 +276,3 @@ class TestRollout:
                 f"slot {slot} (wall {wall_i}): compiled emitted "
                 f"{actual} RENDERs, reference expected {expected}"
             )
-

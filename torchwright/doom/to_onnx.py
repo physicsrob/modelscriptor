@@ -15,17 +15,14 @@ Input schema (per position):
 Output schema: token-type-dependent (see game_graph module docstring).
 
 Usage:
-    python -m torchwright.doom.to_onnx [--scene box|multi]
+    python -m torchwright.doom.to_onnx
 """
 
 import argparse
 
 from torchwright.compiler.export import compile_headless_to_onnx
 from torchwright.doom.game_graph import build_game_graph
-from torchwright.reference_renderer.scenes import (
-    box_room_textured,
-    multi_room_textured,
-)
+from torchwright.reference_renderer.scenes import box_room_textured
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig
 
@@ -34,7 +31,6 @@ def main():
     parser = argparse.ArgumentParser(
         description="Compile the DOOM v2 game graph and save it to ONNX",
     )
-    parser.add_argument("--scene", choices=["box", "multi"], default="box")
     parser.add_argument(
         "--wad",
         type=str,
@@ -74,7 +70,7 @@ def main():
         "--output",
         type=str,
         default=None,
-        help="Output .onnx path. Default: doom_game_v2_<scene>.onnx",
+        help="Output .onnx path. Default: doom_game.onnx",
     )
     args = parser.parse_args()
 
@@ -88,20 +84,13 @@ def main():
         floor_color=(0.4, 0.4, 0.4),
     )
 
-    output_path = args.output or f"doom_game_{args.scene}.onnx"
+    output_path = args.output or "doom_game.onnx"
 
-    if args.scene == "box":
-        segments, textures = box_room_textured(
-            wad_path=args.wad,
-            tex_size=args.tex_size,
-        )
-        max_coord = 10.0
-    else:
-        segments, textures = multi_room_textured(
-            wad_path=args.wad,
-            tex_size=args.tex_size,
-        )
-        max_coord = 15.0
+    segments, textures = box_room_textured(
+        wad_path=args.wad,
+        tex_size=args.tex_size,
+    )
+    max_coord = 200.0
 
     print(f"Building game graph (d={args.d}, max_walls={args.max_walls})...")
     graph_io, pos_encoding = build_game_graph(

@@ -103,18 +103,6 @@ def _box_room_walls(size: float = 10.0) -> list[tuple[float, float, float, float
     ]
 
 
-def _multi_room_walls() -> list[tuple[float, float, float, float]]:
-    """A crude approximation of multi_room: walls spanning ±12."""
-    return [
-        (-12.0, -6.0, -4.0, -6.0),
-        (-12.0, 6.0, -4.0, 6.0),
-        (-12.0, -6.0, -12.0, 6.0),
-        (4.0, -4.0, 12.0, -4.0),
-        (4.0, 4.0, 12.0, 4.0),
-        (12.0, -4.0, 12.0, 4.0),
-    ]
-
-
 def _e1m1_synthetic_walls() -> list[tuple[float, float, float, float]]:
     """8-wall synthetic E1M1-scale subset reaching coord magnitude 80."""
     return [
@@ -130,10 +118,7 @@ def _e1m1_synthetic_walls() -> list[tuple[float, float, float, float]]:
 
 
 def _expected_global_max(walls: list[tuple[float, float, float, float]]) -> float:
-    return max(
-        max(abs(ax), abs(ay), abs(bx), abs(by))
-        for ax, ay, bx, by in walls
-    )
+    return max(max(abs(ax), abs(ay), abs(bx), abs(by)) for ax, ay, bx, by in walls)
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +178,9 @@ def _check(scenario_name: str, walls: list[tuple[float, float, float, float]]):
     # ``exp(log_inv_tol)·log_inv_tol`` ≈ 1 % at the worst.  Set the
     # tolerance accordingly.
     inv_scale_rel_tol = 0.01
-    assert abs(inv_s_val - expected_inv_scale) / expected_inv_scale < inv_scale_rel_tol, (
+    assert (
+        abs(inv_s_val - expected_inv_scale) / expected_inv_scale < inv_scale_rel_tol
+    ), (
         f"{scenario_name}: inv_scale={inv_s_val} vs "
         f"expected {expected_inv_scale} "
         f"(rel_err {(inv_s_val - expected_inv_scale)/expected_inv_scale:.4g})"
@@ -209,11 +196,6 @@ def test_scale_find_box_room():
     on the production attention precisely because of this case.
     """
     _check("box_room", _box_room_walls(10.0))
-
-
-def test_scale_find_multi_room():
-    """Multi-room: walls extending to ±12; global_max = 12, no ties."""
-    _check("multi_room", _multi_room_walls())
 
 
 def test_scale_find_e1m1_synthetic():

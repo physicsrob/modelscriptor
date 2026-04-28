@@ -564,9 +564,7 @@ class WADReader:
         missing = [n for n in required if n not in lumps]
         if missing:
             raise KeyError(f"Map {map_name!r} missing required lumps: {missing}")
-        things = (
-            self._parse_things(*lumps["THINGS"]) if "THINGS" in lumps else []
-        )
+        things = self._parse_things(*lumps["THINGS"]) if "THINGS" in lumps else []
         return MapData(
             name=map_name,
             vertices=self._parse_vertexes(*lumps["VERTEXES"]),
@@ -633,40 +631,38 @@ class WADReader:
             valid_name_to_id[name] = len(textures)
             textures.append(downscale_texture(tex, tex_size, tex_size))
 
-        # Remap segments: any texture_id pointing at a dropped name
-        # becomes -1; otherwise rewrite to the compacted index.
+        # Remap segments: any texture_id (middle / upper / lower)
+        # pointing at a dropped name becomes -1; otherwise rewrite to
+        # the compacted index.  Preserves all sector data.
         if dropped_names:
-            # Build old_id -> new_id mapping
             old_to_new: Dict[int, int] = {}
             for old_name, old_id in name_to_id.items():
                 if old_name in valid_name_to_id:
                     old_to_new[old_id] = valid_name_to_id[old_name]
+
+            def _remap(old_id: int) -> int:
+                if old_id < 0:
+                    return -1
+                return old_to_new.get(old_id, -1)
+
             remapped: List[Segment] = []
             for seg in segments:
-                if seg.texture_id < 0:
-                    remapped.append(seg)
-                elif seg.texture_id in old_to_new:
-                    remapped.append(
-                        Segment(
-                            ax=seg.ax,
-                            ay=seg.ay,
-                            bx=seg.bx,
-                            by=seg.by,
-                            color=seg.color,
-                            texture_id=old_to_new[seg.texture_id],
-                        )
+                remapped.append(
+                    Segment(
+                        ax=seg.ax,
+                        ay=seg.ay,
+                        bx=seg.bx,
+                        by=seg.by,
+                        color=seg.color,
+                        front_floor=seg.front_floor,
+                        front_ceiling=seg.front_ceiling,
+                        texture_id=_remap(seg.texture_id),
+                        back_floor=seg.back_floor,
+                        back_ceiling=seg.back_ceiling,
+                        upper_texture_id=_remap(seg.upper_texture_id),
+                        lower_texture_id=_remap(seg.lower_texture_id),
                     )
-                else:
-                    remapped.append(
-                        Segment(
-                            ax=seg.ax,
-                            ay=seg.ay,
-                            bx=seg.bx,
-                            by=seg.by,
-                            color=seg.color,
-                            texture_id=-1,
-                        )
-                    )
+                )
             segments = remapped
 
         return segments, textures, valid_name_to_id
@@ -726,12 +722,17 @@ def seg_list_to_segments(
 ) -> Tuple[List[Segment], Dict[str, int]]:
     """Convert a map's SEGS to a list of renderable ``Segment`` objects.
 
-    Each seg becomes one Segment with:
+    Each seg becomes one sector-aware ``Segment``:
 
     - Coordinates looked up from ``md.vertices`` (DOOM-native int16,
       cast to float)
-    - Texture id assigned on first sight of the texture name
-    - Color derived from the seg's sector index (HSV hash)
+    - Front sector's floor / ceiling carried on every seg
+    - Two-sided segs (linedef has both front and back sidedef) also
+      carry the back sector's floor / ceiling, plus separate
+      upper / lower texture ids
+    - Texture ids assigned on first sight of each name; ``-`` becomes
+      ``-1``
+    - Color derived from the front sector's index (HSV hash)
 
     Segs with invalid vertex/linedef/sidedef refs are silently skipped.
     Returns ``(segments, name_to_id)`` — caller loads textures using
@@ -751,23 +752,48 @@ def seg_list_to_segments(
         if seg.linedef < 0 or seg.linedef >= nl:
             continue
         ld = md.linedefs[seg.linedef]
-        sd_idx = ld.front_sidedef if seg.side == 0 else ld.back_sidedef
-        if sd_idx < 0 or sd_idx >= ns:
+        front_sd_idx = ld.front_sidedef if seg.side == 0 else ld.back_sidedef
+        back_sd_idx = ld.back_sidedef if seg.side == 0 else ld.front_sidedef
+        if front_sd_idx < 0 or front_sd_idx >= ns:
             continue
-        sd = md.sidedefs[sd_idx]
-        tex_name = _pick_seg_texture(sd)
-        tex_id = _assign_tex_id(tex_name, name_to_id)
-        color = sector_color(sd.sector)
+        sd_front = md.sidedefs[front_sd_idx]
+        front_sec = md.sectors[sd_front.sector]
+        color = sector_color(sd_front.sector)
+
+        is_two_sided = 0 <= back_sd_idx < ns
+        if is_two_sided:
+            sd_back = md.sidedefs[back_sd_idx]
+            back_sec = md.sectors[sd_back.sector]
+            mid_name = sd_front.middle  # usually '-' for two-sided
+            upper_name = sd_front.upper
+            lower_name = sd_front.lower
+        else:
+            sd_back = None
+            back_sec = None
+            mid_name = _pick_seg_texture(sd_front)
+            upper_name = "-"
+            lower_name = "-"
+
+        mid_id = _assign_tex_id(mid_name, name_to_id)
+        upper_id = _assign_tex_id(upper_name, name_to_id)
+        lower_id = _assign_tex_id(lower_name, name_to_id)
+
         v1 = md.vertices[seg.v1]
         v2 = md.vertices[seg.v2]
-        segments.append(
-            Segment(
-                ax=float(v1.x),
-                ay=float(v1.y),
-                bx=float(v2.x),
-                by=float(v2.y),
-                color=color,
-                texture_id=tex_id,
-            )
+        seg_kw: Dict[str, object] = dict(
+            ax=float(v1.x),
+            ay=float(v1.y),
+            bx=float(v2.x),
+            by=float(v2.y),
+            color=color,
+            front_floor=float(front_sec.floor_h),
+            front_ceiling=float(front_sec.ceiling_h),
+            texture_id=mid_id,
         )
+        if is_two_sided and back_sec is not None:
+            seg_kw["back_floor"] = float(back_sec.floor_h)
+            seg_kw["back_ceiling"] = float(back_sec.ceiling_h)
+            seg_kw["upper_texture_id"] = upper_id
+            seg_kw["lower_texture_id"] = lower_id
+        segments.append(Segment(**seg_kw))
     return segments, name_to_id

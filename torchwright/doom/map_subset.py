@@ -145,6 +145,35 @@ def _decode_child(child_ref: int) -> Tuple[bool, int]:
     return False, child_ref
 
 
+def find_sector_at(md: MapData, x: float, y: float) -> int:
+    """Return the sector index containing ``(x, y)`` by BSP descent.
+
+    Uses DOOM's classification rule (point on FRONT side iff
+    ``dx*(y-py) < dy*(x-px)``) at each internal node, recurses into
+    front or back child accordingly, and reads the sector off the
+    first seg of the resulting subsector via its sidedef.
+    """
+    idx = len(md.nodes) - 1  # root
+    while True:
+        node = md.nodes[idx]
+        on_front = node.dx * (y - node.py) < node.dy * (x - node.px)
+        child = node.front_child if on_front else node.back_child
+        is_ss, ref = _decode_child(child)
+        if is_ss:
+            ss = md.subsectors[ref]
+            seg = md.segs[ss.first_seg]
+            ld = md.linedefs[seg.linedef]
+            sd_idx = ld.front_sidedef if seg.side == 0 else ld.back_sidedef
+            return md.sidedefs[sd_idx].sector
+        idx = ref
+
+
+# DOOM's player eye height (world units above the sector floor the
+# player is standing on).  The full player capsule is 56 units tall;
+# the eye sits 41 units above the feet.
+DOOM_PLAYER_EYE_HEIGHT = 41.0
+
+
 def _walk_paths(md: MapData, root_node_idx: int) -> Dict[int, List[Tuple[int, int]]]:
     """Return, for every subsector, its path from the BSP root.
 
@@ -533,7 +562,7 @@ def load_map_subset(
     px: float,
     py: float,
     max_walls: int = 32,
-    max_textures: int = 8,
+    max_textures: int = 32,
     max_bsp_nodes: int = 48,
     tex_size: int = 8,
 ) -> MapSubset:
@@ -544,14 +573,15 @@ def load_map_subset(
     whose leaves cover the selected segs' subsectors.  Precomputes the
     per-seg coefficients needed by the transformer's BSP rank sort.
 
-    Sets ``scene_origin = (px, py)`` so ``step_frame`` shifts world
-    coords into a player-centred frame before feeding the graph.  Raw
-    DOOM map coords for E1M1-class maps run to thousands of units; the
-    player-spawn origin keeps the host-feed envelope near zero,
-    bringing the player and any nearby walls inside the
-    ``max_coord``-sized clamp envelope without changing graph
-    topology.  Distant walls outside the local envelope still get
-    fed; ``CROSS_A``/``DOT_A`` clamping at ±40 absorbs the overflow.
+    All output coords are in raw DOOM world units.  ``scene_origin``
+    is set to ``(px, py)`` so ``step_frame`` can subtract it from
+    every wall / player coord, then add it back when reading
+    ``RESOLVED_X/Y``.  The transformer expects coords in its
+    compile-time ``max_coord`` envelope; for E1M1-class maps where
+    walls live at thousands of units, transformer callers should
+    apply a host-side scale on top of this subset before feeding
+    ``step_frame``.  The reference renderer is scale-invariant and
+    consumes the raw subset directly.
 
     Raises ``ValueError`` if the required BSP subtree exceeds
     ``max_bsp_nodes`` — callers should increase the cap or reduce
@@ -624,31 +654,65 @@ def load_map_subset(
     )
 
     # --- 7. Convert selected segs to Segment objects ---
+    # Each seg carries the front sector's floor/ceiling (always) and the
+    # back sector's floor/ceiling when the linedef is two-sided.  The
+    # renderer uses these to project upper / lower wall fragments and
+    # see-through middle gaps.  Texture IDs cover all three of the
+    # sidedef's slots: ``texture_id`` is the middle / single-sided
+    # texture; ``upper_texture_id`` / ``lower_texture_id`` apply to
+    # two-sided segs only.
     segments: List[Segment] = []
     name_to_id: Dict[str, int] = {}
     seen_tex_names: List[str] = []  # preserve first-sight order
+    n_sd = len(md.sidedefs)
     for W_idx in selected_orig:
         seg = md.segs[W_idx]
         ld = md.linedefs[seg.linedef]
-        sd_idx = ld.front_sidedef if seg.side == 0 else ld.back_sidedef
-        sd = md.sidedefs[sd_idx]
-        tex_name = _pick_seg_texture(sd)
-        tex_id = _assign_tex_id(tex_name, name_to_id)
-        if tex_name not in ("-", "") and tex_name not in seen_tex_names:
-            seen_tex_names.append(tex_name)
+        front_sd_idx = ld.front_sidedef if seg.side == 0 else ld.back_sidedef
+        back_sd_idx = ld.back_sidedef if seg.side == 0 else ld.front_sidedef
+        sd_front = md.sidedefs[front_sd_idx]
+        front_sec = md.sectors[sd_front.sector]
+        color = sector_color(sd_front.sector)
+
+        is_two_sided = 0 <= back_sd_idx < n_sd
+        if is_two_sided:
+            sd_back = md.sidedefs[back_sd_idx]
+            back_sec = md.sectors[sd_back.sector]
+            mid_name = sd_front.middle  # usually '-' for two-sided
+            upper_name = sd_front.upper
+            lower_name = sd_front.lower
+        else:
+            sd_back = None
+            back_sec = None
+            mid_name = _pick_seg_texture(sd_front)
+            upper_name = "-"
+            lower_name = "-"
+
+        mid_id = _assign_tex_id(mid_name, name_to_id)
+        upper_id = _assign_tex_id(upper_name, name_to_id)
+        lower_id = _assign_tex_id(lower_name, name_to_id)
+        for n in (mid_name, upper_name, lower_name):
+            if n not in ("-", "") and n not in seen_tex_names:
+                seen_tex_names.append(n)
+
         v1 = md.vertices[seg.v1]
         v2 = md.vertices[seg.v2]
-        color = sector_color(sd.sector)
-        segments.append(
-            Segment(
-                ax=float(v1.x),
-                ay=float(v1.y),
-                bx=float(v2.x),
-                by=float(v2.y),
-                color=color,
-                texture_id=tex_id,
-            )
+        seg_kw: Dict[str, object] = dict(
+            ax=float(v1.x),
+            ay=float(v1.y),
+            bx=float(v2.x),
+            by=float(v2.y),
+            color=color,
+            texture_id=mid_id,
+            front_floor=float(front_sec.floor_h),
+            front_ceiling=float(front_sec.ceiling_h),
         )
+        if is_two_sided and back_sec is not None:
+            seg_kw["back_floor"] = float(back_sec.floor_h)
+            seg_kw["back_ceiling"] = float(back_sec.ceiling_h)
+            seg_kw["upper_texture_id"] = upper_id
+            seg_kw["lower_texture_id"] = lower_id
+        segments.append(Segment(**seg_kw))
 
     # --- 8. Load textures, capped at max_textures ---
     # Prioritize by appearance order (closer segs saw them first).
@@ -664,15 +728,18 @@ def load_map_subset(
         textures.append(downscale_texture(tex, tex_size, tex_size))
 
     # Remap texture ids so that only kept textures get valid ids; the
-    # rest become -1 (so the renderer falls back to solid color).
+    # rest become -1 (so the renderer falls back to solid color).  All
+    # three slots (middle, upper, lower) are remapped independently.
     new_name_to_id: Dict[str, int] = {name: i for i, name in enumerate(kept_names)}
+
+    def _remap(old_id: int) -> int:
+        if old_id < 0:
+            return -1
+        old_name = _reverse_lookup(name_to_id, old_id)
+        return new_name_to_id.get(old_name, -1)
+
     remapped: List[Segment] = []
     for s in segments:
-        if s.texture_id < 0:
-            remapped.append(s)
-            continue
-        old_name = _reverse_lookup(name_to_id, s.texture_id)
-        new_id = new_name_to_id.get(old_name, -1)
         remapped.append(
             Segment(
                 ax=s.ax,
@@ -680,7 +747,13 @@ def load_map_subset(
                 bx=s.bx,
                 by=s.by,
                 color=s.color,
-                texture_id=new_id,
+                texture_id=_remap(s.texture_id),
+                front_floor=s.front_floor,
+                front_ceiling=s.front_ceiling,
+                back_floor=s.back_floor,
+                back_ceiling=s.back_ceiling,
+                upper_texture_id=_remap(s.upper_texture_id),
+                lower_texture_id=_remap(s.lower_texture_id),
             )
         )
     segments = remapped

@@ -579,10 +579,15 @@ def _rescale_segments(segments, factor: float):
 
     DOOM's native coords span ±4000 — the reference renderer's
     small-screen defaults (24-row) need smaller coords to avoid
-    subpixel wall heights.  Tests that render through the renderer
-    apply the scaling themselves.
+    subpixel wall heights.  Floor / ceiling z-values are scaled by
+    the same factor so vertical projection stays in proportion with
+    the rescaled horizontal geometry.  Tests that render through the
+    renderer apply the scaling themselves.
     """
     from torchwright.reference_renderer.types import Segment
+
+    def _scale(z):
+        return None if z is None else z * factor
 
     return [
         Segment(
@@ -591,7 +596,13 @@ def _rescale_segments(segments, factor: float):
             bx=s.bx * factor,
             by=s.by * factor,
             color=s.color,
+            front_floor=s.front_floor * factor,
+            front_ceiling=s.front_ceiling * factor,
             texture_id=s.texture_id,
+            back_floor=_scale(s.back_floor),
+            back_ceiling=_scale(s.back_ceiling),
+            upper_texture_id=s.upper_texture_id,
+            lower_texture_id=s.lower_texture_id,
         )
         for s in segments
     ]

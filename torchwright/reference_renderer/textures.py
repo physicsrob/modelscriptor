@@ -119,12 +119,19 @@ def downscale_texture(
 
     Args:
         tex: Source texture, shape ``(src_w, src_h, 3)``.
-        target_w, target_h: Target dimensions.
+        target_w, target_h: Target dimensions.  Each is capped to the
+            corresponding source dimension — a 32x16 source texture
+            asked for ``(64, 64)`` returns a ``(32, 16, 3)`` array, not
+            an upscaled image.  The renderer reads each texture's
+            actual shape at sample time so heterogeneous sizes are
+            fine.
 
     Returns:
-        ``(target_w, target_h, 3)`` float64 array.
+        ``(min(target_w, src_w), min(target_h, src_h), 3)`` float64 array.
     """
     sw, sh = tex.shape[0], tex.shape[1]
+    target_w = min(target_w, sw)
+    target_h = min(target_h, sh)
     result = np.zeros((target_w, target_h, 3), dtype=np.float64)
     for col in range(target_w):
         for row in range(target_h):

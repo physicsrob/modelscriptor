@@ -1,7 +1,7 @@
 """Interactive DOOM game loop with pygame display.
 
 Usage:
-    python -m torchwright.doom.play [--scene box|multi] [--mode transformer|reference]
+    python -m torchwright.doom.play [--mode transformer|reference]
 """
 
 import argparse
@@ -14,31 +14,25 @@ import numpy as np
 from torchwright.doom.game import GameState, update_state
 from torchwright.doom.input import PlayerInput
 from torchwright.reference_renderer.render import render_frame
-from torchwright.reference_renderer.scenes import (
-    box_room_textured,
-    multi_room_textured,
-)
+from torchwright.reference_renderer.scenes import box_room_textured
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
 
 def _make_alt_segments(half=5.0):
     """Build an alternative L-shaped room layout for level-swap demo."""
+    common = dict(
+        color=(0.5, 0.5, 0.5),
+        front_floor=-1.0,
+        front_ceiling=1.0,
+    )
     return [
-        Segment(
-            ax=half, ay=-half, bx=half, by=0.0, color=(0.5, 0.5, 0.5), texture_id=0
-        ),
-        Segment(ax=half, ay=0.0, bx=0.0, by=0.0, color=(0.5, 0.5, 0.5), texture_id=1),
-        Segment(ax=0.0, ay=0.0, bx=0.0, by=half, color=(0.5, 0.5, 0.5), texture_id=2),
-        Segment(
-            ax=0.0, ay=half, bx=-half, by=half, color=(0.5, 0.5, 0.5), texture_id=3
-        ),
-        Segment(
-            ax=-half, ay=half, bx=-half, by=-half, color=(0.5, 0.5, 0.5), texture_id=0
-        ),
-        Segment(
-            ax=-half, ay=-half, bx=half, by=-half, color=(0.5, 0.5, 0.5), texture_id=1
-        ),
+        Segment(ax=half, ay=-half, bx=half, by=0.0, texture_id=0, **common),
+        Segment(ax=half, ay=0.0, bx=0.0, by=0.0, texture_id=1, **common),
+        Segment(ax=0.0, ay=0.0, bx=0.0, by=half, texture_id=2, **common),
+        Segment(ax=0.0, ay=half, bx=-half, by=half, texture_id=3, **common),
+        Segment(ax=-half, ay=half, bx=-half, by=-half, texture_id=0, **common),
+        Segment(ax=-half, ay=-half, bx=half, by=-half, texture_id=1, **common),
     ]
 
 
@@ -184,7 +178,6 @@ def play(
 
 def main():
     parser = argparse.ArgumentParser(description="Play DOOM in a transformer")
-    parser.add_argument("--scene", choices=["box", "multi"], default="box")
     parser.add_argument(
         "--mode",
         choices=["transformer", "reference"],
@@ -226,20 +219,12 @@ def main():
         floor_color=(0.4, 0.4, 0.4),
     )
 
-    if args.scene == "box":
-        segments, textures = box_room_textured(
-            wad_path=args.wad,
-            tex_size=args.tex_size,
-        )
-        start_x, start_y, start_angle = 0.0, 0.0, 0
-        max_coord = 10.0
-    else:
-        segments, textures = multi_room_textured(
-            wad_path=args.wad,
-            tex_size=args.tex_size,
-        )
-        start_x, start_y, start_angle = -8.0, 0.0, 0
-        max_coord = 15.0
+    segments, textures = box_room_textured(
+        wad_path=args.wad,
+        tex_size=args.tex_size,
+    )
+    start_x, start_y, start_angle = 0.0, 0.0, 0
+    max_coord = 200.0
 
     play(
         segments,

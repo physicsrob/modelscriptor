@@ -78,19 +78,16 @@ def _config() -> RenderConfig:
 
 
 def _segments(half: float = 5.0) -> List[Segment]:
+    common = dict(
+        color=(0.8, 0.2, 0.1),
+        front_floor=-1.0,
+        front_ceiling=1.0,
+    )
     return [
-        Segment(
-            ax=half, ay=-half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=0
-        ),
-        Segment(
-            ax=-half, ay=-half, bx=-half, by=half, color=(0.8, 0.2, 0.1), texture_id=1
-        ),
-        Segment(
-            ax=-half, ay=half, bx=half, by=half, color=(0.8, 0.2, 0.1), texture_id=2
-        ),
-        Segment(
-            ax=-half, ay=-half, bx=half, by=-half, color=(0.8, 0.2, 0.1), texture_id=3
-        ),
+        Segment(ax=half, ay=-half, bx=half, by=half, texture_id=0, **common),
+        Segment(ax=-half, ay=-half, bx=-half, by=half, texture_id=1, **common),
+        Segment(ax=-half, ay=half, bx=half, by=half, texture_id=2, **common),
+        Segment(ax=-half, ay=-half, bx=half, by=-half, texture_id=3, **common),
     ]
 
 

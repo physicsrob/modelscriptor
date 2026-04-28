@@ -207,10 +207,10 @@ _COL_FOLD_BP_DOT_ABS = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
 
 
 # Floor for the log() call inside the scale-find reduction.  Set well
-# below any realistic DOOM scene's largest wall coord magnitude
-# (box_room ≈ 5, multi_room ≈ 12) so a typical compile interpolates
-# rather than clamps; setting it any lower would widen log's input
-# range and inflate float32 cancellation in the slope-delta sum.
+# below any realistic DOOM scene's largest wall coord magnitude so a
+# typical compile interpolates rather than clamps; setting it any
+# lower would widen log's input range and inflate float32
+# cancellation in the slope-delta sum.
 _SCALE_FIND_MIN = 0.5
 
 
@@ -492,9 +492,7 @@ def build_thinking_wall(
     with annotate("thinking_wall/wall_geom_attention"):
         # Q at identifier positions: [2·wall_j, 1].
         two_n = multiply_const(wi_clamped, 2.0)
-        one_lit_q = create_literal_value(
-            torch.tensor([1.0]), name="tw_wall_geom_q_one"
-        )
+        one_lit_q = create_literal_value(torch.tensor([1.0]), name="tw_wall_geom_q_one")
         q_raw = Concatenate([two_n, one_lit_q])
         q_gated = cond_gate(is_any_identifier, q_raw)
 

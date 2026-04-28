@@ -19,7 +19,7 @@ from PIL import Image
 from torchwright.doom.game import GameState, update_state
 from torchwright.doom.input import PlayerInput
 from torchwright.reference_renderer.render import intersect_ray_segment, render_frame
-from torchwright.reference_renderer.scenes import box_room_textured, multi_room_textured
+from torchwright.reference_renderer.scenes import box_room_textured
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig, Segment
 
@@ -226,7 +226,7 @@ def main():
         default="walkthrough.gif",
         help="Output GIF path",
     )
-    parser.add_argument("--scene", choices=["box", "multi", "e1m1"], default="box")
+    parser.add_argument("--scene", choices=["box", "e1m1"], default="e1m1")
     parser.add_argument(
         "--mode",
         choices=["transformer", "reference"],
@@ -240,10 +240,17 @@ def main():
         default="doom1.wad",
         help="Path to doom1.wad for DOOM textures",
     )
-    parser.add_argument("--tex-size", type=int, default=8)
-    parser.add_argument("--width", type=int, default=64)
-    parser.add_argument("--height", type=int, default=80)
-    parser.add_argument("--fov", type=int, default=32)
+    parser.add_argument(
+        "--tex-size",
+        type=int,
+        default=1024,
+        help="Per-axis cap on texture pixels (DOOM textures stay at "
+        "native resolution since none exceed 1024 in either axis).  "
+        "Decrease for an aliased low-fi look.",
+    )
+    parser.add_argument("--width", type=int, default=320)
+    parser.add_argument("--height", type=int, default=200)
+    parser.add_argument("--fov", type=int, default=64)
     parser.add_argument("--frames", type=int, default=300)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument(
@@ -279,24 +286,22 @@ def main():
         floor_color=(0.4, 0.4, 0.4),
     )
 
+    from torchwright.doom.map_subset import DOOM_PLAYER_EYE_HEIGHT
+
     subset = None
     still = False
     if args.scene == "box":
+        # box_room is a 256-unit one-sector DOOM-shaped room, floor=0,
+        # ceiling=128.  Player eye sits 41 above the floor.
         segments, textures = box_room_textured(
             wad_path=args.wad,
             tex_size=args.tex_size,
         )
         start_x, start_y, start_angle = 0.0, 0.0, 0
-        max_coord = 10.0
-    elif args.scene == "multi":
-        segments, textures = multi_room_textured(
-            wad_path=args.wad,
-            tex_size=args.tex_size,
-        )
-        start_x, start_y, start_angle = -8.0, 0.0, 0
-        max_coord = 15.0
+        max_coord = 200.0
+        config.player_eye_z = DOOM_PLAYER_EYE_HEIGHT
     else:  # e1m1
-        from torchwright.doom.map_subset import load_map_subset
+        from torchwright.doom.map_subset import find_sector_at, load_map_subset
         from torchwright.doom.wad import WADReader
 
         # Read the player-1 start (thing type 1) from the WAD's THINGS
@@ -307,28 +312,40 @@ def main():
         spawn_x = float(spawn.x)
         spawn_y = float(spawn.y)
         start_angle = round(spawn.angle / 360 * 256) % 256
+        spawn_sector_idx = find_sector_at(md, spawn_x, spawn_y)
+        spawn_floor_h = float(md.sectors[spawn_sector_idx].floor_h)
         print(
             f"E1M1 player-1 spawn: pos=({spawn_x}, {spawn_y}) "
-            f"angle_deg={spawn.angle} → renderer_angle={start_angle}"
+            f"angle_deg={spawn.angle} → renderer_angle={start_angle}  "
+            f"sector={spawn_sector_idx} floor_h={spawn_floor_h}"
         )
 
-        # max_walls > 4 saturates the transformer's ±40 CROSS_A/DOT_A
-        # clamp on far walls, but the reference renderer ray-casts in
-        # world coords with no such limit; pick a count that gives the
-        # spawn alcove + the room and corridor visible from it.
+        # The sector-aware reference renderer is scale-invariant, so
+        # we feed raw DOOM world coords directly.  max_walls=64 +
+        # max_bsp_nodes=96 captures the spawn alcove walls plus all
+        # four Hangar pillars (16 walls) plus the surrounding Hangar
+        # walls.  32 walls clipped the back two pillars at ~547 units.
         subset = load_map_subset(
             wad_path=args.wad,
             map_name="E1M1",
             px=spawn_x,
             py=spawn_y,
-            max_walls=32,
+            max_walls=64,
+            max_bsp_nodes=96,
             tex_size=args.tex_size,
         )
         segments = subset.segments
         textures = subset.textures
         start_x, start_y = spawn_x, spawn_y
-        max_coord = 100.0
+        # max_coord matters only for the transformer pipeline, which
+        # E1M1's raw coord magnitudes (~1500) far exceed.  Transformer
+        # callers will need their own host-side scaling step on top of
+        # this subset.
+        max_coord = 4000.0
         still = True
+        # Player eye sits 41 world units above the spawn sector's
+        # floor.  Same units as everything else (raw DOOM units).
+        config.player_eye_z = spawn_floor_h + DOOM_PLAYER_EYE_HEIGHT
 
     if args.mode == "transformer":
         from torchwright.doom.compile import compile_game, step_frame

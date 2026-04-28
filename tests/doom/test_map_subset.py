@@ -21,10 +21,7 @@ from torchwright.doom.map_subset import (
     side_P,
 )
 from torchwright.doom.wad import WADReader
-from torchwright.reference_renderer.scenes import (
-    box_room_textured,
-    multi_room_textured,
-)
+from torchwright.reference_renderer.scenes import box_room_textured
 from torchwright.reference_renderer.types import Segment
 
 # E1M1's canonical player spawn (Doomguy, THING type 1).  We don't
@@ -697,30 +694,20 @@ def test_build_scene_subset_rank_matches_python_traversal() -> None:
         ), f"at ({px}, {py}): rank order {computed} != tree DFS {reference}"
 
 
-def test_build_scene_subset_multi_room() -> None:
-    """22-seg multi_room scene: 21 BSP nodes, rank well-defined."""
-    segments, textures = multi_room_textured(
-        wad_path="doom1.wad",
-        tex_size=8,
-    )
-    assert len(segments) == 22
-    subset = build_scene_subset(segments, textures, max_bsp_nodes=48)
-    assert len(subset.bsp_nodes) == 21
-    assert subset.seg_bsp_coeffs.shape == (22, 48)
-
-    # Sample positions in each room; rank produces a permutation of
-    # 0..N-1.  (A valid traversal visits each seg exactly once.)
-    tree = _build_balanced_bsp(list(range(len(segments))), segments, depth=0)
-    for px, py in [(-8.0, 0.0), (8.0, 0.0), (0.0, 0.0)]:
-        computed = _rank_order_scene(subset, px, py)
-        reference = _traverse_scene_tree(tree, px, py)
-        assert computed == reference, f"at ({px},{py}): {computed} != {reference}"
-        assert sorted(computed) == list(range(22))
-
-
 def test_build_scene_subset_single_seg() -> None:
     """N=1 edge case: no BSP nodes, zero coefficients, trivial rank."""
-    segments = [Segment(ax=0, ay=0, bx=1, by=0, color=(0.5, 0.5, 0.5), texture_id=0)]
+    segments = [
+        Segment(
+            ax=0,
+            ay=0,
+            bx=1,
+            by=0,
+            color=(0.5, 0.5, 0.5),
+            front_floor=-1.0,
+            front_ceiling=1.0,
+            texture_id=0,
+        )
+    ]
     textures = [np.zeros((8, 8, 3), dtype=np.float64)]
     subset = build_scene_subset(segments, textures, max_bsp_nodes=16)
     assert len(subset.bsp_nodes) == 0
@@ -733,7 +720,16 @@ def test_build_scene_subset_too_many_segs_raises() -> None:
     """N > max_bsp_nodes + 1 is rejected with a helpful ValueError."""
     # 8 segs would need 7 nodes; max_bsp_nodes=4 is too small.
     segments = [
-        Segment(ax=i, ay=0, bx=i + 1, by=0, color=(0.5, 0.5, 0.5), texture_id=0)
+        Segment(
+            ax=i,
+            ay=0,
+            bx=i + 1,
+            by=0,
+            color=(0.5, 0.5, 0.5),
+            front_floor=-1.0,
+            front_ceiling=1.0,
+            texture_id=0,
+        )
         for i in range(8)
     ]
     textures: List[np.ndarray] = []

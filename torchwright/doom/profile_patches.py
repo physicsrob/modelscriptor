@@ -36,10 +36,7 @@ from typing import List, Optional, Tuple
 
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.doom.game_graph import build_game_graph
-from torchwright.reference_renderer.scenes import (
-    box_room_textured,
-    multi_room_textured,
-)
+from torchwright.reference_renderer.scenes import box_room_textured
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig
 
@@ -353,7 +350,6 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--height", type=int, default=200)
     parser.add_argument("--fov", type=int, default=64)
     parser.add_argument("--tex-size", type=int, default=64)
-    parser.add_argument("--scene", choices=["box", "multi"], default="box")
     parser.add_argument("--wad", type=str, default="doom1.wad")
     parser.add_argument(
         "--chunk-size",
@@ -392,18 +388,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     # textures (no WAD needed). At larger tex-size the user will
     # usually pass a real WAD.
     wad_path = args.wad if args.tex_size > 8 else None
-    if args.scene == "box":
-        segments, textures = box_room_textured(
-            wad_path=wad_path,
-            tex_size=args.tex_size,
-        )
-        max_coord = 10.0
-    else:
-        segments, textures = multi_room_textured(
-            wad_path=wad_path,
-            tex_size=args.tex_size,
-        )
-        max_coord = 15.0
+    segments, textures = box_room_textured(
+        wad_path=wad_path,
+        tex_size=args.tex_size,
+    )
+    max_coord = 200.0
 
     print(
         f"Profiling {len(rps)} patch configurations at "

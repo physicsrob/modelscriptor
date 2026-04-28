@@ -5,6 +5,7 @@ __pycache__
 .pytest_cache
 *.onnx
 *.gif
+*.png
 *.vocab.json
 .claude/worktrees/
 .python-version

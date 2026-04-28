@@ -8,7 +8,7 @@ from torchwright.reference_renderer.render import (
     render_wall_column,
     save_png,
 )
-from torchwright.reference_renderer.scenes import box_room, multi_room
+from torchwright.reference_renderer.scenes import box_room
 
 __all__ = [
     "WallColumnResult",
@@ -21,5 +21,4 @@ __all__ = [
     "RenderConfig",
     "generate_trig_table",
     "box_room",
-    "multi_room",
 ]

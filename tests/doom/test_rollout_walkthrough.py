@@ -27,7 +27,6 @@ from torchwright.reference_renderer.scenes import box_room_textured
 from torchwright.reference_renderer.trig import generate_trig_table
 from torchwright.reference_renderer.types import RenderConfig
 
-
 _TRIG = generate_trig_table()
 _MOVE_SPEED = 0.3
 _TURN_SPEED = 4
@@ -58,7 +57,11 @@ class TestRolloutWalkthrough:
     @pytest.fixture(scope="class")
     def scene(self):
         config = _walkthrough_config()
+        # box_room_textured's default size is 256 (DOOM scale); the
+        # walkthrough rollout is compiled at max_coord=10, so we
+        # explicitly request a 10-unit room here.
         segs, textures = box_room_textured(
+            size=10.0,
             wad_path="doom1.wad",
             tex_size=_WALKTHROUGH_TEX_SIZE,
         )
