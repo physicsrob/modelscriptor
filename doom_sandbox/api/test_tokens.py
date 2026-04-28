@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from doom_sandbox.api import (
+from . import (
     FloatSlot,
     IntSlot,
     Token,
@@ -17,8 +17,8 @@ from doom_sandbox.api import (
     is_type,
     make_token,
 )
-from doom_sandbox.api.vec import _make_vec
-from doom_sandbox.runtime.embedding import Layout, active_layout, embed
+from .vec import _make_vec
+from ..runtime.embedding import Layout, active_layout, embed
 
 
 RENDER = TokenType("RENDER", slots={
@@ -134,7 +134,7 @@ def test_make_token_depth_with_no_slots_is_1():
 # --- make_token round-trips through deembed ---
 
 def test_make_token_round_trips():
-    from doom_sandbox.runtime.embedding import deembed
+    from ..runtime.embedding import deembed
     layout = _layout()
     with active_layout(layout):
         vec = make_token(RENDER, col=constant(123), chunk=constant(7))
@@ -144,7 +144,7 @@ def test_make_token_round_trips():
 
 
 def test_make_token_round_trips_float_slot():
-    from doom_sandbox.runtime.embedding import deembed
+    from ..runtime.embedding import deembed
     layout = _layout()
     with active_layout(layout):
         vec = make_token(VALUE, v=constant(-1.234))

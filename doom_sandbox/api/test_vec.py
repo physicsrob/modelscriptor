@@ -7,9 +7,9 @@ import dataclasses
 import numpy as np
 import pytest
 
-from doom_sandbox.api import Vec, constant
-from doom_sandbox.api import _runtime
-from doom_sandbox.api.vec import _make_vec
+from . import Vec, constant
+from . import _runtime
+from .vec import _make_vec
 
 
 def test_constant_scalar_makes_1_vec():

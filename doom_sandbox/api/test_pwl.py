@@ -5,11 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from doom_sandbox.api import constant, pwl_def
-from doom_sandbox.api import _runtime
-from doom_sandbox.api.pwl import PWLDef2D
-from doom_sandbox.api.vec import _make_vec
-from doom_sandbox.runtime.noise import NOISE_REL
+from . import constant, pwl_def
+from . import _runtime
+from .pwl import PWLDef2D
+from .vec import _make_vec
+from ..runtime.noise import NOISE_REL
 
 
 def _exact_atol(values):

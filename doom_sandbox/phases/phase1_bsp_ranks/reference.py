@@ -11,7 +11,7 @@ loaded data.
 
 from __future__ import annotations
 
-from doom_sandbox.types import GameState, MapSubset
+from ...types import GameState, MapSubset
 
 
 def expected_bsp_ranks(scene: MapSubset, state: GameState) -> list[int]:

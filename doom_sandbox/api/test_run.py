@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from doom_sandbox.api import (
+from . import (
     Config,
     FloatSlot,
     ForwardOutput,
@@ -23,9 +23,9 @@ from doom_sandbox.api import (
     pwl_def,
     run,
 )
-from doom_sandbox.api import _runtime
-from doom_sandbox.api.vec import _make_vec
-from doom_sandbox.runtime.loop import MaxPositionsExceeded
+from . import _runtime
+from .vec import _make_vec
+from ..runtime.loop import MaxPositionsExceeded
 
 
 # Vocabs / forwards used across tests are declared here at module load so
@@ -606,5 +606,5 @@ def test_vocab_overridable_max_for_testing():
 
 
 def test_vocab_default_budget_is_128k():
-    from doom_sandbox.api import DEFAULT_MAX_VOCAB_CARDINALITY
+    from . import DEFAULT_MAX_VOCAB_CARDINALITY
     assert DEFAULT_MAX_VOCAB_CARDINALITY == 131_072

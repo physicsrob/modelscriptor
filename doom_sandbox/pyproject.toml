@@ -17,13 +17,12 @@ dev = [
 package = false
 
 [tool.pytest.ini_options]
-# Tests use absolute imports (`from doom_sandbox.api import ...`). When
-# the sandbox runs as a self-contained directory, this directory IS the
-# package, so we add `..` to sys.path — Python then locates
-# `doom_sandbox` as a sibling of the chosen rootdir.
-#
-# IMPORTANT: this requires the directory to be named exactly
-# `doom_sandbox`. `cp -r doom_sandbox /tmp/` preserves the name and
-# works; renaming the copy (e.g. `mv doom_sandbox my-sandbox`) would
-# break the absolute imports.
+# All intra-sandbox imports are relative (`from .api import X`,
+# `from ..runtime.embedding import Y`), so the package's literal name
+# isn't baked into the source. We add `..` to sys.path so pytest can
+# import this directory as a package under whatever name it has on
+# disk. The directory name need only be a valid Python identifier
+# (letters, digits, underscores) — `doom_sandbox`, `mysandbox`,
+# `phase1_workspace`, etc. all work; a name with a dash like
+# `my-sandbox` does not.
 pythonpath = [".."]

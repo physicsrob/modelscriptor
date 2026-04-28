@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from doom_sandbox.api import (
+from . import (
     FloatSlot,
     IntSlot,
     Past,
@@ -13,9 +13,9 @@ from doom_sandbox.api import (
     TokenType,
     constant,
 )
-from doom_sandbox.api.past import MARGIN
-from doom_sandbox.api.vec import Vec, _make_vec
-from doom_sandbox.runtime.embedding import Layout
+from .past import MARGIN
+from .vec import Vec, _make_vec
+from ..runtime.embedding import Layout
 
 
 # Vocab used across the suite.

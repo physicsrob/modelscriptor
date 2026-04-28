@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from doom_sandbox.api import concat, constant, split
-from doom_sandbox.api.vec import _make_vec
+from . import concat, constant, split
+from .vec import _make_vec
 import numpy as np
 
 

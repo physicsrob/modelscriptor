@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from doom_sandbox.api import (
+from ..api import (
     FloatSlot,
     IntSlot,
     Token,
     TokenType,
 )
-from doom_sandbox.runtime.embedding import (
+from .embedding import (
     Layout,
     _quantize_float,
     deembed,
@@ -146,7 +146,7 @@ def test_deembed_picks_max_type_one_hot():
     # one-hot, so to exercise argmax over a non-one-hot we have to
     # bypass the public API.
     import numpy as np
-    from doom_sandbox.api.vec import _make_vec
+    from ..api.vec import _make_vec
     data = np.array([0.3, 1.0, 0.4, 0.0, 0.0, 5.0])
     vec = _make_vec(data, depth=0)
     decoded = deembed(vec, layout)
@@ -220,7 +220,7 @@ def test_int_slot_fractional_raw_value_rounds():
     exercise the round() step of deembed (not reachable via embed,
     which writes integer values directly)."""
     import numpy as np
-    from doom_sandbox.api.vec import _make_vec
+    from ..api.vec import _make_vec
     types = _vocab()
     layout = Layout(types)
     col_col = layout.slot_columns[("RENDER", "col")]

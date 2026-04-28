@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from doom_sandbox.fixtures import (
+from . import (
     assert_pose_clear_of_planes,
     available_fixtures,
     load_fixture,
 )
-from doom_sandbox.phases.phase1_bsp_ranks.reference import expected_bsp_ranks
-from doom_sandbox.types import BSPNode, GameState, MapSubset
+from ..phases.phase1_bsp_ranks.reference import expected_bsp_ranks
+from ..types import BSPNode, GameState, MapSubset
 
 
 # --- Loader basics ---

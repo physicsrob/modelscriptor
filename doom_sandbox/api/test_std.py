@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from doom_sandbox.api import (
+from . import (
     clamp,
     compare_const,
     constant,
@@ -19,8 +19,8 @@ from doom_sandbox.api import (
     sum,
     type_switch,
 )
-from doom_sandbox.api.vec import _make_vec
-from doom_sandbox.runtime.noise import NOISE_REL
+from .vec import _make_vec
+from ..runtime.noise import NOISE_REL
 
 
 def _exact_atol(values):

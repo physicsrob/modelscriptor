@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from doom_sandbox.api import (
+from . import (
     assert_,
     assert_bool,
     assert_close,
@@ -15,7 +15,7 @@ from doom_sandbox.api import (
     debug_watch,
     print_vec,
 )
-from doom_sandbox.api.vec import _make_vec
+from .vec import _make_vec
 
 
 # --- print_vec / debug_watch ---
