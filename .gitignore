@@ -8,3 +8,4 @@ __pycache__
 *.vocab.json
 .claude/worktrees/
 .python-version
+.codex
