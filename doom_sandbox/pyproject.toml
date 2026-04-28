@@ -1,0 +1,29 @@
+[project]
+name = "doom-sandbox"
+version = "0.1.0"
+description = "Constrained Python environment for designing DOOM-rendering algorithms before porting to a transformer."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pydantic>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+# Tests use absolute imports (`from doom_sandbox.api import ...`). When
+# the sandbox runs as a self-contained directory, this directory IS the
+# package, so we add `..` to sys.path — Python then locates
+# `doom_sandbox` as a sibling of the chosen rootdir.
+#
+# IMPORTANT: this requires the directory to be named exactly
+# `doom_sandbox`. `cp -r doom_sandbox /tmp/` preserves the name and
+# works; renaming the copy (e.g. `mv doom_sandbox my-sandbox`) would
+# break the absolute imports.
+pythonpath = [".."]
