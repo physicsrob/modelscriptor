@@ -1,4 +1,7 @@
 {
+  "worktree": {
+    "symlinkDirectories": [".venv"]
+  },
   "hooks": {
     "PostToolUse": [
       {
