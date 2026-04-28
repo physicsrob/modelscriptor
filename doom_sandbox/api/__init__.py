@@ -14,6 +14,7 @@ from .debug import (
     print_vec,
 )
 from .forward import (
+    DEFAULT_MAX_VOCAB_CARDINALITY,
     Config,
     ForwardOutput,
     Pixel,
@@ -26,10 +27,14 @@ from .pwl import PWLDef, PWLDef2D, pwl_def
 from .std import (
     clamp,
     compare_const,
+    linear,
     multiply,
+    one_hot,
     piecewise_linear,
     piecewise_linear_2d,
+    reduce_sum,
     relu,
+    sum,
     type_switch,
 )
 from .tokens import (
@@ -40,6 +45,7 @@ from .tokens import (
     TokenType,
     extract_float_slot,
     extract_int_slot,
+    extract_type_slot,
     is_type,
     make_token,
 )
@@ -64,6 +70,7 @@ __all__ = [
     "make_token",
     "extract_int_slot",
     "extract_float_slot",
+    "extract_type_slot",
     "is_type",
     # Past
     "Past",
@@ -71,6 +78,7 @@ __all__ = [
     "ForwardOutput",
     "Pixel",
     "TokenVocab",
+    "DEFAULT_MAX_VOCAB_CARDINALITY",
     "Config",
     "RunOutput",
     "run",
@@ -82,6 +90,10 @@ __all__ = [
     "piecewise_linear",
     "multiply",
     "piecewise_linear_2d",
+    "linear",
+    "sum",
+    "reduce_sum",
+    "one_hot",
     # Debug
     "print_vec",
     "debug_watch",

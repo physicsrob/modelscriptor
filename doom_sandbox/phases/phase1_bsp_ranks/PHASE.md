@@ -14,26 +14,35 @@ parameterized tokens, and at least one cross-position attention pattern.
 
 ## Success criterion
 
-The phase passes when this test passes for every fixture:
+The phase passes when this test passes for every fixture, at every
+pose in `scene.test_poses`:
 
 ```python
 def test_phase1_box_room():
     scene = load_fixture("box_room")
-    state = GameState(x=..., y=..., angle=...)
+    for state in scene.test_poses:
+        expected = expected_bsp_ranks(scene, state)
 
-    expected = expected_bsp_ranks(scene, state)
+        config = setup()
+        prefill = get_prefill(scene, state)
+        output = run(config, prefill, forward)
+        actual = extract_bsp_ranks(output)
 
-    config = setup()
-    prefill = get_prefill(scene, state)
-    output = run(config, prefill, forward)
-    actual = extract_bsp_ranks(output)
-
-    assert actual == expected
+        assert actual == expected, f"mismatch at pose ({state.x}, {state.y})"
 ```
 
 Exact integer match — no tolerance, no near-equality. Quantization
 through `IntSlot`s is exact; `FloatSlot` quantization rounds back to
 integer at extract time.
+
+`scene.test_poses` is a fixture-supplied list of player states picked
+to land clearly off every BSP plane, so the PWL-approximated `side_P`
+bits are robust against framework numerical noise. If you add new
+fixtures or roll your own pose, call
+`assert_pose_clear_of_planes(scene, state)` (in
+`doom_sandbox.fixtures`) to surface a near-plane pose loudly rather
+than as a downstream rank mismatch — `compare_const`'s deadband and
+FloatSlot quantization can otherwise flip a `side_P` bit silently.
 
 ## Required functions
 
@@ -75,7 +84,13 @@ FRONT side of BSP plane `i` (`sign(nx_i·player_x + ny_i·player_y + d_i) > 0`).
   always integer-valued (counts of walls in subtrees).
 - Per-wall BSP constants (`MapSubset.seg_bsp_consts`) — also integer.
 - Player position (`GameState.x, .y`).
-- One identifier emission per wall: `BSP_RANK` carrying the integer rank.
+- One identifier emission per wall: `BSP_RANK` carrying **both the
+  wall index and the integer rank**. The emission must be
+  self-describing so `extract_bsp_ranks` can sort by wall index
+  without depending on emission order. Either a single
+  `BSP_RANK(wall_index, rank)` token or a marker+VALUE pair like
+  `BSP_RANK(wall_index) → VALUE(rank)` works; the load-bearing
+  property is that the wall index travels with the value.
 
 **Deferred to later phases:**
 - Wall geometry (`ax`, `ay`, `bx`, `by`, `tex_id`) — not needed for rank.
@@ -91,6 +106,70 @@ FRONT side of BSP plane `i` (`sign(nx_i·player_x + ny_i·player_y + d_i) > 0`).
   later-phase concern.
 - **`N ≤ 8` walls per scene.** Same reason.
 - **Frame budget: 8k tokens.** Total prefill + autoregressive ≤ 8192.
+
+## Fixed dimensions and padding
+
+Phase 1 commits to **fixed maximums**, not "whatever this scene
+happens to have." Pick `M_MAX = 16` and `N_MAX = 8` as Python
+constants at module load, and pad every scene to those sizes with
+neutral values. The cross-position aggregation patterns in the API
+require this — `Past.mean(name)` divides by the count of contributing
+positions, so recovering a sum (e.g. `coeffs · side_P_vec`) needs a
+`× count` multiplication, and `count` must be a fixed Python int
+known at module load (PWL weights, `linear` matrices, and any
+counts-as-constants are all frozen before `forward()` runs).
+
+Padding pattern in `get_prefill`:
+
+```python
+M_MAX = 16
+N_MAX = 8
+
+def get_prefill(scene, state):
+    tokens = []
+    # ... player and other tokens ...
+    # Real BSP nodes
+    for j, node in enumerate(scene.bsp_nodes):
+        tokens.append(make_bsp_node(j, nx=node.nx, ny=node.ny, d=node.d))
+    # Padding BSP nodes — pick (nx, ny, d) so the half-plane test
+    # produces a constant 0 (BACK) for any in-room player. (0, 0, -1)
+    # works: 0·x + 0·y + (-1) = -1 < 0 always, so side_P_j = 0.
+    for j in range(len(scene.bsp_nodes), M_MAX):
+        tokens.append(make_bsp_node(j, nx=0.0, ny=0.0, d=-1.0))
+    # Real wall coefficients (dense over (i, j))
+    for i, coeffs in enumerate(scene.seg_bsp_coeffs):
+        for j, c in enumerate(coeffs):
+            tokens.append(make_bsp_coeff(i, j, c=c))
+        for j in range(len(coeffs), M_MAX):
+            tokens.append(make_bsp_coeff(i, j, c=0))
+    # Padding walls — coefficients = 0, const = 0 contributes nothing.
+    for i in range(len(scene.seg_bsp_coeffs), N_MAX):
+        for j in range(M_MAX):
+            tokens.append(make_bsp_coeff(i, j, c=0))
+    # ... etc ...
+    return tokens
+```
+
+`extract_bsp_ranks` returns ranks for the **real** walls only — slice
+the autoregressive output by `len(scene.segments)`, not by `N_MAX`.
+
+Two architectures both work over fixed-dim padded scenes:
+
+1. **`mean × M_MAX` aggregation.** Each `THINK_PARTIAL(i, j)`
+   position publishes `c_{i,j} · side_P_j` slotted into a width-`N_MAX`
+   one-hot at slot `i` (zero elsewhere). At `BSP_RANK(i)` the
+   per-wall sum is `past.mean("partial_vec") × M_MAX`, then a
+   `one_hot(i, N_MAX)` + `multiply` + `reduce_sum` extracts wall `i`'s
+   sum. Faithful to the transformer's natural averaging primitive.
+2. **Per-position width-M lookup.** At `BSP_RANK(i)`, do M_MAX
+   sequential `past.lookup`s — one per `j` — to fetch each
+   `side_P_j` into slot `j` of a width-`M_MAX` Vec, similarly fetch
+   the M_MAX coefficients for wall `i`, then `multiply` +
+   `reduce_sum` for the dot product locally. Trades aggregation
+   depth for sequential-lookup depth; no `× M_MAX` multiplication.
+
+Both are first-class. Pick whichever reads better; the rank test
+doesn't care.
 
 ## Hints (not prescriptions)
 
@@ -161,6 +240,15 @@ some way to know "is this the last wall?" — maybe a `TOTAL_WALLS`
 token in prefill, maybe by reading the count of `BSP_CONST` markers
 implicitly, maybe by structural choice in the autoregressive loop.
 The agent picks.
+
+### Prefill → autoregressive transition
+
+See "Prefill vs. autoregressive transition" in `doom_sandbox/CLAUDE.md`.
+The recommended pattern — dedicated marker token (e.g. `BEGIN`) as the
+final prefill token, only its `forward()` branch produces the AR-start
+token — keeps prefill ordering decoupled from AR-start logic. Without
+the marker, *some* structural type ends up last in prefill and its
+branch silently becomes load-bearing for AR boot, which is brittle.
 
 ### Phases don't import each other
 

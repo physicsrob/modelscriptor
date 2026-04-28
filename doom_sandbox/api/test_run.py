@@ -558,3 +558,53 @@ def test_decode_pixels_receives_input_token_per_position():
     assert seen_inputs[1].values["n"] == 1
     assert seen_inputs[2].values["n"] == 2
     assert seen_inputs[3].values["n"] == 3
+
+
+# --- TokenVocab cardinality validation ---
+
+def test_vocab_cardinality_sums_across_types():
+    A = TokenType("A_card", slots={"x": IntSlot(0, 100)})
+    B = TokenType("B_card", slots={"y": IntSlot(0, 200)})
+    NOSLOTS = TokenType("NS_card", slots={})
+    vocab = TokenVocab([A, B, NOSLOTS])
+    assert vocab.cardinality == 100 + 200 + 1
+
+
+def test_vocab_under_budget_constructs_fine():
+    # Two FloatSlot-carrying types fit under 128K (65536 + 65536 = 131072).
+    A = TokenType("A_under", slots={"v": FloatSlot(-1.0, 1.0, levels=65536)})
+    B = TokenType("B_under", slots={"v": FloatSlot(-1.0, 1.0, levels=65535)})
+    vocab = TokenVocab([A, B])
+    assert vocab.cardinality == 65536 + 65535
+
+
+def test_vocab_over_budget_raises_with_top_offenders():
+    PACKED = TokenType("PACKED_BAD", slots={
+        f"c{i}": IntSlot(-8, 9) for i in range(16)
+    })
+    SMALL = TokenType("SMALL", slots={"x": IntSlot(0, 10)})
+    with pytest.raises(ValueError) as exc:
+        TokenVocab([SMALL, PACKED])
+    msg = str(exc.value)
+    assert "exceeds budget" in msg
+    assert "PACKED_BAD" in msg
+    # Suggestions surface in the error.
+    assert "marker+VALUE" in msg or "FloatSlot" in msg
+
+
+def test_vocab_overridable_max_for_testing():
+    """Tests / unusual phases can override the budget."""
+    PACKED = TokenType("PACKED_OK", slots={
+        f"c{i}": IntSlot(-8, 9) for i in range(16)
+    })
+    # Default budget rejects.
+    with pytest.raises(ValueError):
+        TokenVocab([PACKED])
+    # Bumped budget accepts.
+    vocab = TokenVocab([PACKED], max_cardinality=10**20)
+    assert vocab.cardinality == 17 ** 16
+
+
+def test_vocab_default_budget_is_128k():
+    from doom_sandbox.api import DEFAULT_MAX_VOCAB_CARDINALITY
+    assert DEFAULT_MAX_VOCAB_CARDINALITY == 131_072

@@ -420,6 +420,13 @@ class Past:
         `sum / M`; if you need the sum you multiply by M yourself, or
         have producers scale their contributions by M up front.
 
+        Recovering a sum requires `M` to be a Python int known at
+        module load — PWL weights, `linear` matrices, and any
+        scaling factors are frozen before `forward()` runs. That is
+        why phases that use `mean × count` commit to fixed-dimension
+        scenes and pad smaller fixtures with neutral values (see the
+        per-phase PHASE.md's "Fixed dimensions and padding" section).
+
         All contributing values must have the same shape. Adds depth
         +1 over the deepest contributor."""
         contributors: list[Vec] = []

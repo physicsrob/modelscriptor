@@ -40,11 +40,54 @@ class Pixel:
     color: tuple[int, int, int]   # RGB
 
 
+DEFAULT_MAX_VOCAB_CARDINALITY: int = 131_072
+
+
 @dataclass
 class TokenVocab:
-    """The set of `TokenType`s used by a phase."""
+    """The set of `TokenType`s used by a phase.
+
+    Constructs validate that the total discrete vocabulary cardinality
+    (sum of `TokenType.cardinality` over all types) stays under
+    `max_cardinality`. The eventual transformer compilation target has
+    a discrete vocabulary; cardinality blows up multiplicatively across
+    packed slots, so a design that's clean at the sandbox level can be
+    catastrophic when ported. This budget catches the problem at
+    `setup()` time.
+
+    Default budget: 131,072 (= 2^17). Override only for tests or when
+    you have strong reason to believe the larger budget is acceptable
+    in the target — the intent is to push agents toward the
+    marker+VALUE pattern (one or two FloatSlot-carrying types, plus
+    small IntSlot markers) rather than packing many slot values into
+    one type's body.
+    """
 
     types: list[TokenType]
+    max_cardinality: int = DEFAULT_MAX_VOCAB_CARDINALITY
+
+    def __post_init__(self) -> None:
+        total = self.cardinality
+        if total > self.max_cardinality:
+            offenders = sorted(
+                self.types, key=lambda t: t.cardinality, reverse=True
+            )
+            top = offenders[: min(3, len(offenders))]
+            details = ", ".join(
+                f"{t.name}={t.cardinality:,}" for t in top
+            )
+            raise ValueError(
+                f"TokenVocab cardinality {total:,} exceeds budget "
+                f"{self.max_cardinality:,}. Top contributors: {details}. "
+                f"Reduce slot counts on the heaviest type, prefer "
+                f"IntSlot over FloatSlot, or split FloatSlot payloads "
+                f"into separate VALUE tokens (marker+VALUE pattern)."
+            )
+
+    @property
+    def cardinality(self) -> int:
+        """Total discrete vocabulary size — sum across types."""
+        return sum(t.cardinality for t in self.types)
 
 
 @dataclass

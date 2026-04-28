@@ -13,6 +13,7 @@ from doom_sandbox.api import (
     constant,
     extract_float_slot,
     extract_int_slot,
+    extract_type_slot,
     is_type,
     make_token,
 )
@@ -304,3 +305,215 @@ def test_extract_float_slot_wrong_kind_raises():
         input_vec = embed(Token(RENDER, {"col": 1, "chunk": 0}), layout)
         with pytest.raises(ValueError, match="not declared as FloatSlot"):
             extract_float_slot(input_vec, "col")
+
+
+# --- TokenType.one_hot ---
+
+def test_one_hot_sets_type_column():
+    layout = _layout()
+    with active_layout(layout):
+        vec = RENDER.one_hot()
+    n_types = len(layout.types)
+    assert vec.shape == n_types
+    assert vec.depth == 0
+    assert vec._data[layout.type_columns["RENDER"]] == 1.0
+    for name, col in layout.type_columns.items():
+        if name != "RENDER":
+            assert vec._data[col] == 0.0
+
+
+def test_one_hot_for_each_type_is_unique_one_hot():
+    layout = _layout()
+    with active_layout(layout):
+        seen = []
+        for T in (RENDER, VALUE, NO_OP):
+            v = T.one_hot()
+            assert v._data.sum() == 1.0
+            seen.append(tuple(v._data.tolist()))
+    assert len(set(seen)) == len(seen)  # each type's one-hot is distinct
+
+
+def test_one_hot_raises_for_type_outside_active_vocab():
+    layout = _layout([RENDER, VALUE])  # NO_OP excluded
+    with active_layout(layout):
+        with pytest.raises(ValueError, match="not in the active vocab"):
+            NO_OP.one_hot()
+
+
+def test_one_hot_raises_without_active_layout():
+    with pytest.raises(RuntimeError, match="No active token layout"):
+        RENDER.one_hot()
+
+
+def test_one_hot_dot_input_type_recovers_type_match_bit():
+    """The point of one_hot(): use it as a query against `input.type`.
+    Their dot product is 1.0 when input matches T, 0.0 otherwise."""
+    layout = _layout()
+    with active_layout(layout):
+        for tok_type in (RENDER, VALUE, NO_OP):
+            input_vec = embed(Token(tok_type, {}), layout)
+            # input.type slice = first N_TYPES columns of input_vec
+            n_types = len(layout.types)
+            input_type = input_vec._data[:n_types]
+            for query_type in (RENDER, VALUE, NO_OP):
+                q = query_type.one_hot()
+                score = float(np.dot(q._data, input_type))
+                expected = 1.0 if query_type == tok_type else 0.0
+                assert score == expected
+
+
+# --- TokenType.check ---
+
+def test_check_returns_1_for_matching_type():
+    layout = _layout()
+    with active_layout(layout):
+        input_vec = embed(Token(RENDER, {"col": 7, "chunk": 1}), layout)
+        out = RENDER.check(input_vec)
+        assert out.shape == 1
+        assert out._data[0] == 1.0
+
+
+def test_check_returns_0_for_non_matching_type():
+    layout = _layout()
+    with active_layout(layout):
+        input_vec = embed(Token(VALUE, {"v": 0.5}), layout)
+        out = RENDER.check(input_vec)
+        assert out._data[0] == 0.0
+
+
+def test_check_depth_plus_1():
+    layout = _layout()
+    with active_layout(layout):
+        input_vec = embed(Token(RENDER, {}), layout)
+        out = RENDER.check(input_vec)
+        assert out.depth == input_vec.depth + 1
+
+
+def test_check_unknown_type_raises():
+    layout = _layout([RENDER, VALUE])  # NO_OP excluded
+    with active_layout(layout):
+        input_vec = embed(Token(RENDER, {}), layout)
+        with pytest.raises(ValueError, match="not in the active vocab"):
+            NO_OP.check(input_vec)
+
+
+def test_check_full_token_only_rejects_input_type_slice():
+    """T.check() requires the full token Vec. The narrower input.type
+    slice (width-N_TYPES) is rejected — passing the wrong shape would
+    be silent corruption otherwise."""
+    layout = _layout()
+    with active_layout(layout):
+        input_vec = embed(Token(RENDER, {}), layout)
+        n_types = len(layout.types)
+        slice_vec = _make_vec(input_vec._data[:n_types], depth=0)
+        with pytest.raises(ValueError, match="expected a Vec of width"):
+            RENDER.check(slice_vec)
+
+
+# --- extract_type_slot ---
+
+def test_extract_type_slot_returns_value_at_specific_column():
+    layout = _layout()
+    with active_layout(layout):
+        input_vec = embed(Token(RENDER, {"col": 42, "chunk": 3}), layout)
+        col = extract_type_slot(input_vec, RENDER, "col")
+        chunk = extract_type_slot(input_vec, RENDER, "chunk")
+        assert col._data[0] == 42
+        assert chunk._data[0] == 3
+
+
+def test_extract_type_slot_auto_masks_when_active_type_differs():
+    """When the active input is a different type, the (T, slot) column
+    is 0.0, so extract returns 0 — the auto-masking property."""
+    layout = Layout([RENDER, OTHER])
+    with active_layout(layout):
+        # OTHER is active; RENDER's col column is 0 (not written).
+        input_vec = embed(Token(OTHER, {"col": 7}), layout)
+        out = extract_type_slot(input_vec, RENDER, "col")
+        assert out._data[0] == 0.0
+
+
+def test_extract_type_slot_disambiguates_shared_slot_names():
+    """RENDER and OTHER both have a 'col' slot at different columns.
+    extract_type_slot reads exactly one of them; flat
+    extract_int_slot would sum them."""
+    layout = Layout([RENDER, OTHER])
+    with active_layout(layout):
+        input_vec = embed(Token(RENDER, {"col": 5}), layout)
+        # extract_type_slot reads RENDER's col exactly.
+        from_render = extract_type_slot(input_vec, RENDER, "col")
+        from_other = extract_type_slot(input_vec, OTHER, "col")
+        assert from_render._data[0] == 5
+        assert from_other._data[0] == 0
+
+
+def test_extract_type_slot_unknown_type_raises():
+    layout = _layout([RENDER, VALUE])  # NO_OP excluded
+    with active_layout(layout):
+        input_vec = embed(Token(RENDER, {}), layout)
+        with pytest.raises(ValueError, match="not in the active vocab"):
+            extract_type_slot(input_vec, NO_OP, "col")
+
+
+def test_extract_type_slot_undeclared_slot_raises():
+    layout = _layout()
+    with active_layout(layout):
+        input_vec = embed(Token(RENDER, {}), layout)
+        with pytest.raises(ValueError, match="does not declare slot"):
+            extract_type_slot(input_vec, RENDER, "v")  # v is on VALUE, not RENDER
+
+
+def test_extract_type_slot_wrong_input_width_raises():
+    layout = _layout()
+    with active_layout(layout):
+        narrow = _make_vec(np.zeros(1), depth=0)
+        with pytest.raises(ValueError, match="expected a Vec of width"):
+            extract_type_slot(narrow, RENDER, "col")
+
+
+def test_extract_type_slot_depth_plus_1():
+    layout = _layout()
+    with active_layout(layout):
+        input_vec = embed(Token(RENDER, {"col": 1}), layout)
+        out = extract_type_slot(input_vec, RENDER, "col")
+        assert out.depth == input_vec.depth + 1
+
+
+def test_extract_type_slot_raises_without_active_layout():
+    with pytest.raises(RuntimeError, match="No active token layout"):
+        extract_type_slot(_make_vec(np.zeros(5), depth=0), RENDER, "col")
+
+
+# --- Cardinality ---
+
+def test_int_slot_cardinality_is_hi_minus_lo():
+    assert IntSlot(0, 320).cardinality == 320
+    assert IntSlot(-8, 9).cardinality == 17
+    assert IntSlot(0, 1).cardinality == 1
+
+
+def test_float_slot_cardinality_is_levels():
+    assert FloatSlot(-1.0, 1.0, levels=65536).cardinality == 65536
+    assert FloatSlot(-10.0, 10.0, levels=4).cardinality == 4
+
+
+def test_token_type_cardinality_no_slots_is_1():
+    assert NO_OP.cardinality == 1
+
+
+def test_token_type_cardinality_single_slot_matches_slot():
+    assert OTHER.cardinality == 8  # single IntSlot(0, 8)
+
+
+def test_token_type_cardinality_multi_slot_is_product():
+    # RENDER has IntSlot(0, 320) and IntSlot(0, 16)
+    assert RENDER.cardinality == 320 * 16
+
+
+def test_token_type_cardinality_packed_slots_explode():
+    """The point of cardinality tracking: many packed slots multiply
+    into an unrenderably large vocabulary."""
+    PACKED = TokenType("PACKED", slots={
+        f"c{i}": IntSlot(-8, 9) for i in range(16)
+    })
+    assert PACKED.cardinality == 17 ** 16  # ~4.5e19

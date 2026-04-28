@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .game_state import GameState
+
 
 class Segment(BaseModel):
     """A wall segment — line from `(ax, ay)` to `(bx, by)`.
@@ -106,6 +108,14 @@ class MapSubset(BaseModel):
     original_seg_indices : list[int]
         Segment indices in the original WAD's seg array, for cross-
         checking against reference traversal. Optional.
+    test_poses : list[GameState]
+        Recommended player states for sandbox tests. Each pose is far
+        enough from every BSP plane that PWL-approximated `side_P`
+        bits are robust against the framework's numerical noise — the
+        fixture builder picks them so phase tests don't have to do
+        their own geometric reasoning. Verify with
+        `assert_pose_clear_of_planes` (in `doom_sandbox.fixtures`) if
+        you roll your own. Optional; default empty.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -118,6 +128,7 @@ class MapSubset(BaseModel):
     textures: list[Texture] = Field(default_factory=list)
     tex_name_to_id: dict[str, int] = Field(default_factory=dict)
     original_seg_indices: list[int] = Field(default_factory=list)
+    test_poses: list[GameState] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_shapes(self) -> "MapSubset":

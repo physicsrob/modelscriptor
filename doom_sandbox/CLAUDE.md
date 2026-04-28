@@ -127,10 +127,30 @@ Pre-built primitives covering common patterns are in
 `clamp(lo, hi)`, `compare_const(c, input_range)`,
 `piecewise_linear(fn, breakpoints, input_range)`,
 `multiply(input_range, breakpoints=2)`,
-`piecewise_linear_2d(fn, breakpoints, input_range)`, and
-`type_switch(*branches)`. Use them. If something you need isn't there,
-**ask before adding a new primitive** — new primitives carry a
-porting cost.
+`piecewise_linear_2d(fn, breakpoints, input_range)`,
+`type_switch(*branches)`, plus the linear-projection family:
+
+- `linear(vec, output_matrix)` — fixed linear projection of a Vec by
+  a `(d_input, d_output)` matrix. Foundational; covers anything that
+  needs a fixed linear map (one-hot pick, weighted reduce, arbitrary
+  projection). Mirrors the parent project's `Linear`.
+- `sum(*vecs)` — pointwise sum of N same-shape Vecs (variadic).
+  Mirrors `sum_nodes`. Note this shadows Python's `builtins.sum`.
+- `reduce_sum(vec)` — sum across a single Vec's indices to a 1-Vec.
+  The natural complement to `multiply` for inner-product chains:
+  `reduce_sum(MUL(a, b))` is the dot product of two same-shape Vecs.
+- `one_hot(scalar_vec, n)` — turns a 1-Vec carrying an integer in
+  `[0, n)` into a width-`n` one-hot Vec. Trapezoidal kernel mirroring
+  the parent's `in_range` (clean one-hot at integer inputs;
+  `±0.05`-wide blend zones at half-integer boundaries). The standard
+  way to address a width-`n` Vec by a runtime index — combine with
+  `multiply` + `reduce_sum` for indexed extraction.
+
+All four add depth +1 and are free linear / single-MLP ops in
+transformer terms.
+
+Use them. If something you need isn't there, **ask before adding a
+new primitive** — new primitives carry a porting cost.
 
 ## Free utilities
 
@@ -220,6 +240,37 @@ Slot semantics:
   evenly-spaced steps over `[lo, hi]`. Round-trip introduces ~one LSB of
   quantization error. Default 65536 levels gives ~`(hi-lo)/2^16` precision.
 
+### Vocabulary cardinality budget
+
+The eventual transformer compilation target has a discrete vocabulary
+— every distinct `(type, slot_values)` combination is a separate
+token. Cardinalities multiply across slots within a type, so packing
+many slot values into one type's body explodes fast:
+
+- A type with no slots: cardinality 1.
+- A type's cardinality: product of its slots' cardinalities
+  (`hi - lo` for `IntSlot`, `levels` for `FloatSlot`).
+- The vocab's cardinality: sum across types.
+
+`TokenVocab` raises at construction if total cardinality exceeds
+**131,072 (= 2^17)** by default. The error names the worst
+contributors so you can see which type to slim. Concrete examples:
+
+| Token shape | Cardinality |
+|---|---|
+| `RENDER(col: IntSlot(0,320), chunk: IntSlot(0,16))` | 5,120 |
+| `VALUE(v: FloatSlot(-1,1, levels=65536))` | 65,536 |
+| `BSP_COEFF(wall_index: IntSlot(0,8), bsp_node_index: IntSlot(0,16), c: IntSlot(-8,9))` | 2,176 |
+| `BSP_ROW(wall_index: IntSlot(0,8), c0..c15: IntSlot(-8,9))` | 8 × 17¹⁶ ≈ 4.5 × 10¹⁹ ❌ |
+
+The budget pushes you toward the **marker + VALUE** pattern: a
+type with one or two small `IntSlot` markers, followed by separate
+`VALUE(v: FloatSlot)` tokens for any continuous payload. Trying to
+pack many coefficients or floats into one type's body will fail
+loudly at `setup()`. Override `max_cardinality` on `TokenVocab` only
+for tests or with strong reason — the budget is what makes the
+sandbox a faithful preview of what the real transformer can encode.
+
 ## ForwardOutput
 
 ```python
@@ -246,6 +297,24 @@ class ForwardOutput:
 To make a Vec visible to other positions, call `past.publish(name, vec)`
 during your `forward()` — see *Cross-position attention via past* below.
 
+## Prefill vs. autoregressive transition
+
+`forward()` runs at every prefill position. The deembedded `next_token`
+is recorded but discarded at all positions except the **last** prefill,
+where it becomes the input to the first autoregressive position.
+
+**Recommended pattern:** end prefill with a dedicated marker token
+(`BEGIN`, `EOS`, `GO` — pick a name) and have only its `forward()`
+branch produce the AR-start token. This decouples prefill ordering
+from AR-start logic — reordering structural prefill tokens (BSP
+nodes, coefficients, walls) doesn't break the AR seed.
+
+Other prefill positions still need *some* valid `next_token` Vec —
+`forward()` always returns one. The agent picks the simplest path: a
+NO_OP placeholder type, re-emitting the input, or sharing a branch
+with the BEGIN marker (the value is discarded at non-BEGIN positions
+anyway).
+
 ## input_vec — the per-position input
 
 `input_vec` is a Vec encoding the input token at the current position —
@@ -257,13 +326,48 @@ vocab); you don't read the layout, you read through primitives.
 
 ```python
 is_render = is_type(input_vec, RENDER)             # 1-Vec: 1.0 if RENDER, else 0.0
-col       = extract_int_slot(input_vec, "col")     # 1-Vec carrying the int value
+is_render = RENDER.check(input_vec)                # method form, equivalent
+col       = extract_int_slot(input_vec, "col")     # flat namespace — sum across types
+col       = extract_type_slot(input_vec, RENDER, "col")  # specific (RENDER, col) column
 v         = extract_float_slot(input_vec, "v")     # 1-Vec carrying the float
 ```
 
-`is_type` returns a 1-Vec that's 1.0 when the input is the named type
-and 0.0 otherwise. Types are mutually exclusive — exactly one
-`is_type(input_vec, T)` returns 1.0 across the vocab.
+`is_type(input_vec, T)` (free function) and `T.check(input_vec)` (method)
+return a 1-Vec that's 1.0 when the input is type T and 0.0 otherwise.
+Types are mutually exclusive — exactly one of these returns 1.0 across
+the vocab.
+
+`extract_int_slot` / `extract_float_slot` take a slot *name* and sum
+across every type's column with that name (returning the active type's
+value, since other types' columns are 0). Use these when you want
+"whichever type has this slot, give me its value."
+
+`extract_type_slot(input_vec, T, name)` reads exactly the `(T, name)`
+column. The auto-masking is implicit: when the active input is a
+different type, that column is 0 and you get 0 back. Use this when
+slot names collide across types (e.g. `wall_index` shared by
+`BSP_COEFF`, `BSP_RANK`, `THINK_BSP_RANK`) and you want to read one
+specific type's value.
+
+### Querying by type via `T.one_hot()`
+
+`T.one_hot()` returns a width-`N_TYPES` one-hot Vec for type `T`,
+matching the encoding of the auto-published `input.type` key. Use it
+as a query for `past.lookup` / `past.pick_*` to attend to positions
+of a specific type:
+
+```python
+player_x = past.lookup(
+    query=PLAYER.one_hot(),
+    key_name="input.type",
+    value_name="input.x",
+)
+```
+
+Depth 0 (constant once the layout is built); requires an active
+layout (only callable inside `forward()` or an `active_layout`
+block). The natural type-keyed-attention idiom — no need to publish
+your own per-type indicator.
 
 If a slot isn't declared on the current input's type,
 `extract_*_slot` returns 0. Use `is_type` masks to ignore extractions

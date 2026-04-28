@@ -22,6 +22,11 @@ class IntSlot:
                 f"IntSlot requires lo < hi, got {self.lo}, {self.hi}"
             )
 
+    @property
+    def cardinality(self) -> int:
+        """Number of distinct values this slot can carry: `hi - lo`."""
+        return self.hi - self.lo
+
 
 @dataclass(frozen=True)
 class FloatSlot:
@@ -41,6 +46,11 @@ class FloatSlot:
                 f"FloatSlot requires levels >= 2, got {self.levels}"
             )
 
+    @property
+    def cardinality(self) -> int:
+        """Number of distinct values this slot can carry: `levels`."""
+        return self.levels
+
 
 Slot = IntSlot | FloatSlot
 
@@ -53,6 +63,9 @@ class TokenType:
     vocabulary in `setup()`. Identity is by `name` — types with the same
     name compare equal and hash equally regardless of slot definitions.
     Names are expected to be unique within a vocab.
+
+    Layout-aware methods (`one_hot`, `check`) require an active layout
+    and are intended for use inside `forward()`.
     """
 
     name: str
@@ -63,6 +76,69 @@ class TokenType:
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, TokenType) and self.name == other.name
+
+    @property
+    def cardinality(self) -> int:
+        """Number of distinct discrete tokens this type can represent.
+
+        For a type with no slots, 1 (the type itself is the token). For
+        a type with slots, the product of the slots' cardinalities —
+        every combination of slot values is a distinct token. This is
+        the cost the type contributes to the eventual transformer's
+        discrete vocabulary.
+        """
+        if not self.slots:
+            return 1
+        product = 1
+        for slot in self.slots.values():
+            product *= slot.cardinality
+        return product
+
+    def one_hot(self) -> Vec:
+        """Return this type's one-hot Vec for use as a `past.lookup` query.
+
+        Returns a width-`N_TYPES` Vec with 1.0 at this type's column and
+        0.0 elsewhere — matching the encoding of the auto-published
+        `input.type` key. Depth 0 (constant once the layout is built).
+
+        Requires an active layout (raises if called outside `forward()`
+        or an `active_layout` context). Construction is layout-side
+        data, not user-side compute, so no noise is applied.
+
+        Example:
+
+        ```
+        player_x = past.lookup(
+            query=PLAYER.one_hot(),
+            key_name="input.type",
+            value_name="input.x",
+        )
+        ```
+        """
+        from ..runtime.embedding import get_active_layout
+
+        layout = get_active_layout()
+        if not layout.has_type(self):
+            raise ValueError(
+                f"Token type {self.name!r} is not in the active vocab"
+            )
+        n_types = len(layout.types)
+        data = np.zeros(n_types, dtype=np.float64)
+        data[layout.type_columns[self.name]] = 1.0
+        return _make_vec(data, depth=0)
+
+    def check(self, input_vec: Vec) -> Vec:
+        """Method form of `is_type(input_vec, self)`.
+
+        Returns a 1-shape Vec: 1.0 if `input_vec`'s type is this
+        token type, 0.0 otherwise. `input_vec` must be a full
+        token-embedding Vec (width `layout.width`); passing the
+        narrower `input.type` slice raises a shape mismatch from
+        the underlying `is_type` call.
+
+        Adds depth +1.
+        """
+        return is_type(input_vec, self)
 
 
 @dataclass(frozen=True)
@@ -116,6 +192,51 @@ def make_token(token_type: TokenType, **slot_values: Vec) -> Vec:
         data[col] = float(slot_vec._data[0])
         max_input_depth = max(max_input_depth, slot_vec.depth)
     return _make_vec(data, depth=max_input_depth + 1)
+
+
+def extract_type_slot(
+    input_vec: Vec, token_type: TokenType, slot_name: str
+) -> Vec:
+    """Extract the value at the `(token_type, slot_name)` column from `input_vec`.
+
+    Returns a 1-shape Vec carrying the slot value. Auto-masks: when
+    the active input is a different type, the column is 0.0 (because
+    only the active type's slot columns hold values), so the returned
+    Vec is 0.0. Use this to read a slot at a specific type without
+    needing to multiply by `is_type` first.
+
+    Differs from `extract_int_slot` / `extract_float_slot`: those use
+    a flat slot-name namespace and sum across every type's column with
+    that name (returning whichever active type's value is set).
+    `extract_type_slot` reads exactly one specific `(type, slot)` column.
+
+    Raises if `token_type` isn't in the active vocab, or if it doesn't
+    declare the named slot.
+
+    Adds depth +1.
+    """
+    from ..runtime.embedding import get_active_layout
+
+    layout = get_active_layout()
+    if not layout.has_type(token_type):
+        raise ValueError(
+            f"Token type {token_type.name!r} is not in the active vocab"
+        )
+    canonical = layout.types_by_name[token_type.name]
+    if slot_name not in canonical.slots:
+        raise ValueError(
+            f"Token type {canonical.name!r} does not declare slot "
+            f"{slot_name!r}; declared slots: {list(canonical.slots)}"
+        )
+    if input_vec.shape != layout.width:
+        raise ValueError(
+            f"extract_type_slot expected a Vec of width {layout.width}, "
+            f"got shape {input_vec.shape}"
+        )
+    col = layout.slot_columns[(canonical.name, slot_name)]
+    value = float(input_vec._data[col])
+    data = np.array([value], dtype=np.float64)
+    return _make_vec(data, depth=input_vec.depth + 1)
 
 
 def extract_int_slot(input_vec: Vec, name: str) -> Vec:
