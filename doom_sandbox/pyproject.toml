@@ -1,0 +1,28 @@
+[project]
+name = "doom-sandbox"
+version = "0.1.0"
+description = "Constrained Python environment for designing DOOM-rendering algorithms before porting to a transformer."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pydantic>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+# All intra-sandbox imports are relative (`from .api import X`,
+# `from ..runtime.embedding import Y`), so the package's literal name
+# isn't baked into the source. We add `..` to sys.path so pytest can
+# import this directory as a package under whatever name it has on
+# disk. The directory name need only be a valid Python identifier
+# (letters, digits, underscores) — `doom_sandbox`, `mysandbox`,
+# `phase1_workspace`, etc. all work; a name with a dash like
+# `my-sandbox` does not.
+pythonpath = [".."]
