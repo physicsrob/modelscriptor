@@ -216,8 +216,8 @@ def render_footer_block(
 
     The footer is deliberately distribution-agnostic: it reports the worst
     observed abs and rel error across every distribution the op was measured
-    on. Project-specific context (DOOM callsites, distribution names) lives
-    in ``docs/numerical_noise.md``, not in the op's docstring.
+    on. Per-distribution context lives in ``docs/numerical_noise.md``, not
+    in the op's docstring.
     """
     body = indent + "   "
     rel_txt = "n/a" if _is_nan(max_rel_error) else _fmt(max_rel_error)

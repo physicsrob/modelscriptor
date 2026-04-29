@@ -355,11 +355,14 @@ one call:
                          d=2048, d_head=32, atol=500.0)
 
 **Interpreting `atol`.**  The tolerance must account for accumulated
-piecewise-linear approximation error through the graph.  For a
-shallow graph (few ops, small value range), `atol=1e-3` is
-appropriate.  For the DOOM renderer (deep op chains, values in the
-10^4 range), `atol=500` is the empirical floor — see the atol
-comment in `tests/debug/test_probe.py:test_probe_clean_on_v2_box_room`.
+piecewise-linear approximation error through the graph.  Both op-chain
+depth and value-range magnitude push the floor up: a shallow graph
+with values near 1 can use `atol=1e-3`; a deep chain operating on
+values in the `10^4` range may need `atol` of several hundred to
+absorb fp32 accumulation in the matmul-based residual writes.  Set it
+just above the largest legitimate divergence the oracle comparison
+should tolerate, and tighten it whenever you land a precision
+improvement.
 
 ## probe_residual — layer-by-layer node values
 

@@ -950,10 +950,9 @@ def compile_to_onnx(
 # In-process headless callable: a thin adapter over HeadlessTransformer.compute()
 # that presents the same (inputs) -> outputs interface as OnnxHeadlessModule.
 #
-# Used for dev-mode DOOM play and compiler-output tests that don't need an
-# ONNX round-trip.  For production inference, export with
-# compile_headless_to_onnx instead — that path streams weights and runs
-# under onnxruntime.
+# Used for compiler-output tests that don't need an ONNX round-trip.  For
+# production inference, export with compile_headless_to_onnx instead —
+# that path streams weights and runs under onnxruntime.
 # ---------------------------------------------------------------------------
 
 

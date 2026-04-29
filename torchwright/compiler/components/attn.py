@@ -18,8 +18,7 @@ from torchwright.graph.attn import CAUSAL_MASK_SENTINEL  # kept for compat
 # Why it matters here: cancel heads (V=identity, O=-identity) rely on
 # attn_out + skip = 0 algebraically.  A 1-LSB perturbation at q≈22855
 # leaves a ~1/512 leak in the residual column, which propagates through
-# the encoder and flips Gray-code bits at boundary q values — see
-# tests/doom/test_thinking_readback.py::test_emit_continuous_roundtrip.
+# the encoder and flips Gray-code bits at boundary q values.
 # Same shape applies to compute_linear (Linear emulated as self-attn).
 _SDPA_BACKEND = [SDPBackend.MATH]
 

@@ -1,10 +1,8 @@
 """Unit tests for piecewise_linear_2d.
 
-The 2D primitive had no dedicated tests — it was only exercised
-indirectly through the DOOM renderer tests.  These tests verify
-correctness in isolation: exact at grid points, bounded interpolation
-error, boundary clamping, non-uniform grids, and compiled-vs-oracle
-agreement via probe_graph.
+These tests verify correctness in isolation: exact at grid points,
+bounded interpolation error, boundary clamping, non-uniform grids, and
+compiled-vs-oracle agreement via probe_graph.
 """
 
 import math
