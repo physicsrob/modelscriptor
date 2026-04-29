@@ -113,19 +113,20 @@ and directory-level runs belong on Modal via `make test`.
 
 ## How Test Sharding Works
 
-`make test` runs the full suite across 4 independent A100 GPU containers
+`make test` runs the full suite across independent A100 GPU containers
 on Modal.  Each container runs a subset of tests with exclusive GPU access.
 
-**Why sharding?** The DOOM renderer tests call `compile_game(d=2048)` which
-builds a ~8GB transformer model on GPU.  Sharding gives each compiled-test
-file its own GPU so compilations run in parallel.
+**Why sharding?** Tests that compile large transformer modules on GPU
+can take tens of seconds each.  Sharding gives each heavy-test file
+its own GPU so compilations run in parallel.
 
 **How it's configured** (in `modal_test.py`):
 
-- `_HEAVY_FILES` — test files with large `compile_game()` calls get their
-  own container.
-- `_MEDIUM_FILE_GROUPS` — list of file lists; each inner list shares one
-  container.  Multiple medium groups keep no single shard from
+- `_HEAVY_FILES` — test files heavy enough to warrant their own
+  container.  Currently empty; populate when a heavy compiled-test
+  file is added.
+- `_MEDIUM_FILE_GROUPS` — list of file lists; each inner list shares
+  one container.  Multiple medium groups keep any single shard from
   dominating wall time.
 - Everything else goes into a catch-all shard automatically.
 
@@ -133,9 +134,8 @@ file its own GPU so compilations run in parallel.
 
 - New test files anywhere under `tests/` are picked up by the catch-all
   shard automatically.  No config changes needed.
-- If a new file calls `compile_game(d=2048)` and is slow enough to warrant
-  its own container, add it to `_HEAVY_FILES` or one of the
-  `_MEDIUM_FILE_GROUPS`.
+- If a new file is slow enough to warrant its own container, add it
+  to `_HEAVY_FILES` or one of the `_MEDIUM_FILE_GROUPS`.
 
 **When using `FILE=`**, sharding is bypassed — the file runs in a single
 container.  `-k` filters passed via `ARGS=` are applied to every shard.
@@ -147,20 +147,6 @@ Modal container orchestration overhead).
 
 Single file (`make test FILE=...`): depends on the file.
 - Fast tests (ops, compile/forward, graph): 10-30s
-- Compiled DOOM pipeline (test_pipeline.py): ~35-60s
-
-## Writing Tests That Use compile_game()
-
-Tests calling `compile_game()` are expensive (~17s to compile, ~2s per
-`step_frame` inference on A100).  Follow these patterns:
-
-1. **Use class-scoped fixtures** to share the compiled module across tests
-   in the same class.  See `TestPipeline` in `tests/doom/test_pipeline.py`
-   for an example.
-
-2. **Don't pass `device="cpu"`** to `compile_headless()` or `compile_game()`.
-   The default is `"auto"` which uses GPU when available.  Forcing CPU will
-   make inference ~8x slower.
 
 ## When full-suite tests fail but `-k` passes
 
