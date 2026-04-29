@@ -51,32 +51,9 @@ test-local:
 	fi
 	uv run pytest $(FILE) $(ARGS)
 
-.PHONY: graph-stats
-graph-stats:
-	uv run python graph_stats.py $(ARGS)
-
 .PHONY: measure-noise
 measure-noise:
 	uv run python -m scripts.measure_op_noise $(ARGS)
-
-.PHONY: walkthrough
-walkthrough:
-	@bash -c ' \
-		LOGFILE=/tmp/torchwright-walkthrough-$$(date +%Y%m%d-%H%M%S).log ; \
-		ln -sfn "$$LOGFILE" /tmp/torchwright-walkthrough.log ; \
-		echo "=== Log file: $$LOGFILE ===" | tee "$$LOGFILE" ; \
-		echo "=== Rendering walkthrough on Modal ===" | tee -a "$$LOGFILE" ; \
-		start=$$(date +%s) ; \
-		uv run modal run modal_walkthrough.py $(ARGS) 2>&1 | tee -a "$$LOGFILE" ; \
-		rc=$${PIPESTATUS[0]} ; \
-		end=$$(date +%s) ; \
-		echo "" | tee -a "$$LOGFILE" ; \
-		echo "=== Finished in $$((end - start))s (exit $$rc) ===" | tee -a "$$LOGFILE" ; \
-		echo "=== Log file: $$LOGFILE ===" | tee -a "$$LOGFILE" ; \
-		exit $$rc \
-	'
-	xdg-open walkthrough.gif
-	xdg-open reference.gif
 
 .PHONY: modal-run
 modal-run:
