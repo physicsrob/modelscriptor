@@ -200,7 +200,7 @@ def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
     assert layer_d_head >= node.d_qk, (
         f"d_head={layer_d_head} is too small for Attn node "
         f"'{node.name}' which needs d_qk={node.d_qk} for Q/K. "
-        f"Use d_head>={node.d_qk} or let compile_game auto-size it."
+        f"Pass d_head>={node.d_qk} to compile_headless()."
     )
 
     # Q/K are shared across all V/O chunk heads, padded to layer d_head
