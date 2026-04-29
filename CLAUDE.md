@@ -165,15 +165,13 @@ Tests calling `compile_game()` are expensive (~17s to compile, ~2s per
 ## When full-suite tests fail but `-k` passes
 
 A test that passes under `make test FILE=... ARGS="-k foo"` but fails when
-the full `tests/doom/` suite runs is almost always cross-test GPU state —
-cuBLAS algorithm cache biased by prior allocations, tensor-cache warmup,
-or scheduler nondeterminism — not a logic bug in the failing test. The
+the full suite runs is almost always cross-test GPU state — cuBLAS
+algorithm cache biased by prior allocations, tensor-cache warmup, or
+scheduler nondeterminism — not a logic bug in the failing test. The
 diagnostic signature is an allocator-sensitive compute path or a
 tolerance-boundary flake (see *FP nondeterminism at tolerance boundaries*
 under *Debugging compiled graphs*). Investigate the ops on the failing
 codepath, not the test.
-
-Worked example: `docs/postmortems/angle_210_overlay_reserve.md` §2.
 
 # Numerical noise
 
@@ -479,10 +477,6 @@ changes).  Full-suite-only test regressions (passes under `-k`,
 fails in the full suite) are the most common way this bites; see
 *When full-suite tests fail but `-k` passes* under *Testing*.
 
-Worked example: `_VIS_C_TOL = 0.01` in
-`torchwright/doom/stages/wall.py`, widened from the default
-`0.005`.  See `docs/postmortems/angle_210_overlay_reserve.md` §2.
-
 ## Triage sequence for wrong output
 
 1. **`compiled(inputs, debug=True)`** — does the self-consistency
@@ -524,11 +518,10 @@ implementation.
 
 # Doctrine
 
-The DOOM renderer project has a recurring failure mode: ship a
-99%-working thing, build on top, and have the 1% bite later. The
-rules below exist to defeat that pattern. They constrain how to
-investigate, what to ship, what to defer, and what to write in
-xfail reasons.
+The doctrine below exists to defeat a recurring failure mode in
+compiler work: ship a 99%-working thing, build on top, and have
+the 1% bite later. The rules below constrain how to investigate,
+what to ship, what to defer, and what to write in xfail reasons.
 
 ## D1 — Suspected-compiler-bug protocol
 
@@ -543,14 +536,6 @@ stated compiler invariant.
 **Why.** Routing around a compiler bug leaves a landmine for the
 next user. Every "I packed it differently and the bug went away"
 fix is one we'll re-encounter, harder to debug, somewhere else.
-
-**Worked example.** Phase E (commit `c2d5a7a`) attempted three
-rounds of routing around suspected residual-column overlap by
-reshaping user code (separate output → packed payload →
-packed-but-narrow-extract).  None resolved the root cause; the bug
-surfaced again as the (3, 2, 20) xfail.  Eventually fixed by a
-root-cause precision tightening (commit `2e6f5da`) — see
-`docs/postmortems/phase_e_xfail.md` for the full arc.
 
 **Escalation.** Inform the user immediately with the specific
 trigger that fired and ask for guidance.  Do not proceed with
@@ -572,15 +557,6 @@ look like understanding.
 tomorrow's assumed explanation, and the real bug grows another
 layer of camouflage.
 
-**Worked example.** The Phase E xfail was shipped with the reason
-*"likely due to compile-side precision loss in the per-wall
-is_renderable gate at geometry that lands near the
-attention-edge-of-view."* That explanation was a guess wearing the
-costume of an investigation — the actual root cause (fp32 precision
-compounding driven by an overly-loose declared output range on
-`piecewise_linear_2d`) sat undiscovered until someone eventually ran
-the oracle probe.  See `docs/postmortems/phase_e_xfail.md`.
-
 **Tooling.** `torchwright/debug/probe.py` runs a compiled module
 side-by-side with the recursive graph oracle and reports the first
 node whose compiled value diverges.  Use it as the first step on
@@ -601,10 +577,10 @@ missing, add it.
 **Why.** Compressing the cause to one sentence is the diagnostic.
 If the sentence won't compress, the cause isn't known yet.
 
-**Worked example.** The Phase E xfail reason wraps three hedged
-conjunctions into one sentence ("likely … near … under …").  That
-*and-of-maybes* structure is the warning sign — when only an
-and-of-maybes will fit, the sentence is hiding ignorance.
+**Worked example.** "Likely X near Y under Z" — three hedged
+conjunctions in one sentence. That *and-of-maybes* structure is
+the warning sign: when only an and-of-maybes will fit, the
+sentence is hiding ignorance.
 
 ## D4 — Foundation rule
 
@@ -616,15 +592,6 @@ N+1, not a footnote.
 cost of going back.  Downstream changes pile up against the
 unfixed anomaly and turn what would have been a local fix into a
 re-architecture.
-
-**Worked example.** The Phase E xfail was shipped to unblock
-downstream phases on the theory that the real cause could be
-chased later.  By the time someone went back to root-cause it,
-the SORTED above-threshold primitive had acquired more callers —
-the fix landed cleanly (commit `2e6f5da`) but only because the
-root cause turned out to be in `piecewise_linear_2d`'s declared
-range, not in SORTED itself.  Had it been in SORTED, every
-downstream user would have needed re-validation.
 
 ## D5 — xfail hygiene
 
@@ -645,13 +612,6 @@ evidence and no follow-up.
 trap.  The next contributor reads the reason, takes it as an
 explanation, and stops looking.
 
-**Worked example.** The Phase E xfail shipped with the
-unacceptable form (see D2).  It was eventually resolved by a
-root-cause fix (commit `2e6f5da`) rather than by rewriting the
-xfail reason — but the interim cost was a trap reason sitting in
-the test file that anyone reading it would have taken as
-explanation.
-
 **Tooling.** `torchwright/debug/probe.py` is what you use to
 convert form 2 into form 1.
 
@@ -667,12 +627,6 @@ layer; this rule applies to behavior bugs.)
 **Why.** Integration tests that catch bugs are slow, indirect,
 and easily broken by unrelated changes.  Smallest repros are
 fast, direct, and survive refactors.
-
-**Worked example.** Phase E's (3, 2, 20) regression surfaced as a
-render test (slow, system-level).  The smallest repro was a
-SORTED-stage call to `attend_argmin_above_integer` with the
-specific `indicators_above` input that fails to concentrate — a
-stage-level unit test, not a render test.
 
 **Tooling.** `torchwright/debug/probe.py` to identify which
 layer / which node / which inputs reproduce the bug; `make
@@ -690,11 +644,6 @@ update it too.
 assumptions.  If `compare`'s bound moves from 1e-3 to 5e-3
 silently, every downstream stage that budgeted against 1e-3 is
 now over-budget without anyone knowing.
-
-**Worked example.** Phase E raised `_ABOVE_BONUS` from 100 to
-1000 to give the SORTED softmax more headroom.  That changes the
-piecewise softmax's effective working range and may change its
-measured error bound.  Neither was re-measured at the time.
 
 **Tooling.** `docs/op_noise_data.json` is the canonical source;
 `docs/numerical_noise.md` and per-op docstring footers are
