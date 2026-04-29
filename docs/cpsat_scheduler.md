@@ -57,8 +57,6 @@ fewer layers).
 - `torchwright/compiler/forward/compile.py` — adds the `optimize`
   level kwarg to `forward_compile` and the warm-start probe that
   feeds CP-SAT a complete heuristic hint.
-- `scripts/cpsat_schedule.py` — probe script for ad-hoc Pareto
-  exploration. Imports from the production module.
 
 ### Data flow
 

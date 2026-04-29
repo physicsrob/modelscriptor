@@ -21,10 +21,9 @@ Public API:
   distinguishes proven-optimal from feasible-only.  Raises only on
   graph-precondition violations (see ``docs/cpsat_scheduler.md`` §3).
 
-Callers (``forward_compile``, ``scripts/cpsat_schedule.py``) decide
-how to handle non-optimal / no-solution outcomes — the forward
-compiler falls back to the heuristic schedule, the probe script
-reports the gap.
+Callers (``forward_compile``) decide how to handle non-optimal /
+no-solution outcomes — the forward compiler falls back to the
+heuristic schedule.
 """
 
 from __future__ import annotations
