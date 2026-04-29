@@ -167,12 +167,12 @@ is the canonical source; `docs/numerical_noise.md` and the per-op docstring
 footers are **generated** from that JSON. Never edit them by hand.
 
 Commentary on the measurements — which numbers are by design, which deserve
-investigation, and which DOOM call-sites each distribution covers — lives in
-`docs/numerical_noise_findings.md`. That file is **hand-written and is
-Claude's responsibility to keep current**. The measurement pipeline does not
-regenerate it and the consistency test does not enforce it; synthesizing
-findings from the raw numbers is an interpretive task that belongs to the
-agent running the workflow, not to the script.
+investigation — lives in `docs/numerical_noise_findings.md`. That file is
+**hand-written and is Claude's responsibility to keep current**. The
+measurement pipeline does not regenerate it and the consistency test does
+not enforce it; synthesizing findings from the raw numbers is an
+interpretive task that belongs to the agent running the workflow, not to
+the script.
 
 Specifically, whenever you run `make measure-noise` — whether because you
 added an op, edited one, or widened a distribution — you must:
@@ -183,8 +183,6 @@ added an op, edited one, or widened a distribution — you must:
    entry in `docs/numerical_noise_findings.md` or add a new one.
 3. Remove findings that no longer apply (e.g., if a bound is tightened and
    the previously-flagged number is now within expectations).
-4. Keep the call-site cross-reference table in sync when you add, rename, or
-   remove a `doom_*` distribution.
 
 Regenerate the auto-artefacts with:
 

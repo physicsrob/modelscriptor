@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "commit": "3829b69",
-  "measured_at": "2026-04-26",
+  "commit": "c234ba4",
+  "measured_at": "2026-04-29",
   "ops": [
     {
       "name": "abs",
@@ -289,7 +289,7 @@
       "distributions": [
         {
           "name": "linear_bin_index_tex_col_16",
-          "description": "16-bin quantisation of x ∈ [0, 64] with x_min=0, x_max=64 — mirrors texture-column bucketing in the RENDER stage.",
+          "description": "16-bin quantisation of x ∈ [0, 64] with x_min=0, x_max=64.",
           "n_samples": 4096,
           "max_abs_error": 1.0,
           "mean_abs_error": 0.0630863,
@@ -371,8 +371,8 @@
       "notes": "Rank-3 SVD of `atan(cross/dot)` on a non-uniform grid. Worst-cell error is bounded by σ_{K+1}, the first truncated singular value — verify against the SVD computed in `tests/ops/test_low_rank_2d.py:100`.",
       "distributions": [
         {
-          "name": "doom_atan_cross_dot",
-          "description": "atan2(cross/dot) over [-2, 2] × [0.5, 10] on non-uniform grid — mirrors the `atan_front_*` callsite at `torchwright/doom/stages/sorted.py:549` (rank-3 SVD).",
+          "name": "atan_cross_dot_nonuniform",
+          "description": "atan2(cross/dot) over [-2, 2] × [0.5, 10] on a non-uniform grid — rank-3 SVD via `low_rank_2d`.",
           "n_samples": 4096,
           "max_abs_error": 0.0651017,
           "mean_abs_error": 0.0158553,
@@ -530,8 +530,8 @@
       "notes": "Triangulated-grid lookup with non-uniform breakpoints. On non-uniform grids `piecewise_linear_2d` uses a constrained least-squares fit that can oscillate in cell interiors — `low_rank_2d` is preferred there.",
       "distributions": [
         {
-          "name": "doom_diff_trig",
-          "description": "wall-geometry product over DIFF_BP × TRIG_BP — mirrors the `sort_ey_cos`/`sort_ex_sin` family of calls at `torchwright/doom/stages/thinking_wall.py:1115` and neighbours.",
+          "name": "diff_trig_nonuniform",
+          "description": "Two-input product over DIFF_BP × TRIG_BP — DIFF in [-40, 40] (non-uniform), TRIG in [-1, 1] (non-uniform).",
           "n_samples": 4096,
           "max_abs_error": 7.77784,
           "mean_abs_error": 1.30067,
@@ -546,8 +546,8 @@
           }
         },
         {
-          "name": "doom_diff_vel",
-          "description": "collision product over DIFF_BP × VEL_BP — mirrors the `p_dx_ey`/`p_dy_ex` family at `torchwright/doom/stages/thinking_wall.py:1014`.",
+          "name": "diff_vel_nonuniform",
+          "description": "Two-input product over DIFF_BP × VEL_BP — DIFF in [-40, 40] (non-uniform), VEL in [-0.7, 0.7] (non-uniform).",
           "n_samples": 4096,
           "max_abs_error": 5.44453,
           "mean_abs_error": 0.93746,
@@ -566,11 +566,11 @@
     {
       "name": "reciprocal",
       "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Geometric breakpoint spacing keeps relative interpolation error roughly constant across the range. Measured against a reciprocal graph whose `(min_value, max_value, step)` matches its production callsite: `(0.3, 200.0, 1.0)` for `doom_reciprocal_wall` (`torchwright/doom/stages/wall.py:431`).",
+      "notes": "Geometric breakpoint spacing keeps relative interpolation error roughly constant across the range. Measured against a reciprocal graph with `(min_value, max_value, step) = (0.3, 200.0, 1.0)`.",
       "distributions": [
         {
-          "name": "doom_reciprocal_wall",
-          "description": "1/x over [0.3, 200.0], step=1.0 — mirrors the `inv_abs_num_t` callsite at `torchwright/doom/stages/wall.py:339`.",
+          "name": "reciprocal_03_200",
+          "description": "1/x over [0.3, 200.0], step=1.0.",
           "n_samples": 4096,
           "max_abs_error": 0.000913722,
           "mean_abs_error": 0.000126387,

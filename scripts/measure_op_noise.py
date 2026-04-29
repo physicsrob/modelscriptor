@@ -377,9 +377,9 @@ def _bin_index_distribution(
     )
 
 
-# Non-uniform breakpoint tables that mirror DOOM pipeline configurations. Kept
-# small so the script stays fast; production configurations have dozens more
-# breakpoints but the measurement is representative.
+# Non-uniform breakpoint tables for representative 2D op measurements. Kept
+# small so the script stays fast; production configurations may use dozens
+# more breakpoints but the measurement is representative.
 _DIFF_BP = [-40.0, -20.0, -10.0, -5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0]
 _TRIG_BP = [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0]
 _VEL_BP = [-0.7, -0.35, -0.1, 0.0, 0.1, 0.35, 0.7]
@@ -390,26 +390,20 @@ _ATAN_BP_DOT = [0.5, 1.0, 2.0, 5.0, 10.0]
 def _distributions() -> Dict[str, InputDistribution]:
     """All named input distributions, keyed by name."""
     return {
-        "doom_reciprocal_wall": _uniform_1d(
-            "doom_reciprocal_wall",
-            (
-                "1/x over [0.3, 200.0], step=1.0 — mirrors the "
-                "`inv_abs_num_t` callsite at `torchwright/doom/stages/wall.py:339`."
-            ),
+        "reciprocal_03_200": _uniform_1d(
+            "reciprocal_03_200",
+            "1/x over [0.3, 200.0], step=1.0.",
             0.3,
             200.0,
         ),
-        # NOTE: `doom_reciprocal_sorted` is defined here for future use but
+        # NOTE: `reciprocal_01_50_step01` is defined here for future use but
         # is currently not referenced by any TargetOp — see the NOTE on the
         # `reciprocal` TargetOp for the op-math precision mismatch that
-        # blocks it, and the "Known gap: reciprocal sorted callsite" entry
+        # blocks it, and the "Known gap: reciprocal at step=0.1" entry
         # in `docs/numerical_noise_findings.md`.
-        "doom_reciprocal_sorted": _uniform_1d(
-            "doom_reciprocal_sorted",
-            (
-                "1/x over [0.1, 50.0], step=0.1 — mirrors the "
-                "`inv_denom_abs` callsite at `torchwright/doom/stages/wall.py:813`."
-            ),
+        "reciprocal_01_50_step01": _uniform_1d(
+            "reciprocal_01_50_step01",
+            "1/x over [0.1, 50.0], step=0.1.",
             0.1,
             50.0,
         ),
@@ -484,21 +478,19 @@ def _distributions() -> Dict[str, InputDistribution]:
             -10.0,
             10.0,
         ),
-        "doom_diff_trig": _uniform_2d(
-            "doom_diff_trig",
-            "wall-geometry product over DIFF_BP × TRIG_BP — mirrors the "
-            "`sort_ey_cos`/`sort_ex_sin` family of calls at "
-            "`torchwright/doom/stages/thinking_wall.py:1115` and neighbours.",
+        "diff_trig_nonuniform": _uniform_2d(
+            "diff_trig_nonuniform",
+            "Two-input product over DIFF_BP × TRIG_BP — DIFF in [-40, 40] "
+            "(non-uniform), TRIG in [-1, 1] (non-uniform).",
             -40.0,
             40.0,
             -1.0,
             1.0,
         ),
-        "doom_diff_vel": _uniform_2d(
-            "doom_diff_vel",
-            "collision product over DIFF_BP × VEL_BP — mirrors the "
-            "`p_dx_ey`/`p_dy_ex` family at "
-            "`torchwright/doom/stages/thinking_wall.py:1014`.",
+        "diff_vel_nonuniform": _uniform_2d(
+            "diff_vel_nonuniform",
+            "Two-input product over DIFF_BP × VEL_BP — DIFF in [-40, 40] "
+            "(non-uniform), VEL in [-0.7, 0.7] (non-uniform).",
             -40.0,
             40.0,
             -0.7,
@@ -514,11 +506,10 @@ def _distributions() -> Dict[str, InputDistribution]:
             -10.0,
             10.0,
         ),
-        "doom_atan_cross_dot": _uniform_2d(
-            "doom_atan_cross_dot",
-            "atan2(cross/dot) over [-2, 2] × [0.5, 10] on non-uniform grid — "
-            "mirrors the `atan_front_*` callsite at "
-            "`torchwright/doom/stages/sorted.py:549` (rank-3 SVD).",
+        "atan_cross_dot_nonuniform": _uniform_2d(
+            "atan_cross_dot_nonuniform",
+            "atan2(cross/dot) over [-2, 2] × [0.5, 10] on a non-uniform "
+            "grid — rank-3 SVD via `low_rank_2d`.",
             -2.0,
             2.0,
             0.5,
@@ -540,8 +531,8 @@ def _distributions() -> Dict[str, InputDistribution]:
         ),
         "compare_near_thresh_05": _near_threshold_1d(
             "compare_near_thresh_05",
-            "Samples within ±0.3 of threshold 0.5 — matches BSP-side-bit "
-            "callsites at `torchwright/doom/stages/wall.py:386`.",
+            "Samples within ±0.3 of threshold 0.5 — measures compare's "
+            "ramp accuracy at a non-zero threshold.",
             0.5,
             0.3,
         ),
@@ -575,8 +566,7 @@ def _distributions() -> Dict[str, InputDistribution]:
         ),
         "linear_bin_index_tex_col_16": _bin_index_distribution(
             "linear_bin_index_tex_col_16",
-            "16-bin quantisation of x ∈ [0, 64] with x_min=0, x_max=64 — "
-            "mirrors texture-column bucketing in the RENDER stage.",
+            "16-bin quantisation of x ∈ [0, 64] with x_min=0, x_max=64.",
             x_min_val=0.0,
             x_max_val=64.0,
         ),
@@ -673,23 +663,21 @@ def _target_ops() -> List[TargetOp]:
                 nodes["x"], min_value=0.3, max_value=200.0, step=1.0
             ),
             reference_fn=lambda inputs: 1.0 / inputs["x"],
-            # NOTE: `doom_reciprocal_sorted` is temporarily omitted. Its
-            # production callsite (`torchwright/doom/stages/wall.py:813`) uses
-            # `step=0.1`, which produces ~500 breakpoints; float32 accumulation
+            # NOTE: `reciprocal_01_50_step01` is temporarily omitted. With
+            # `step=0.1`, it produces ~500 breakpoints; float32 accumulation
             # across that many ReLU terms exceeds `piecewise_linear`'s declared
             # `atol=1e-3` at the tail. This is an op-math precision-claim
             # mismatch, not a measurement issue — see the "Known gap: reciprocal
-            # sorted callsite" entry in `docs/numerical_noise_findings.md`. Once
-            # the op-math fix lands, restore `doom_reciprocal_sorted` here with
+            # at step=0.1" entry in `docs/numerical_noise_findings.md`. Once
+            # the op-math fix lands, restore `reciprocal_01_50_step01` here with
             # a `build_graphs_per_distribution` entry using
             # `reciprocal(nodes["x"], min_value=0.1, max_value=50.0, step=0.1)`.
-            distribution_names=("doom_reciprocal_wall",),
+            distribution_names=("reciprocal_03_200",),
             notes=(
                 "Geometric breakpoint spacing keeps relative interpolation error "
                 "roughly constant across the range. Measured against a "
-                "reciprocal graph whose `(min_value, max_value, step)` matches "
-                "its production callsite: `(0.3, 200.0, 1.0)` for "
-                "`doom_reciprocal_wall` (`torchwright/doom/stages/wall.py:431`)."
+                "reciprocal graph with "
+                "`(min_value, max_value, step) = (0.3, 200.0, 1.0)`."
             ),
         ),
         TargetOp(
@@ -864,7 +852,7 @@ def _target_ops() -> List[TargetOp]:
                 rank=3,
             ),
             reference_fn=lambda inputs: torch.atan(inputs["a"] / inputs["b"]),
-            distribution_names=("doom_atan_cross_dot",),
+            distribution_names=("atan_cross_dot_nonuniform",),
             notes=(
                 "Rank-3 SVD of `atan(cross/dot)` on a non-uniform grid. "
                 "Worst-cell error is bounded by σ_{K+1}, the first truncated "
@@ -885,7 +873,7 @@ def _target_ops() -> List[TargetOp]:
                 fn=lambda x, y: x * y,
             ),
             reference_fn=lambda inputs: inputs["a"] * inputs["b"],
-            distribution_names=("doom_diff_trig", "doom_diff_vel"),
+            distribution_names=("diff_trig_nonuniform", "diff_vel_nonuniform"),
             notes=(
                 "Triangulated-grid lookup with non-uniform breakpoints. On "
                 "non-uniform grids `piecewise_linear_2d` uses a constrained "
@@ -1290,16 +1278,16 @@ def render_markdown(data: Dict) -> str:
     lines.append(
         "Every piecewise-linear op in `torchwright/ops/` is measured on one or more"
     )
-    lines.append("named input distributions that mirror its production use in")
+    lines.append("named input distributions characterising its expected input ranges.")
     lines.append(
-        "`torchwright/doom/`. The canonical data lives in `docs/op_noise_data.json`;"
+        "The canonical data lives in `docs/op_noise_data.json`; this file is"
     )
-    lines.append("this file is regenerated from that JSON by `make measure-noise`.")
+    lines.append("regenerated from that JSON by `make measure-noise`.")
     lines.append("")
     lines.append(
         "For commentary on the numbers — which are expected, which warrant "
-        "investigation — and for the DOOM call-site cross-reference, see the "
-        "hand-written `docs/numerical_noise_findings.md`."
+        "investigation — see the hand-written "
+        "`docs/numerical_noise_findings.md`."
     )
     lines.append("")
     lines.append("## Summary")
