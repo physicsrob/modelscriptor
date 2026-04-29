@@ -232,42 +232,6 @@ To add a new op, append a `TargetOp(...)` to `_target_ops()` in
 `scripts/measure_op_noise.py`. See the "Adding a new op" section at the end
 of `docs/numerical_noise.md` for the full pattern.
 
-# Walkthrough
-
-## Rendering a Walkthrough
-
-Use `make walkthrough` to compile the DOOM game graph on a Modal A100 and
-generate a GIF walkthrough.  This produces both a transformer-rendered
-`walkthrough.gif` and a reference-rendered `reference.gif`, then opens
-the walkthrough GIF.
-
-    # Render 10 frames (default)
-    make walkthrough
-
-    # Render a specific number of frames
-    make walkthrough ARGS="--frames 5"
-
-    # Use the multi-room scene instead of the default box room
-    make walkthrough ARGS="--scene multi"
-
-    # Combine options
-    make walkthrough ARGS="--frames 20 --scene multi"
-
-All flags (`--width`, `--height`, `--fps`, `--scale`, `--d`, `--d-head`,
-`--rows-per-patch`, `--tex-size`) are passed through via `ARGS=`.
-
-## Critical Rules
-
-- NEVER pipe `make walkthrough` or `make graph-stats` through `tail`,
-  `head`, or any other output-truncating filter.  The user always
-  wants to see the full output.
-- NEVER re-run `make walkthrough` just because you lost output (e.g.
-  you piped through `| tail -10` and now want to grep).  If the code
-  hasn't changed, the previous run's full output is in the log file —
-  `make walkthrough` prints its path at the start and end, and
-  `/tmp/torchwright-walkthrough.log` symlinks to the latest run.
-  Grep that file instead of spending another render cycle.
-
 # Running scripts on GPU
 
 **If a script needs a GPU, run it on Modal via `make modal-run`.**
@@ -291,9 +255,6 @@ against.
 
 - **Tests** — use `make test`.  Its sharding + mutex + log-file
   plumbing is not reproduced by `modal-run`.
-- **Walkthrough renders** — use `make walkthrough`.  It syncs GIF
-  bytes back to the local working tree, which `modal-run` does not
-  do.
 - **Scripts that produce local artifacts** (GIFs, JSON files under
   `docs/`, etc.).  `modal-run` captures stdout/stderr only; anything
   the script writes to disk stays on the Modal worker.  If your
