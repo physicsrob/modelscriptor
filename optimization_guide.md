@@ -6,10 +6,15 @@ compiler are small and readable (`torchwright/compiler/forward/`);
 read the source when a detail matters.
 
 This guide is deliberately light on specific numbers — the graph and
-compiler evolve, and quantitative snapshots go stale. Run
-`make graph-stats` for current per-annotation costs, layer counts,
-and critical-path targets; this doc is for the concepts behind those
-numbers.
+compiler evolve, and quantitative snapshots go stale. References below
+to `make graph-stats` describe a per-annotation/per-stage diagnostic
+that was removed from this repo in Step E (it shipped together with
+the DOOM renderer and now lives in the sibling `torchwright_doom`
+repo). The principles still apply to any compiled graph; replicate
+the diagnostic from the verbose `compile_headless` output, or pull the
+original implementation from the sibling repo if you need it. The
+DOOM-anchored worked examples in this doc are illustrative — they
+preserve the original numbers that informed each rule of thumb.
 
 ---
 
@@ -580,9 +585,8 @@ layers indicate a wide intermediate living too long.
 `torchwright/debug/probe.py` runs the compiled module side-by-side
 with a recursive oracle evaluator for a single position and reports
 the first divergence. Run it after any graph restructuring. For
-multi-position / autoregressive behaviour, the golden-frame test
-(`make walkthrough`) or the relevant test file under `tests/doom/`
-is the authoritative check.
+multi-position / autoregressive behaviour, the test suite (`make
+test`) is the authoritative check.
 
 ### Attribute layer count to a subsystem
 
