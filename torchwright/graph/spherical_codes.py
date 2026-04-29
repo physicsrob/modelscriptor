@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 
 
@@ -15,7 +17,14 @@ def load_spherical_codes(filename):
     return tensor
 
 
-spherical_codes = 10.0 * load_spherical_codes("E8.8.1024.txt")
+# Locate E8.8.1024.txt regardless of cwd. The repo-root path (parent.parent.parent
+# from this file) covers workspace and standalone clones; the bare filename
+# fallback covers Modal, where the file is staged at cwd via add_local_file.
+_E8_FILENAME = "E8.8.1024.txt"
+_E8_AT_SOURCE = Path(__file__).resolve().parent.parent.parent / _E8_FILENAME
+spherical_codes = 10.0 * load_spherical_codes(
+    str(_E8_AT_SOURCE) if _E8_AT_SOURCE.exists() else _E8_FILENAME
+)
 
 
 def get_spherical_codes(d: int, max_index: int = 1024):
