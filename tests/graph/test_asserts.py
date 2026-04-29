@@ -626,8 +626,7 @@ def test_picked_from_returns_result_width():
 #
 # assert_picked_from's predicate is still covered by the unit tests
 # above (accepts_clean_pick, rejects_blend, rejects_no_valid_keys,
-# accepts_duplicate_valid_values), and its production usage is
-# exercised by torchwright/doom/stages/sorted.py + tests/doom/.
+# accepts_duplicate_valid_values).
 
 
 # ---------------------------------------------------------------------------

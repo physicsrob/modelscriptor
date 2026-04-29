@@ -25,24 +25,13 @@ app = modal.App("torchwright-test", image=IMAGE)
 # own container; everything else is batched together.
 # New test files are caught by the catch-all shard automatically.
 
-_HEAVY_FILES = [
-    "tests/doom/test_rollout.py",
-    "tests/doom/test_rollout_walkthrough.py",
-    "tests/doom/test_rollout_e1m1.py",
-    "tests/doom/test_frame_match.py",
-    "tests/doom/test_affine_bounds.py",
-]
+_HEAVY_FILES: list[str] = []
 
 # Each inner list becomes one container.  Splitting medium files across
 # multiple groups keeps any single shard from dominating wall time.
 _MEDIUM_FILE_GROUPS: list[list[str]] = [
     [
         "tests/debug/test_probe.py",
-        "tests/doom/test_parametric_intersection.py",
-        "tests/doom/test_render_graph_precision.py",
-    ],
-    [
-        "tests/doom/test_wad_maps.py",
         "tests/compile/forward/test_sort_digits.py",
         "tests/ops/test_resampling_primitives.py",
     ],
