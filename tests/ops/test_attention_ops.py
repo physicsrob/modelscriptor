@@ -1096,3 +1096,86 @@ def test_most_recent_matching_value_wider_than_d_pos():
     assert torch.allclose(result[0], value_in[0], atol=1e-2)
     assert torch.allclose(result[1], value_in[0], atol=1e-2)
     assert torch.allclose(result[2], value_in[2], atol=1e-2)
+
+
+def test_most_recent_matching_exclude_self():
+    """``exclude_self=True`` skips the current query position even when
+    its own key matches — picking the most recent matching position
+    strictly before self.
+
+    Setup: every position queries type 0; positions 0, 2, 3 are
+    type-0 keys (matches) and position 1 is type 1 (no match).
+
+    Default (exclude_self=False) behaviour:
+        pos 1 → match at pos 0  → value 10
+        pos 2 → match at pos 2  → value 30   (self matches)
+        pos 3 → match at pos 3  → value 40   (self matches)
+
+    With exclude_self=True the head shifts key/value back by one, so
+    self can no longer contribute and the predecessor's value is
+    returned at the rightmost slot:
+        pos 1 → predecessor of pos 1 is pos 0 (match) → value 10
+        pos 2 → predecessor of pos 2 is pos 1 (no match); next
+                most-recent match below self is pos 0      → value 10
+        pos 3 → predecessor of pos 3 is pos 2 (match)      → value 30
+    Position 0 is degenerate under the shift (no prior position exists)
+    and is not asserted.
+    """
+    pe = _pe()
+    query = InputNode("query", 4, value_range=(-1.0, 1.0))
+    key = InputNode("key", 4, value_range=(-1.0, 1.0))
+    value = InputNode("value", 1, value_range=(-100.0, 100.0))
+
+    out_default = attend_most_recent_matching(pe, query, key, value)
+    out_excl = attend_most_recent_matching(pe, query, key, value, exclude_self=True)
+
+    n_pos = 4
+    # types per position: 0, 1, 0, 0 — positions 0, 2, 3 match type 0.
+    key_in = torch.eye(4)[torch.tensor([0, 1, 0, 0])]
+    # All queries look for type 0.
+    query_in = torch.eye(4)[torch.tensor([0, 0, 0, 0])]
+    value_in = torch.tensor([[10.0], [20.0], [30.0], [40.0]])
+
+    result_default = _run(out_default, n_pos, query=query_in, key=key_in, value=value_in)
+    result_excl = _run(out_excl, n_pos, query=query_in, key=key_in, value=value_in)
+
+    # Sanity: default mode picks self when self matches.
+    assert abs(result_default[1].item() - 10.0) < 1e-2, result_default[1]
+    assert abs(result_default[2].item() - 30.0) < 1e-2, result_default[2]
+    assert abs(result_default[3].item() - 40.0) < 1e-2, result_default[3]
+
+    # exclude_self mode: self's match doesn't count; we get the most
+    # recent strict-prior match instead.
+    assert abs(result_excl[1].item() - 10.0) < 1e-2, result_excl[1]
+    assert abs(result_excl[2].item() - 10.0) < 1e-2, result_excl[2]
+    assert abs(result_excl[3].item() - 30.0) < 1e-2, result_excl[3]
+
+
+def test_most_recent_matching_exclude_self_width_constraint():
+    """``exclude_self=True`` requires ``len(value) <= d_pos`` and
+    ``len(key_vector) <= d_pos`` because each pre-shift compiles to a
+    single attention head whose width is bounded by ``d_pos``.  The
+    default mode has no such limit.
+    """
+    import pytest
+
+    pe = _pe()  # d_pos = 16
+    query = InputNode("query", 4, value_range=(-1.0, 1.0))
+    key = InputNode("key", 4, value_range=(-1.0, 1.0))
+    wide_value = InputNode("value", 24, value_range=(-100.0, 100.0))
+
+    # Default mode accepts width 24 > d_pos = 16.
+    attend_most_recent_matching(pe, query, key, wide_value)
+
+    # exclude_self mode rejects it.
+    with pytest.raises(AssertionError, match="value width"):
+        attend_most_recent_matching(pe, query, key, wide_value, exclude_self=True)
+
+    # Symmetric check on key width.
+    wide_query = InputNode("query", 24, value_range=(-1.0, 1.0))
+    wide_key = InputNode("key", 24, value_range=(-1.0, 1.0))
+    narrow_value = InputNode("value", 1, value_range=(-100.0, 100.0))
+    with pytest.raises(AssertionError, match="key_vector width"):
+        attend_most_recent_matching(
+            pe, wide_query, wide_key, narrow_value, exclude_self=True
+        )

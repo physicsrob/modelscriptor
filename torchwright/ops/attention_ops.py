@@ -1011,6 +1011,7 @@ def attend_most_recent_matching(
     value: Node,
     *,
     match_gain: float = 200.0,
+    exclude_self: bool = False,
     assert_hardness_gt: Optional[float] = None,
 ) -> Node:
     """Attend to the **most recent** key position whose ``key_vector``
@@ -1104,6 +1105,18 @@ def attend_most_recent_matching(
             physical heads.
         match_gain: Coefficient on the dot-product term.  See the
             invariant above.
+        exclude_self: If ``True``, the current query position is
+            excluded from selection — the head returns ``value`` at the
+            most recent matching position **strictly before** self.
+            Implemented by pre-shifting ``key_vector`` and ``value`` by
+            one position via :meth:`PosEncoding.attend_to_offset`, so
+            that at slot ``i`` the head sees the predecessor's key and
+            value.  Costs two extra attention heads (one for the key
+            shift, one for the value shift) and adds the constraint
+            ``len(key_vector) <= d_pos`` and ``len(value) <= d_pos``
+            (the shift's per-head width limit).  At query position 0
+            the result is degenerate (no prior position exists) — the
+            caller must not consume it there.
         assert_hardness_gt: If set, wraps the output in a softmax
             hardness assertion verifying the max attention weight per
             query exceeds this threshold during ``debug=True`` forward
@@ -1124,9 +1137,27 @@ def attend_most_recent_matching(
         "query_vector and key_vector must have the same width "
         f"(got {len(query_vector)} and {len(key_vector)})"
     )
+    d_pos = pos_encoding.d_pos
+    if exclude_self:
+        assert len(key_vector) <= d_pos, (
+            f"attend_most_recent_matching(exclude_self=True): "
+            f"key_vector width ({len(key_vector)}) must be <= d_pos ({d_pos}); "
+            "the position-shift step uses one attention head per shift."
+        )
+        assert len(value) <= d_pos, (
+            f"attend_most_recent_matching(exclude_self=True): "
+            f"value width ({len(value)}) must be <= d_pos ({d_pos}); "
+            "the position-shift step uses one attention head per shift."
+        )
+        # Shift key and value back by one position so that at slot i the
+        # head sees key_vector[i-1] / value[i-1].  The causal mask still
+        # admits i in [0, j], but the rightmost slot i = j now carries
+        # the predecessor's data — self can no longer contribute its own
+        # match.
+        key_vector = pos_encoding.attend_to_offset(key_vector, delta_pos=-1)
+        value = pos_encoding.attend_to_offset(value, delta_pos=-1)
     W = len(query_vector)
     d_v = len(value)
-    d_pos = pos_encoding.d_pos
 
     # d_qk layout:
     #   cols 0..W-1   content match:   Q = match_gain · query_vector[c],
